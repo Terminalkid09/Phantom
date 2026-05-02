@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.env
+data/sessions/*.json
+data/presets/*.json
+*.pcap
+*.pcapng
+*.pdf
+*.xml
+shell.elf
+*.exe
+*.log
