@@ -57,7 +57,7 @@ class ScanModule(BaseModule):
                 f"snmpwalk -c public -v1 {t}",
                 f"snmpwalk -c public -v2c {t}",
                 f"onesixtyone {t} public",
-                f"smtp-user-enum -M VRFY -U /usr/share/wordlists/unix-users.txt -t {t}",
+                f"smtp-user-enum -M VRFY -U /usr/share/seclists/Usernames/top-usernames-shortlist.txt -t {t}",
             ],
         }
 
@@ -89,27 +89,26 @@ class ScanModule(BaseModule):
         self.do_preview(_)
 
     def _conditional_suggestions(self, results: dict):
-        """
-        Analyze scan output and suggest additional tools based on open ports.
-        """
         all_output = " ".join(results.values()).lower()
 
-        if "445" in all_output or "smb" in all_output:
+        # SMB
+        if "445/tcp open" in all_output or "microsoft-ds" in all_output:
             console.print("\n[yellow][!] Port 445 / SMB detected.[/]")
             console.print("    Consider running: enum4linux -a, smbclient, rpcclient")
             if input("    Add these commands now? [y/N] ").strip().lower() == "y":
-                # Add extra commands to session results? We could also re-run preview.
-                # For simplicity, just print them.
                 console.print("    [dim]Run: use scan, then run-group \"SERVICE ENUM\"[/]")
 
-        if "443" in all_output:
+        # HTTPS
+        if "443/tcp open" in all_output or "https" in all_output:
             console.print("\n[yellow][!] Port 443 (HTTPS) detected.[/]")
             console.print("    Consider: sslscan, openssl s_client, whatweb")
 
-        if "161" in all_output:
+        # SNMP
+        if "161/udp open" in all_output or "snmp" in all_output:
             console.print("\n[yellow][!] Port 161 (SNMP) detected.[/]")
             console.print("    Consider: snmpwalk, onesixtyone")
 
+        # Nessuna porta aperta
         if "open" not in all_output:
             console.print("\n[yellow][!] No open ports found with standard scans.[/]")
             console.print("    Consider: UDP scan, stealth scans (NULL, FIN, Xmas), or decoy scans.")

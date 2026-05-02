@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime
 from phantom.modules.base_module import BaseModule
 from phantom.core.session import session
@@ -6,13 +7,17 @@ from rich.console import Console
 
 console = Console()
 
-
 class ReportModule(BaseModule):
     module_name = "report"
 
     def export(self, fmt: str = "json", filename: str = ""):
+        # Assicura che il filename abbia l'estensione corretta
         if not filename:
             filename = f"report_{session.target or 'phantom'}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{fmt}"
+        else:
+            # Aggiunge l'estensione se non presente
+            if not filename.endswith(f".{fmt}"):
+                filename += f".{fmt}"
 
         if fmt == "json":
             self._export_json(filename)
@@ -39,11 +44,16 @@ class ReportModule(BaseModule):
         console.print(f"[green][+] JSON report saved to {filename}[/]")
 
     def _export_html(self, filename: str):
-        # Basic HTML template
+        # Basic HTML template with a little style
         html = f"""<!DOCTYPE html>
 <html>
 <head><title>Phantom Report - {session.target}</title>
-<style>body {{ font-family: monospace; margin: 2em; }} .section {{ margin: 2em 0; }} pre {{ background: #f4f4f4; padding: 1em; }}</style>
+<style>
+body {{ font-family: monospace; margin: 2em; background: #fff; }}
+.section {{ margin: 2em 0; }}
+pre {{ background: #f4f4f4; padding: 1em; overflow: auto; }}
+h1 {{ color: #2c3e50; }}
+</style>
 </head>
 <body>
 <h1>Phantom Penetration Test Report</h1>
@@ -97,9 +107,10 @@ class ReportModule(BaseModule):
 
     def do_run(self, _):
         fmt = input("  Format (json/html/pdf) [json]: ").strip().lower() or "json"
-        fname = input(f"  Filename [report_{session.target or 'phantom'}.{fmt}]: ").strip()
+        default_name = f"report_{session.target or 'phantom'}.{fmt}"
+        fname = input(f"  Filename [{default_name}]: ").strip()
         if not fname:
-            fname = f"report_{session.target or 'phantom'}.{fmt}"
+            fname = default_name
         self.export(fmt, fname)
 
     def do_preview(self, _):
