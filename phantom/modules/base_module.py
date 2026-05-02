@@ -1,7 +1,7 @@
 import cmd
 from rich.console import Console
 from phantom.core.session import session
-from phantom.core.preview import PrewiewSession
+from phantom.core.preview import PreviewSession
 from phantom.core.executor import run_commands
 
 console = Console()
@@ -36,28 +36,28 @@ class BaseModule(cmd.Cmd):
         else:
             console.print("[red]Usage: show session[/]")
 
-        def do_note(self, arg):
-            text = arg.strip().strip('"').strip('"')
-            if text:
-                session.add_note(text)
-                console.print("[green][+] Note added.[/]")
-            else:
-                console.print("[red]Usage: note \"your note here\"[/]")
+    def do_note(self, arg):
+        text = arg.strip().strip('"').strip('"')
+        if text:
+            session.add_note(text)
+            console.print("[green][+] Note added.[/]")
+        else:
+            console.print("[red]Usage: note \"your note here\"[/]")
 
 
-        # Methods to be implemented by child classes
-        def build_commands(self) -> dict:
-            """
-            return a dictionary of command groups:
-            {
-            "NMAP": ["nmap -sV target", ...],
-            "NETWORK": ["ping target", ...]
-            }
-            """
-            raise NotImplementedError("Each module must implement build_commands()")
+    # Methods to be implemented by child classes
+    def build_commands(self) -> dict:
+        """
+        return a dictionary of command groups:
+        {
+        "NMAP": ["nmap -sV target", ...],
+        "NETWORK": ["ping target", ...]
+        }
+        """
+        raise NotImplementedError("Each module must implement build_commands()")
 
-        def do_prewiew(self, _):
-            raise NotImplementedError("Each module must implement do_prewiew()")
+    def do_preview(self, _):
+        raise NotImplementedError("Each module must implement do_preview()")
 
-        def do_run(self, _):
-            raise NotImplementedError("Each module must implement do_run()")
+    def do_run(self, _):
+        raise NotImplementedError("Each module must implement do_run()")

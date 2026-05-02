@@ -18,4 +18,4 @@ def show_notes() -> None:
     for idx, note in enumerate(session.notes, start=1):
         table.add_row(str(idx), note["timestamp"], note["text"])
 
-        console.print(table)
+    console.print(table)
