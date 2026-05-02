@@ -109,7 +109,7 @@ def exploitdb_lookup(cve_id: str) -> bool:
     try:
         # searchsploit --cve <CVE> --json
         result = subprocess.run(
-            ["searchsploot", "--cve", cve_id, "--json"],
+            ["searchsploit", "--cve", cve_id, "--json"],
             capture_output=True,
             text=True,
             timeout=10
