@@ -99,12 +99,12 @@ class ScanModule(BaseModule):
                 console.print("    [dim]Run: use scan, then run-group \"SERVICE ENUM\"[/]")
 
         # HTTPS
-        if "443/tcp open" in all_output or "https" in all_output:
+        if "443/tcp open" in all_output:
             console.print("\n[yellow][!] Port 443 (HTTPS) detected.[/]")
             console.print("    Consider: sslscan, openssl s_client, whatweb")
 
         # SNMP
-        if "161/udp open" in all_output or "snmp" in all_output:
+        if "161/udp open" in all_output:
             console.print("\n[yellow][!] Port 161 (SNMP) detected.[/]")
             console.print("    Consider: snmpwalk, onesixtyone")
 
