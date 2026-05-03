@@ -4,12 +4,12 @@ from typing import Dict, List, Optional, Tuple
 console = Console()
 
 class PreviewSession:
-    def __init__(self, groups: Dict[str, List[str]]):
+    def __init__(self, groups: Dict[str, List[str]]) -> None:
         self.groups = groups
         self._flat: List[Tuple[str, str]] = []
         self._rebuild_flat()
 
-    def _rebuild_flat(self):
+    def _rebuild_flat(self) -> None:
         self._flat = [(g, c) for g, lst in self.groups.items() for c in lst]
 
     def _display(self):

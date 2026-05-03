@@ -3,6 +3,9 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List
+from rich.console import Console
+
+console = Console()
 
 @dataclass
 class Session:
@@ -44,7 +47,7 @@ class Session:
         path = f"data/sessions/{name}.json"
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.__dict__, f, indent=2, default=str)
-        print(f"[+] Session saved: {path}")
+        console.print(f"[green][+] Session saved: {path}[/]")
 
     def load(self, name: str) -> None:
         """Load a session from data/sessions/{name}.json."""

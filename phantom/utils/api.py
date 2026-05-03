@@ -119,8 +119,8 @@ def exploitdb_lookup(cve_id: str) -> bool:
             # The JSON contains a "RESULTS_EXPLOIT" list
             exploits = data.get("RESULTS_EXPLOIT", [])
             return len(exploits) > 0
-    except Exception:
-        pass
+    except Exception as e:
+        console.print(f"[yellow]ExploitDB search error: {e}[/]")
     return False
 
 # GitHub check for public poC repo related to a CVE

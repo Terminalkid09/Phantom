@@ -3,9 +3,9 @@ from typing import List
 
 def is_in_scope(target: str, scope_list: List[str]) -> bool:
     """
-    return true if the target is allowed by the scope
-    - empty scope = everything allowed.
-    - scope can contain single ips ora CIDR subnets
+    Return true if the target is allowed by the configured scope.
+    - empty scope = everything allowed
+    - scope may contain single IPs or CIDR subnets
     - domain names are always allowed
     """
     if not scope_list:
