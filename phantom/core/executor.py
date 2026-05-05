@@ -1,3 +1,4 @@
+import re
 import subprocess
 import threading
 import sys
@@ -11,9 +12,7 @@ TIMEOUT_SECONDS = 300  # Ask user after this many seconds
 
 
 def _is_safe_target(target: str) -> bool:
-    """Return True if target contains no dangerous shell metacharacters."""
-    dangerous = set(';&|$`\\')
-    return not any(c in dangerous for c in target)
+    return bool(re.match(r'^[a-zA-Z0-9.\-/:]+$', target))
 
 
 def run_command(cmd: str, target_ip: str = "") -> str:
