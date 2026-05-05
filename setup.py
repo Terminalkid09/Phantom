@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="phantom",
-    version="1.0.0",
+    version="1.1.0",
     description="Offensive Security Framework — CLI shell per penetration testing",
     author="Terminalkid09",
     packages=find_packages(),
