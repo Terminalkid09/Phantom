@@ -1,4 +1,11 @@
 import cmd
+import sys
+import os
+import platform
+import importlib.util
+import argparse
+import json                 
+from datetime import datetime
 from rich.console import Console
 from rich.table import Table
 from phantom.core.session import session
@@ -7,22 +14,125 @@ from phantom.core.notes import show_notes
 
 console = Console()
 
-BANNER = """
-  ██████╗ ██╗  ██╗ █████╗ ███╗  ██╗████████╗ ██████╗ ███╗  ███╗
-  ██╔══██╗██║  ██║██╔══██╗████╗ ██║╚══██╔══╝██╔═══██╗████╗████║
-  ██████╔╝███████║███████║██╔██╗██║   ██║   ██║   ██║██╔████╔██║
-  ██╔═══╝ ██╔══██║██╔══██║██║╚████║   ██║   ██║   ██║██║╚██╔╝██║
-  ██║     ██║  ██║██║  ██║██║ ╚███║   ██║   ╚██████╔╝██║ ╚═╝ ██║
-  ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝
-  v1.0.0 — Offensive Security Framework
+
+def build_banner() -> str:
+    import sys
+    import platform
+    from datetime import datetime
+
+    python_ver = sys.version.split()[0]
+    os_info = platform.system() + " " + platform.release()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    return f"""
+[bold red] ________  ___  ___  ________  ________   _________  ________  _____ ______[/]      [bold magenta]  .**.  .**.[/]
+[bold red]|\   __  \|\  \|\  \|\   __  \|\   ___  \|\___   ___\\   __  \|\   _ \  _   \[/]    [bold magenta] .*******.[/]
+[bold red]\ \  \|\  \ \  \\\  \ \  \|\  \ \  \\ \  \|___ \  \_\ \  \|\  \ \  \\\__\ \  \[/]  [bold magenta] .*******.[/]
+[bold red] \ \   ____\ \   __  \ \   __  \ \  \\ \  \   \ \  \ \ \  \\\  \ \  \\|__| \  \[/]  [bold magenta]  .*****.[/]
+[bold red]  \ \  \___|\ \  \ \  \ \  \ \  \ \  \\ \  \   \ \  \ \ \  \\\  \ \  \    \ \  \[/] [bold magenta]   .***.[/]
+[bold red]   \ \__\    \ \__\ \__\ \__\ \__\ \__\\ \__\   \ \__\ \ \_______\ \__\    \ \__\[/][bold magenta]    .*.[/]
+[bold red]    \|__|     \|__|\|__|\|__|\|__|\|__| \|__|    \|__|  \|_______|\|__|     \|__|[/] [bold magenta]     *[/]
+  [dim]──────────────────────────────────────────────────────────────────────────────────[/]
+  [bold white]Offensive Security Framework[/]  [dim]v1.1.0[/]
+  [cyan]Python[/] [dim]{python_ver}[/]   [cyan]OS[/] [dim]{os_info}[/]   [cyan]Time[/] [dim]{now}[/]
+  [dim]──────────────────────────────────────────────────────────────────────────────────[/]
+  [dim]Use 'help' for commands. Use responsibly and legally.[/]
 """
+
+
+# Mode → modules sequence mapping
+MODE_SEQUENCES = {
+    "recon":   ["scan", "osint"],
+    "osint":   ["osint"],
+    "full":    ["scan", "osint", "web", "exploit"],
+    "exploit": ["exploit", "payload"],
+}
+
 
 class PhantomShell(cmd.Cmd):
     intro = ""
     prompt = "[phantom] > "
 
     def preloop(self):
-        console.print(BANNER)
+        console.print(build_banner())
+        self.plugins = self._load_plugins()
+        if self.plugins:
+            console.print(f"[dim][+] Loaded {len(self.plugins)} plugin(s)[/]")
+
+    def _load_plugins(self):
+        """Load external plugins from ~/.phantom/plugins/*.py"""
+        plugin_dir = os.path.expanduser("~/.phantom/plugins")
+        if not os.path.exists(plugin_dir):
+            os.makedirs(plugin_dir, exist_ok=True)
+            return {}
+
+        plugins = {}
+        for file in os.listdir(plugin_dir):
+            if file.endswith(".py") and not file.startswith("__"):
+                name = file[:-3]
+                spec = importlib.util.spec_from_file_location(name, os.path.join(plugin_dir, file))
+                module = importlib.util.module_from_spec(spec)
+                try:
+                    spec.loader.exec_module(module)
+                    # Cerca una classe che eredita da BaseModule
+                    for attr in dir(module):
+                        obj = getattr(module, attr)
+                        if isinstance(obj, type) and hasattr(obj, "module_name") and obj.__name__ != "BaseModule":
+                            plugins[obj.module_name] = obj
+                except Exception as e:
+                    console.print(f"[red]Failed to load plugin {file}: {e}[/]")
+        return plugins
+
+    # Profile management
+    def save_profile(self, name: str):
+        """Save current session settings as a profile."""
+        profile_dir = os.path.expanduser("~/.phantom/profiles")
+        os.makedirs(profile_dir, exist_ok=True)
+        profile_path = os.path.join(profile_dir, f"{name}.json")
+        data = {
+            "target": session.target,
+            "mode": session.mode,
+            "scope": session.scope,
+            "active_wordlist": session.active_wordlist,
+            "timeout_seconds": 300, 
+            "aggressive_confirm": True,
+        }
+        with open(profile_path, "w") as f:
+            json.dump(data, f, indent=2)
+        console.print(f"[green][+] Profile saved: {name}[/]")
+
+    def load_profile(self, name: str):
+        """Load a profile and apply settings to current session."""
+        profile_path = os.path.expanduser(f"~/.phantom/profiles/{name}.json")
+        if not os.path.exists(profile_path):
+            console.print(f"[red]Profile '{name}' not found.[/]")
+            return
+        with open(profile_path, "r") as f:
+            data = json.load(f)
+        if data.get("target"):
+            session.target = data["target"]
+        if data.get("mode"):
+            session.mode = data["mode"]
+        if data.get("scope"):
+            session.scope = data["scope"]
+        if data.get("active_wordlist"):
+            session.active_wordlist = data["active_wordlist"]
+        console.print(f"[green][+] Profile '{name}' loaded.[/]")
+        self.do_show("session")
+
+    def do_save_profile(self, name: str):
+        """save-profile <name> — save current settings as a profile."""
+        if not name.strip():
+            console.print("[red]Usage: save-profile <name>[/]")
+            return
+        self.save_profile(name.strip())
+
+    def do_load_profile(self, name: str):
+        """load-profile <name> — load a profile."""
+        if not name.strip():
+            console.print("[red]Usage: load-profile <name>[/]")
+            return
+        self.load_profile(name.strip())
 
     def do_set(self, arg: str):
         """set target <ip/domain> | set mode <recon|osint|full|exploit> | set scope <cidr,ip,...>"""
@@ -42,11 +152,14 @@ class PhantomShell(cmd.Cmd):
             console.print(f"[green][+] Target set to {value}[/]")
 
         elif key == "mode":
-            if value in ("recon", "osint", "full", "exploit"):
+            valid_modes = list(MODE_SEQUENCES.keys())
+            if value in valid_modes:
                 session.mode = value
-                console.print(f"[green][+] Mode set to {value}[/]")
+                steps = " → ".join(MODE_SEQUENCES[value])
+                console.print(f"[green][+] Mode set to {value}[/]  [dim]({steps})[/]")
+                console.print(f"[dim]    Type 'run' to launch the sequence automatically.[/]")
             else:
-                console.print("[red]Invalid mode. Use: recon, osint, full, exploit[/]")
+                console.print(f"[red]Invalid mode. Use: {', '.join(valid_modes)}[/]")
 
         elif key == "scope":
             session.scope = [s.strip() for s in value.split(",")]
@@ -55,8 +168,28 @@ class PhantomShell(cmd.Cmd):
         else:
             console.print(f"[red]Unknown key: {key}[/]")
 
+    def do_run(self, _):
+        """run — launch all modules for the current mode in sequence"""
+        if not session.target:
+            console.print("[red][!] No target set. Use 'set target <ip>' first.[/]")
+            return
+
+        mode = session.mode
+        steps = MODE_SEQUENCES.get(mode, ["scan"])
+        total = len(steps)
+
+        console.print(f"\n[bold cyan][*] Mode: {mode.upper()} — {' → '.join(s.upper() for s in steps)}[/]\n")
+
+        for i, module_name in enumerate(steps, 1):
+            console.print(f"[bold cyan]── STEP {i}/{total}: {module_name.upper()} {'─' * (50 - len(module_name))}[/]")
+            self.do_use(module_name)
+            console.print(f"\n[green][+] {module_name.upper()} complete.[/]\n")
+
+        console.print(f"[bold green][+] {mode.upper()} sequence complete. Results saved to session.[/]")
+        console.print(f"[dim]    Use 'export json report.json' to generate a report.[/]")
+
     def do_show(self, arg: str):
-        """show session | show scope | show presets"""
+        """show session | show scope | show presets | show mode"""
         arg = arg.strip().lower()
         if arg == "session":
             table = Table(title="Current session")
@@ -64,6 +197,7 @@ class PhantomShell(cmd.Cmd):
             table.add_column("Value")
             table.add_row("Target", session.target or "—")
             table.add_row("Mode", session.mode)
+            table.add_row("Mode sequence", " → ".join(MODE_SEQUENCES.get(session.mode, [])))
             table.add_row("Scope", ", ".join(session.scope) if session.scope else "—")
             table.add_row("Active wordlist", session.active_wordlist or "—")
             table.add_row("Completed modules", ", ".join(session.results.keys()) or "—")
@@ -74,10 +208,14 @@ class PhantomShell(cmd.Cmd):
                 console.print(f"[cyan]Scope: {', '.join(session.scope)}[/]")
             else:
                 console.print("[yellow]No scope defined.[/]")
+        elif arg == "mode":
+            console.print(f"[cyan]Mode: {session.mode}[/]")
+            console.print(f"  Sequence: {' → '.join(MODE_SEQUENCES.get(session.mode, []))}")
+            console.print(f"  Type 'run' to launch.")
         elif arg == "presets":
             console.print("[yellow]Presets not yet implemented.[/]")
         else:
-            console.print("[red]Usage: show session | show scope | show presets[/]")
+            console.print("[red]Usage: show session | show scope | show mode | show presets[/]")
 
     def do_note(self, arg: str):
         """note \"<text>\" — add an inline note to the session"""
@@ -155,21 +293,74 @@ class PhantomShell(cmd.Cmd):
         rm = ReportModule()
         rm.export(fmt, filename)
 
+    def do_scan_diff(self, arg: str):
+        """scan-diff <target> [--since YYYY-MM-DD | --old TS --new TS]"""
+        from phantom.utils.scan_history import load_history, diff_scans
+        parser = argparse.ArgumentParser(prog="scan-diff", add_help=False)
+        parser.add_argument("target", help="Target to diff")
+        parser.add_argument("--since", help="Compare last scan with the one after this date (YYYY-MM-DD)")
+        parser.add_argument("--old", help="Old timestamp (format: YYYYMMDD_HHMMSS)")
+        parser.add_argument("--new", help="New timestamp (format: YYYYMMDD_HHMMSS)")
+        try:
+            args = parser.parse_args(arg.split())
+        except SystemExit:
+            return
+
+        history = load_history(args.target)
+        if len(history) < 2:
+            console.print("[yellow]Need at least two scans for diff.[/]")
+            return
+
+        if args.old and args.new:
+            old = next((h for h in history if args.old in h["timestamp"]), None)
+            new = next((h for h in history if args.new in h["timestamp"]), None)
+        elif args.since:
+            since_dt = datetime.strptime(args.since, "%Y-%m-%d")
+            new = history[0]  # latest
+            candidates = [h for h in history if datetime.fromisoformat(h["timestamp"]) > since_dt]
+            old = candidates[-1] if candidates else None
+        else:
+            new = history[0]
+            old = history[1]
+
+        if not old or not new:
+            console.print("[red]Could not find matching scans.[/]")
+            return
+
+        added, removed, changed = diff_scans(old["services"], new["services"])
+
+        console.print(f"\n[bold cyan]Diff: {old['timestamp']} → {new['timestamp']}[/]\n")
+        if added:
+            console.print("[green][+] Added ports:[/]")
+            for s in added:
+                console.print(f"    {s['port']}/{s['protocol']}  {s['service']}  {s['version']}")
+        if removed:
+            console.print("[red][-] Removed ports:[/]")
+            for s in removed:
+                console.print(f"    {s['port']}/{s['protocol']}  {s['service']}  {s['version']}")
+        if changed:
+            console.print("[yellow][*] Changed services:[/]")
+            for old_s, new_s in changed:
+                console.print(f"    {old_s['port']}/{old_s['protocol']}: {old_s['service']} {old_s['version']} → {new_s['service']} {new_s['version']}")
+        if not (added or removed or changed):
+            console.print("[dim]No changes detected.[/]")
+
     def do_use(self, arg: str):
-        """use <module> — enter a module (scan, osint, web, brute, exploit, payload, handler, pivot, analyzer, report)"""
+        """use <module> — enter a module"""
         module_name = arg.strip().lower()
         modules = {
-            "scan": "phantom.modules.scan.ScanModule",
-            "osint": "phantom.modules.osint.OsintModule",
-            "web": "phantom.modules.web.WebModule",
-            "brute": "phantom.modules.brute.BruteModule",
-            "exploit": "phantom.modules.exploit.ExploitModule",
-            "payload": "phantom.modules.payload.PayloadModule",
-            "handler": "phantom.modules.handler.HandlerModule",
-            "pivot": "phantom.modules.pivot.PivotModule",
+            "scan":     "phantom.modules.scan.ScanModule",
+            "osint":    "phantom.modules.osint.OsintModule",
+            "web":      "phantom.modules.web.WebModule",
+            "brute":    "phantom.modules.brute.BruteModule",
+            "exploit":  "phantom.modules.exploit.ExploitModule",
+            "payload":  "phantom.modules.payload.PayloadModule",
+            "handler":  "phantom.modules.handler.HandlerModule",
+            "pivot":    "phantom.modules.pivot.PivotModule",
             "analyzer": "phantom.modules.analyzer.AnalyzerModule",
-            "report": "phantom.modules.report.ReportModule",
+            "report":   "phantom.modules.report.ReportModule",
         }
+        modules.update(self.plugins) # Add loaded plugins to the available modules
         if module_name not in modules:
             console.print(f"[red]Unknown module: {module_name}[/]")
             console.print(f"  Available: {', '.join(modules.keys())}")
