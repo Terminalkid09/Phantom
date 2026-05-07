@@ -10,12 +10,20 @@ Tests:
 """
 
 import subprocess
+import shutil
 from unittest.mock import MagicMock, patch, mock_open, call
 
 import pytest
 
 from phantom.core.executor import run_command, run_commands, _is_safe_target
 from phantom.core.session import session
+
+
+@pytest.fixture(autouse=True)
+def mock_shutil_which():
+    """Mock shutil.which to always return True for tests."""
+    with patch("shutil.which", return_value="/usr/bin/tool"):
+        yield
 
 
 class TestIsSafeTarget:
