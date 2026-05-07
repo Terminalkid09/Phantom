@@ -1,59 +1,79 @@
-# Phantom
+# Phantom 🛡️❤️
 
-```text
-  ________  ___  ___  ________  ________   _________  ________  _____ ______          .**.  .**.
-  |\   __  \|\  \|\  \|\   __  \|\   ___  \|\___   ___\\   __  \|\   _ \  _   \       .*******.
-  \ \  \|\  \ \  \\\  \ \  \|\  \ \  \\ \  \|___ \  \_\ \  \|\  \ \  \\\__\ \  \     .*******.
-   \ \   ____\ \   __  \ \   __  \ \  \\ \  \   \ \  \ \ \  \\\  \ \  \\|__| \  \     .*****.
-    \ \  \___|\ \  \ \  \ \  \ \  \ \  \\ \  \   \ \  \ \ \  \\\  \ \  \    \ \  \      .***.
-     \ \__\    \ \__\ \__\ \__\ \__\ \__\\ \__\   \ \__\ \ \_______\ \__\    \ \__\       .*.
-      \|__|     \|__|\|__|\|__|\|__|\|__| \|__|    \|__|  \|_______|\|__|     \|__|        *
-  ----------------------------------------------------------------------------------
-  Offensive Security Framework  v1.1.0
-  Python 3.10+   OS Linux/Windows   Time current
-  ----------------------------------------------------------------------------------
-  Use 'help' for commands. Use responsibly and legally.
-```
+[![Version](https://img.shields.io/badge/version-1.1.0-red.svg)](CHANGELOG.md)
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey.svg)](#)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-Phantom is a Python-based offensive security CLI framework that orchestrates reconnaissance, OSINT, web testing, brute force, exploitation, and reporting into a single interactive session – with previewable, editable command workflows.
+**Phantom** is a professional-grade Offensive Security CLI Framework designed to orchestrate the entire penetration testing lifecycle—from reconnaissance and OSINT to exploitation and reporting—into a single, unified, and interactive session.
 
-## Features
+Built for speed and flexibility, Phantom allows you to automate complex workflows while maintaining full control over every command executed.
 
-- Interactive CLI with persistent session (target, scope, notes, command history)
-- Preview and edit commands before execution (remove, edit, add, run-group, run-single)
-- Target and scope management – prevents accidental out-of-scope tests
-- Mode-driven workflows – recon, osint, full, exploit modes with `run` to execute sequence automatically
-- Profiles – save/load your preferred settings (`save-profile`, `load-profile`)
-- Scan history diff – compare scan results over time (`scan-diff`)
-- Plugin system – drop a Python module in `~/.phantom/plugins/` to add custom commands
-- 10+ built-in modules: scan, osint, web, brute, exploit, payload, handler, pivot, analyzer, report
-- Report export – JSON, HTML, PDF
-- External APIs – NVD, crt.sh, ExploitDB, Shodan, GitHub (optional)
+---
 
-## Requirements
+## 🚀 Key Features
 
-### Python packages (required)
-- rich
-- requests
-- python-nmap
-- scapy
-- reportlab
-- python-whois
-- dnspython
+### 🧩 Extensible Architecture
+- **Plugin System**: Seamlessly extend the framework by dropping Python modules into `~/.phantom/plugins/`.
+- **10+ Built-in Modules**: Native integration for `scan`, `osint`, `web`, `brute`, `exploit`, `payload`, and more.
 
-### System tools (required – most are pre-installed on Kali)
-```
-nmap, gobuster, hydra, sqlmap, nikto, enum4linux, sslscan, traceroute,
-arp-scan, netdiscover, amass, subfinder, whatweb, wafw00f, feroxbuster,
-ffuf, wfuzz, john, hashcat, medusa, dirb, dnsenum, dnsrecon, fierce,
-tshark, searchsploit, msfvenom, chisel
-```
+### ⚙️ Smart Workflows
+- **Mode-Driven Execution**: Preset modes (`recon`, `osint`, `full`, `exploit`) for automated sequential testing.
+- **Interactive Command Preview**: Preview, edit, or skip commands before they hit the target.
+- **Aggressive Mode**: Inject custom payloads or aggressive flags dynamically into your workflow.
 
-> Note: Some tools (like subfinder, assetfinder) are optional – Phantom will skip them if not found.
+### 📊 Advanced Data Management
+- **Scan History & Diff**: Track changes in the target's attack surface over time.
+- **Intelligent Wordlist Manager**: Automatically indexes and categorizes wordlists from standard paths (SecLists, Dirb, etc.).
+- **Report Engine**: Professional exports in **JSON**, **HTML**, and **PDF** formats.
 
-## Installation
+### 🛡️ Safety & Reliability
+- **Scope Enforcement**: Prevents accidental testing of out-of-scope targets.
+- **Tool Check**: Automatically verifies if system dependencies (Nmap, SQLMap, etc.) are installed.
+- **Session Persistence**: Complete session state (notes, history, results) saved to disk.
 
-### From source (recommended)
+---
+
+## ⌨️ Core Commands
+
+| Command | Description |
+| :--- | :--- |
+| `set target <ip/domain>` | Define the current testing target. |
+| `set mode <recon/full/...>` | Select the automation workflow. |
+| `set scope <ip,cidr,...>` | Define authorized testing boundaries. |
+| `run` | Execute the selected mode sequence automatically. |
+| `use <module>` | Enter a specific module (e.g., `use scan`, `use exploit`). |
+| `scan-diff <target>` | Compare current scan results with previous ones. |
+| `wordlists list/use/search` | Manage and select wordlists for attacks. |
+| `save-session <name>` | Save current target, notes, and results. |
+| `save-profile <name>` | Persist your configuration and preferences. |
+| `note "text"` | Add a timestamped note to the session. |
+| `export <pdf/html/json>` | Generate a professional report of findings. |
+
+---
+
+## 🛠️ Modules Overview
+
+| Module | Purpose | Key Tools |
+| :--- | :--- | :--- |
+| **Scan** | Active Reconnaissance | `nmap`, `traceroute`, `service enum` |
+| **OSINT** | Passive Intelligence | `crt.sh`, `Shodan`, `BGP`, `Whois` |
+| **Web** | Web Application Pentest | `gobuster`, `sqlmap`, `nikto`, `ffuf` |
+| **Brute** | Credential Auditing | `hydra`, `medusa`, `john`, `hashcat` |
+| **Exploit** | CVE Correlation | `searchsploit`, `NVD API`, `GitHub PoCs` |
+| **Payload** | Payload Generation | `msfvenom`, `shellgen` |
+| **Analyzer** | Traffic Analysis | `scapy`, `tshark` |
+| **Pivot** | Post-Exploitation | `ssh tunneling`, `chisel` |
+
+---
+
+## 📥 Installation
+
+### Prerequisites
+- Python 3.10 or higher.
+- Standard security tools (pre-installed on Kali/Parrot): `nmap`, `sqlmap`, `gobuster`, etc.
+
+### From Source
 ```bash
 git clone https://github.com/Terminalkid09/phantom.git
 cd phantom
@@ -61,129 +81,54 @@ pip install -e .
 phantom
 ```
 
-### Using pipx (isolated)
-```bash
-pipx install git+https://github.com/Terminalkid09/phantom.git
-```
+---
 
-## Running Tests
-```bash
-pip install pytest pytest-mock
-pytest tests/ -v
-```
+## 🏁 Quick Start
 
-## Quick Start
 ```bash
+# Start Phantom
 phantom
+
+# Configure Session
 set target scanme.nmap.org
 set scope 45.33.32.156
 set mode full
-run                                  
+
+# Run Workflow
+run
+
+# Export Findings
 use report
-export json report.json
+export pdf report.pdf
 ```
 
-## Command Reference
+---
 
-### Global Shell Commands
+## 📝 Extending Phantom (Plugins)
 
-| Command | Description |
-|---------|-------------|
-| `set target <ip/domain>` | Set the target |
-| `set mode <recon/ osint/ full/ exploit>` | Select operation mode |
-| `set scope <cidr,ip,...>` | Whitelist IP/CIDR (warnings) |
-| `run` | Execute the mode-specific module sequence automatically |
-| `show session/ scope/ mode` | Display current state |
-| `note "text"` / `notes` | Add/show inline notes |
-| `save-session <name>` / `load-session <name>` | Persist session to disk |
-| `list-sessions` | Show saved sessions |
-| `history` | View command history |
-| `save-profile <name>` / `load-profile <name>` | Save/load settings profiles |
-| `wordlists list/ use/ search/ info` | Wordlist manager |
-| `scan-diff <target> [--since YYYY-MM-DD]` | Compare scan history |
-| `export json/ pdf/ html <file>` | Generate report |
-| `use <module>` | Enter a module (scan, osint, web, brute, exploit, payload, handler, pivot, analyzer, report) |
-| `exit` / `quit` | Close Phantom (asks to save) |
-
-### Built-in Modules
-
-| Module | Command | Description | Key Sub-commands |
-|--------|---------|-------------|-------------------|
-| Scan | `use scan` | Network reconnaissance (Nmap, traceroute, service enum) | `preview`, `run-all`, `run-group`, `edit`, `remove`, `add` |
-| OSINT | `use osint` | Passive domain/IP intelligence, APIs (crt.sh, Shodan, BGP) | `crtsh`, `shodan`, `bgp` |
-| Web | `use web` | Web enumeration, fuzzing, SQLmap | `preview`, `run-all` |
-| Brute | `use brute` | Controlled brute-force wizard (Hydra, Medusa, John, Hashcat) | `run`, `crack` |
-| Exploit | `use exploit` | CVE correlation & exploitability scoring (NVD, searchsploit, GitHub) | `run` |
-| Payload | `use payload` | msfvenom payload generator + listener helper | `generate` |
-| Handler | `use handler` | Reverse-shell listener (Metasploit, netcat) | `listen`, `nc` |
-| Pivot | `use pivot` | Port forwarding & tunneling (SSH, Chisel) | `setup` |
-| Analyzer | `use analyzer` | PCAP analysis and anomaly detection (scapy) | `capture`, `load` |
-| Report | `use report` | Export session results | `export` |
-
-## Extending Phantom – Plugins
-
-Phantom automatically loads any Python module placed in `~/.phantom/plugins/`.  
-To add a new module:
-
-1. Create a file `~/.phantom/plugins/my_module.py`
-2. Inherit from `BaseModule` (from `phantom.modules.base_module`)
-3. Implement `build_commands()`, `do_preview()`, and `do_run()`
-4. Restart Phantom – the module will appear in the `use` list.
-
-Example plugin:
+Creating a custom module is as simple as inheriting from `BaseModule`:
 
 ```python
 from phantom.modules.base_module import BaseModule
 
-class MyModule(BaseModule):
-    module_name = "mymod"
+class MyTool(BaseModule):
+    module_name = "mytool"
     def build_commands(self):
-        return {"CUSTOM": ["echo 'Hello from plugin'"]}
-    def do_preview(self, _):
-        # ... implement preview logic
+        return {"CUSTOM": ["echo 'Running custom logic on {self.target}'"]}
+    def do_run(self, _):
+        # Implementation...
 ```
 
-## Scan History & Diff
+Drop the file in `~/.phantom/plugins/` and it will be available in the next session!
 
-Each time you run the `scan` module, Phantom saves the detected services (from Nmap XML) into `data/scan_history/<target>/`.  
-Use `scan-diff <target> --since 2025-03-01` to see what changed between scans – open ports, new services, version updates.
+---
 
-## Profiles
+## ⚖️ Legal Disclaimer
 
-Save your current session settings (target, mode, scope, active wordlist, etc.) as a profile:
+Phantom is intended for **authorized penetration testing and educational purposes only**. Use this tool only on systems where you have explicit, written permission. The author is not responsible for any misuse or damage caused by this program.
 
-```bash
-save-profile myprofile
-```
+---
 
-Later, reload them:
-
-```bash
-load-profile myprofile
-```
-
-Profiles are stored in `~/.phantom/profiles/`.
-
-## Legal Disclaimer
-
-Phantom is designed for authorized penetration testing and security research only.  
-Use this tool only on systems you own or have explicit written permission to test.  
-Unauthorized use is illegal. The author assumes no liability for misuse or damage.
-
-## Contributing
-
-To add a built-in module:
-1. Create `phantom/modules/newmodule.py`
-2. Inherit from `BaseModule`
-3. Add the module to the dictionary in `phantom/core/shell.py` under `do_use()`
-4. Write tests in `tests/` with pytest
-
-For plugins, just drop your file into `~/.phantom/plugins/` – no pull request required.
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for version history.
-
-## Author
+## 👨‍💻 Author
 
 **Terminalkid09** – [GitHub](https://github.com/Terminalkid09)
