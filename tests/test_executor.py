@@ -71,7 +71,9 @@ class TestRunCommand:
         """Reset session before each test."""
         session.target = "10.0.0.1"
         session.scope = []
+        session.results = {}
         session.history = []
+        session.results = {}
 
     def test_run_command_adds_to_history(self, monkeypatch):
         """run_command should add the executed command to session history."""
@@ -135,7 +137,7 @@ class TestRunCommand:
         # The timeout mechanism is tested via system integration tests
 
     def test_run_command_with_timeout_user_skips(self, monkeypatch):
-        """When user chooses 'n' on timeout, command should be skipped."""
+        """When user chooses 'k' on timeout, command should be killed and skipped."""
         mock_process = MagicMock()
         mock_process.poll = MagicMock(return_value=None)  # Still running
         mock_process.kill = MagicMock()
@@ -146,7 +148,7 @@ class TestRunCommand:
 
         with patch.object(subprocess, "Popen", return_value=mock_process):
             with patch("phantom.core.executor.threading.Thread", return_value=mock_reader):
-                with patch("builtins.input", return_value="n"):
+                with patch("builtins.input", return_value="k"):
                     output = run_command("long-running-command")
                     assert output == ""
                     mock_process.kill.assert_called()
@@ -188,6 +190,7 @@ class TestRunCommands:
         """Reset session before each test."""
         session.target = "10.0.0.1"
         session.scope = []
+        session.results = {}
 
     def test_run_commands_executes_list_sequentially(self, monkeypatch):
         """run_commands should execute each command in the list."""

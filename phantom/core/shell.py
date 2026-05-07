@@ -25,18 +25,18 @@ def build_banner() -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     return f"""
-[bold red] ________  ___  ___  ________  ________   _________  ________  _____ ______   [/]
-[bold red]|\\   __  \\|\\  \\|\\  \\|\\   __  \\|\\   ___  \\|\\___   ___\\\\   __  \\|\\   _ \\  _   \\  [/]
-[bold red]\\ \\  |\\  \\ \\  \\\\  \\ \\  |\\  \\ \\  \\ \\  \\|___ \\  \\_\\ \\  |\\  \\ \\  \\\\__\\ \\  \\ [/]
-[bold red] \\ \\   ____\\ \\   __  \\ \\   __  \\ \\  \\ \\  \\   \\ \\  \\ \\ \\  \\\\  \\ \\  \\|__| \\  \\[/]
-[bold red]  \\ \\  \\___|\\ \\  \\ \\  \\ \\  \\ \\  \\ \\  \\ \\  \\   \\ \\  \\ \\ \\  \\\\  \\ \\  \\    \\ \\  \\[/]
-[bold red]   \\ \\__\\    \\ \\__\\ \\__\\ \\__\\ \\__\\ \\__\\ \\__\\   \\ \\__\\ \\ \\_______\\ \\__\\    \\ \\__\\[/]
-[bold red]    \\|__|     \\|__|\\|__|\\|__|\\|__|\\|__| \\|__|    \\|__|  \\|_______|\\|__|     \\|__|[/]
-  [dim]──────────────────────────────────────────────────────────────────────────────────[/]
-  [bold white]Offensive Security Framework[/]  [dim]v1.1.0[/]
-  [cyan]Python[/] [dim]{python_ver}[/]   [cyan]OS[/] [dim]{os_info}[/]   [cyan]Time[/] [dim]{now}[/]
-  [dim]──────────────────────────────────────────────────────────────────────────────────[/]
-  [dim]Use 'help' for commands. Use responsibly and legally.[/]
+[bold red] ________  ___  ___  ________  ________   _________  ________  _____ ______   [/bold red]
+[bold red]|\\   __  \\|\\  \\|\\  \\|\\   __  \\|\\   ___  \\|\\___   ___\\\\   __  \\|\\   _ \\  _   \\  [/bold red]
+[bold red]\\ \\  |\\  \\ \\  \\\\  \\ \\  |\\  \\ \\  \\ \\  \\|___ \\  \\_\\ \\  |\\  \\ \\  \\\\__\\ \\  \\ [/bold red]
+[bold red] \\ \\   ____\\ \\   __  \\ \\   __  \\ \\  \\ \\  \\   \\ \\  \\ \\ \\  \\\\  \\ \\  \\|__| \\  \\[/bold red]
+[bold red]  \\ \\  \\___|\\ \\  \\ \\  \\ \\  \\ \\  \\ \\  \\ \\  \\   \\ \\  \\ \\ \\  \\\\  \\ \\  \\    \\ \\  \\[/bold red]
+[bold red]   \\ \\__\\    \\ \\__\\ \\__\\ \\__\\ \\__\\ \\__\\ \\__\\   \\ \\__\\ \\ \\_______\\ \\__\\    \\ \\__\\[/bold red]
+[bold red]    \\|__|     \\|__|\\|__|\\|__|\\|__|\\|__| \\|__|    \\|__|  \\|_______|\\|__|     \\|__|[/bold red]
+  [dim]──────────────────────────────────────────────────────────────────────────────────[/dim]
+  [bold white]Offensive Security Framework[/bold white]  [dim]v1.1.0[/dim]
+  [cyan]Python[/cyan] [dim]{python_ver}[/dim]   [cyan]OS[/cyan] [dim]{os_info}[/dim]   [cyan]Time[/cyan] [dim]{now}[/dim]
+  [dim]──────────────────────────────────────────────────────────────────────────────────[/dim]
+  [dim]Use 'help' for commands. Use responsibly and legally.[/dim]
 """
 
 
@@ -71,27 +71,52 @@ class PhantomShell(cmd.Cmd):
             console.print(f"[dim][+] Loaded {len(self.plugins)} plugin(s)[/]")
 
     def _load_plugins(self):
-        """Load external plugins from ~/.phantom/plugins/*.py"""
+        """
+        Load external plugins from ~/.phantom/plugins/*.py
+        Security: Verifies class inheritance and warns user.
+        """
         plugin_dir = os.path.expanduser("~/.phantom/plugins")
         if not os.path.exists(plugin_dir):
             os.makedirs(plugin_dir, exist_ok=True)
             return {}
 
         plugins = {}
-        for file in os.listdir(plugin_dir):
-            if file.endswith(".py") and not file.startswith("__"):
-                name = file[:-3]
-                spec = importlib.util.spec_from_file_location(name, os.path.join(plugin_dir, file))
-                module = importlib.util.module_from_spec(spec)
-                try:
-                    spec.loader.exec_module(module)
-                    # Cerca una classe che eredita da BaseModule
-                    for attr in dir(module):
-                        obj = getattr(module, attr)
-                        if isinstance(obj, type) and hasattr(obj, "module_name") and obj.__name__ != "BaseModule":
-                            plugins[obj.module_name] = obj
-                except Exception as e:
-                    console.print(f"[red]Failed to load plugin {file}: {e}[/]")
+        self._plugin_modules = {} # Store actual classes
+        
+        # Security Warning
+        plugin_files = [f for f in os.listdir(plugin_dir) if f.endswith(".py") and not f.startswith("__")]
+        if plugin_files:
+            console.print("[yellow][!] Warning: Loading external plugins from ~/.phantom/plugins[/]")
+            console.print("[dim]    Verify plugin source before use to prevent arbitrary code execution.[/]")
+
+        for file in plugin_files:
+            name = file[:-3]
+            plugin_path = os.path.join(plugin_dir, file)
+            
+            # Basic permission check on Linux/Unix
+            if os.name == "posix":
+                import stat
+                mode = os.stat(plugin_path).st_mode
+                if mode & stat.S_IWOTH:
+                    console.print(f"[red][!] Security Error: Plugin {file} is world-writable! Skipping.[/]")
+                    continue
+
+            spec = importlib.util.spec_from_file_location(name, plugin_path)
+            module = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(module)
+                # Search for classes that inherit from BaseModule
+                from phantom.modules.base_module import BaseModule
+                for attr in dir(module):
+                    obj = getattr(module, attr)
+                    if (isinstance(obj, type) and 
+                        issubclass(obj, BaseModule) and 
+                        obj is not BaseModule and
+                        hasattr(obj, "module_name")):
+                        self._plugin_modules[obj.module_name] = obj
+                        plugins[obj.module_name] = obj
+            except Exception as e:
+                console.print(f"[red]Failed to load plugin {file}: {e}[/]")
         return plugins
 
     # Profile management
@@ -128,6 +153,14 @@ class PhantomShell(cmd.Cmd):
             session.scope = data["scope"]
         if data.get("active_wordlist"):
             session.active_wordlist = data["active_wordlist"]
+        
+        # Apply timeout and aggressive confirm
+        if "timeout_seconds" in data:
+            from phantom.core import executor
+            executor.TIMEOUT_SECONDS = data["timeout_seconds"]
+        if "aggressive_confirm" in data:
+            session.aggressive_confirm = data["aggressive_confirm"]
+
         console.print(f"[green][+] Profile '{name}' loaded.[/]")
         self.do_show("session")
 
@@ -214,9 +247,10 @@ class PhantomShell(cmd.Cmd):
         console.print(f"[dim]    Use 'export json report.json' to generate a report.[/]")
 
     def do_show(self, arg: str):
-        """show session | show scope | show presets | show mode"""
+        """show session | show scope | show mode"""
         arg = arg.strip().lower()
         if arg == "session":
+            from phantom.core import executor
             table = Table(title="Current session")
             table.add_column("Field", style="cyan")
             table.add_column("Value")
@@ -224,6 +258,7 @@ class PhantomShell(cmd.Cmd):
             table.add_row("Mode", session.mode)
             table.add_row("Mode sequence", " → ".join(MODE_SEQUENCES.get(session.mode, [])))
             table.add_row("Scope", ", ".join(session.scope) if session.scope else "—")
+            table.add_row("Timeout", f"{executor.TIMEOUT_SECONDS}s")
             table.add_row("Active wordlist", session.active_wordlist or "—")
             table.add_row("Completed modules", ", ".join(session.results.keys()) or "—")
             table.add_row("Notes", str(len(session.notes)))
@@ -237,10 +272,8 @@ class PhantomShell(cmd.Cmd):
             console.print(f"[cyan]Mode: {session.mode}[/]")
             console.print(f"  Sequence: {' → '.join(MODE_SEQUENCES.get(session.mode, []))}")
             console.print(f"  Type 'run' to launch.")
-        elif arg == "presets":
-            console.print("[yellow]Presets not yet implemented.[/]")
         else:
-            console.print("[red]Usage: show session | show scope | show mode | show presets[/]")
+            console.print("[red]Usage: show session | show scope | show mode[/]")
 
     def do_note(self, arg: str):
         """note \"<text>\" — add an inline note to the session"""
@@ -297,10 +330,6 @@ class PhantomShell(cmd.Cmd):
             return
         for entry in session.history:
             console.print(f"  [dim]{entry}[/]")
-
-    def do_capture(self, arg: str):
-        """Save snapshot of current output (to be implemented)"""
-        console.print("[yellow]Capture command not yet implemented.[/]")
 
     def do_export(self, arg: str):
         """export <json|pdf|html> [filename] — export session results"""
@@ -385,17 +414,27 @@ class PhantomShell(cmd.Cmd):
             "analyzer": "phantom.modules.analyzer.AnalyzerModule",
             "report":   "phantom.modules.report.ReportModule",
         }
-        modules.update(self.plugins) # Add loaded plugins to the available modules
-        if module_name not in modules:
-            console.print(f"[red]Unknown module: {module_name}[/]")
-            console.print(f"  Available: {', '.join(modules.keys())}")
+        
+        # Standard modules
+        if module_name in modules:
+            import importlib
+            path, cls_name = modules[module_name].rsplit(".", 1)
+            mod = importlib.import_module(path)
+            cls = getattr(mod, cls_name)
+            instance = cls()
+            instance.cmdloop()
             return
-        import importlib
-        path, cls_name = modules[module_name].rsplit(".", 1)
-        mod = importlib.import_module(path)
-        cls = getattr(mod, cls_name)
-        instance = cls()
-        instance.cmdloop()
+
+        # Plugin modules
+        plugin_modules = getattr(self, "_plugin_modules", {})
+        if module_name in plugin_modules:
+            cls = plugin_modules[module_name]
+            instance = cls()
+            instance.cmdloop()
+            return
+
+        console.print(f"[red]Unknown module: {module_name}[/]")
+        console.print(f"  Available: {', '.join(list(modules.keys()) + list(plugin_modules.keys()))}")
 
     def do_back(self, arg: str):
         """Return to main shell (already here)"""
