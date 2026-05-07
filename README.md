@@ -1,78 +1,79 @@
-```text
-  ██████╗ ██╗  ██╗ █████╗ ███╗  ██╗████████╗ ██████╗ ███╗  ███╗
-  ██╔══██╗██║  ██║██╔══██╗████╗ ██║╚══██╔══╝██╔═══██╗████╗████║
-  ██████╔╝███████║███████║██╔██╗██║   ██║   ██║   ██║██╔████╔██║
-  ██╔═══╝ ██╔══██║██╔══██║██║╚████║   ██║   ██║   ██║██║╚██╔╝██║
-  ██║     ██║  ██║██║  ██║██║ ╚███║   ██║   ╚██████╔╝██║ ╚═╝ ██║
-  ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝
-  v1.0.0 — Offensive Security Framework
-```
+# Phantom 🛡️❤️
 
-![CI](https://github.com/Terminalkid09/phantom/workflows/CI/badge.svg)
+[![Version](https://img.shields.io/badge/version-1.1.0-red.svg)](CHANGELOG.md)
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey.svg)](#)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-# Phantom
+**Phantom** is a professional-grade Offensive Security CLI Framework designed to orchestrate the entire penetration testing lifecycle—from reconnaissance and OSINT to exploitation and reporting—into a single, unified, and interactive session.
 
-Phantom is a Python-based offensive security CLI framework that orchestrates reconnaissance, OSINT, web testing, brute force, exploitation, and reporting into a single interactive session. It exists to reduce manual tool chaining and keep the operator in control with previewable, editable command workflows.
+Built for speed and flexibility, Phantom allows you to automate complex workflows while maintaining full control over every command executed.
 
-## Features
-- Interactive CLI shell with persistent session state
-- Target and scope management for safe operations
-- Preview-driven command generation and editing
-- Network scanning and recon orchestration
-- OSINT and subdomain discovery workflows
-- Web enumeration and fuzzing command generation
-- Brute force and payload generation support
-- Exploitability scoring and vulnerability correlation
-- Report export in JSON, HTML, and PDF formats
-- API integrations: NVD, crt.sh, ExploitDB, Shodan, GitHub
+---
 
-## Requirements
-- Python 3.10+
-- `pip` dependencies:
-  - rich
-  - requests
-  - python-nmap
-  - scapy
-  - reportlab
-  - python-whois
-  - dnspython
-- System tools required:
-  - nmap
-  - gobuster
-  - hydra
-  - sqlmap
-  - metasploit-framework
-  - nikto
-  - enum4linux
-  - sslscan
-  - traceroute
-  - arp-scan
-  - netdiscover
-  - amass
-  - subfinder
-  - whatweb
-  - wafw00f
-  - feroxbuster
-  - ffuf
-  - wfuzz
-  - john
-  - hashcat
-  - medusa
-  - dirb
-  - dnsenum
-  - dnsrecon
-  - fierce
-  - tshark
-  - scapy
-  - searchsploit
-  - msfvenom
-  - chisel
+## 🚀 Key Features
 
-### Optional vs Required
-- Required: Python 3.10+, rich, requests, reportlab, scapy, python-whois, dnspython.
-- Optional: tools such as Shodan, GitHub, and local exploit search tools are only used by optional OSINT and exploitation workflows.
+### 🧩 Extensible Architecture
+- **Plugin System**: Seamlessly extend the framework by dropping Python modules into `~/.phantom/plugins/`.
+- **10+ Built-in Modules**: Native integration for `scan`, `osint`, `web`, `brute`, `exploit`, `payload`, and more.
 
-## Installation
+### ⚙️ Smart Workflows
+- **Mode-Driven Execution**: Preset modes (`recon`, `osint`, `full`, `exploit`) for automated sequential testing.
+- **Interactive Command Preview**: Preview, edit, or skip commands before they hit the target.
+- **Aggressive Mode**: Inject custom payloads or aggressive flags dynamically into your workflow.
+
+### 📊 Advanced Data Management
+- **Scan History & Diff**: Track changes in the target's attack surface over time.
+- **Intelligent Wordlist Manager**: Automatically indexes and categorizes wordlists from standard paths (SecLists, Dirb, etc.).
+- **Report Engine**: Professional exports in **JSON**, **HTML**, and **PDF** formats.
+
+### 🛡️ Safety & Reliability
+- **Scope Enforcement**: Prevents accidental testing of out-of-scope targets.
+- **Tool Check**: Automatically verifies if system dependencies (Nmap, SQLMap, etc.) are installed.
+- **Session Persistence**: Complete session state (notes, history, results) saved to disk.
+
+---
+
+## ⌨️ Core Commands
+
+| Command | Description |
+| :--- | :--- |
+| `set target <ip/domain>` | Define the current testing target. |
+| `set mode <recon/full/...>` | Select the automation workflow. |
+| `set scope <ip,cidr,...>` | Define authorized testing boundaries. |
+| `run` | Execute the selected mode sequence automatically. |
+| `use <module>` | Enter a specific module (e.g., `use scan`, `use exploit`). |
+| `scan-diff <target>` | Compare current scan results with previous ones. |
+| `wordlists list/use/search` | Manage and select wordlists for attacks. |
+| `save-session <name>` | Save current target, notes, and results. |
+| `save-profile <name>` | Persist your configuration and preferences. |
+| `note "text"` | Add a timestamped note to the session. |
+| `export <pdf/html/json>` | Generate a professional report of findings. |
+
+---
+
+## 🛠️ Modules Overview
+
+| Module | Purpose | Key Tools |
+| :--- | :--- | :--- |
+| **Scan** | Active Reconnaissance | `nmap`, `traceroute`, `service enum` |
+| **OSINT** | Passive Intelligence | `crt.sh`, `Shodan`, `BGP`, `Whois` |
+| **Web** | Web Application Pentest | `gobuster`, `sqlmap`, `nikto`, `ffuf` |
+| **Brute** | Credential Auditing | `hydra`, `medusa`, `john`, `hashcat` |
+| **Exploit** | CVE Correlation | `searchsploit`, `NVD API`, `GitHub PoCs` |
+| **Payload** | Payload Generation | `msfvenom`, `shellgen` |
+| **Analyzer** | Traffic Analysis | `scapy`, `tshark` |
+| **Pivot** | Post-Exploitation | `ssh tunneling`, `chisel` |
+
+---
+
+## 📥 Installation
+
+### Prerequisites
+- Python 3.10 or higher.
+- Standard security tools (pre-installed on Kali/Parrot): `nmap`, `sqlmap`, `gobuster`, etc.
+
+### From Source
 ```bash
 git clone https://github.com/Terminalkid09/phantom.git
 cd phantom
@@ -80,61 +81,54 @@ pip install -e .
 phantom
 ```
 
-Alternative install with pipx:
-```bash
-pipx install git+https://github.com/Terminalkid09/phantom.git
-```
+---
 
-## Running Tests
-```bash
-pip install pytest pytest-mock
-pytest tests/ -v
-```
+## 🏁 Quick Start
 
-
-## Quick Start
 ```bash
+# Start Phantom
 phantom
-set target 10.0.0.1
-set scope 10.0.0.0/24
+
+# Configure Session
+set target scanme.nmap.org
+set scope 45.33.32.156
 set mode full
-use scan
-preview
-# edit or remove commands as needed
-run-all
+
+# Run Workflow
+run
+
+# Export Findings
 use report
-export json report.json
+export pdf report.pdf
 ```
 
-## Module Reference
-| Module | Command | Description | Key Commands |
-|---|---|---|---|
-| Shell core | `phantom` | Main interactive CLI | `set`, `show`, `note`, `history`, `export`, `use` |
-| Scan | `use scan` | Network reconnaissance command generator | `preview`, `run-all` |
-| OSINT | `use osint` | Passive domain/IP intelligence and API lookups | `crtsh`, `shodan`, `bgp` |
-| Web | `use web` | Web enumeration and fuzzing workflow | `preview`, `run-all` |
-| Brute | `use brute` | Controlled brute force wizard | `run`, `crack` |
-| Exploit | `use exploit` | CVE correlation and exploitability scoring | `run`, `preview` |
-| Payload | `use payload` | Payload generation and listener helper | `generate`, `run` |
-| Handler | `use handler` | Reverse shell listener helper | `listen`, `nc` |
-| Pivot | `use pivot` | Port forwarding and tunneling helper | `setup`, `run` |
-| Analyzer | `use analyzer` | PCAP analysis and anomaly detection | `capture`, `load` |
-| Report | `use report` | Export session results to JSON/HTML/PDF | `export`, `preview` |
+---
 
-## Legal Disclaimer
-Phantom is designed for authorized penetration testing and security research only.
-Use this tool only on systems you own or have explicit written permission to test.
-Unauthorized use against systems you do not own is illegal under computer crime laws
-in most jurisdictions. The author assumes no liability for misuse or damage caused
-by this tool. Always obtain proper authorization before conducting any security testing.
+## 📝 Extending Phantom (Plugins)
 
-## Contributing
-To add a new module:
-1. Create a new module under `phantom/modules/`.
-2. Inherit from `phantom.modules.base_module.BaseModule`.
-3. Implement `build_commands()`, `do_preview()`, and `do_run()`.
-4. Add the module name in `phantom/core/shell.py` under `do_use()`.
-5. Add tests in `tests/` using pytest and mocks for external interaction.
+Creating a custom module is as simple as inheriting from `BaseModule`:
 
-## Author
-Terminalkid09 — https://github.com/Terminalkid09
+```python
+from phantom.modules.base_module import BaseModule
+
+class MyTool(BaseModule):
+    module_name = "mytool"
+    def build_commands(self):
+        return {"CUSTOM": ["echo 'Running custom logic on {self.target}'"]}
+    def do_run(self, _):
+        # Implementation...
+```
+
+Drop the file in `~/.phantom/plugins/` and it will be available in the next session!
+
+---
+
+## ⚖️ Legal Disclaimer
+
+Phantom is intended for **authorized penetration testing and educational purposes only**. Use this tool only on systems where you have explicit, written permission. The author is not responsible for any misuse or damage caused by this program.
+
+---
+
+## 👨‍💻 Author
+
+**Terminalkid09** – [GitHub](https://github.com/Terminalkid09)

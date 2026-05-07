@@ -1,6 +1,7 @@
 import builtins
 import json
 import os
+import tempfile
 from unittest.mock import MagicMock, mock_open
 
 import pytest
@@ -30,24 +31,55 @@ class TestSession:
         assert len(self.session.history) == 1
         assert "set target 10.0.0.1" in self.session.history[0]
 
-    def test_save_writes_json_file(self, monkeypatch):
-        """Session.save should write JSON data to the expected file path."""
-        mocked_open = mock_open()
-        monkeypatch.setattr(os, "makedirs", lambda *args, **kwargs: None)
-        monkeypatch.setattr("builtins.open", mocked_open)
+    def test_save_writes_json_file_atomically(self, monkeypatch):
+        """Session.save should write JSON data using atomic save (temp file + replace)."""
+        # Mock tempfile.NamedTemporaryFile
+        mock_temp = MagicMock()
+        mock_temp.name = "data/sessions/tmp_testsession.json"
+        mock_temp.__enter__ = MagicMock(return_value=mock_temp)
+        mock_temp.__exit__ = MagicMock(return_value=False)
+
+        mock_named_temp = MagicMock(return_value=mock_temp)
+        monkeypatch.setattr(tempfile, "NamedTemporaryFile", mock_named_temp)
+
+        # Mock os.replace
+        mock_replace = MagicMock()
+        monkeypatch.setattr(os, "replace", mock_replace)
+
+        # Mock json.dump
         json_dump_mock = MagicMock()
         monkeypatch.setattr("phantom.core.session.json.dump", json_dump_mock)
+
+        # Mock os.makedirs
+        monkeypatch.setattr(os, "makedirs", lambda *args, **kwargs: None)
 
         self.session.target = "127.0.0.1"
         self.session.mode = "full"
         self.session.save("testsession")
 
-        mocked_open.assert_called_once_with("data/sessions/testsession.json", "w", encoding="utf-8")
-        assert json_dump_mock.called
+        # Verify NamedTemporaryFile called with correct parameters
+        mock_named_temp.assert_called_once_with(
+            mode='w', dir='data/sessions', delete=False, suffix='.json', encoding='utf-8'
+        )
+        # Verify json.dump called on the temporary file
+        json_dump_mock.assert_called_once_with(
+            self.session.__dict__, mock_temp, indent=2, default=str
+        )
+        # Verify os.replace called with temp path and final path
+        mock_replace.assert_called_once_with(
+            mock_temp.name, "data/sessions/testsession.json"
+        )
 
     def test_load_reads_json_file(self, monkeypatch):
         """Session.load should populate session data from a JSON file."""
-        sample_data = {"target": "1.2.3.4", "mode": "recon", "scope": ["10.0.0.0/24"], "results": {}, "notes": [], "history": []}
+        sample_data = {
+            "target": "1.2.3.4",
+            "mode": "recon",
+            "scope": ["10.0.0.0/24"],
+            "results": {},
+            "notes": [],
+            "history": [],
+        }
         mocked_open = mock_open(read_data=json.dumps(sample_data))
         monkeypatch.setattr("builtins.open", mocked_open)
         monkeypatch.setattr("phantom.core.session.json.load", lambda f: sample_data)

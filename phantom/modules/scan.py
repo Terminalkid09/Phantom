@@ -2,7 +2,8 @@
 scan.py – Network reconnaissance module.
 Orchestrates Nmap and network tools with conditional suggestions.
 """
-
+import os
+from phantom.utils.scan_history import save_scan_history
 from phantom.modules.base_module import BaseModule
 from phantom.core.preview import PreviewSession
 from phantom.core.executor import run_commands
@@ -26,6 +27,7 @@ class ScanModule(BaseModule):
             "NMAP": [
                 f"sudo nmap -sS -p- --min-rate 5000 -T4 {t}",
                 f"sudo nmap -sV -sC -p- {t}",
+                f"sudo nmap -sV -sC -p- -oX data/sessions/scan_{t}.xml {t}  # REQUIRED FOR EXPLOIT MODULE",
                 f"sudo nmap -sU --top-ports 200 {t}",
                 f"sudo nmap -sS --top-ports 1000 {t}",
                 f"sudo nmap -O {t}",
@@ -37,7 +39,6 @@ class ScanModule(BaseModule):
                 f"sudo nmap -sF {t}",
                 f"sudo nmap -sX {t}",
                 f"sudo nmap -sA {t}",
-                f"sudo nmap -oX data/sessions/scan_{t}.xml {t}",
             ],
             "NETWORK": [
                 f"traceroute {t}",
@@ -82,6 +83,9 @@ class ScanModule(BaseModule):
 
         results = run_commands(chosen_commands, session.target)
         session.add_result("scan", results)
+        xml_path = f"data/sessions/scan_{session.target}.xml"
+        if os.path.exists(xml_path):
+            save_scan_history(session.target, xml_path)
         self._conditional_suggestions(results)
 
     def do_run(self, _):
