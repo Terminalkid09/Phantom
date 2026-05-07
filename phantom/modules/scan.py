@@ -27,6 +27,7 @@ class ScanModule(BaseModule):
             "NMAP": [
                 f"sudo nmap -sS -p- --min-rate 5000 -T4 {t}",
                 f"sudo nmap -sV -sC -p- {t}",
+                f"sudo nmap -sV -sC -p- -oX data/sessions/scan_{t}.xml {t}  # REQUIRED FOR EXPLOIT MODULE",
                 f"sudo nmap -sU --top-ports 200 {t}",
                 f"sudo nmap -sS --top-ports 1000 {t}",
                 f"sudo nmap -O {t}",
@@ -38,7 +39,6 @@ class ScanModule(BaseModule):
                 f"sudo nmap -sF {t}",
                 f"sudo nmap -sX {t}",
                 f"sudo nmap -sA {t}",
-                f"sudo nmap -oX data/sessions/scan_{t}.xml {t}",
             ],
             "NETWORK": [
                 f"traceroute {t}",
