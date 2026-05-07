@@ -26,12 +26,12 @@ def build_banner() -> str:
 
     return f"""
 [bold red] ________  ___  ___  ________  ________   _________  ________  _____ ______   [/]
-[bold red]|\   __  \|\  \|\  \|\   __  \|\   ___  \|\___   ___\\   __  \|\   _ \  _   \  [/]
-[bold red]\ \  \|\  \ \  \\\  \ \  \|\  \ \  \\ \  \|___ \  \_\ \  \|\  \ \  \\\__\ \  \ [/]
-[bold red] \ \   ____\ \   __  \ \   __  \ \  \\ \  \   \ \  \ \ \  \\\  \ \  \\|__| \  \[/]
-[bold red]  \ \  \___|\ \  \ \  \ \  \ \  \ \  \\ \  \   \ \  \ \ \  \\\  \ \  \    \ \  \[/]
-[bold red]   \ \__\    \ \__\ \__\ \__\ \__\ \__\\ \__\   \ \__\ \ \_______\ \__\    \ \__\[/]
-[bold red]    \|__|     \|__|\|__|\|__|\|__|\|__| \|__|    \|__|  \|_______|\|__|     \|__|[/]
+[bold red]|\\   __  \\|\\  \\|\\  \\|\\   __  \\|\\   ___  \\|\\___   ___\\\\   __  \\|\\   _ \\  _   \\  [/]
+[bold red]\\ \\  |\\  \\ \\  \\\\  \\ \\  |\\  \\ \\  \\ \\  \\|___ \\  \\_\\ \\  |\\  \\ \\  \\\\__\\ \\  \\ [/]
+[bold red] \\ \\   ____\\ \\   __  \\ \\   __  \\ \\  \\ \\  \\   \\ \\  \\ \\ \\  \\\\  \\ \\  \\|__| \\  \\[/]
+[bold red]  \\ \\  \\___|\\ \\  \\ \\  \\ \\  \\ \\  \\ \\  \\ \\  \\   \\ \\  \\ \\ \\  \\\\  \\ \\  \\    \\ \\  \\[/]
+[bold red]   \\ \\__\\    \\ \\__\\ \\__\\ \\__\\ \\__\\ \\__\\ \\__\\   \\ \\__\\ \\ \\_______\\ \\__\\    \\ \\__\\[/]
+[bold red]    \\|__|     \\|__|\\|__|\\|__|\\|__|\\|__| \\|__|    \\|__|  \\|_______|\\|__|     \\|__|[/]
   [dim]──────────────────────────────────────────────────────────────────────────────────[/]
   [bold white]Offensive Security Framework[/]  [dim]v1.1.0[/]
   [cyan]Python[/] [dim]{python_ver}[/]   [cyan]OS[/] [dim]{os_info}[/]   [cyan]Time[/] [dim]{now}[/]
@@ -52,6 +52,17 @@ MODE_SEQUENCES = {
 class PhantomShell(cmd.Cmd):
     intro = ""
     prompt = "[phantom] > "
+
+    def precmd(self, line: str) -> str:
+        """Allow hyphens in commands by translating them to underscores."""
+        if not line.strip():
+            return line
+        # Only translate the command part, not the arguments
+        parts = line.split(maxsplit=1)
+        cmd_part = parts[0].replace("-", "_")
+        if len(parts) > 1:
+            return f"{cmd_part} {parts[1]}"
+        return cmd_part
 
     def preloop(self):
         console.print(build_banner())
@@ -133,6 +144,20 @@ class PhantomShell(cmd.Cmd):
             console.print("[red]Usage: load-profile <name>[/]")
             return
         self.load_profile(name.strip())
+
+    def do_list_profiles(self, arg: str):
+        """List all saved profiles."""
+        profile_dir = os.path.expanduser("~/.phantom/profiles")
+        if not os.path.exists(profile_dir):
+            console.print("[yellow]No profiles found.[/]")
+            return
+        profiles = [f.replace(".json", "") for f in os.listdir(profile_dir) if f.endswith(".json")]
+        if not profiles:
+            console.print("[yellow]No profiles found.[/]")
+            return
+        console.print("[cyan]Available Profiles:[/]")
+        for p in profiles:
+            console.print(f"  [white]- {p}[/]")
 
     def do_set(self, arg: str):
         """set target <ip/domain> | set mode <recon|osint|full|exploit> | set scope <cidr,ip,...>"""
