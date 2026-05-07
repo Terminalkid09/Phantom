@@ -2,6 +2,7 @@ import re
 import subprocess
 import threading
 import sys
+import shutil
 from rich.console import Console
 from phantom.core.session import session
 from phantom.core.scope import is_in_scope
@@ -15,11 +16,23 @@ def _is_safe_target(target: str) -> bool:
     return bool(re.match(r'^[a-zA-Z0-9.\-/:]+$', target))
 
 
+def _is_tool_installed(cmd: str) -> bool:
+    """Check if the primary tool in the command string is installed."""
+    # Get the first word (the binary)
+    tool = cmd.split()[0] if cmd.split() else ""
+    if not tool:
+        return True # Empty command, let subprocess handle it
+    
+    # Check if it exists in PATH
+    return shutil.which(tool) is not None
+
+
 def run_command(cmd: str, target_ip: str = "") -> str:
     """
     Run a shell command with interactive timeout.
     - Checks scope before running.
     - Checks for dangerous characters in target.
+    - Checks if tool is installed.
     - Streams output in real time.
     - After TIMEOUT_SECONDS asks user: continue / skip / kill.
     Returns combined stdout+stderr as string.
@@ -30,6 +43,13 @@ def run_command(cmd: str, target_ip: str = "") -> str:
 
     if target_ip and not _is_safe_target(target_ip):
         console.print(f"[red][!] Blocked: target '{target_ip}' contains dangerous characters.[/]")
+        return ""
+
+    # Check if the tool is installed
+    if not _is_tool_installed(cmd):
+        tool = cmd.split()[0] if cmd.split() else "Unknown"
+        console.print(f"[yellow][!] Warning: tool '{tool}' is not installed. Skipping command.[/]")
+        console.print(f"    [dim]Tip: Install it via 'sudo apt install {tool}' or equivalent.[/]")
         return ""
 
     console.print(f"\n  [dim]$ {cmd}[/]")
