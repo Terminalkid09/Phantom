@@ -1,0 +1,23 @@
+stages:
+  - test
+  - build
+
+variables:
+  DOCKER_IMAGE: phantom-framework
+
+unit_tests:
+  stage: test
+  image: python:3.10
+  script:
+    - pip install -r requirements.txt
+    - pytest tests/
+
+docker_build:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - docker build -t $DOCKER_IMAGE .
+  only:
+    - main

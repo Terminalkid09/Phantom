@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  phantom:
+    build: .
+    container_name: phantom-framework
+    privileged: true # Required for network tools like TShark/Nmap
+    stdin_open: true # Allow interactive shell
+    tty: true        # Allow interactive shell
+    volumes:
+      - ./data:/app/data
+      - phantom-plugins:/root/.phantom
+    env_file:
+      - .env
+    environment:
+      - AI_PROVIDER=${AI_PROVIDER:-}
+      - AI_API_KEY=${AI_API_KEY:-}
+      - AI_ENDPOINT=${AI_ENDPOINT:-}
+      - AI_MODEL=${AI_MODEL:-}
+    networks:
+      - phantom-net
+
+  # Local AI Provider (Optional - Uncomment to use)
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: phantom-ollama
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ./ollama:/root/.ollama
+  #   networks:
+  #     - phantom-net
+
+networks:
+  phantom-net:
+    driver: bridge
+
+volumes:
+  phantom-plugins:
