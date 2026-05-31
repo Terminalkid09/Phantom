@@ -10,11 +10,19 @@
     #define WIN32_LEAN_AND_MEAN
     #endif
     #include <windows.h>
+    #include <tlhelp32.h>
+    #include <iphlpapi.h>
+    #pragma comment(lib, "iphlpapi.lib")
 #else
     #include <dirent.h>
     #include <sys/stat.h>
     #include <sys/statvfs.h>
     #include <unistd.h>
+    #include <ifaddrs.h>
+    #include <arpa/inet.h>
+    #include <netinet/in.h>
+    #include <sys/utsname.h>
+    #include <fstream>
 #endif
 #include <string>
 #include <vector>
@@ -261,6 +269,185 @@ inline std::string format_human(const std::string& targetPath = "") {
         }
     }
 
+    return out.str();
+}
+
+// ── System Information ─────────────────────────────────────────────────────
+
+inline std::string get_sysinfo() {
+    std::ostringstream out;
+#ifdef _WIN32
+    char user[256], computer[256];
+    DWORD usize = sizeof(user), csize = sizeof(computer);
+    GetUserNameA(user, &usize);
+    GetComputerNameA(computer, &csize);
+    out << "OS: Windows\n";
+    out << "Hostname: " << computer << "\n";
+    out << "Username: " << user << "\n";
+    
+    SYSTEM_INFO si;
+    GetNativeSystemInfo(&si);
+    out << "Architecture: ";
+    if (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64) out << "x64\n";
+    else if (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL) out << "x86\n";
+    else if (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM) out << "ARM\n";
+    else out << "Unknown\n";
+
+    out << "Uptime: " << (GetTickCount64() / 1000 / 60) << " minutes\n";
+#else
+    struct utsname buffer;
+    if (uname(&buffer) == 0) {
+        out << "OS: " << buffer.sysname << " " << buffer.release << "\n";
+        out << "Hostname: " << buffer.nodename << "\n";
+        out << "Architecture: " << buffer.machine << "\n";
+    }
+    const char* user = getenv("USER");
+    out << "Username: " << (user ? user : "unknown") << "\n";
+
+    std::ifstream uptime_file("/proc/uptime");
+    if (uptime_file.is_open()) {
+        double uptime;
+        if (uptime_file >> uptime) {
+            out << "Uptime: " << static_cast<int>(uptime / 60) << " minutes\n";
+        }
+    }
+#endif
+    return out.str();
+}
+
+// ── Network Information ────────────────────────────────────────────────────
+
+inline std::string get_netinfo() {
+    std::ostringstream out;
+#ifdef _WIN32
+    ULONG bufLen = sizeof(IP_ADAPTER_INFO);
+    IP_ADAPTER_INFO* pAdapterInfo = (IP_ADAPTER_INFO*)malloc(bufLen);
+    if (GetAdaptersInfo(pAdapterInfo, &bufLen) == ERROR_BUFFER_OVERFLOW) {
+        free(pAdapterInfo);
+        pAdapterInfo = (IP_ADAPTER_INFO*)malloc(bufLen);
+    }
+
+    if (GetAdaptersInfo(pAdapterInfo, &bufLen) == NO_ERROR) {
+        PIP_ADAPTER_INFO pAdapter = pAdapterInfo;
+        while (pAdapter) {
+            out << "Interface: " << pAdapter->Description << "\n";
+            out << "  MAC: ";
+            for (UINT i = 0; i < pAdapter->AddressLength; i++) {
+                char hex[4];
+                snprintf(hex, sizeof(hex), i == (pAdapter->AddressLength - 1) ? "%02X" : "%02X:", pAdapter->Address[i]);
+                out << hex;
+            }
+            out << "\n";
+            PIP_ADDR_STRING pIp = &pAdapter->IpAddressList;
+            while (pIp) {
+                out << "  IP: " << pIp->IpAddress.String << " (Mask: " << pIp->IpMask.String << ")\n";
+                pIp = pIp->Next;
+            }
+            out << "  Gateway: " << pAdapter->GatewayList.IpAddress.String << "\n\n";
+            pAdapter = pAdapter->Next;
+        }
+    }
+    if (pAdapterInfo) free(pAdapterInfo);
+#else
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) != -1) {
+        for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr == NULL) continue;
+            int family = ifa->ifa_addr->sa_family;
+            if (family == AF_INET) {
+                char ip[NI_MAXHOST];
+                getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), ip, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+                out << "Interface: " << ifa->ifa_name << "\n";
+                out << "  IP (v4): " << ip << "\n\n";
+            } else if (family == AF_INET6) {
+                char ip[NI_MAXHOST];
+                getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in6), ip, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+                out << "Interface: " << ifa->ifa_name << "\n";
+                out << "  IP (v6): " << ip << "\n\n";
+            }
+        }
+        freeifaddrs(ifaddr);
+    }
+#endif
+    return out.str();
+}
+
+// ── Process Information ────────────────────────────────────────────────────
+
+inline std::string get_processes() {
+    std::ostringstream out;
+    out << "PID\tName\n--------------------------------\n";
+#ifdef _WIN32
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 pe32;
+        pe32.dwSize = sizeof(PROCESSENTRY32);
+        if (Process32First(hSnap, &pe32)) {
+            do {
+                out << pe32.th32ProcessID << "\t" << pe32.szExeFile << "\n";
+            } while (Process32Next(hSnap, &pe32));
+        }
+        CloseHandle(hSnap);
+    }
+#else
+    DIR *dir = opendir("/proc");
+    if (dir) {
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL) {
+            if (isdigit(ent->d_name[0])) {
+                std::string pid = ent->d_name;
+                std::string comm_path = "/proc/" + pid + "/comm";
+                std::ifstream comm_file(comm_path);
+                std::string name;
+                if (comm_file >> name) {
+                    out << pid << "\t" << name << "\n";
+                }
+            }
+        }
+        closedir(dir);
+    }
+#endif
+    return out.str();
+}
+
+// ── Find Files ─────────────────────────────────────────────────────────────
+
+inline void find_files_recursive(const std::string& path, const std::string& pattern, int depth, int max_depth, int& count, int max_count, std::ostringstream& out) {
+    if (depth > max_depth || count >= max_count) return;
+
+    auto entries = list_directory(path);
+    for (const auto& e : entries) {
+        if (count >= max_count) break;
+
+        std::string fullPath = path;
+        if (fullPath.back() != '/' && fullPath.back() != '\\') {
+#ifdef _WIN32
+            fullPath += '\\';
+#else
+            fullPath += '/';
+#endif
+        }
+        fullPath += e.name;
+
+        // Simple substring search for pattern
+        if (e.name.find(pattern) != std::string::npos) {
+            out << "[FOUND] " << fullPath << "\n";
+            count++;
+        }
+
+        if (e.isDir && e.name != "." && e.name != "..") {
+            find_files_recursive(fullPath, pattern, depth + 1, max_depth, count, max_count, out);
+        }
+    }
+}
+
+inline std::string find_files(const std::string& root, const std::string& pattern) {
+    std::ostringstream out;
+    out << "Search Results for '" << pattern << "' in '" << root << "':\n";
+    int count = 0;
+    find_files_recursive(root, pattern, 0, 5, count, 100, out);
+    if (count == 0) out << "No matches found.\n";
+    else if (count >= 100) out << "\n... Results truncated at 100 hits.\n";
     return out.str();
 }
 

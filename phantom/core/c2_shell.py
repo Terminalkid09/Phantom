@@ -75,11 +75,32 @@ class C2Shell(cmd.Cmd):
 
         table = Table(title="Active Beacons", border_style="purple")
         table.add_column("ID", style="cyan")
-        table.add_column("IP Address", style="green")
+        table.add_column("Source IP", style="green")
+        table.add_column("Local IPs", style="dim green")
+        table.add_column("User@Host", style="magenta")
+        table.add_column("OS", style="blue")
         table.add_column("Last Seen", style="yellow")
         
         for bid, info in beacons.items():
-            table.add_row(bid, info.get("ip", "Unknown"), info.get("last_seen", "Never"))
+            user = info.get("user", "")
+            host = info.get("hostname", "")
+            user_host = f"{user}@{host}" if user or host else "Unknown"
+            
+            os_arch = info.get("os", "Unknown")
+            if "arch" in info:
+                os_arch += f" ({info['arch']})"
+                
+            local_ips = info.get("local_ips", "")
+            if len(local_ips) > 20: local_ips = local_ips[:17] + "..."
+            
+            table.add_row(
+                bid, 
+                info.get("ip", "Unknown"), 
+                local_ips,
+                user_host,
+                os_arch,
+                info.get("last_seen", "Never")
+            )
             
         console.print(table)
 

