@@ -42,7 +42,7 @@ def with_backoff(func: Callable, max_retries: int = 5, initial_delay: int = 2):
         return None
     return wrapper
 
-# NVD free 
+@retry_api(retries=2, backoff=6)
 def nvd_lookup(software: str, version: str = "") -> List[Dict[str, Any]]:
     """
     Query NVD for CVEs matching software name and optional version.

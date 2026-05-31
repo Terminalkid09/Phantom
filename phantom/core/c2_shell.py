@@ -12,22 +12,22 @@ console = Console()
 
 def build_c2_banner():
     return r"""
-[bold purple]
+[bold magenta]
   ██████╗██████╗     ██████╗ ██████╗ ██████╗ ███████╗
  ██╔════╝╚════██╗   ██╔════╝██╔═══██╗██╔══██╗██╔════╝
  ██║      █████╔╝   ██║     ██║   ██║██████╔╝█████╗  
  ██║     ██╔═══╝    ██║     ██║   ██║██╔══██╗██╔══╝  
  ╚██████╗███████╗██╗╚██████╗╚██████╔╝██║  ██║███████╗
   ╚═════╝╚══════╝╚═╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝
-[/bold purple]
+[/bold magenta]
   [dim]──────────────────────────────────────────────────────────[/dim]
-  [bold purple]Phantom C2 Operations Center[/bold purple]  [dim]v1.0.0[/dim]
+  [bold magenta]Phantom C2 Operations Center[/bold magenta]  [dim]v1.0.0[/dim]
   [dim]Secure Encrypted Asynchronous Communications[/dim]
 """
 
 class C2Shell(cmd.Cmd):
     intro = ""
-    prompt = "[bold purple]C2[/bold purple] > "
+    prompt = "\033[1;35mC2\033[0m > "
 
     def __init__(self):
         super().__init__()
@@ -39,9 +39,9 @@ class C2Shell(cmd.Cmd):
 
     def postcmd(self, stop, line):
         if self.active_beacon:
-            self.prompt = f"[bold purple]C2[/bold purple] ([cyan]{self.active_beacon}[/cyan]) > "
+            self.prompt = f"\033[1;35mC2\033[0m (\033[36m{self.active_beacon}\033[0m) > "
         else:
-            self.prompt = "[bold purple]C2[/bold purple] > "
+            self.prompt = "\033[1;35mC2\033[0m > "
         return stop
 
     def do_listeners(self, arg):
@@ -73,7 +73,7 @@ class C2Shell(cmd.Cmd):
             notifier.warn("No active beacons.")
             return
 
-        table = Table(title="Active Beacons", border_style="purple")
+        table = Table(title="Active Beacons", border_style="magenta")
         table.add_column("ID", style="cyan")
         table.add_column("Source IP", style="green")
         table.add_column("Local IPs", style="dim green")

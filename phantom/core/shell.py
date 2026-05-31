@@ -17,37 +17,29 @@ load_dotenv()
 console = Console()
 
 
-def build_dashboard() -> "Layout":
-    """Build a structured dashboard header."""
-    from rich.layout import Layout
+def build_dashboard():
+    """Build a structured dashboard header without taking up full terminal height."""
     from rich.panel import Panel
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="main", size=3),
-    )
+    from rich.console import Group
 
     # Header Panel
     target = session.target or "None"
     mode = session.mode.upper()
-    layout["header"].update(
-        Panel(
-            f"[bold cyan]Target:[/] {target}  |  [bold magenta]Mode:[/] {mode}  |  [bold yellow]Time:[/] {datetime.now().strftime('%H:%M:%S')}",
-            title="[bold white]Phantom Framework Status[/]",
-            border_style="blue"
-        )
+    header_panel = Panel(
+        f"[bold cyan]Target:[/] {target}  |  [bold magenta]Mode:[/] {mode}  |  [bold yellow]Time:[/] {datetime.now().strftime('%H:%M:%S')}",
+        title="[bold white]Phantom Framework Status[/]",
+        border_style="blue"
     )
 
     # Info Panel
     scope = ", ".join(session.scope) if session.scope else "None"
     sniffer_status = "[green]ACTIVE[/]" if session.results.get("_sniffer_active") else "[red]INACTIVE[/]"
-    layout["main"].update(
-        Panel(
-            f"[bold green]Scope:[/] {scope}  |  [bold cyan]Sniffer:[/] {sniffer_status}  |  [bold white]Notes:[/] {len(session.notes)}",
-            border_style="dim"
-        )
+    info_panel = Panel(
+        f"[bold green]Scope:[/] {scope}  |  [bold cyan]Sniffer:[/] {sniffer_status}  |  [bold white]Notes:[/] {len(session.notes)}",
+        border_style="dim"
     )
-    return layout
+    
+    return Group(header_panel, info_panel)
 
 
 def build_banner() -> str:
@@ -87,7 +79,7 @@ MODE_SEQUENCES = {
 
 class PhantomShell(cmd.Cmd):
     intro = ""
-    prompt = "[phantom] > "
+    prompt = "\033[1;36mphantom\033[0m > "
 
     def precmd(self, line: str) -> str:
         """Allow hyphens in commands by translating them to underscores."""
@@ -108,11 +100,11 @@ class PhantomShell(cmd.Cmd):
             notifier.info(f"Loaded {len(self.plugins)} plugin(s)")
 
     def postcmd(self, stop, line):
-        """Show mini-dashboard after each command to keep info fresh."""
-        if line.strip() and not line.startswith("help"):
-            target = session.target or "—"
-            sniffer = "[G]" if session.results.get("_sniffer_active") else "[R]"
-            self.prompt = f"[phantom|{target}|{sniffer}] > "
+        """Update prompt with context."""
+        if session.target:
+            self.prompt = f"\033[1;36mphantom\033[0m (\033[1;31m{session.target}\033[0m) > "
+        else:
+            self.prompt = "\033[1;36mphantom\033[0m > "
         return stop
 
     def _load_plugins(self):

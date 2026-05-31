@@ -6,6 +6,7 @@ setup(
     description="Offensive Security Framework — CLI shell per penetration testing",
     author="Terminalkid09",
     packages=find_packages(),
+    include_package_data=True,
     install_requires=[
         "rich>=13.0.0",
         "requests>=2.31.0",

@@ -9,6 +9,7 @@ from phantom.core.preview import PreviewSession
 from phantom.core.executor import run_commands
 from phantom.core.session import session
 from rich.console import Console
+from rich.table import Table
 from phantom.utils.aggressive import filter_aggressive_commands
 
 from phantom.utils.notifier import notifier
