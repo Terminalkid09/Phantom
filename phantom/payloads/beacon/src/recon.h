@@ -9,10 +9,13 @@
     #ifndef WIN32_LEAN_AND_MEAN
     #define WIN32_LEAN_AND_MEAN
     #endif
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
     #include <windows.h>
     #include <tlhelp32.h>
     #include <iphlpapi.h>
     #pragma comment(lib, "iphlpapi.lib")
+    #pragma comment(lib, "ws2_32.lib")
 #else
     #include <dirent.h>
     #include <sys/stat.h>
@@ -21,8 +24,12 @@
     #include <ifaddrs.h>
     #include <arpa/inet.h>
     #include <netinet/in.h>
+    #include <netdb.h>
     #include <sys/utsname.h>
     #include <fstream>
+    #include <cstdio>
+    #include <ctime>
+    #include <cstdlib>
 #endif
 #include <string>
 #include <vector>
@@ -306,9 +313,27 @@ inline std::string get_sysinfo() {
 
     std::ifstream uptime_file("/proc/uptime");
     if (uptime_file.is_open()) {
+        // Linux / Android
         double uptime;
         if (uptime_file >> uptime) {
             out << "Uptime: " << static_cast<int>(uptime / 60) << " minutes\n";
+        }
+    } else {
+        // macOS fallback: use sysctl via popen
+        FILE* fp = popen("sysctl -n kern.boottime 2>/dev/null", "r");
+        if (fp) {
+            char buf[256];
+            if (fgets(buf, sizeof(buf), fp)) {
+                // Parse "{ sec = 1234567890, usec = 0 }" format
+                const char* sec_ptr = strstr(buf, "sec = ");
+                if (sec_ptr) {
+                    long boot_time = atol(sec_ptr + 6);
+                    long now = static_cast<long>(time(nullptr));
+                    long uptime_min = (now - boot_time) / 60;
+                    out << "Uptime: " << uptime_min << " minutes\n";
+                }
+            }
+            pclose(fp);
         }
     }
 #endif
@@ -320,34 +345,80 @@ inline std::string get_sysinfo() {
 inline std::string get_netinfo() {
     std::ostringstream out;
 #ifdef _WIN32
-    ULONG bufLen = sizeof(IP_ADAPTER_INFO);
-    IP_ADAPTER_INFO* pAdapterInfo = (IP_ADAPTER_INFO*)malloc(bufLen);
-    if (GetAdaptersInfo(pAdapterInfo, &bufLen) == ERROR_BUFFER_OVERFLOW) {
-        free(pAdapterInfo);
-        pAdapterInfo = (IP_ADAPTER_INFO*)malloc(bufLen);
+    ULONG bufLen = 15000;
+    PIP_ADAPTER_ADDRESSES pAddresses = (PIP_ADAPTER_ADDRESSES)malloc(bufLen);
+    ULONG ret = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS, NULL, pAddresses, &bufLen);
+    if (ret == ERROR_BUFFER_OVERFLOW) {
+        free(pAddresses);
+        pAddresses = (PIP_ADAPTER_ADDRESSES)malloc(bufLen);
+        ret = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS, NULL, pAddresses, &bufLen);
     }
 
-    if (GetAdaptersInfo(pAdapterInfo, &bufLen) == NO_ERROR) {
-        PIP_ADAPTER_INFO pAdapter = pAdapterInfo;
-        while (pAdapter) {
-            out << "Interface: " << pAdapter->Description << "\n";
-            out << "  MAC: ";
-            for (UINT i = 0; i < pAdapter->AddressLength; i++) {
-                char hex[4];
-                snprintf(hex, sizeof(hex), i == (pAdapter->AddressLength - 1) ? "%02X" : "%02X:", pAdapter->Address[i]);
-                out << hex;
+    if (ret == NO_ERROR) {
+        PIP_ADAPTER_ADDRESSES pCurr = pAddresses;
+        while (pCurr) {
+            // Skip loopback and tunnel adapters
+            if (pCurr->OperStatus == IfOperStatusUp && pCurr->IfType != IF_TYPE_SOFTWARE_LOOPBACK) {
+                // Convert friendly name
+                char desc[256];
+                WideCharToMultiByte(CP_UTF8, 0, pCurr->FriendlyName, -1, desc, sizeof(desc), NULL, NULL);
+                out << "Interface: " << desc << "\n";
+
+                // MAC address
+                if (pCurr->PhysicalAddressLength > 0) {
+                    out << "  MAC: ";
+                    for (ULONG i = 0; i < pCurr->PhysicalAddressLength; i++) {
+                        char hex[4];
+                        snprintf(hex, sizeof(hex), i == (pCurr->PhysicalAddressLength - 1) ? "%02X" : "%02X:", pCurr->PhysicalAddress[i]);
+                        out << hex;
+                    }
+                    out << "\n";
+                }
+
+                // Unicast addresses (IPv4 + IPv6)
+                PIP_ADAPTER_UNICAST_ADDRESS pUnicast = pCurr->FirstUnicastAddress;
+                while (pUnicast) {
+                    char ip[NI_MAXHOST] = {0};
+                    sockaddr* sa = pUnicast->Address.lpSockaddr;
+                    if (sa->sa_family == AF_INET) {
+                        inet_ntop(AF_INET, &((sockaddr_in*)sa)->sin_addr, ip, sizeof(ip));
+                        out << "  IP (v4): " << ip << "\n";
+                    } else if (sa->sa_family == AF_INET6) {
+                        inet_ntop(AF_INET6, &((sockaddr_in6*)sa)->sin6_addr, ip, sizeof(ip));
+                        out << "  IP (v6): " << ip << "\n";
+                    }
+                    pUnicast = pUnicast->Next;
+                }
+
+                // Gateway
+                PIP_ADAPTER_GATEWAY_ADDRESS_LH pGateway = pCurr->FirstGatewayAddress;
+                while (pGateway) {
+                    char gw[NI_MAXHOST] = {0};
+                    sockaddr* sa = pGateway->Address.lpSockaddr;
+                    if (sa->sa_family == AF_INET) {
+                        inet_ntop(AF_INET, &((sockaddr_in*)sa)->sin_addr, gw, sizeof(gw));
+                        out << "  Gateway: " << gw << "\n";
+                    }
+                    pGateway = pGateway->Next;
+                }
+
+                // DNS
+                PIP_ADAPTER_DNS_SERVER_ADDRESS pDns = pCurr->FirstDnsServerAddress;
+                while (pDns) {
+                    char dns[NI_MAXHOST] = {0};
+                    sockaddr* sa = pDns->Address.lpSockaddr;
+                    if (sa->sa_family == AF_INET) {
+                        inet_ntop(AF_INET, &((sockaddr_in*)sa)->sin_addr, dns, sizeof(dns));
+                        out << "  DNS: " << dns << "\n";
+                    }
+                    pDns = pDns->Next;
+                }
+                out << "\n";
             }
-            out << "\n";
-            PIP_ADDR_STRING pIp = &pAdapter->IpAddressList;
-            while (pIp) {
-                out << "  IP: " << pIp->IpAddress.String << " (Mask: " << pIp->IpMask.String << ")\n";
-                pIp = pIp->Next;
-            }
-            out << "  Gateway: " << pAdapter->GatewayList.IpAddress.String << "\n\n";
-            pAdapter = pAdapter->Next;
+            pCurr = pCurr->Next;
         }
     }
-    if (pAdapterInfo) free(pAdapterInfo);
+    if (pAddresses) free(pAddresses);
 #else
     struct ifaddrs *ifaddr, *ifa;
     if (getifaddrs(&ifaddr) != -1) {
@@ -392,6 +463,7 @@ inline std::string get_processes() {
 #else
     DIR *dir = opendir("/proc");
     if (dir) {
+        // Linux / Android: read /proc/<pid>/comm
         struct dirent *ent;
         while ((ent = readdir(dir)) != NULL) {
             if (isdigit(ent->d_name[0])) {
@@ -405,6 +477,18 @@ inline std::string get_processes() {
             }
         }
         closedir(dir);
+    } else {
+        // macOS fallback: use ps
+        FILE* fp = popen("ps -eo pid,comm 2>/dev/null", "r");
+        if (fp) {
+            char line[512];
+            while (fgets(line, sizeof(line), fp)) {
+                out << line;
+            }
+            pclose(fp);
+        } else {
+            out << "Error: Cannot enumerate processes on this platform.\n";
+        }
     }
 #endif
     return out.str();
