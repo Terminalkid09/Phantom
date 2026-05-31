@@ -68,9 +68,7 @@ class AIConnectorPlugin(BaseModule):
             return None
 
         system = "You are a CVE interpreter. Output only a concise Markdown list: Prereq, Complexity, Vector (RCE/LPE/etc)."
-        prompt = f"Analyze this CVE:
-ID: {cve_id}
-Description: {description}"
+        prompt = f"Analyze this CVE:\nID: {cve_id}\nDescription: {description}"
         
         return self._call_api(prompt, system_prompt=system)
 
@@ -87,8 +85,6 @@ Description: {description}"
         }
         
         system = "You are a Lead Pentester. Generate a structured Executive Summary in Markdown. Highlight critical points and suggest next steps."
-        prompt = f"Session Data: {json.dumps(clean_data, indent=2)}
-
-Generate report:"
+        prompt = f"Session Data: {json.dumps(clean_data, indent=2)}\n\nGenerate report:"
         
         return self._call_api(prompt, system_prompt=system)

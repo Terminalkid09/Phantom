@@ -61,7 +61,7 @@ def build_banner() -> str:
   ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝
 [/bold red]
   [dim]──────────────────────────────────────────────────────────────────────────────────[/dim]
-  [bold white]Offensive Security Framework[/bold white]  [dim]v1.1.0[/dim]
+  [bold white]Offensive Security Framework[/bold white]  [dim]v2.0.0[/dim]
   [cyan]Python[/cyan] [dim]{python_ver}[/dim]   [cyan]OS[/cyan] [dim]{os_info}[/dim]   [cyan]Time[/cyan] [dim]{now}[/dim]
   [dim]──────────────────────────────────────────────────────────────────────────────────[/dim]
   [dim]Use 'help' for commands. Use responsibly and legally.[/dim]
@@ -101,10 +101,9 @@ class PhantomShell(cmd.Cmd):
 
     def postcmd(self, stop, line):
         """Update prompt with context."""
-        if session.target:
-            self.prompt = f"\033[1;36mphantom\033[0m (\033[1;31m{session.target}\033[0m) > "
-        else:
-            self.prompt = "\033[1;36mphantom\033[0m > "
+        t = f"(\033[1;31m{session.target}\033[0m)" if session.target else ""
+        m = f"[\033[1;35m{session.mode.upper()}\033[0m]"
+        self.prompt = f"\033[1;36mphantom\033[0m{t}{m} > "
         return stop
 
     def _load_plugins(self):
@@ -279,6 +278,7 @@ class PhantomShell(cmd.Cmd):
                     return
             session.target = value
             notifier.success(f"Target set to {value}")
+            console.print(build_dashboard())
 
         elif key == "mode":
             valid_modes = list(MODE_SEQUENCES.keys())
@@ -286,6 +286,7 @@ class PhantomShell(cmd.Cmd):
                 session.mode = value
                 steps = " → ".join(MODE_SEQUENCES[value])
                 notifier.success(f"Mode set to {value}  [dim]({steps})[/]")
+                console.print(build_dashboard())
                 notifier.info("Type 'run' to launch the sequence automatically.")
             else:
                 notifier.error(f"Invalid mode. Use: {', '.join(valid_modes)}")
@@ -293,6 +294,7 @@ class PhantomShell(cmd.Cmd):
         elif key == "scope":
             session.scope = [s.strip() for s in value.split(",")]
             notifier.success(f"Scope set to {', '.join(session.scope)}")
+            console.print(build_dashboard())
 
         else:
             notifier.error(f"Unknown key: {key}")

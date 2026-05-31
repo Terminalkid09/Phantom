@@ -31,7 +31,7 @@ class OsintModule(BaseModule):
         if not t:
             return {}
 
-        return {
+        groups = {
             "WHOIS / DNS": [
                 f"whois {t}",
                 f"host {t}",
@@ -50,6 +50,52 @@ class OsintModule(BaseModule):
                 f"shodan stats \"net:{t}\"",
             ] + [f"shodan search \"{dork} net:{t}\"" for dork in self.DORKS],
         }
+
+        # Add Sherlock if target looks like a username or domain
+        username = self._get_username(t)
+        if username:
+            groups["USERNAME SEARCH"] = [
+                f"sherlock {username} --timeout 5 --print-found"
+            ]
+
+        return groups
+
+    def _get_username(self, target: str) -> str:
+        """Extract a potential username from the target string."""
+        if not target: return ""
+        import ipaddress
+        try:
+            ipaddress.ip_address(target)
+            return "" # IP is not a username
+        except ValueError:
+            # If it's a domain, take the first part
+            return target.split('.')[0] if '.' in target else target
+
+    def do_sherlock(self, args):
+        """sherlock [username] - Search social media for a username."""
+        username = args.strip() or self._get_username(session.target)
+        if not username:
+            notifier.error("No username provided and target is not a valid username candidate.")
+            return
+        
+        notifier.status(f"Running Sherlock for username: {username}...")
+        # Use --timeout 5 to avoid hanging too long
+        cmd = f"sherlock {username} --timeout 5 --print-found"
+        output = run_command(cmd)
+        
+        # Parse output for found social links
+        links = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', output)
+        if links:
+            notifier.success(f"Found {len(links)} social profiles!")
+            existing = session.get_result("osint") or {}
+            existing["social_profiles"] = links
+            session.add_result("osint", existing)
+            for link in links[:10]:
+                console.print(f"  [cyan]{link}[/]")
+            if len(links) > 10:
+                notifier.info(f"... and {len(links)-10} more.")
+        else:
+            notifier.info("No social profiles found with Sherlock.")
 
     def do_shodan(self, query):
         """shodan <query> - Execute a Shodan search (Key required in session config)."""
@@ -166,31 +212,6 @@ class OsintModule(BaseModule):
             session.add_result("osint", existing)
         else:
             notifier.info("No specific intel found in DNS records.")
-
-    def do_sherlock(self, args):
-        """Run Sherlock on the target (if target is likely a username or domain)."""
-        target = args.strip() or session.target
-        if not target:
-            notifier.error("No target specified or set.")
-            return
-        
-        # If target is a domain, try using the name part
-        username = target.split('.')[0] if '.' in target else target
-        notifier.status(f"Running Sherlock for username: {username}...")
-        
-        # Use --timeout 5 to avoid hanging too long
-        cmd = f"sherlock {username} --timeout 5 --print-found"
-        output = run_command(cmd)
-        
-        # Parse output for found social links
-        links = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', output)
-        if links:
-            notifier.success(f"Found {len(links)} social profiles!")
-            existing = session.get_result("osint") or {}
-            existing["social_profiles"] = links
-            session.add_result("osint", existing)
-        else:
-            notifier.info("No social profiles found with Sherlock.")
 
     def _run_api_lookups(self):
         """Perform crt.sh, Shodan, BGP lookups and store results."""

@@ -10,7 +10,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
 # Install system dependencies (security tools + C++ build chain)
+RUN echo "wireshark-common wireshark-common/install-setuid boolean true" | debconf-set-selections
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Essential for group management
+    adduser \
     # Core
     git \
     sudo \
@@ -39,7 +42,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     reaver \
     hcxdumptool \
     hcxtools \
-    # Exploit
+    # OSINT & Exploit
+    sherlock \
     exploitdb \
     # C++ Beacon Build Chain
     g++ \
@@ -55,6 +59,9 @@ RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 # Copy the rest of the application
 COPY . .
+
+# Install the package
+RUN pip install --no-cache-dir --break-system-packages -e .
 
 # Ensure data directories exist
 RUN mkdir -p data/logs data/sessions data/presets

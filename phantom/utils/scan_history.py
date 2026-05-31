@@ -31,6 +31,8 @@ def save_scan_history(target: str, xml_path: str):
 
 def load_history(target: str, timestamp: str = None):
     """Load all history files for a target, optionally filter by timestamp."""
+    if not os.path.exists(HISTORY_DIR):
+        return []
     files = [f for f in os.listdir(HISTORY_DIR) if f.startswith(target) and f.endswith(".json")]
     files.sort(reverse=True)  # newer first
     if timestamp:

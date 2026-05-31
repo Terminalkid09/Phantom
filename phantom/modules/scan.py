@@ -116,7 +116,11 @@ class ScanModule(BaseModule):
 
         vulns = []
         for svc in services:
-            cves = nvd_lookup(svc['service'], svc['version'])
+            try:
+                cves = nvd_lookup(svc['service'], svc['version'])
+            except Exception as e:
+                console.print(f"[yellow]    CVE search failed for {svc['service']}: {e}[/]")
+                cves = []
             for cve in cves:
                 score = cve['cvss']
                 if exploitdb_lookup(cve['id']):

@@ -31,7 +31,7 @@ def with_backoff(func: Callable, max_retries: int = 5, initial_delay: int = 2):
                 if resp.status_code == 429:
                     console.print(f"[yellow][!] Rate limit hit (429). Backing off for {delay}s...[/]")
                     time.sleep(delay)
-                    delay *= 2
+                    delay *= 3  # Increase backoff factor
                     continue
                 resp.raise_for_status()
                 return resp
@@ -42,11 +42,31 @@ def with_backoff(func: Callable, max_retries: int = 5, initial_delay: int = 2):
         return None
     return wrapper
 
+def retry_api(retries: int = 3, backoff: int = 2):
+    """Decorator factory for retrying API calls on exception."""
+    def decorator(func: Callable):
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            delay = backoff
+            for i in range(retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if i < retries - 1:
+                        console.print(f"[yellow][!] API error: {e}. Retrying in {delay}s... (Attempt {i+1}/{retries})[/]")
+                        time.sleep(delay)
+                        delay *= 2
+            # On final failure, re-raise the last exception
+            raise last_exception
+        return wrapper
+    return decorator
+
 @retry_api(retries=2, backoff=6)
 def nvd_lookup(software: str, version: str = "") -> List[Dict[str, Any]]:
     """
     Query NVD for CVEs matching software name and optional version.
-    Returns list of dicts with keys: id, cvss, description, has_exploit (False initially).
+    Returns list of dicts. Propagates exceptions for retry_api.
     """
     query = f"{software} {version}".strip()
     if not query:
@@ -55,33 +75,29 @@ def nvd_lookup(software: str, version: str = "") -> List[Dict[str, Any]]:
         "keywordSearch": query,
         "resultsPerPage": 20,
     }
-    try:
-        resp = requests.get(NVD_URL, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        results = []
-        for vuln in data.get("vulnerabilities", []):
-            cve = vuln.get("cve", {})
-            metrics = cve.get("metrics", {})
-            cvss = 0.0
-            if "cvssMetricV31" in metrics:
-                cvss = metrics["cvssMetricV31"][0]["cvssData"]["baseScore"]
-            elif "cvssMetricV2" in metrics:
-                cvss = metrics["cvssMetricV2"][0]["cvssData"]["baseScore"]
-            results.append({
-                "id": cve.get("id"),
-                "cvss": cvss,
-                "description": cve.get("descriptions", [{}])[0].get("value", "")[:200],
-                "has_exploit": False,   # placeholder, will be updated by exploitdb_lookup
-                "requires_auth": False,
-                "local_only": False,
-                "recent": False,
-                "exact_match": True,
-            })
-        return results
-    except Exception as e:
-        console.print(f"[yellow]NVD API error: {e}[/]")
-        return []
+    resp = requests.get(NVD_URL, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    results = []
+    for vuln in data.get("vulnerabilities", []):
+        cve = vuln.get("cve", {})
+        metrics = cve.get("metrics", {})
+        cvss = 0.0
+        if "cvssMetricV31" in metrics:
+            cvss = metrics["cvssMetricV31"][0]["cvssData"]["baseScore"]
+        elif "cvssMetricV2" in metrics:
+            cvss = metrics["cvssMetricV2"][0]["cvssData"]["baseScore"]
+        results.append({
+            "id": cve.get("id"),
+            "cvss": cvss,
+            "description": cve.get("descriptions", [{}])[0].get("value", "")[:200],
+            "has_exploit": False,
+            "requires_auth": False,
+            "local_only": False,
+            "recent": False,
+            "exact_match": True,
+        })
+    return results
 
 # crt.sh subdomains from certificate logs
 def crtsh_lookup(domain: str) -> List[str]:

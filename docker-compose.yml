@@ -5,6 +5,7 @@ services:
     build: .
     container_name: phantom-framework
     privileged: true # Required for network tools like TShark/Nmap
+    # network_mode: host # Uncomment for better WiFi/Scanner compatibility (Linux only)
     stdin_open: true # Allow interactive shell
     tty: true        # Allow interactive shell
     volumes:

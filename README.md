@@ -1,6 +1,7 @@
 # Phantom 🛡️❤️
 
 [![Version](https://img.shields.io/badge/version-2.0.0-red.svg)](CHANGELOG.md)
+[![GitLab CI](https://gitlab.com/Terminalkid09/phantom/badges/main/pipeline.svg)](https://gitlab.com/Terminalkid09/phantom/-/commits/main)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey.svg)](#)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -62,11 +63,10 @@ The fastest way to run Phantom with all its dependencies:
 
 ```bash
 # Build and start with Docker Compose
-docker-compose up --build
+docker-compose up --build -d
 
-# Or run manually
-docker build -t phantom .
-docker run -it --privileged --net=host phantom
+# Connect to the interactive shell (REQUIRED for CLI interaction)
+docker exec -it phantom-framework python3 -m phantom.main
 ```
 
 The Docker image is based on **Kali Rolling** and comes pre-installed with all security tools (nmap, sqlmap, aircrack-ng, hydra, hashcat, gobuster, nikto, ffuf, tshark, exploitdb) and the C++ build chain (g++, mingw-w64, cmake) for compiling the C2 Beacon.
