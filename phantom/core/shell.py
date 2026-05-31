@@ -488,9 +488,6 @@ class PhantomShell(cmd.Cmd):
             "scan":     "phantom.modules.scan.ScanModule",
             "osint":    "phantom.modules.osint.OsintModule",
             "wifi":     "phantom.modules.wifi.WifiModule",
-            "shodan":   "phantom.modules.shodan.ShodanModule",
-            "sniffer":  "phantom.modules.sniffer.SnifferModule",
-            "cve":      "phantom.modules.cve.CveModule",
             "web":      "phantom.modules.web.WebModule",
             "brute":    "phantom.modules.brute.BruteModule",
             "exploit":  "phantom.modules.exploit.ExploitModule",
@@ -521,6 +518,82 @@ class PhantomShell(cmd.Cmd):
 
         notifier.error(f"Unknown module: {module_name}")
         notifier.info(f"Available: {', '.join(list(modules.keys()) + list(plugin_modules.keys()))}")
+
+    def do_help(self, arg: str):
+        """help [command] — Show the help panel or details about a specific command."""
+        from rich.table import Table
+        from rich.panel import Panel
+        from rich.columns import Columns
+
+        if arg.strip():
+            # Show help for a specific command
+            func = getattr(self, f"do_{arg.strip().replace('-', '_')}", None)
+            if func and func.__doc__:
+                console.print(Panel(func.__doc__, title=f"[bold cyan]Help: {arg}[/]", border_style="cyan"))
+            else:
+                notifier.error(f"No help available for '{arg}'.")
+            return
+
+        # ── Session & Config ────────────────────────────────────────────
+        t1 = Table(title="[bold white]Session & Config[/]", border_style="blue", show_lines=False)
+        t1.add_column("Command", style="cyan", no_wrap=True)
+        t1.add_column("Description", style="white")
+        t1.add_row("set target <ip>", "Define the testing target")
+        t1.add_row("set mode <mode>", "Select workflow: recon, osint, full, exploit")
+        t1.add_row("set scope <cidr,...>", "Define authorized testing boundaries")
+        t1.add_row("show session", "Display current session info")
+        t1.add_row("note \"text\"", "Add a timestamped note")
+        t1.add_row("notes", "Display all session notes")
+        t1.add_row("history", "Show command history")
+
+        # ── Execution ───────────────────────────────────────────────────
+        t2 = Table(title="[bold white]Execution[/]", border_style="green", show_lines=False)
+        t2.add_column("Command", style="cyan", no_wrap=True)
+        t2.add_column("Description", style="white")
+        t2.add_row("run", "Launch the full mode sequence automatically")
+        t2.add_row("use <module>", "Enter a module (scan, osint, wifi, web, ...)")
+        t2.add_row("c2", "Enter the C2 Operations Center")
+
+        # ── Persistence ─────────────────────────────────────────────────
+        t3 = Table(title="[bold white]Persistence & Reporting[/]", border_style="yellow", show_lines=False)
+        t3.add_column("Command", style="cyan", no_wrap=True)
+        t3.add_column("Description", style="white")
+        t3.add_row("save-session <name>", "Save current session to disk")
+        t3.add_row("load-session <name>", "Load a previously saved session")
+        t3.add_row("list-sessions", "List all saved sessions")
+        t3.add_row("save-profile <name>", "Save settings as a reusable profile")
+        t3.add_row("load-profile <name>", "Load a profile")
+        t3.add_row("export <json|pdf|html>", "Generate a professional report")
+        t3.add_row("scan-diff <target>", "Compare scan results over time")
+
+        # ── Modules ─────────────────────────────────────────────────────
+        t4 = Table(title="[bold white]Available Modules[/]", border_style="magenta", show_lines=False)
+        t4.add_column("Module", style="bold magenta", no_wrap=True)
+        t4.add_column("Purpose", style="white")
+        t4.add_row("scan", "Active Reconnaissance (nmap, traceroute)")
+        t4.add_row("osint", "Passive Intelligence (crt.sh, Shodan, Whois)")
+        t4.add_row("wifi", "Wireless Attacks (aircrack-ng, reaver, PMKID)")
+        t4.add_row("web", "Web Application Pentest (gobuster, sqlmap, nikto)")
+        t4.add_row("brute", "Credential Auditing (hydra, john, hashcat)")
+        t4.add_row("exploit", "CVE Correlation & C2 Beacon Deployment")
+        t4.add_row("payload", "Payload Generation (msfvenom)")
+        t4.add_row("analyzer", "Traffic Analysis (scapy, tshark)")
+        t4.add_row("pivot", "Post-Exploitation (SSH tunneling, chisel)")
+        t4.add_row("report", "Report Generation (JSON, PDF, HTML)")
+        t4.add_row("c2", "Command & Control Operations Center")
+
+        console.print()
+        console.print(t1)
+        console.print()
+        console.print(t2)
+        console.print()
+        console.print(t3)
+        console.print()
+        console.print(t4)
+        console.print()
+        console.print("[dim]  Type 'help <command>' for details on a specific command.[/]")
+        console.print("[dim]  Type 'wordlists list' to manage attack dictionaries.[/]")
+        console.print()
 
     def do_back(self, arg: str):
         """Return to main shell (already here)"""

