@@ -3,6 +3,7 @@ import socket
 from phantom.modules.base_module import BaseModule
 from phantom.core.executor import run_command
 from phantom.core.session import session
+from phantom.utils.notifier import notifier
 from rich.console import Console
 
 console = Console()
@@ -97,12 +98,8 @@ class PayloadModule(BaseModule):
 
     def _get_lhost(self) -> str:
         """Auto-detect local IP (VPN/tun0 or default route)."""
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-        except Exception:
-            return "127.0.0.1"
+        from phantom.utils.network import get_lhost
+        return get_lhost()
 
     def _guess_os(self) -> tuple:
         """
@@ -156,11 +153,10 @@ class PayloadModule(BaseModule):
         os_string, arch, platform = self._guess_os()
         lhost = self._get_lhost()
 
-        console.print("[green][+] Auto-detected from scan results:[/]")
-        console.print(f"    OS:      [cyan]{os_string}[/]")
-        console.print(f"    Arch:    [cyan]{arch}[/]")
-        console.print(f"    LHOST:   [cyan]{lhost}[/]")
-        console.print(f"    Target:  [cyan]{session.target or 'not set'}[/]\n")
+        notifier.info(f"Auto-detected Target OS: {os_string} ({arch})")
+        notifier.info(f"LHOST: {lhost}")
+        notifier.info(f"Target: {session.target or 'not set'}")
+        console.print()
 
         # Payload type
         suggested_payload = self._suggest_payload(arch, platform)
@@ -196,7 +192,7 @@ class PayloadModule(BaseModule):
 
         if action == "1":
             run_command(cmd)
-            console.print(f"[green][+] Payload saved: {out_file}[/]")
+            notifier.success(f"Payload saved: {out_file}")
             self._start_listener(lport, payload_str)
 
         elif action == "2":
@@ -212,7 +208,7 @@ class PayloadModule(BaseModule):
     def _start_listener(self, port: str, payload: str):
         """Start Metasploit multi/handler for the generated payload."""
         from phantom.modules.handler import HandlerModule
-        console.print("[yellow][*] Starting listener...[/]")
+        notifier.status("Starting Metasploit listener...")
         HandlerModule().start_listener(port, payload)
 
     def do_run(self, _):

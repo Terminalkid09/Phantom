@@ -1,15 +1,46 @@
 from phantom.modules.base_module import BaseModule
 from phantom.core.preview import PreviewSession
-from phantom.core.executor import run_commands
+from phantom.core.executor import run_commands, run_command
 from phantom.core.session import session
 from rich.console import Console
 from phantom.utils.aggressive import filter_aggressive_commands
+from phantom.utils.notifier import notifier
 
 console = Console()
 
 
 class WebModule(BaseModule):
     module_name = "web"
+
+    def do_sqlmap(self, args):
+        """sqlmap <target_url> [options] — Smarter SQLmap wrapper with --batch."""
+        target = args.strip() or f"http://{session.target}"
+        notifier.status(f"Launching SQLmap on {target}...")
+        
+        # Force --batch for non-interactive use within framework
+        cmd = f"sqlmap -u {target} --batch --random-agent --level 1 --risk 1"
+        if "--forms" in args: cmd += " --forms"
+        
+        output = run_command(cmd)
+        if "is vulnerable" in output.lower() or "sql injection" in output.lower():
+            notifier.success(f"VULNERABILITY FOUND: SQL Injection detected on {target}")
+            session.add_note(f"Web: SQLMap found vulnerability on {target}")
+        else:
+            notifier.info("SQLmap scan complete. No obvious vulnerabilities found.")
+
+    def do_nikto(self, _):
+        """nikto — Smarter Nikto wrapper."""
+        t = session.target
+        if not t:
+            notifier.error("No target set.")
+            return
+        
+        notifier.status(f"Starting Nikto scan on {t}...")
+        output = run_command(f"nikto -h {t} -Tuning 123b -nointeractive")
+        
+        if "+ 0 items" not in output:
+            notifier.success(f"Nikto found potential issues on {t}")
+            session.add_note(f"Web: Nikto found findings on {t}")
 
     def build_commands(self) -> dict:
         """Return the command groups for web enumeration."""
@@ -54,7 +85,7 @@ class WebModule(BaseModule):
     def do_preview(self, _):
         """Show preview, let user edit, then execute selected commands."""
         if not session.target:
-            console.print("[red][!] No target set. Use 'set target <ip/domain>' first.[/]")
+            notifier.error("No target set. Use 'set target <ip/domain>' first.")
             return
 
         groups = self.build_commands()
@@ -64,12 +95,13 @@ class WebModule(BaseModule):
         preview = PreviewSession(groups)
         chosen_commands = preview.interactive()
         if chosen_commands is None:
-            console.print("[yellow]Web enumeration cancelled.[/]")
+            notifier.warn("Web enumeration cancelled.")
             return
 
         # Check for aggressive commands (SQLmap)
         chosen_commands = filter_aggressive_commands(chosen_commands)
 
+        notifier.status(f"Starting Web enumeration for {session.target}...")
         results = run_commands(chosen_commands, session.target)
         session.add_result("web", results)
 

@@ -31,6 +31,22 @@ Built for speed and flexibility, Phantom allows you to automate complex workflow
 - **Scope Enforcement**: Prevents accidental testing of out-of-scope targets.
 - **Tool Check**: Automatically verifies if system dependencies (Nmap, SQLMap, etc.) are installed.
 - **Session Persistence**: Complete session state (notes, history, results) saved to disk.
+- **Docker Ready**: Seamless deployment with pre-configured Kali Linux environment.
+
+---
+
+## 🐳 Docker Deployment
+
+The fastest way to run Phantom with all its dependencies:
+
+```bash
+# Build and start with Docker Compose
+docker-compose up --build
+
+# Or run manually
+docker build -t phantom .
+docker run -it --privileged --net=host phantom
+```
 
 ---
 

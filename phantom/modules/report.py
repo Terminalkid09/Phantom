@@ -3,6 +3,7 @@ import os
 from datetime import datetime
 from phantom.modules.base_module import BaseModule
 from phantom.core.session import session
+from phantom.utils.notifier import notifier
 from rich.console import Console
 
 console = Console()
@@ -26,7 +27,7 @@ class ReportModule(BaseModule):
         elif fmt == "pdf":
             self._export_pdf(filename)
         else:
-            console.print(f"[red]Unsupported format: {fmt}[/]")
+            notifier.error(f"Unsupported format: {fmt}")
 
     def _export_json(self, filename: str):
         data = {
@@ -41,7 +42,7 @@ class ReportModule(BaseModule):
         }
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, default=str)
-        console.print(f"[green][+] JSON report saved to {filename}[/]")
+        notifier.success(f"JSON report saved to {filename}")
 
     def _export_html(self, filename: str):
         # Basic HTML template with a little style
@@ -75,14 +76,14 @@ h1 {{ color: #2c3e50; }}
         html += "</pre></div></body></html>"
         with open(filename, "w", encoding="utf-8") as f:
             f.write(html)
-        console.print(f"[green][+] HTML report saved to {filename}[/]")
+        notifier.success(f"HTML report saved to {filename}")
 
     def _export_pdf(self, filename: str):
         try:
             from reportlab.lib.pagesizes import A4
             from reportlab.pdfgen import canvas
         except ImportError:
-            console.print("[red]reportlab not installed. Install with: pip install reportlab[/]")
+            notifier.error("reportlab not installed. Install with: pip install reportlab")
             return
         c = canvas.Canvas(filename, pagesize=A4)
         width, height = A4
@@ -103,7 +104,7 @@ h1 {{ color: #2c3e50; }}
                 c.showPage()
                 y = height - 50
         c.save()
-        console.print(f"[green][+] PDF report saved to {filename}[/]")
+        notifier.success(f"PDF report saved to {filename}")
 
     def do_run(self, _):
         fmt = input("  Format (json/html/pdf) [json]: ").strip().lower() or "json"

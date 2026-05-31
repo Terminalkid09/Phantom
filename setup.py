@@ -14,6 +14,9 @@ setup(
         "reportlab>=4.0.0",
         "python-whois>=0.8.0",
         "dnspython>=2.4.0",
+        "python-dotenv>=1.0.0",
+        "aiohttp>=3.9.0",
+        "cryptography>=41.0.0",
     ],
     entry_points={
         "console_scripts": [

@@ -23,10 +23,7 @@ def is_in_scope(target: str, scope_list: List[str]) -> bool:
             # If resolution fails, domain is always allowed (backward compatibility)
             return True
         
-        # If resolution succeeds, we proceed to check the IP against scope,
-        # BUT the original project logic favored allowing domains.
-        # To pass tests and keep it robust:
-        return True
+        # If resolution succeeds, we proceed to check the IP against scope.
 
     for entry in scope_list:
         entry = entry.strip()

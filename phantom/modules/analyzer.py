@@ -1,7 +1,11 @@
 import os
+import subprocess
+import threading
+import signal
 from phantom.modules.base_module import BaseModule
 from phantom.core.executor import run_command
 from phantom.core.session import session
+from phantom.utils.notifier import notifier
 from rich.console import Console
 from rich.table import Table
 
@@ -10,6 +14,84 @@ console = Console()
 
 class AnalyzerModule(BaseModule):
     module_name = "analyzer"
+
+    def __init__(self):
+        super().__init__()
+        self.process = None
+        self.stop_event = threading.Event()
+
+    def do_start(self, interface="eth0"):
+        """start <interface> — Start background TShark sniffing for credentials."""
+        if self.process:
+            notifier.warn("Sniffer already running.")
+            return
+        
+        notifier.status(f"Starting background sniffer on {interface}...")
+        cmd = ["sudo", "tshark", "-i", interface, "-l", "-V"]
+        
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                preexec_fn=os.setsid if os.name == 'posix' else None
+            )
+            session.results["_sniffer_active"] = True
+            self.stop_event.clear()
+            threading.Thread(target=self._live_parse, daemon=True).start()
+            notifier.success(f"Sniffer started on {interface}.")
+        except FileNotFoundError:
+            notifier.error("tshark not found. Install with: sudo apt install tshark")
+        except PermissionError:
+            notifier.error("Permission denied. Run Phantom with sudo for sniffing.")
+        except Exception as e:
+            notifier.error(f"Error starting sniffer: {e}")
+
+    def _live_parse(self):
+        """Parse TShark output in real-time for sensitive info."""
+        for line in iter(self.process.stdout.readline, ""):
+            if self.stop_event.is_set(): break
+            
+            # Extract basic credentials
+            if any(p in line for p in ["USER ", "PASS ", "Authorization: Basic"]):
+                notifier.success(f"Sensitive data detected: {line.strip()}")
+                session.add_note(f"Live Sniffer: Found potential creds - {line.strip()}")
+
+    def do_stop(self, _) -> None:
+        """stop — Stop the background sniffer."""
+        if not self.process:
+            notifier.warn("Sniffer not running.")
+            return
+        
+        self.stop_event.set()
+        try:
+            if os.name == 'posix':
+                try:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError) as e:
+                    notifier.warn(f"Could not send SIGTERM to process group: {e}")
+            else:
+                self.process.terminate()
+            
+            # Give process time to exit gracefully
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                notifier.warn("Sniffer killed forcefully (did not stop within 5s).")
+        except Exception as e:
+            notifier.error(f"Error stopping sniffer: {e}")
+        finally:
+            self.process = None
+            session.results.pop("_sniffer_active", None)
+        notifier.success("Sniffer stopped.")
+
+    def postcmd(self, stop: bool, line: str) -> bool:
+        """Warn user if leaving with active sniffer."""
+        if stop and self.process:
+            notifier.warn("Sniffer is still running! Use 'stop' first or it will become a zombie.")
+        return stop
 
     def do_capture(self, args):
         """capture --interface eth0 --duration 60 --output file.pcap"""
@@ -23,31 +105,31 @@ class AnalyzerModule(BaseModule):
         except SystemExit:
             return
         cmd = f"sudo tshark -i {parsed.interface} -a duration:{parsed.duration} -w {parsed.output}"
-        console.print(f"[cyan][*] Capturing on {parsed.interface} for {parsed.duration}s → {parsed.output}[/]")
+        notifier.status(f"Capturing on {parsed.interface} for {parsed.duration}s → {parsed.output}")
         run_command(cmd, session.target)
 
     def do_load(self, pcap_path: str):
         """load <file.pcap> — analyze an existing pcap file."""
         pcap_path = pcap_path.strip()
         if not pcap_path or not os.path.exists(pcap_path):
-            console.print("[red]File not found. Usage: load <file.pcap>[/]")
+            notifier.error("File not found. Usage: load <file.pcap>")
             return
         try:
             from scapy.all import rdpcap
         except ImportError:
-            console.print("[red]scapy not installed. Run: pip install scapy[/]")
+            notifier.error("scapy not installed. Run: pip install scapy")
             return
 
         # Tentativo di lettura con gestione errori
         try:
             packets = rdpcap(pcap_path)
         except Exception as e:
-            console.print(f"[red]Error reading PCAP: {e}[/]")
+            notifier.error(f"Error reading PCAP: {e}")
             return
 
         # Controllo se il file contiene pacchetti
         if len(packets) == 0:
-            console.print("[yellow]PCAP file contains no packets.[/]")
+            notifier.warn("PCAP file contains no packets.")
             return
 
         # Analisi dei pacchetti
@@ -61,11 +143,14 @@ class AnalyzerModule(BaseModule):
         for pkt in packets:
             # Credenziali in chiaro
             if pkt.haslayer(Raw):
-                raw = pkt[Raw].load.decode('utf-8', errors='ignore')
-                if "Authorization: Basic" in raw:
-                    findings.append(("CRITICAL", "HTTP Basic Auth in clear text", raw[:100]))
-                if "USER " in raw or "PASS " in raw:
-                    findings.append(("CRITICAL", "FTP/Telnet credentials in clear text", raw[:100]))
+                try:
+                    raw = pkt[Raw].load.decode('utf-8', errors='ignore')
+                    if "Authorization: Basic" in raw:
+                        findings.append(("CRITICAL", "HTTP Basic Auth in clear text", raw[:100]))
+                    if "USER " in raw or "PASS " in raw:
+                        findings.append(("CRITICAL", "FTP/Telnet credentials in clear text", raw[:100]))
+                except (UnicodeDecodeError, IndexError, AttributeError):
+                    pass
 
             # ARP poisoning
             if pkt.haslayer(ARP) and pkt[ARP].op == 2:
@@ -78,7 +163,7 @@ class AnalyzerModule(BaseModule):
                     findings.append(("MEDIUM", "Long DNS query – possible tunneling", query[:80]))
 
         if not findings:
-            console.print("[green][+] No anomalies found in the PCAP.[/]")
+            notifier.success("No anomalies found in the PCAP.")
             session.add_result("analyzer", {"status": "clean"})
             return
 

@@ -9,7 +9,8 @@ api.py – Wrappers for free external APIs:
 import requests
 import subprocess
 import json
-from typing import List, Dict, Any
+import time
+from typing import List, Dict, Any, Callable
 from rich.console import Console
 
 console = Console()
@@ -17,6 +18,29 @@ console = Console()
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 CRTSH_URL = "https://crt.sh/"
 SHODAN_INTERNETDB = "https://internetdb.shodan.io/"
+
+def with_backoff(func: Callable, max_retries: int = 5, initial_delay: int = 2):
+    """Wrapper for exponential backoff on API calls (429 handling)."""
+    def wrapper(*args, **kwargs):
+        delay = initial_delay
+        for i in range(max_retries):
+            try:
+                resp = func(*args, **kwargs)
+                if resp.status_code == 200:
+                    return resp
+                if resp.status_code == 429:
+                    console.print(f"[yellow][!] Rate limit hit (429). Backing off for {delay}s...[/]")
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                resp.raise_for_status()
+                return resp
+            except Exception as e:
+                if i == max_retries - 1: raise e
+                time.sleep(delay)
+                delay *= 2
+        return None
+    return wrapper
 
 # NVD free 
 def nvd_lookup(software: str, version: str = "") -> List[Dict[str, Any]]:

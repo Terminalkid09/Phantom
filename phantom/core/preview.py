@@ -64,13 +64,12 @@ class PreviewSession:
     def run_all(self) -> List[str]:
         return [cmd for _, cmd in self._flat]
 
-    def run_single(self, index: int) -> List[str]:
+    def run_single(self, index: int) -> Optional[List[str]]:
         """Return a list containing only the command at the given flat index."""
         if 1 <= index <= len(self._flat):
             return [self._flat[index - 1][1]]
-        else:
-            console.print("[red]Invalid index.[/]")
-            return []
+        console.print("[red]Invalid index.[/]")
+        return None
 
     def interactive(self) -> Optional[List[str]]:
         self._display()

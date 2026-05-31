@@ -12,12 +12,10 @@ def get_lhost() -> str:
     4. getsockname() restituisce l'IP di quell'interfaccia.
     """
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Usiamo un IP pubblico standard solo per triggerare la tabella di routing del sistema
-        s.connect(("8.8.8.8", 80))
-        lhost = s.getsockname()[0]
-        s.close()
-        return lhost
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            # Usiamo un IP pubblico standard solo per triggerare la tabella di routing del sistema
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
     except Exception:
         # Se siamo in una rete totalmente isolata senza gateway, proviamo a enumerare le interfacce
         try:

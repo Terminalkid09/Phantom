@@ -6,6 +6,8 @@ from phantom.modules.base_module import BaseModule
 from phantom.core.executor import run_command
 from rich.console import Console
 
+from phantom.utils.notifier import notifier
+
 console = Console()
 
 
@@ -23,10 +25,8 @@ class HandlerModule(BaseModule):
             f'set ExitOnSession false; '
             f'run -j"'
         )
-        console.print(f"[cyan][*] Starting listener on 0.0.0.0:{port} (payload: {payload})[/]")
-        # Run in background: subprocess.Popen would be better, but for simplicity we run synchronous.
-        # In real use, we might want to detach. For now, user must open another terminal or use '&'.
-        console.print("[yellow]Listener will run in foreground. Press Ctrl+C to stop when done.[/]")
+        notifier.status(f"Starting listener on 0.0.0.0:{port} (payload: {payload})")
+        notifier.warn("Listener will run in foreground. Press Ctrl+C to stop when done.")
         run_command(cmd)
 
     def do_listen(self, args):
@@ -48,7 +48,7 @@ class HandlerModule(BaseModule):
     def do_nc(self, port: str):
         """nc <port> — start a simple netcat listener."""
         port = port.strip() or "4444"
-        console.print(f"[cyan][*] Starting netcat listener on port {port}[/]")
+        notifier.status(f"Starting netcat listener on port {port}...")
         run_command(f"nc -lvnp {port}")
 
     def do_run(self, _):

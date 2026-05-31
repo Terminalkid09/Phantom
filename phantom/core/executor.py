@@ -19,6 +19,7 @@ if _IS_UNIX:
 
 
 def _is_safe_target(target: str) -> bool:
+    """Return True if target contains no shell metacharacters."""
     return bool(re.match(r'^[a-zA-Z0-9.\-/:]+$', target))
 
 
@@ -109,8 +110,11 @@ def run_command(cmd: str, target_ip: str = "") -> str:
             lines_in_window = []
 
             def _read():
-                for line in process.stdout:
-                    lines_in_window.append(line)
+                try:
+                    for line in process.stdout:
+                        lines_in_window.append(line)
+                except Exception:
+                    pass
 
             reader = threading.Thread(target=_read, daemon=True)
             reader.start()
@@ -147,8 +151,11 @@ def run_command(cmd: str, target_ip: str = "") -> str:
                     console.print("[yellow]  Running in background. Output will appear at end.[/]")
 
                     def _collect():
-                        for line in process.stdout:
-                            background_buffer.append(line)
+                        try:
+                            for line in process.stdout:
+                                background_buffer.append(line)
+                        except Exception:
+                            pass
 
                     bg_thread = threading.Thread(target=_collect, daemon=True)
                     bg_thread.start()
@@ -159,27 +166,34 @@ def run_command(cmd: str, target_ip: str = "") -> str:
                         "cmd": cmd,
                         "thread": bg_thread,
                         "buffer": background_buffer,
+                        "process": process,
                     })
-                    break
+                    return "".join(output_lines)
 
                 elif choice == "k":
                     process.kill()
+                    process.wait(timeout=5)
                     console.print("[yellow]  Command killed.[/]")
                     break
             else:
                 break
 
-        process.wait()
+        process.wait(timeout=5)
 
+    except FileNotFoundError:
+        console.print(f"[red][!] Command not found. Is it installed?[/]")
+    except PermissionError:
+        console.print(f"[red][!] Permission denied. Try running with sudo.[/]")
     except KeyboardInterrupt:
         try:
             process.kill()
+            process.wait(timeout=2)
         except Exception:
             pass
         console.print("\n[yellow][!] Interrupted by user (Ctrl+C). Moving to next command.[/]")
 
     except Exception as e:
-        console.print(f"[red][!] Execution error: {e}[/]")
+        console.print(f"[red][!] Execution error: {type(e).__name__}: {e}[/]")
 
     finally:
         # Always restore terminal — fixes invisible input after sudo commands
@@ -209,10 +223,18 @@ def run_commands(commands: list, target_ip: str = "") -> dict:
             cmd_label = data.get("cmd", key)
             buffer = data.get("buffer", [])
             thread = data.get("thread")
+            process = data.get("process")
 
             # Wait max 5s for thread to finish collecting
             if thread and thread.is_alive():
                 thread.join(timeout=5)
+            
+            # Ensure process is finished
+            if process and process.poll() is None:
+                try:
+                    process.wait(timeout=1)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
 
             terminal_settings = _save_terminal()
             _restore_terminal(terminal_settings)

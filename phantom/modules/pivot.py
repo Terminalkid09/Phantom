@@ -5,6 +5,7 @@ Generates SSH tunnels and Chisel commands.
 
 from phantom.modules.base_module import BaseModule
 from phantom.core.session import session
+from phantom.utils.notifier import notifier
 from rich.console import Console
 
 console = Console()
@@ -28,7 +29,7 @@ class PivotModule(BaseModule):
 
         choice = input("\n  Tunnel type: ").strip()
         if choice not in TUNNEL_TYPES:
-            console.print("[red]Invalid choice.[/]")
+            notifier.error("Invalid choice.")
             return
 
         # Common parameters
@@ -52,7 +53,7 @@ class PivotModule(BaseModule):
             cmd = f"ssh -D {local_port} {user}@{target} -N"
             desc = f"SOCKS proxy on localhost:{local_port} — configure proxychains"
         elif choice == "4":
-            console.print("\n[cyan]Chisel setup:[/]")
+            notifier.status("Chisel setup instructions:")
             server_port = input("  Server port (on your Kali machine): ").strip() or "8000"
             console.print(f"\n  [bold]On your Kali (server):[/]")
             console.print(f"      [yellow]chisel server -p {server_port} --reverse[/]")
@@ -63,9 +64,9 @@ class PivotModule(BaseModule):
         else:
             return
 
-        console.print(f"\n  [green]{desc}[/]")
+        notifier.success(desc)
         console.print(f"  [yellow]{cmd}[/]\n")
-        console.print("  [dim]Copy and run in another terminal.[/]")
+        notifier.info("Copy and run in another terminal.")
 
     def do_run(self, _):
         self.do_setup(_)

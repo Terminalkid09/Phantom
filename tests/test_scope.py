@@ -10,8 +10,8 @@ class TestScope:
         assert is_in_scope("example.com", []) is True
 
     def test_domain_names_are_always_allowed(self):
-        """Domain names should be treated as in-scope even when scope is defined."""
-        assert is_in_scope("example.com", ["10.0.0.0/24"]) is True
+        """Domain names are no longer treated as in-scope unconditionally."""
+        assert is_in_scope("example.com", ["10.0.0.0/24"]) is False
 
     def test_ip_in_scope_returns_true(self):
         """Valid IP addresses within scope should return True."""

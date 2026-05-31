@@ -11,6 +11,8 @@ from phantom.core.session import session
 from rich.console import Console
 from phantom.utils.aggressive import filter_aggressive_commands
 
+from phantom.utils.notifier import notifier
+
 console = Console()
 
 
@@ -65,7 +67,7 @@ class ScanModule(BaseModule):
     def do_preview(self, _):
         """Show preview, let user edit, then execute selected commands."""
         if not session.target:
-            console.print("[red][!] No target set. Use 'set target <ip>' first.[/]")
+            notifier.error("No target set. Use 'set target <ip>' first.")
             return
 
         groups = self.build_commands()
@@ -75,18 +77,68 @@ class ScanModule(BaseModule):
         preview = PreviewSession(groups)
         chosen_commands = preview.interactive()
         if chosen_commands is None:
-            console.print("[yellow]Scan cancelled.[/]")
+            notifier.warn("Scan cancelled.")
             return
 
         # Check for aggressive commands and ask for confirmation
         chosen_commands = filter_aggressive_commands(chosen_commands)
 
+        notifier.status(f"Starting scan sequence for {session.target}...")
         results = run_commands(chosen_commands, session.target)
         session.add_result("scan", results)
+        
+        # Trigger Smart Intelligence: CVE Analysis
+        self._analyze_vulnerabilities(results)
+
         xml_path = f"data/sessions/scan_{session.target}.xml"
         if os.path.exists(xml_path):
             save_scan_history(session.target, xml_path)
+            notifier.success(f"Scan results saved to history.")
+        
         self._conditional_suggestions(results)
+
+    def _analyze_vulnerabilities(self, results):
+        """Automatically correlate scan results with CVEs."""
+        from phantom.utils.api import nvd_lookup, exploitdb_lookup
+        import re
+        
+        console.print("\n[bold cyan]── SMART INTELLIGENCE: CVE CORRELATION ─────────────[/]")
+        services = []
+        for output in results.values():
+            matches = re.findall(r"(\d+)/(tcp|udp)\s+open\s+([\w-]+)\s+(.*)", output)
+            for port, proto, service, version in matches:
+                services.append({"service": service, "version": version.strip()})
+        
+        if not services:
+            console.print("[dim]    No versioned services found for CVE analysis.[/]")
+            return
+
+        vulns = []
+        for svc in services:
+            cves = nvd_lookup(svc['service'], svc['version'])
+            for cve in cves:
+                score = cve['cvss']
+                if exploitdb_lookup(cve['id']):
+                    score += 2.0
+                    cve['has_exploit'] = True
+                cve['final_score'] = min(score, 10.0)
+                vulns.append(cve)
+        
+        if vulns:
+            vulns.sort(key=lambda x: x['final_score'], reverse=True)
+            table = Table(title="Vulnerability Insights")
+            table.add_column("CVE ID", style="bold red")
+            table.add_column("Score", style="bold magenta")
+            table.add_column("Exploit", style="green")
+            table.add_column("Description")
+            
+            for v in vulns[:5]:
+                table.add_row(v['id'], f"{v['final_score']:.1f}", "YES" if v.get('has_exploit') else "no", v['description'][:60]+"...")
+            console.print(table)
+            session.add_result("cve_analysis", vulns)
+            console.print(f"[dim]    Run 'use exploit' to search for found CVEs.[/]")
+        else:
+            console.print("[dim]    No critical CVEs matched for these versions.[/]")
 
     def do_run(self, _):
         """Alias for do_preview."""
