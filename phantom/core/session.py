@@ -11,7 +11,7 @@ console = Console()
 @dataclass
 class Session:
     target: str = ""
-    mode: str = "recon"
+    mode: str = ""
     scope: List[str] = field(default_factory=list)
     results: Dict[str, Any] = field(default_factory=dict)
     notes: List[Dict[str, str]] = field(default_factory=list)

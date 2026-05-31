@@ -102,7 +102,7 @@ class PhantomShell(cmd.Cmd):
     def postcmd(self, stop, line):
         """Update prompt with context."""
         t = f"(\033[1;31m{session.target}\033[0m)" if session.target else ""
-        m = f"[\033[1;35m{session.mode.upper()}\033[0m]"
+        m = f"[\033[1;35m{session.mode.upper()}\033[0m]" if session.mode else ""
         self.prompt = f"\033[1;36mphantom\033[0m{t}{m} > "
         return stop
 
@@ -256,9 +256,9 @@ class PhantomShell(cmd.Cmd):
         key, value = parts[0].lower(), parts[1]
 
         if key == "target":
-            # Validation: Alphanumeric, dots, hyphens, and colons (IPv6) or valid URL
+            # Validation: Alphanumeric, dots, hyphens, underscores and colons (IPv6) or valid URL
             import re
-            TARGET_REGEX = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9.\-:]*$')
+            TARGET_REGEX = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9.\-_:]*$')
             URL_TARGET_REGEX = re.compile(r'^https?://[a-zA-Z0-9.\-:/]+$')
             
             is_valid = False
@@ -278,7 +278,6 @@ class PhantomShell(cmd.Cmd):
                     return
             session.target = value
             notifier.success(f"Target set to {value}")
-            console.print(build_dashboard())
 
         elif key == "mode":
             valid_modes = list(MODE_SEQUENCES.keys())
@@ -286,7 +285,6 @@ class PhantomShell(cmd.Cmd):
                 session.mode = value
                 steps = " → ".join(MODE_SEQUENCES[value])
                 notifier.success(f"Mode set to {value}  [dim]({steps})[/]")
-                console.print(build_dashboard())
                 notifier.info("Type 'run' to launch the sequence automatically.")
             else:
                 notifier.error(f"Invalid mode. Use: {', '.join(valid_modes)}")
@@ -294,7 +292,6 @@ class PhantomShell(cmd.Cmd):
         elif key == "scope":
             session.scope = [s.strip() for s in value.split(",")]
             notifier.success(f"Scope set to {', '.join(session.scope)}")
-            console.print(build_dashboard())
 
         else:
             notifier.error(f"Unknown key: {key}")
@@ -304,8 +301,9 @@ class PhantomShell(cmd.Cmd):
         if not session.target:
             notifier.error("No target set. Use 'set target <ip>' first.")
             return
-
-        mode = session.mode
+        
+        # Fallback to recon if no mode is set
+        mode = session.mode if session.mode else "recon"
         steps = MODE_SEQUENCES.get(mode, ["scan"])
         total = len(steps)
 

