@@ -6,11 +6,13 @@
 //  2. Dynamic API resolution via PEB walk (no static IAT entries)
 // ============================================================================
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+    #include <winternl.h>
 #endif
-#include <windows.h>
-#include <winternl.h>
 #include <cstdint>
 #include <cstring>
 
@@ -51,7 +53,12 @@ struct DecryptedString {
         enc.decrypt(buf);
     }
     ~DecryptedString() {
+#ifdef _WIN32
         SecureZeroMemory(buf, N);
+#else
+        volatile char* p = buf;
+        for (size_t i = 0; i < N; ++i) p[i] = 0;
+#endif
     }
     operator const char*() const { return buf; }
     const char* c_str() const { return buf; }
@@ -65,6 +72,7 @@ struct DecryptedString {
 #define XOR_DEC(enc) ::obf::DecryptedString<decltype(enc)::length>(enc)
 
 
+#ifdef _WIN32
 // ────────────────────────────────────────────────────────────────────────────
 //  2. DYNAMIC API RESOLUTION VIA PEB
 //     Walk the PEB → InMemoryOrderModuleList to find a loaded DLL by hash,
@@ -177,3 +185,4 @@ constexpr uint32_t FN_VIRTUALALLOC    = 0x382C0F97;  // VirtualAlloc
 constexpr uint32_t FN_VIRTUALFREE     = 0x668FCF2E;  // VirtualFree
 constexpr uint32_t FN_SLEEP           = 0x0E076F64;  // Sleep
 constexpr uint32_t FN_GETLASTERROR    = 0x5DE40B6C;  // GetLastError
+#endif

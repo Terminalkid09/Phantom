@@ -6,20 +6,25 @@
 //  Zero external dependencies — uses only bcrypt.dll which ships with Windows.
 // ============================================================================
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+    #include <bcrypt.h>
+    #pragma comment(lib, "bcrypt.lib")
+    #ifndef NT_SUCCESS
+    #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+    #endif
+#else
+    #include <openssl/evp.h>
+    #include <openssl/err.h>
+    typedef unsigned char BYTE;
 #endif
-#include <windows.h>
-#include <bcrypt.h>
 #include <vector>
 #include <string>
 #include <cstring>
 
-#pragma comment(lib, "bcrypt.lib")
-
-#ifndef NT_SUCCESS
-#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
-#endif
 
 namespace crypto {
 
@@ -98,34 +103,29 @@ inline std::vector<BYTE> base64_decode(const std::string& enc) {
 // ── AES-256-CBC Encrypt ────────────────────────────────────────────────────
 
 inline std::string encrypt(const std::string& plaintext) {
+#ifdef _WIN32
     BCRYPT_ALG_HANDLE hAlg = nullptr;
     BCRYPT_KEY_HANDLE hKey = nullptr;
     NTSTATUS status;
     std::string result;
 
-    // Open AES algorithm provider
     status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0);
     if (!NT_SUCCESS(status)) return "";
 
-    // Set CBC chaining mode
     status = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
         (PUCHAR)BCRYPT_CHAIN_MODE_CBC, sizeof(BCRYPT_CHAIN_MODE_CBC), 0);
     if (!NT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(hAlg, 0); return ""; }
 
-    // Generate key from raw bytes
     status = BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0,
         (PUCHAR)AES_KEY, KEY_LEN, 0);
     if (!NT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(hAlg, 0); return ""; }
 
-    // PKCS7 pad the plaintext
     std::vector<BYTE> padded = pkcs7_pad(
         std::vector<BYTE>(plaintext.begin(), plaintext.end()));
 
-    // IV must be copied because BCryptEncrypt modifies it in place
     BYTE iv[BLOCK_LEN];
     memcpy(iv, AES_IV, BLOCK_LEN);
 
-    // Determine output size
     ULONG cbCiphertext = 0;
     status = BCryptEncrypt(hKey, padded.data(), (ULONG)padded.size(),
         nullptr, iv, BLOCK_LEN, nullptr, 0, &cbCiphertext, 0);
@@ -133,7 +133,7 @@ inline std::string encrypt(const std::string& plaintext) {
 
     {
         std::vector<BYTE> ciphertext(cbCiphertext);
-        memcpy(iv, AES_IV, BLOCK_LEN);  // Reset IV
+        memcpy(iv, AES_IV, BLOCK_LEN);
 
         status = BCryptEncrypt(hKey, padded.data(), (ULONG)padded.size(),
             nullptr, iv, BLOCK_LEN, ciphertext.data(), cbCiphertext, &cbCiphertext, 0);
@@ -147,11 +147,46 @@ cleanup:
     if (hKey) BCryptDestroyKey(hKey);
     if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
     return result;
+#else
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return "";
+
+    std::vector<BYTE> padded = pkcs7_pad(std::vector<BYTE>(plaintext.begin(), plaintext.end()));
+    std::vector<BYTE> ciphertext(padded.size() + BLOCK_LEN);
+    int len = 0;
+    int ciphertext_len = 0;
+
+    BYTE iv[BLOCK_LEN];
+    memcpy(iv, AES_IV, BLOCK_LEN);
+
+    if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, AES_KEY, iv)) {
+        EVP_CIPHER_CTX_free(ctx);
+        return "";
+    }
+    EVP_CIPHER_CTX_set_padding(ctx, 0); // We do our own padding
+
+    if (1 != EVP_EncryptUpdate(ctx, ciphertext.data(), &len, padded.data(), padded.size())) {
+        EVP_CIPHER_CTX_free(ctx);
+        return "";
+    }
+    ciphertext_len = len;
+
+    if (1 != EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &len)) {
+        EVP_CIPHER_CTX_free(ctx);
+        return "";
+    }
+    ciphertext_len += len;
+    EVP_CIPHER_CTX_free(ctx);
+
+    ciphertext.resize(ciphertext_len);
+    return base64_encode(ciphertext);
+#endif
 }
 
 // ── AES-256-CBC Decrypt ────────────────────────────────────────────────────
 
 inline std::string decrypt(const std::string& ciphertext_b64) {
+#ifdef _WIN32
     BCRYPT_ALG_HANDLE hAlg = nullptr;
     BCRYPT_KEY_HANDLE hKey = nullptr;
     NTSTATUS status;
@@ -181,7 +216,7 @@ inline std::string decrypt(const std::string& ciphertext_b64) {
 
     {
         std::vector<BYTE> plaintext(cbPlaintext);
-        memcpy(iv, AES_IV, BLOCK_LEN);  // Reset IV
+        memcpy(iv, AES_IV, BLOCK_LEN);
 
         status = BCryptDecrypt(hKey, ciphertext.data(), (ULONG)ciphertext.size(),
             nullptr, iv, BLOCK_LEN, plaintext.data(), cbPlaintext, &cbPlaintext, 0);
@@ -196,6 +231,46 @@ cleanup:
     if (hKey) BCryptDestroyKey(hKey);
     if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
     return result;
+#else
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return "";
+
+    std::vector<BYTE> ciphertext = base64_decode(ciphertext_b64);
+    if (ciphertext.empty()) {
+        EVP_CIPHER_CTX_free(ctx);
+        return "";
+    }
+
+    std::vector<BYTE> plaintext(ciphertext.size() + BLOCK_LEN);
+    int len = 0;
+    int plaintext_len = 0;
+
+    BYTE iv[BLOCK_LEN];
+    memcpy(iv, AES_IV, BLOCK_LEN);
+
+    if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, AES_KEY, iv)) {
+        EVP_CIPHER_CTX_free(ctx);
+        return "";
+    }
+    EVP_CIPHER_CTX_set_padding(ctx, 0);
+
+    if (1 != EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext.data(), ciphertext.size())) {
+        EVP_CIPHER_CTX_free(ctx);
+        return "";
+    }
+    plaintext_len = len;
+
+    if (1 != EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len)) {
+        EVP_CIPHER_CTX_free(ctx);
+        return "";
+    }
+    plaintext_len += len;
+    EVP_CIPHER_CTX_free(ctx);
+
+    plaintext.resize(plaintext_len);
+    auto unpadded = pkcs7_unpad(plaintext);
+    return std::string(unpadded.begin(), unpadded.end());
+#endif
 }
 
 }  // namespace crypto

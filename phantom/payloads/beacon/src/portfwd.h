@@ -6,18 +6,31 @@
 //  remote host:port. Runs in a background thread.
 // ============================================================================
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <netdb.h>
+    #include <unistd.h>
+    #include <fcntl.h>
+    #define SOCKET int
+    #define INVALID_SOCKET -1
+    #define SOCKET_ERROR -1
+    #define closesocket close
+    #define Sleep(ms) std::this_thread::sleep_for(std::chrono::milliseconds(ms))
 #endif
-#include <windows.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <string>
 #include <thread>
 #include <atomic>
 #include <vector>
-
-#pragma comment(lib, "ws2_32.lib")
 
 namespace portfwd {
 
@@ -70,15 +83,14 @@ struct PortForward {
 
 private:
     void run() {
-        // Init Winsock (idempotent if already initialized)
+#ifdef _WIN32
         WSADATA wsa;
         WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
 
-        // Create listening socket
         SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (listenSock == INVALID_SOCKET) { running = false; return; }
 
-        // Allow address reuse
         int opt = 1;
         setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
 
@@ -99,9 +111,13 @@ private:
             return;
         }
 
-        // Set non-blocking for accept loop
+#ifdef _WIN32
         u_long nonBlocking = 1;
         ioctlsocket(listenSock, FIONBIO, &nonBlocking);
+#else
+        int flags = fcntl(listenSock, F_GETFL, 0);
+        fcntl(listenSock, F_SETFL, flags | O_NONBLOCK);
+#endif
 
         while (running) {
             SOCKET clientSock = accept(listenSock, nullptr, nullptr);
@@ -110,7 +126,6 @@ private:
                 continue;
             }
 
-            // Connect to remote target
             addrinfo hints{}, *result = nullptr;
             hints.ai_family = AF_INET;
             hints.ai_socktype = SOCK_STREAM;
