@@ -10,6 +10,7 @@ import requests
 import subprocess
 import json
 import time
+import copy
 from typing import List, Dict, Any, Callable
 from rich.console import Console
 
@@ -42,8 +43,14 @@ def with_backoff(func: Callable, max_retries: int = 5, initial_delay: int = 2):
         return None
     return wrapper
 
-def retry_api(retries: int = 3, backoff: int = 2):
-    """Decorator factory for retrying API calls on exception."""
+def retry_api(retries: int = 3, backoff: int = 2, return_on_fail=None):
+    """Decorator factory for retrying API calls on exception.
+
+    If return_on_fail is provided, a DEEP COPY of that value is returned on
+    final failure to avoid accidental shared-mutability between calls.
+    If return_on_fail is a callable, it will be called to produce the return
+    value (useful for generating fresh containers).
+    """
     def decorator(func: Callable):
         def wrapper(*args, **kwargs):
             last_exception = None
@@ -57,12 +64,20 @@ def retry_api(retries: int = 3, backoff: int = 2):
                         console.print(f"[yellow][!] API error: {e}. Retrying in {delay}s... (Attempt {i+1}/{retries})[/]")
                         time.sleep(delay)
                         delay *= 2
-            # On final failure, re-raise the last exception
+            # On final failure, return a safe default if provided, else re-raise
+            if return_on_fail is not None:
+                try:
+                    if callable(return_on_fail):
+                        return return_on_fail()
+                    return copy.deepcopy(return_on_fail)
+                except Exception:
+                    # If copying fails for any reason, fall back to the original object
+                    return return_on_fail
             raise last_exception
         return wrapper
     return decorator
 
-@retry_api(retries=2, backoff=6)
+@retry_api(retries=2, backoff=6, return_on_fail=[])
 def nvd_lookup(software: str, version: str = "") -> List[Dict[str, Any]]:
     """
     Query NVD for CVEs matching software name and optional version.

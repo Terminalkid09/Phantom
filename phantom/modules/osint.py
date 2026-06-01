@@ -31,27 +31,32 @@ class OsintModule(BaseModule):
         if not t:
             return {}
 
-        groups = {
-            "WHOIS / DNS": [
+        groups = {}
+
+        # CONTROLLO CONTESTO: Se contiene '_' o '@', è un handle social, non un dominio/IP
+        is_social_target = "_" in t or "@" in t
+
+        if not is_social_target:
+            # Popola i comandi infrastrutturali SOLO se è un vero dominio o IP
+            groups["WHOIS / DNS"] = [
                 f"whois {t}",
                 f"host {t}",
                 f"dig {t} ANY +short",
                 f"dig {t} MX +short",
                 f"dig {t} TXT +short",
                 f"dig {t} NS +short",
-            ],
-            "SUBDOMAIN ENUM": [
+            ]
+            groups["SUBDOMAIN ENUM"] = [
                 f"amass enum -d {t} -passive",
                 f"subfinder -d {t} -silent",
                 f"assetfinder --subs-only {t}",
-            ],
-            "DORKING (Shodan)": [
+            ]
+            groups["DORKING (Shodan)"] = [
                 f"shodan search \"net:{t}\"",
                 f"shodan stats \"net:{t}\"",
-            ] + [f"shodan search \"{dork} net:{t}\"" for dork in self.DORKS],
-        }
+            ] + [f"shodan search \"{dork} net:{t}\"" for dork in self.DORKS]
 
-        # Add Sherlock if target looks like a username or domain
+        # Add Sherlock se il target è un candidato username valido
         username = self._get_username(t)
         if username:
             groups["USERNAME SEARCH"] = [
@@ -61,14 +66,20 @@ class OsintModule(BaseModule):
         return groups
 
     def _get_username(self, target: str) -> str:
-        """Extract a potential username from the target string."""
-        if not target: return ""
+        """Extract a potential username from the target string without breaking social handles."""
+        if not target: 
+            return ""
+        
         import ipaddress
         try:
             ipaddress.ip_address(target)
-            return "" # IP is not a username
+            return "" # Un IP non è un username
         except ValueError:
-            # If it's a domain, take the first part
+            # Se contiene caratteri tipici dei social, l'username è l'intero target (pulito da eventuali @)
+            if "_" in target or "@" in target:
+                return target.lstrip("@")
+            
+            # Se è un dominio classico (es. azienda.com), prendiamo solo la prima parte
             return target.split('.')[0] if '.' in target else target
 
     def do_sherlock(self, args):
@@ -79,7 +90,6 @@ class OsintModule(BaseModule):
             return
         
         notifier.status(f"Running Sherlock for username: {username}...")
-        # Use --timeout 5 to avoid hanging too long
         cmd = f"sherlock {username} --timeout 5 --print-found"
         output = run_command(cmd)
         
@@ -136,7 +146,7 @@ class OsintModule(BaseModule):
     def do_preview(self, _):
         """Show preview, let user edit, then execute selected commands."""
         if not session.target:
-            notifier.error("No target set. Use 'set target <domain/ip>' first.")
+            notifier.error("No target set. Use 'set target <domain/ip/username>' first.")
             return
 
         groups = self.build_commands()
@@ -153,9 +163,12 @@ class OsintModule(BaseModule):
         results = run_commands(chosen_commands, session.target)
         session.add_result("osint", results)
 
-        # Additionally, run automated intel extraction
-        self._extract_dns_intel(session.target)
-        self._run_api_lookups()
+        # Esegue l'estrazione automatica via API solo se NON siamo in un contesto puramente social
+        if not ("_" in session.target or "@" in session.target):
+            self._extract_dns_intel(session.target)
+            self._run_api_lookups()
+        else:
+            notifier.info("Social handle detected. Automated DNS/Network lookups skipped.")
 
     def do_run(self, _):
         """Alias for do_preview."""
@@ -167,24 +180,19 @@ class OsintModule(BaseModule):
         intel = {"emails": set(), "phones": set(), "notes": []}
         
         try:
-            # Check TXT for SPF, DMARC, or plain text intel
             answers = dns.resolver.resolve(domain, 'TXT')
             for rdata in answers:
                 txt = str(rdata)
-                # Email regex
                 emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', txt)
                 for e in emails: intel["emails"].add(e)
-                # Phone regex (basic)
                 phones = re.findall(r'\+?[0-9]{7,15}', txt)
                 for p in phones: intel["phones"].add(p)
-                
                 if "v=spf1" in txt:
                     intel["notes"].append(f"SPF record found: {txt[:50]}...")
         except Exception:
             pass
 
         try:
-            # Check MX
             answers = dns.resolver.resolve(domain, 'MX')
             for rdata in answers:
                 mx_host = str(rdata.exchange)
@@ -196,13 +204,11 @@ class OsintModule(BaseModule):
             table = Table(title="DNS Intelligence Results")
             table.add_column("Type", style="bold magenta")
             table.add_column("Value", style="white")
-            
             for e in intel["emails"]: table.add_row("Email", e)
             for p in intel["phones"]: table.add_row("Phone", p)
             for n in intel["notes"]: table.add_row("Note", n)
-            
             console.print(table)
-            # Store in session
+            
             existing = session.get_result("osint") or {}
             existing["dns_intel"] = {
                 "emails": list(intel["emails"]),
@@ -260,12 +266,14 @@ class OsintModule(BaseModule):
             if "asn" in bgp_data:
                 notifier.info(f"ASN: {bgp_data['asn']} - {bgp_data.get('name', '')}")
 
-
     def do_crtsh(self, _):
         """crtsh — manual lookup of subdomains via crt.sh."""
         t = session.target
         if not t:
             notifier.error("No target set.")
+            return
+        if "_" in t or "@" in t:
+            notifier.error("crt.sh lookup is only available for domains.")
             return
         subdomains = crtsh_lookup(t)
         if subdomains:
@@ -275,10 +283,7 @@ class OsintModule(BaseModule):
             notifier.warn("No subdomains found or API error.")
 
     def do_diff(self, args):
-        """
-        diff <session1> <session2>
-        Compare OSINT results between two saved sessions.
-        """
+        """diff <session1> <session2> - Compare OSINT results between two saved sessions."""
         parts = args.split()
         if len(parts) < 2:
             notifier.error("Usage: diff <session_old> <session_new>")
@@ -289,7 +294,9 @@ class OsintModule(BaseModule):
         raw2 = session.load_raw(s2_name)
 
         if not raw1 or not raw2:
-            notifier.error("One or both sessions could not be loaded.")
+            raw1_status = "Loaded" if raw1 else "Failed"
+            raw2_status = "Loaded" if raw2 else "Failed"
+            notifier.error(f"Session loading issue. Session 1: {raw1_status}, Session 2: {raw2_status}")
             return
 
         res1 = raw1.get("results", {}).get("osint", {})

@@ -19,8 +19,9 @@ if _IS_UNIX:
 
 
 def _is_safe_target(target: str) -> bool:
-    """Return True if target contains no shell metacharacters."""
-    return bool(re.match(r'^[a-zA-Z0-9.\-/:]+$', target))
+    """Return True if target contains no shell metacharacters (allows @ and _ for social handles)."""
+    # MODIFICATA: Ora include '@' e '_' per supportare l'OSINT sui profili social
+    return bool(re.match(r'^[@a-zA-Z0-9._\-/: ]+$', target))
 
 
 def _is_tool_installed(cmd: str) -> bool:

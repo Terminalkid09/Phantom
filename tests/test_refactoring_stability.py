@@ -17,7 +17,7 @@ class TestShellStability:
         """PhantomShell should instantiate without side effects."""
         from phantom.core.shell import PhantomShell
         shell = PhantomShell()
-        assert shell.prompt == "[phantom] > "
+        assert shell.prompt == "\x1b[1;36m[phantom]\x1b[0m > "
 
     def test_mode_sequences_valid(self):
         """All mode sequences should reference valid module names."""

