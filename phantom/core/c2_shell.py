@@ -45,11 +45,11 @@ class C2Shell(cmd.Cmd):
         return stop
 
     def do_listeners(self, arg):
-        """listeners [start <port> | stop]"""
+        """listeners [start <port> <host> | stop]"""
         parts = arg.split()
         if not parts:
             if server_instance.thread and server_instance.thread.is_alive():
-                console.print(f"[*] Listener [green]ACTIVE[/green] on port {server_instance.port}")
+                console.print(f"[*] Listener [green]ACTIVE[/green] on {server_instance.host}:{server_instance.port}")
             else:
                 console.print("[*] Listener [red]INACTIVE[/red]")
             return
@@ -57,9 +57,9 @@ class C2Shell(cmd.Cmd):
         action = parts[0]
         if action == "start":
             port = int(parts[1]) if len(parts) > 1 else 443
-            server_instance.port = port
-            server_instance.start()
-            notifier.success(f"Started listener on port {port}")
+            host = parts[2] if len(parts) > 2 else "0.0.0.0"
+            server_instance.start(host=host, port=port)
+            notifier.success(f"Started listener on {host}:{port}")
         elif action == "stop":
             server_instance.stop()
             notifier.success("Stopped listener")

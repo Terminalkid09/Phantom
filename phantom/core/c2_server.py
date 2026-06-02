@@ -233,9 +233,9 @@ async def handle_payload(request: web.Request) -> web.Response:
 # ── Server Lifecycle ───────────────────────────────────────────────────────
 
 class C2Server:
-    def __init__(self, host: str = "127.0.0.1", port: int = 443):
+    def __init__(self, host: str = "0.0.0.0", port: int = 443):
         if host == "0.0.0.0":
-            logger.warning("C2 Server listening on 0.0.0.0. Ensure firewall is configured.")
+            logger.info("C2 Server listening on 0.0.0.0. Ensure firewall allows incoming traffic on port " + str(port))
         self.host = host
         self.port = port
         self.app = web.Application()
