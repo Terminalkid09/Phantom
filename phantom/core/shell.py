@@ -251,7 +251,7 @@ class PhantomShell(cmd.Cmd):
             console.print(f"  [white]- {p}[/]")
 
     def do_set(self, arg: str):
-        """set target <ip/domain> | set mode <recon|osint|full|exploit> | set scope <cidr,ip,...>"""
+        """set target <ip/domain> | set mode <recon|osint|full|exploit> | set scope <cidr,...> | set lhost <ip> | set lport <port>"""
         parts = arg.strip().split(maxsplit=1)
         if len(parts) < 2:
             notifier.error("Usage: set <target|mode|scope> <value>")
