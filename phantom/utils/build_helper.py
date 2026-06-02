@@ -66,8 +66,12 @@ def check_build_env(platform):
     
     if platform == "linux":
         if not shutil.which("g++"): missing.append("build-essential")
-        if not os.path.exists("/usr/include/curl/curl.h"): missing.append("libcurl4-openssl-dev")
-        if not os.path.exists("/usr/include/openssl/ssl.h"): missing.append("libssl-dev")
+        # Header checks for libraries
+        has_curl = os.path.exists("/usr/include/curl/curl.h") or os.path.exists("/usr/include/x86_64-linux-gnu/curl/curl.h")
+        if not has_curl: missing.append("libcurl4-openssl-dev")
+        
+        has_ssl = os.path.exists("/usr/include/openssl/ssl.h") or os.path.exists("/usr/include/x86_64-linux-gnu/openssl/ssl.h")
+        if not has_ssl: missing.append("libssl-dev")
         
     elif platform == "windows":
         has_cl = shutil.which("cl") is not None
