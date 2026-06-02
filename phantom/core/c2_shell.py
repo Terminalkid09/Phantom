@@ -45,7 +45,7 @@ class C2Shell(cmd.Cmd):
         return stop
 
     def do_listeners(self, arg):
-        """listeners [start <port> <host> | stop]"""
+        """listeners [start <port> [host] | stop] - Manage C2 listener."""
         parts = arg.split()
         if not parts:
             if server_instance.thread and server_instance.thread.is_alive():
@@ -56,15 +56,15 @@ class C2Shell(cmd.Cmd):
 
         action = parts[0]
         if action == "start":
-            port = int(parts[1]) if len(parts) > 1 else 443
-            host = parts[2] if len(parts) > 2 else "0.0.0.0"
+            port = int(parts[1]) if len(parts) > 1 else (session.lport or 443)
+            host = parts[2] if len(parts) > 2 else (session.lhost or "0.0.0.0")
             server_instance.start(host=host, port=port)
             notifier.success(f"Started listener on {host}:{port}")
         elif action == "stop":
             server_instance.stop()
             notifier.success("Stopped listener")
         else:
-            notifier.error("Usage: listeners [start <port> | stop]")
+            notifier.error("Usage: listeners start [port] [host] | listeners stop")
 
     def do_beacons(self, arg):
         """beacons - list active beacons"""

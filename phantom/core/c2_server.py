@@ -286,6 +286,9 @@ class C2Server:
             self.loop.call_soon_threadsafe(self.loop.stop)
             if self.thread:
                 self.thread.join(timeout=2)
+                self.thread = None
+            self.loop = None
+            self.runner = None
 
 
 server_instance = C2Server()
