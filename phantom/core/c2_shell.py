@@ -6,6 +6,7 @@ from rich.table import Table
 from datetime import datetime
 
 from phantom.core.c2_server import server_instance, c2_state
+from phantom.core.session import session
 from phantom.utils.notifier import notifier
 
 console = Console()
