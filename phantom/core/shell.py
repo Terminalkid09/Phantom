@@ -298,6 +298,15 @@ class PhantomShell(cmd.Cmd):
             session.scope = [s.strip() for s in value.split(",")]
             notifier.success(f"Scope set to {', '.join(session.scope)}")
 
+        elif key == "lhost":
+            session.lhost = value
+            notifier.success(f"LHOST set to: {value}")
+        elif key == "lport":
+            try:
+                session.lport = int(value)
+                notifier.success(f"LPORT set to: {value}")
+            except ValueError:
+                notifier.error("LPORT must be an integer.")
         else:
             notifier.error(f"Unknown key: {key}")
 
@@ -338,6 +347,8 @@ class PhantomShell(cmd.Cmd):
             table.add_row("Scope", ", ".join(session.scope) if session.scope else "—")
             table.add_row("Timeout", f"{executor.TIMEOUT_SECONDS}s")
             table.add_row("Active wordlist", session.active_wordlist or "—")
+            table.add_row("LHOST (Manual)", session.lhost or "Auto-detect")
+            table.add_row("LPORT (Manual)", str(session.lport) if session.lport else "Auto-detect")
             table.add_row("Completed modules", ", ".join(session.results.keys()) or "—")
             table.add_row("Notes", str(len(session.notes)))
             console.print(table)

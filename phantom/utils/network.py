@@ -2,15 +2,15 @@ import socket
 
 def get_lhost() -> str:
     """
-    Rileva l'IP locale (LHOST) che verrà usato per connettersi al target.
-    
-    Il metodo del 'dummy socket' è il più affidabile:
-    1. Crea un socket UDP (non orientato alla connessione).
-    2. Tenta di 'connettersi' a un IP esterno (8.8.8.8). 
-       NOTA: Non vengono inviati pacchetti in rete e l'IP non deve essere raggiungibile.
-    3. Chiede al sistema operativo: 'Quale interfaccia useresti per raggiungere questo IP?'.
-    4. getsockname() restituisce l'IP di quell'interfaccia.
+    Rileva l'IP locale (LHOST). Priorità:
+    1. session.lhost (se impostato manualmente)
+    2. dummy socket verso 8.8.8.8
+    3. hostname fallback
     """
+    from phantom.core.session import session
+    if session.lhost:
+        return session.lhost
+
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             # Usiamo un IP pubblico standard solo per triggerare la tabella di routing del sistema

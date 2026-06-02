@@ -11,6 +11,8 @@ console = Console()
 @dataclass
 class Session:
     target: str = ""
+    lhost: str = ""
+    lport: int = 0
     mode: str = ""
     scope: List[str] = field(default_factory=list)
     results: Dict[str, Any] = field(default_factory=dict)
