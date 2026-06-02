@@ -75,6 +75,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     flex \
     texinfo \
     help2man \
+    # RCE Deployer dependencies
+    sshpass \
+    smbclient \
+    curl \
+    default-mysql-client \
+    postgresql-client \
+    python3-impacket \
+    python3-psycopg2 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
