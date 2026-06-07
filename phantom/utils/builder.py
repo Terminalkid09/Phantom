@@ -73,7 +73,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False) ->
                 subprocess.run(
                     ["cl", "/EHsc", "/O2", "/std:c++17", "src/main.cpp", "/Fe:beacon.exe",
                      "/I", "src",
-                     "/link", "winhttp.lib", "bcrypt.lib", "ws2_32.lib", "/SUBSYSTEM:WINDOWS"],
+                     "/link", "winhttp.lib", "bcrypt.lib", "ws2_32.lib", "gdi32.lib", "user32.lib", "/SUBSYSTEM:WINDOWS"],
                     cwd=beacon_dir, check=True, capture_output=True, text=True)
             else:
                 mingw_cpp = "x86_64-w64-mingw32-g++"
@@ -82,7 +82,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False) ->
                     return None
                 subprocess.run(
                     [mingw_cpp, "-std=c++17", "-O2", "-s", "-o", "beacon.exe",
-                     "-Isrc", "src/main.cpp", "-lwinhttp", "-lbcrypt", "-lws2_32", "-static", "-mwindows"],
+                     "-Isrc", "src/main.cpp", "-lwinhttp", "-lbcrypt", "-lws2_32", "-lgdi32", "-luser32", "-static", "-mwindows"],
                     cwd=beacon_dir, check=True, capture_output=True, text=True)
             _mark_built(beacon_dir, out_name)
             return beacon_out
