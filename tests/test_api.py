@@ -22,6 +22,8 @@ class DummyResponse:
 class TestApi:
     def test_nvd_lookup_returns_empty_on_network_error(self, monkeypatch):
         """nvd_lookup should return an empty list when requests.get raises."""
+        api._cache.clear()
+        api._cache_loaded = True
         monkeypatch.setattr(api.requests, "get", lambda *args, **kwargs: (_ for _ in ()).throw(Exception("network")))
         assert api.nvd_lookup("apache", "2.4") == []
 
