@@ -6,70 +6,107 @@
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey.svg)](#)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**Phantom** is a professional-grade Offensive Security CLI Framework designed to orchestrate the entire penetration testing lifecycle—from reconnaissance and OSINT to exploitation, C2 operations, and reporting—into a single, unified, and interactive session.
+**Phantom** is an offensive security CLI framework that orchestrates the penetration testing lifecycle — from reconnaissance and OSINT to exploitation, C2 operations, and reporting — in a single interactive session.
 
-Built for speed and flexibility, Phantom allows you to automate complex workflows while maintaining full control over every command executed.
+Built for speed and flexibility, Phantom automates multi-step workflows while keeping every external command visible and controllable.
 
 ---
 
 ## 🚀 Key Features
 
 ### 🧩 Extensible Architecture
-- **Plugin System**: Seamlessly extend the framework by dropping Python modules into `~/.phantom/plugins/`.
-- **12+ Built-in Modules**: Native integration for `scan`, `osint`, `wifi`, `web`, `brute`, `exploit`, `payload`, `handler`, `pivot`, `analyzer`, `report`, and `c2`.
-- **AI Integration**: Optional AI-powered CVE interpretation and executive summary generation (OpenAI / Ollama).
+- **Plugin System**: Drop Python modules into `~/.phantom/plugins/` or `phantom/plugins/`.
+- **12+ Built-in Modules**: `scan`, `osint`, `wifi`, `web`, `brute`, `exploit`, `payload`, `handler`, `pivot`, `analyzer`, `report`, and `c2`.
+- **AI Integration** (optional): CVE interpretation and executive summaries via OpenAI or Ollama.
 
 ### ⚙️ Smart Workflows
-- **Mode-Driven Execution**: Preset modes (`recon`, `osint`, `full`, `exploit`) for automated sequential testing.
-- **Interactive Command Preview**: Preview, edit, or skip commands before they hit the target.
-- **Aggressive Mode**: Inject custom payloads or aggressive flags dynamically into your workflow.
-- **Scope Enforcement**: Prevents accidental testing of out-of-scope targets.
+- **Mode-Driven Execution**: Preset modes (`recon`, `osint`, `full`, `exploit`) run module sequences automatically.
+- **`--auto` flag**: Skip confirmation prompts during `run`.
+- **Interactive Command Preview**: Preview, edit, or skip commands before execution.
+- **Scope Enforcement**: Blocks out-of-scope targets before commands run.
 
 ### 📊 Advanced Data Management
-- **Scan History & Diff**: Track changes in the target's attack surface over time.
-- **Intelligent Wordlist Manager**: Automatically indexes and categorizes wordlists from standard paths (SecLists, Dirb, etc.).
-- **Report Engine**: Professional exports in **JSON**, **HTML**, and **PDF** formats.
-- **Session Persistence**: Complete session state (notes, history, results) saved to disk.
+- **Scan History & Diff**: Track attack-surface changes over time.
+- **Wordlist Manager**: Indexes SecLists, Dirb, and custom wordlists.
+- **Report Engine**: Export to **JSON**, **HTML**, and **PDF**.
+- **Session Persistence**: Atomic saves of notes, history, and results.
 
 ### 📡 WiFi Offensive Module
-- **Monitor Mode Management**: Seamless `airmon-ng` integration to start/stop monitor mode.
-- **WPA/WPA2 Cracking**: Automated handshake capture with parallel deauthentication.
-- **PMKID Attack**: Modern clientless WPA attack via `hcxdumptool` — no handshake needed.
-- **WPS Brute Force**: Integrated `reaver` for WPS PIN attacks.
-- **Post-Crack Pivot**: After cracking a network, seamlessly transition to internal scanning.
+- Monitor mode, WPA/WPA2 handshake capture, PMKID, WPS brute force, post-crack pivot.
 
 ### 🎯 C2 Operations Center
-- **Async C2 Server**: `aiohttp`-based listener running in a background thread with sleep/jitter support.
-- **AES-256-CBC Encryption**: All beacon ↔ server communication is encrypted end-to-end.
-- **Cross-Platform C++ Beacon**: A single C++ codebase that compiles natively for **Windows**, **Linux**, **macOS**, and **Android** (ARM64). Dependencies: `ws2_32`, `iphlpapi` (Windows) and `pthread` (POSIX).
-- **EDR Evasion**: Dynamic API resolution via PEB walk (Windows), compile-time XOR string obfuscation for payloads and network headers (All Platforms).
-- **Context-Aware Keylogger**: Logs keystrokes intelligently on Windows.
-- **Automated Delivery**: `generate <platform>` command auto-compiles the beacon and produces platform-specific droppers (PowerShell, Bash, ADB).
-- **Continuous Integration**: GitLab CI pipeline configured for automated multi-platform compilation using `mingw-w64`, `g++`, `clang`, and Android NDK.
-- **Recon & Pivoting**: Cross-platform file system enumeration (with a safe 1MB limit for `cat`), file transfer, and TCP port forwarding.
-- **Network Resilience**: Explicit connection timeouts to prevent hanging sockets during C2 communication.
+- **Async C2 Server**: `aiohttp` listener with sleep/jitter (5s ±30%).
+- **AES-256-CBC**: Encrypted beacon ↔ server traffic (keys from `.env`, embedded at compile time).
+- **Cross-Platform C++ Beacon**: Windows, Linux, macOS, Android (ARM64).
+- **Agent capabilities**: Recon, file transfer (`download`/`upload`), TCP port forwarding, OS shell execution, context-aware keylogger (Windows).
+- **`beacons`**: Active callback sessions with telemetry.
+- **`payloads`**: History of generated dropper one-liners (survives screen clears).
+- **`generate`**: Auto-compile beacon + platform dropper (PowerShell, Bash, ADB).
+- **HTTPS**: Automatic on ports 443/8443.
+- **GitLab CI**: Multi-platform beacon builds via MinGW, g++, NDK.
+
+### 🔍 CVE Intelligence
+- NVD API integration with **24h cache**, rate limiting, and optional `NVD_API_KEY`.
+- Exploitability scoring (CVSS + ExploitDB + MSF + GitHub PoC).
+- Light service summary during scan; full correlation in `use exploit → run`.
 
 ### 🛡️ Safety & Reliability
-- **Scope Enforcement**: Prevents accidental testing of out-of-scope targets.
-- **Tool Check**: Automatically verifies if system dependencies (Nmap, SQLMap, etc.) are installed.
-- **Session Persistence**: Complete session state (notes, history, results) saved to disk.
-- **Docker Ready**: Seamless deployment with pre-configured Kali Linux environment.
+- Input validation on targets (anti-injection).
+- Tool availability checks before execution.
+- Terminal integrity handling (termios).
+- Docker-ready Kali-based image.
+
+---
+
+## ⚙️ Configuration
+
+Copy the example environment file and set your secrets:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Required | Description |
+| :--- | :---: | :--- |
+| `PHANTOM_C2_KEY` | Recommended | AES key — **exactly 32 bytes** (recompile beacons after change) |
+| `PHANTOM_C2_IV` | Recommended | AES IV — **exactly 16 bytes** |
+| `PHANTOM_PAYLOAD_TOKEN` | Recommended | Auth token for beacon download endpoints |
+| `NVD_API_KEY` | Optional | NVD API key (50 req/30s vs 5 without) |
+| `AI_PROVIDER` / `AI_API_KEY` | Optional | OpenAI or Ollama integration |
+
+`.env` is searched in: project root → `~/.phantom/.env` → `~/.env` → package dir.
+
+> **Important:** After changing `PHANTOM_C2_KEY` or `PHANTOM_C2_IV`, regenerate beacons with `generate` or `deploy-agent`.
 
 ---
 
 ## 🐳 Docker Deployment
 
-The fastest way to run Phantom with all its dependencies:
-
 ```bash
-# Build and start with Docker Compose
-docker-compose up --build -d
+# 1. Configure secrets
+cp .env.example .env
+# Edit .env with your C2 keys and optional NVD API key
 
-# Connect to the interactive shell (REQUIRED for CLI interaction)
+# 2. Build and start (detached)
+docker compose up --build -d
+
+# 3. Connect to the interactive CLI
 docker exec -it phantom-framework python3 -m phantom.main
 ```
 
-The Docker image is based on **Kali Rolling** and comes pre-installed with all security tools (nmap, sqlmap, aircrack-ng, hydra, hashcat, gobuster, nikto, ffuf, tshark, exploitdb) and the C++ build chain (g++, mingw-w64, cmake) for compiling the C2 Beacon.
+The image is based on **Kali Rolling** with nmap, sqlmap, aircrack-ng, hydra, hashcat, gobuster, nikto, ffuf, tshark, exploitdb, and the full C++ build chain (g++, mingw-w64, Android NDK).
+
+**After changing `.env` keys**, rebuild the image so beacons embed the new crypto material:
+
+```bash
+docker compose build --no-cache && docker compose up -d
+```
+
+C2-only mode:
+
+```bash
+docker exec -it phantom-framework python3 -m phantom.main --c2
+```
 
 ---
 
@@ -80,16 +117,23 @@ The Docker image is based on **Kali Rolling** and comes pre-installed with all s
 | `set target <ip/domain>` | Define the current testing target. |
 | `set mode <recon/full/...>` | Select the automation workflow. |
 | `set scope <ip,cidr,...>` | Define authorized testing boundaries. |
-| `run` | Execute the selected mode sequence automatically. |
-| `use <module>` | Enter a specific module (e.g., `use scan`, `use exploit`). |
+| `run` | Execute the selected mode sequence (confirms unless `--auto`). |
+| `use <module>` | Enter a specific module interactively. |
 | `c2` | Enter the C2 Operations Center. |
-| `scan-diff <target>` | Compare current scan results with previous ones. |
-| `wordlists list/use/search` | Manage and select wordlists for attacks. |
-| `save-session <name>` | Save current target, notes, and results. |
-| `save-profile <name>` | Persist your configuration and preferences. |
-| `note "text"` | Add a timestamped note to the session. |
-| `export <pdf/html/json>` | Generate a professional report of findings. |
-| `help` | Display the formatted help panel with all commands. |
+| `scan-diff <target>` | Compare scan results with previous runs. |
+| `wordlists list/use/search` | Manage attack wordlists. |
+| `save-session <name>` | Save target, notes, and results. |
+| `export <pdf/html/json>` | Generate a report. |
+| `help` | Show the command reference. |
+
+### CLI Flags
+
+```bash
+phantom              # Main pentest shell
+phantom --c2         # C2 Operations Center only
+phantom --auto       # Run mode sequences without confirmation
+phantom --profile X  # Load a saved profile at startup
+```
 
 ---
 
@@ -97,31 +141,62 @@ The Docker image is based on **Kali Rolling** and comes pre-installed with all s
 
 | Module | Purpose | Key Tools |
 | :--- | :--- | :--- |
-| **Scan** | Active Reconnaissance | `nmap`, `traceroute`, `service enum` |
-| **OSINT** | Passive Intelligence | `crt.sh`, `Shodan`, `BGP`, `Whois` |
-| **WiFi** | Wireless Cracking | `aircrack-ng`, `reaver`, `hcxdumptool`, `PMKID` |
-| **Web** | Web Application Pentest | `gobuster`, `sqlmap`, `nikto`, `ffuf` |
-| **Brute** | Credential Auditing | `hydra`, `medusa`, `john`, `hashcat` |
-| **Exploit** | CVE Correlation & C2 Dropper | `searchsploit`, `NVD API`, `C2 Beacon` |
-| **Payload** | Payload Generation | `msfvenom`, `shellgen` |
-| **Handler** | Listener Management | `metasploit multi/handler` |
-| **Analyzer** | Traffic Analysis | `scapy`, `tshark` |
-| **Pivot** | Post-Exploitation | `ssh tunneling`, `chisel` |
-| **Report** | Report Generation | `JSON`, `HTML`, `PDF` |
-| **C2** | Command & Control | `aiohttp`, `AES-256`, `C++ Beacon` |
+| **Scan** | Active reconnaissance | `nmap`, `traceroute`, service enum |
+| **OSINT** | Passive intelligence | `crt.sh`, Shodan, BGP, Whois |
+| **WiFi** | Wireless attacks | `aircrack-ng`, `reaver`, `hcxdumptool` |
+| **Web** | Web application testing | `gobuster`, `sqlmap`, `nikto`, `ffuf` |
+| **Brute** | Credential auditing | `hydra`, `medusa`, `john`, `hashcat` |
+| **Exploit** | CVE correlation & Actionable PoCs | `fire <cve>`, NVD, searchsploit, `deploy-agent` |
+| **Payload** | Payload generation & PrivEsc | `msfvenom`, `privesc`, custom C2 droppers |
+
+---
+
+## 📡 C2 Operations Center (v2.0.0)
+
+The Phantom C2 is an asynchronous Command & Control center built for stealthy operations and robust agent management.
+
+### 🛡️ Professional Evasion & OPSEC
+- **String Obfuscation**: All sensitive strings (commands, JSON keys, API paths) are XOR-encrypted at compile-time using `XOR_STR`.
+- **Anti-Analysis**: Agent detects debuggers (`IsDebuggerPresent`) and VM/Sandbox environments (CPU/RAM checks) to prevent analysis.
+- **Stalling Techniques**: Uses complex mathematical loops to frustrate automated sandbox detonation.
+- **LOLBins Deployment**: Uses `certutil` for stealthy Windows downloads, bypassing common PowerShell monitoring.
+- **Async Traffic**: C2 traffic is encrypted (AES-256-CBC) and features randomized **Jitter** to break timing signatures.
+
+### ⌨️ C2 Shell Commands
+
+| Command | Description |
+| :--- | :--- |
+| `listeners start/stop` | Manage the `aiohttp` listener (supports HTTPS). |
+| `beacons` | List all active agent check-ins and telemetry. |
+| `interact <id>` | Drop into an interactive session with a specific beacon. |
+| `payloads` | View the history of generated dropper commands. |
+| `generate <platform>` | Compile a custom agent and generate a dropper. |
+| `results` | View output from queued tasks. |
+| `beacon-help` | Show commands supported by the C++ agent. |
+
+### 🎯 Actionable Exploitation
+The `exploit` module now features a **PoC Repository**:
+- `fire <cve_id>`: Automatically locates a local PoC for a specific CVE and executes it against the target.
+- Intelligent port selection based on previous scan results.
+| **Handler** | Listener management | Metasploit `multi/handler` |
+| **Analyzer** | Traffic analysis | `scapy`, `tshark` |
+| **Pivot** | Tunneling | SSH forwards, Chisel |
+| **Report** | Report generation | JSON, HTML, PDF |
+| **C2** | Command & control | Encrypted beacon, async server |
 
 ---
 
 ## 📥 Installation
 
 ### Prerequisites
-- Python 3.10 or higher.
-- Standard security tools (pre-installed on Kali/Parrot): `nmap`, `sqlmap`, `gobuster`, etc.
+- Python 3.10+
+- Security tools (pre-installed on Kali/Parrot): `nmap`, `sqlmap`, `gobuster`, etc.
 
 ### From Source
 ```bash
 git clone https://github.com/Terminalkid09/phantom.git
 cd phantom
+cp .env.example .env   # configure secrets
 pip install -e .
 phantom
 ```
@@ -132,83 +207,72 @@ phantom
 
 ### Pentest Mode
 ```bash
-# Start Phantom
 phantom
-
-# Configure Session
 set target scanme.nmap.org
 set scope 45.33.32.156
 set mode full
+run                    # or: phantom --auto
 
-# Run Workflow
-run
-
-# Export Findings
 use report
 export pdf report.pdf
 ```
 
-### WiFi Cracking
-```bash
-phantom
-use wifi
-
-# Setup
-airmon check
-airmon start wlan0
-
-# Scan & Attack
-scan-aps
-handshake AA:BB:CC:DD:EE:FF 6
-crack data/sessions/handshake_AABBCCDDEEFF-01.cap
-
-# Or use modern PMKID (no client needed)
-pmkid AA:BB:CC:DD:EE:FF 6
-```
-
 ### C2 Operations
 ```bash
-# Launch C2 Interface
 phantom --c2
 
-# Start listener and generate dropper
+# Start listener and compile beacon + dropper
 listeners start 443
-generate
+generate linux
 
-# Once beacon connects
+# View history of generated droppers
+payloads
+payloads <id-prefix>
+
+# Active beacons
 beacons
-interact PHANTOM-TARGET-1A2B
-keylog start
-recon
-keylog dump
+interact PHANTOM-TARGET    # prefix match supported
+beacon-help                # list agent commands
+
+# Run commands on the agent (built-in or OS shell)
+whoami
+shell ipconfig
+ls C:\
+download C:\Users\Public\file.txt   # saved to data/downloads/
+results
+
+back
 ```
 
-### Automated Agent Deployment (from Exploit module)
+### Deploy Agent from Exploit Module
 ```bash
 phantom
 use exploit
-deploy-agent
-# → Generates a PowerShell one-liner dropper that downloads and executes the beacon
+deploy-agent linux
+# Compiles beacon, shows dropper, saves to payload history
+# Then: c2 → listeners start → beacons
 ```
 
 ---
 
 ## 📝 Extending Phantom (Plugins)
 
-Creating a custom module is as simple as inheriting from `BaseModule`:
-
 ```python
 from phantom.modules.base_module import BaseModule
 
 class MyTool(BaseModule):
     module_name = "mytool"
+
     def build_commands(self):
-        return {"CUSTOM": ["echo 'Running custom logic on {self.target}'"]}
+        return {"CUSTOM": ["echo 'custom logic'"]}
+
     def do_run(self, _):
-        # Implementation...
+        pass
 ```
 
-Drop the file in `~/.phantom/plugins/` and it will be available in the next session!
+Drop the file in `~/.phantom/plugins/` — it loads on next session.
+
+Dynamic exploits go in `phantom/exploits/<category>/` with a `METADATA` dict and `run(target, port, **kwargs)` function.
 
 ---
 
@@ -217,14 +281,20 @@ Drop the file in `~/.phantom/plugins/` and it will be available in the next sess
 ```
 phantom/
 ├── phantom/
-│   ├── core/              # Shell, session, executor, scope, C2 server/shell
-│   ├── modules/           # scan, osint, wifi, web, brute, exploit, payload, ...
-│   ├── plugins/           # Optional AI connector, custom extensions
-│   ├── payloads/
-│   │   └── beacon/        # C++ Agent source (evasion, crypto, network, keylogger)
-│   └── utils/             # notifier, wordlists, parser, network helpers
-├── tests/                 # 161+ pytest unit tests
-├── Dockerfile             # Kali-based container with all tools pre-installed
+│   ├── core/              # Shell, session, executor, C2 server/shell
+│   ├── modules/           # scan, osint, wifi, web, brute, exploit, ...
+│   ├── plugins/           # AI connector, custom extensions
+│   ├── exploits/          # Dynamic exploit scripts (Python/Bash)
+│   ├── payloads/beacon/   # C++ agent (crypto, network, recon, keylogger)
+│   └── utils/             # API, builder, paths, payload manager, ...
+├── data/
+│   ├── sessions/          # Scan XML, saved sessions
+│   ├── cache/             # NVD CVE cache (24h TTL)
+│   └── downloads/         # Files exfiltrated via beacon
+├── scripts/               # CI helpers (beacon crypto generation)
+├── tests/                 # 167+ pytest unit tests
+├── .env.example           # Environment template
+├── Dockerfile             # Kali-based container
 ├── docker-compose.yml     # One-command deployment
 └── README.md
 ```
@@ -233,7 +303,7 @@ phantom/
 
 ## ⚖️ Legal Disclaimer
 
-Phantom is intended for **authorized penetration testing and educational purposes only**. Use this tool only on systems where you have explicit, written permission. The author is not responsible for any misuse or damage caused by this program.
+Phantom is intended for **authorized penetration testing and educational purposes only**. Use only on systems where you have explicit, written permission. The author is not responsible for any misuse or damage caused by this program.
 
 ---
 
