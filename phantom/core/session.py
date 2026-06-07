@@ -39,9 +39,11 @@ class Session:
 
     def save(self, name: str) -> None:
         """Save the current session to data/sessions/{name}.json atomically."""
-        os.makedirs("data/sessions", exist_ok=True)
-        path = f"data/sessions/{name}.json"
-        with tempfile.NamedTemporaryFile(mode='w', dir='data/sessions', delete=False, suffix='.json', encoding='utf-8') as tmp:
+        from phantom.utils.paths import sessions_dir
+        sdir = sessions_dir()
+        os.makedirs(sdir, exist_ok=True)
+        path = os.path.join(sdir, f"{name}.json")
+        with tempfile.NamedTemporaryFile(mode='w', dir=sdir, delete=False, suffix='.json', encoding='utf-8') as tmp:
             json.dump(self.__dict__, tmp, indent=2, default=str)
             tmp_path = tmp.name
         os.replace(tmp_path, path)
@@ -49,8 +51,10 @@ class Session:
 
     def export_markdown(self, filename: str) -> None:
         """Export session to a structured Markdown report."""
-        os.makedirs("data/sessions", exist_ok=True)
-        path = f"data/sessions/{filename}"
+        from phantom.utils.paths import sessions_dir
+        sdir = sessions_dir()
+        os.makedirs(sdir, exist_ok=True)
+        path = os.path.join(sdir, filename)
         with open(path, "w", encoding="utf-8") as f:
             f.write(f"# Phantom Engagement Report\n")
             f.write(f"**Target:** {self.target}\n")
@@ -66,8 +70,8 @@ class Session:
         console.print(f"[green][+] Report exported: {path}[/]")
 
     def load(self, name: str) -> None:
-        # Check data/sessions (was formerly workspace/ as well)
-        path = f"data/sessions/{name}.json"
+        from phantom.utils.paths import sessions_dir
+        path = os.path.join(sessions_dir(), f"{name}.json")
         if os.path.exists(path):
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -79,14 +83,17 @@ class Session:
 
     @staticmethod
     def list_saved() -> List[str]:
-        os.makedirs("data/sessions", exist_ok=True)
-        d = [f.replace(".json", "") for f in os.listdir("data/sessions") if f.endswith(".json")]
+        from phantom.utils.paths import sessions_dir
+        sdir = sessions_dir()
+        os.makedirs(sdir, exist_ok=True)
+        d = [f.replace(".json", "") for f in os.listdir(sdir) if f.endswith(".json")]
         return sorted(list(set(d)))
 
     @staticmethod
     def load_raw(name: str) -> dict:
         """Load a session file as a raw dictionary without affecting the current session."""
-        path = f"data/sessions/{name}.json"
+        from phantom.utils.paths import sessions_dir
+        path = os.path.join(sessions_dir(), f"{name}.json")
         if os.path.exists(path):
             try:
                 with open(path, 'r', encoding='utf-8') as f:

@@ -8,6 +8,7 @@ def main():
     parser = argparse.ArgumentParser(description="Phantom offensive Security Framework")
     parser.add_argument("--profile", help="Load engagement profile at startup")
     parser.add_argument("--c2", action="store_true", help="Launch Phantom C2 interface instead of pentest shell")
+    parser.add_argument("--auto", action="store_true", help="Run mode sequences without confirmation prompts")
     args = parser.parse_args()
 
     if args.c2:
@@ -16,6 +17,7 @@ def main():
         return
 
     shell = PhantomShell()
+    shell.auto_run = args.auto
     if args.profile:
         shell.load_profile(args.profile)
     try:

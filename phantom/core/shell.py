@@ -11,8 +11,24 @@ from phantom.core.scope import is_in_scope
 from phantom.core.notes import show_notes
 from phantom.utils.notifier import notifier
 
-# Load environment variables
-load_dotenv()
+
+def load_phantom_env() -> None:
+    """Load .env from project root, user home, or package dir (in that order)."""
+    pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    project_root = os.path.dirname(pkg_dir)
+    for path in (
+        os.path.join(project_root, ".env"),
+        os.path.join(os.path.expanduser("~"), ".phantom", ".env"),
+        os.path.join(os.path.expanduser("~"), ".env"),
+        os.path.join(pkg_dir, ".env"),
+    ):
+        if os.path.isfile(path):
+            load_dotenv(path)
+            return
+    load_dotenv()
+
+
+load_phantom_env()
 
 console = Console()
 
@@ -81,6 +97,7 @@ class PhantomShell(cmd.Cmd):
     intro = ""
     # Default prompt (colored). Tests expect the ANSI-colored prompt string
     prompt = "\033[1;36m[phantom]\033[0m > "
+    auto_run = False
 
     def precmd(self, line: str) -> str:
         """Allow hyphens in commands by translating them to underscores."""
@@ -310,22 +327,61 @@ class PhantomShell(cmd.Cmd):
         else:
             notifier.error(f"Unknown key: {key}")
 
+    def _instantiate_module(self, module_name: str):
+        """Create a module instance by name."""
+        modules = {
+            "scan":     "phantom.modules.scan.ScanModule",
+            "osint":    "phantom.modules.osint.OsintModule",
+            "wifi":     "phantom.modules.wifi.WifiModule",
+            "web":      "phantom.modules.web.WebModule",
+            "brute":    "phantom.modules.brute.BruteModule",
+            "exploit":  "phantom.modules.exploit.ExploitModule",
+            "payload":  "phantom.modules.payload.PayloadModule",
+            "handler":  "phantom.modules.handler.HandlerModule",
+            "pivot":    "phantom.modules.pivot.PivotModule",
+            "analyzer": "phantom.modules.analyzer.AnalyzerModule",
+            "report":   "phantom.modules.report.ReportModule",
+        }
+        if module_name not in modules:
+            return None
+        import importlib
+        path, cls_name = modules[module_name].rsplit(".", 1)
+        mod = importlib.import_module(path)
+        return getattr(mod, cls_name)()
+
     def do_run(self, _):
         """run — launch all modules for the current mode in sequence"""
         if not session.target:
             notifier.error("No target set. Use 'set target <ip>' first.")
             return
-        
-        # Fallback to recon if no mode is set
+
         mode = session.mode if session.mode else "recon"
         steps = MODE_SEQUENCES.get(mode, ["scan"])
         total = len(steps)
 
         console.print(f"[bold cyan][*] Mode: {mode.upper()} — {' → '.join(s.upper() for s in steps)}[/]")
 
+        if not self.auto_run:
+            confirm = input(f"\n[?] Run {total} module(s) automatically? [Y/n]: ").strip().lower()
+            if confirm == "n":
+                notifier.warn("Sequence cancelled.")
+                return
+
         for i, module_name in enumerate(steps, 1):
             console.print(f"[bold cyan]── STEP {i}/{total}: {module_name.upper()} {'─' * (50 - len(module_name))}[/]")
-            self.do_use(module_name)
+            instance = self._instantiate_module(module_name)
+            if instance is None:
+                notifier.error(f"Unknown module: {module_name}")
+                continue
+            try:
+                instance.do_run("")
+            except NotImplementedError:
+                notifier.warn(f"{module_name} has no automated run — opening interactive shell.")
+                instance.cmdloop()
+            except SystemExit:
+                raise
+            except Exception as e:
+                notifier.error(f"{module_name} failed: {e}")
             notifier.success(f"{module_name.upper()} complete.")
             console.print()
 
@@ -493,27 +549,14 @@ class PhantomShell(cmd.Cmd):
         """use <module> — enter a module"""
         module_name = arg.strip().lower()
         modules = {
-            "scan":     "phantom.modules.scan.ScanModule",
-            "osint":    "phantom.modules.osint.OsintModule",
-            "wifi":     "phantom.modules.wifi.WifiModule",
-            "web":      "phantom.modules.web.WebModule",
-            "brute":    "phantom.modules.brute.BruteModule",
-            "exploit":  "phantom.modules.exploit.ExploitModule",
-            "payload":  "phantom.modules.payload.PayloadModule",
-            "handler":  "phantom.modules.handler.HandlerModule",
-            "pivot":    "phantom.modules.pivot.PivotModule",
-            "analyzer": "phantom.modules.analyzer.AnalyzerModule",
-            "report":   "phantom.modules.report.ReportModule",
+            "scan", "osint", "wifi", "web", "brute", "exploit",
+            "payload", "handler", "pivot", "analyzer", "report",
         }
-        
-        # Standard modules
+
         if module_name in modules:
-            import importlib
-            path, cls_name = modules[module_name].rsplit(".", 1)
-            mod = importlib.import_module(path)
-            cls = getattr(mod, cls_name)
-            instance = cls()
-            instance.cmdloop()
+            instance = self._instantiate_module(module_name)
+            if instance:
+                instance.cmdloop()
             return
 
         # Plugin modules
