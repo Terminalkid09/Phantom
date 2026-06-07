@@ -183,6 +183,71 @@ class AnalyzerModule(BaseModule):
         # Salva i risultati nella sessione
         session.add_result("analyzer", {"findings": findings, "file": pcap_path})
 
+    def do_privesc(self, arg):
+        """privesc — Analyze session data for potential privilege escalation vectors."""
+        beacons = getattr(session, "beacons", {})
+        # If we are in C2 shell, we might have active beacons in c2_state
+        from phantom.core.c2_server import c2_state
+        beacons = c2_state.get_beacons()
+
+        if not beacons:
+            notifier.warn("No active beacons to analyze. Collect 'sysinfo' first.")
+            return
+
+        table = Table(title="Privilege Escalation Analysis", border_style="bold magenta")
+        table.add_column("Beacon ID", style="cyan")
+        table.add_column("OS", style="blue")
+        table.add_column("Potential Vectors", style="yellow")
+        table.add_column("Suggested Action", style="green")
+
+        found = False
+        for bid, info in beacons.items():
+            os_info = info.get("os", "").lower()
+            sysinfo = info.get("sysinfo", "").lower()
+            
+            vectors = []
+            actions = []
+
+            if "windows" in os_info:
+                # Windows Kernel Exploit detection (Build-based)
+                if "10.0.10240" in os_info: 
+                    vectors.append("MS16-032 (Secondary Logon)")
+                    actions.append("Use MS16-032 PowerShell PoC")
+                if "10.0.14393" in os_info:
+                    vectors.append("CVE-2017-0213 (COM Aggregate)")
+                    actions.append("Execute CVE-2017-0213 binary")
+                if "10.0.19041" in os_info or "10.0.19042" in os_info:
+                    vectors.append("CVE-2021-36934 (HiveNightmare)")
+                    actions.append("Read SAM/SYSTEM hives from VSS")
+                
+                # UAC Bypass check
+                if "admin" not in info.get("user", "").lower():
+                    vectors.append("UAC Bypass potential")
+                    actions.append("Try Fodhelper or ComputerDefaults bypass")
+
+            elif "linux" in os_info or "unix" in os_info:
+                # Linux Kernel Exploit detection
+                if " 4.4.0" in os_info:
+                    vectors.append("CVE-2016-5195 (DirtyCow)")
+                    actions.append("Run DirtyCow C exploit")
+                if " 5.10" in os_info or " 5.15" in os_info:
+                    vectors.append("CVE-2022-0847 (DirtyPipe)")
+                    actions.append("Run DirtyPipe PoC")
+                
+                # Common misconfigs
+                vectors.append("SUID/Sudo checks")
+                actions.append("Run 'find / -perm -u=s -type f' or 'sudo -l'")
+
+            if vectors:
+                table.add_row(bid, os_info[:30], "\n".join(vectors), "\n".join(actions))
+                found = True
+
+        if found:
+            console.print(table)
+            notifier.success("Analysis complete. Review the table for escalation paths.")
+        else:
+            notifier.info("No obvious escalation vectors found automatically. Manual recon recommended.")
+
     def do_run(self, _):
         """Interactive: ask for pcap path and analyze."""
         path = input("  Path to pcap file: ").strip()
