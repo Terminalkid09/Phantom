@@ -22,15 +22,20 @@ class ScanModule(BaseModule):
 
     def build_commands(self) -> dict:
         """Return the command groups for network scanning."""
+        from phantom.utils.paths import scan_xml_path, sessions_dir
+
         t = session.target
         if not t:
             return {}
+
+        os.makedirs(sessions_dir(), exist_ok=True)
+        xml_out = scan_xml_path(t)
 
         return {
             "NMAP": [
                 f"sudo nmap -sS -p- --min-rate 5000 -T4 {t}",
                 f"sudo nmap -sV -sC -p- {t}",
-                f"sudo nmap -sV -sC -p- -oX data/sessions/scan_{t}.xml {t}  # REQUIRED FOR EXPLOIT MODULE",
+                f"sudo nmap -sV -sC -p- -oX {xml_out} {t}  # REQUIRED FOR EXPLOIT MODULE",
                 f"sudo nmap -sU --top-ports 200 {t}",
                 f"sudo nmap -sS --top-ports 1000 {t}",
                 f"sudo nmap -O {t}",
@@ -91,7 +96,8 @@ class ScanModule(BaseModule):
         # Trigger Smart Intelligence: CVE Analysis
         self._analyze_vulnerabilities(results)
 
-        xml_path = f"data/sessions/scan_{session.target}.xml"
+        from phantom.utils.paths import scan_xml_path
+        xml_path = scan_xml_path(session.target)
         if os.path.exists(xml_path):
             save_scan_history(session.target, xml_path)
             notifier.success(f"Scan results saved to history.")
@@ -99,51 +105,29 @@ class ScanModule(BaseModule):
         self._conditional_suggestions(results)
 
     def _analyze_vulnerabilities(self, results):
-        """Automatically correlate scan results with CVEs."""
-        from phantom.utils.api import nvd_lookup, exploitdb_lookup
+        """Light post-scan summary — full CVE analysis deferred to exploit module."""
         import re
-        
-        console.print("\n[bold cyan]── SMART INTELLIGENCE: CVE CORRELATION ─────────────[/]")
+
+        console.print("\n[bold cyan]── SMART INTELLIGENCE: SERVICE SUMMARY ─────────────[/]")
         services = []
         for output in results.values():
-            matches = re.findall(r"(\d+)/(tcp|udp)\s+open\s+([\w-]+)\s+(.*)", output)
+            matches = re.findall(r"(\d+)/(tcp|udp)\s+open\s+([\w-]+)\s*(.*)", output)
             for port, proto, service, version in matches:
-                services.append({"service": service, "version": version.strip()})
-        
+                services.append({"port": port, "service": service, "version": version.strip()})
+
         if not services:
-            console.print("[dim]    No versioned services found for CVE analysis.[/]")
+            console.print("[dim]    No open services detected for analysis.[/]")
             return
 
-        vulns = []
-        for svc in services:
-            try:
-                cves = nvd_lookup(svc['service'], svc['version'])
-            except Exception as e:
-                console.print(f"[yellow]    CVE search failed for {svc['service']}: {e}[/]")
-                cves = []
-            for cve in cves:
-                score = cve['cvss']
-                if exploitdb_lookup(cve['id']):
-                    score += 2.0
-                    cve['has_exploit'] = True
-                cve['final_score'] = min(score, 10.0)
-                vulns.append(cve)
-        
-        if vulns:
-            vulns.sort(key=lambda x: x['final_score'], reverse=True)
-            table = Table(title="Vulnerability Insights")
-            table.add_column("CVE ID", style="bold red")
-            table.add_column("Score", style="bold magenta")
-            table.add_column("Exploit", style="green")
-            table.add_column("Description")
-            
-            for v in vulns[:5]:
-                table.add_row(v['id'], f"{v['final_score']:.1f}", "YES" if v.get('has_exploit') else "no", v['description'][:60]+"...")
-            console.print(table)
-            session.add_result("cve_analysis", vulns)
-            console.print(f"[dim]    Run 'use exploit' to search for found CVEs.[/]")
-        else:
-            console.print("[dim]    No critical CVEs matched for these versions.[/]")
+        table = Table(title="Detected Services (CVE analysis deferred)")
+        table.add_column("Port", style="cyan")
+        table.add_column("Service", style="green")
+        table.add_column("Version", style="yellow")
+        for svc in services[:15]:
+            table.add_row(svc["port"], svc["service"], svc["version"] or "—")
+        console.print(table)
+        session.add_result("service_summary", services)
+        console.print("[dim]    Run 'use exploit' → 'run' for full CVE correlation (cached NVD).[/]")
 
     def do_run(self, _):
         """Alias for do_preview."""

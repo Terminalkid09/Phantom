@@ -36,7 +36,8 @@ def _detect_os_from_xml(target: str) -> str:
     Read OS detection results from the Nmap XML saved during scan.
     Returns a human-readable OS string, or empty string if not found.
     """
-    xml_path = f"data/sessions/scan_{target}.xml"
+    from phantom.utils.paths import scan_xml_path
+    xml_path = scan_xml_path(target)
     if not os.path.exists(xml_path):
         return ""
 
@@ -95,6 +96,37 @@ def _os_to_payload_hint(os_string: str) -> tuple:
 
 class PayloadModule(BaseModule):
     module_name = "payload"
+
+    def build_commands(self) -> dict:
+        return {
+            "CORE": ["generate", "privesc"],
+            "LISTENER": ["handler <port> <payload>"]
+        }
+
+    def do_privesc(self, _):
+        """privesc — List suggested Privilege Escalation tools and techniques for the target."""
+        os_string, arch, platform = self._guess_os()
+        
+        console.print(f"\n[bold yellow]--- Privilege Escalation Assistant ({platform.capitalize()} {arch}) ---[/]")
+        
+        if platform == "windows":
+            console.print("[bold]Suggested Tools:[/]")
+            console.print("  - [green]WinPEAS[/]: https://github.com/peass-ng/PEASS-ng/tree/master/winPEAS")
+            console.print("  - [green]PrivescCheck[/]: https://github.com/itm4n/PrivescCheck")
+            console.print("  - [green]Seatbelt[/]: https://github.com/GhostPack/Seatbelt")
+            console.print("\n[bold]Suggested Techniques:[/]")
+            console.print("  - Check for Unquoted Service Paths")
+            console.print("  - Check for AlwaysInstallElevated registry key")
+            console.print("  - Check for Token Impersonation (SeImpersonatePrivilege)")
+        else:
+            console.print("[bold]Suggested Tools:[/]")
+            console.print("  - [green]LinPEAS[/]: https://github.com/peass-ng/PEASS-ng/tree/master/linPEAS")
+            console.print("  - [green]Linux Smart Enumeration (lse.sh)[/]: https://github.com/diego-treitos/linux-smart-enumeration")
+            console.print("  - [green]linux-exploit-suggester[/]: https://github.com/The-Z-Old-GitHub-Repo-of-Linux-Exploit-Suggester/linux-exploit-suggester")
+            console.print("\n[bold]Suggested Techniques:[/]")
+            console.print("  - Check for SUID binaries (`find / -perm -u=s -type f 2>/dev/null`) ")
+            console.print("  - Check for writable /etc/passwd or /etc/shadow")
+            console.print("  - Check sudo permissions (`sudo -l`)")
 
     def _get_lhost(self) -> str:
         """Auto-detect local IP (VPN/tun0 or default route)."""

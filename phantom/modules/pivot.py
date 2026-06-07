@@ -5,6 +5,7 @@ Generates SSH tunnels and Chisel commands.
 
 from phantom.modules.base_module import BaseModule
 from phantom.core.session import session
+from phantom.core.executor import run_command
 from phantom.utils.notifier import notifier
 from rich.console import Console
 
@@ -32,7 +33,6 @@ class PivotModule(BaseModule):
             notifier.error("Invalid choice.")
             return
 
-        # Common parameters
         target = session.target
         if not target:
             target = input("  Target IP/hostname: ").strip()
@@ -41,15 +41,12 @@ class PivotModule(BaseModule):
         remote_port = input("  Remote port: ").strip() or "80"
 
         if choice == "1":
-            # ssh -L local_port:target:remote_port user@target -N
             cmd = f"ssh -L {local_port}:{target}:{remote_port} {user}@{target} -N"
             desc = f"Port {target}:{remote_port} accessible on localhost:{local_port}"
         elif choice == "2":
-            # ssh -R remote_port:localhost:local_port user@target -N
             cmd = f"ssh -R {remote_port}:localhost:{local_port} {user}@{target} -N"
             desc = f"Local port {local_port} exposed on {target}:{remote_port}"
         elif choice == "3":
-            # ssh -D local_port user@target -N
             cmd = f"ssh -D {local_port} {user}@{target} -N"
             desc = f"SOCKS proxy on localhost:{local_port} — configure proxychains"
         elif choice == "4":
@@ -66,7 +63,16 @@ class PivotModule(BaseModule):
 
         notifier.success(desc)
         console.print(f"  [yellow]{cmd}[/]\n")
-        notifier.info("Copy and run in another terminal.")
+
+        if choice in ("1", "2", "3"):
+            run_bg = input("  Run tunnel in background now? [y/N]: ").strip().lower()
+            if run_bg == "y":
+                bg_cmd = f"nohup {cmd} &>/dev/null &"
+                notifier.status(f"Starting tunnel: {bg_cmd}")
+                run_command(bg_cmd)
+                notifier.success("Tunnel started in background.")
+            else:
+                notifier.info("Copy and run in another terminal.")
 
     def do_run(self, _):
         self.do_setup(_)

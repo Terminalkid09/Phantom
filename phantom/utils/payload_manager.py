@@ -6,9 +6,13 @@ import uuid
 import hashlib
 from typing import List, Dict, Any, Optional
 
-PAYLOAD_HISTORY_FILE = "data/payload_history.json"
-
 VALID_PLATFORMS = ["windows", "linux", "macos", "android"]
+
+
+def _payload_history_path() -> str:
+    """Resolve payload history file relative to project root."""
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(project_root, "data", "payload_history.json")
 
 def add_custom_beacon(platform: str, command: str, description: str, source: str = "c2_shell"):
     """
@@ -47,10 +51,11 @@ def add_custom_beacon(platform: str, command: str, description: str, source: str
 
 def get_custom_beacons() -> List[Dict[str, Any]]:
     """Reads custom beacons from the registry."""
-    if not os.path.exists(PAYLOAD_HISTORY_FILE):
+    path = _payload_history_path()
+    if not os.path.exists(path):
         return []
     try:
-        with open(PAYLOAD_HISTORY_FILE, "r") as f:
+        with open(path, "r") as f:
             data = json.load(f)
             if isinstance(data, list):
                 return data
@@ -60,18 +65,20 @@ def get_custom_beacons() -> List[Dict[str, Any]]:
 
 def clear_payload_history():
     """Wipes the payload history file."""
-    if os.path.exists(PAYLOAD_HISTORY_FILE):
-        os.remove(PAYLOAD_HISTORY_FILE)
+    path = _payload_history_path()
+    if os.path.exists(path):
+        os.remove(path)
 
 def _save_history(history: List[Dict[str, Any]]):
     """Saves the history list to disk using an atomic-like write."""
-    os.makedirs(os.path.dirname(PAYLOAD_HISTORY_FILE), exist_ok=True)
-    temp_file = PAYLOAD_HISTORY_FILE + ".tmp"
+    path = _payload_history_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_file = path + ".tmp"
     try:
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(history, f, indent=4, ensure_ascii=False)
         # Use shutil.move which is atomic on most OSes
-        shutil.move(temp_file, PAYLOAD_HISTORY_FILE)
+        shutil.move(temp_file, path)
     except IOError:
         if os.path.exists(temp_file):
             os.remove(temp_file)

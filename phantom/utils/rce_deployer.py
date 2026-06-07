@@ -101,7 +101,8 @@ def parse_scan_xml(target: str) -> Tuple[List[Dict], Dict, List[Dict]]:
         found_creds e una lista di dict con chiavi:
           {"username": str, "password": str, "method": str, "service": str}
     """
-    xml_path = f"data/sessions/scan_{target}.xml"
+    from phantom.utils.paths import scan_xml_path
+    xml_path = scan_xml_path(target)
     ports: List[Dict] = []
     os_info: Dict = {}
     found_creds: List[Dict] = []
