@@ -4,6 +4,7 @@ stages:
 
 variables:
   DOCKER_IMAGE: phantom-framework
+  BEACON_DIR: phantom/payloads/beacon
 
 # ── Unit Tests ────────────────────────────────────────────────────────────
 unit_tests:
@@ -11,19 +12,26 @@ unit_tests:
   image: python:3.10
   script:
     - pip install -r requirements.txt
-    - pytest tests/ -v
+    - pip install pytest pytest-asyncio
+    - pip install -e .
+    - pytest tests/ -v --tb=short
   tags:
     - docker
+
+# Shared anchor: generate crypto_config.h from env / defaults
+.beacon_crypto: &beacon_crypto
+  - python3 scripts/ci_beacon_prepare.py
 
 # ── Build: Windows Beacon (via MinGW cross-compile) ───────────────────────
 build_windows:
   stage: build
   image: ubuntu:22.04
   before_script:
-    - apt-get update -qq && apt-get install -y -qq g++-mingw-w64-x86-64 > /dev/null
+    - apt-get update -qq && apt-get install -y -qq g++-mingw-w64-x86-64 python3 > /dev/null
   script:
-    - cd phantom/payloads/beacon
-    - x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -o beacon.exe src/main.cpp
+    - *beacon_crypto
+    - cd ${BEACON_DIR}
+    - x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -Isrc -o beacon.exe src/main.cpp
       -lwinhttp -lbcrypt -lws2_32 -static
   artifacts:
     paths:
@@ -40,10 +48,11 @@ build_linux:
   stage: build
   image: ubuntu:22.04
   before_script:
-    - apt-get update -qq && apt-get install -y -qq g++ libcurl4-openssl-dev libssl-dev > /dev/null
+    - apt-get update -qq && apt-get install -y -qq g++ libcurl4-openssl-dev libssl-dev python3 > /dev/null
   script:
-    - cd phantom/payloads/beacon
-    - g++ -std=c++17 -O2 -s -o beacon_linux src/main.cpp
+    - *beacon_crypto
+    - cd ${BEACON_DIR}
+    - g++ -std=c++17 -O2 -s -Isrc -o beacon_linux src/main.cpp
       -lcurl -lssl -lcrypto -lpthread
   artifacts:
     paths:
@@ -58,9 +67,11 @@ build_linux:
 # ── Build: macOS Beacon (requires macOS runner) ─────────────────────────
 build_macos:
   stage: build
+  before_script:
+    - python3 scripts/ci_beacon_prepare.py
   script:
-    - cd phantom/payloads/beacon
-    - clang++ -std=c++17 -O2 -o beacon_macos src/main.cpp
+    - cd ${BEACON_DIR}
+    - clang++ -std=c++17 -O2 -Isrc -o beacon_macos src/main.cpp
       -lcurl -lssl -lcrypto -lpthread -framework CoreGraphics
   artifacts:
     paths:
@@ -76,14 +87,28 @@ build_macos:
 # ── Build: Android Beacon (ARM64 via NDK) ────────────────────────────────
 build_android:
   stage: build
-  image: thyrlian/android-sdk:latest
+  image: ubuntu:22.04
   before_script:
-    - apt-get update -qq && apt-get install -y -qq wget unzip > /dev/null
+    - apt-get update -qq && apt-get install -y -qq wget unzip python3 > /dev/null
+    - |
+      if [ ! -d /opt/android-ndk ]; then
+        wget -q https://dl.google.com/android/repository/android-ndk-r26c-linux.zip -O /tmp/ndk.zip
+        unzip -q /tmp/ndk.zip -d /opt
+        mv /opt/android-ndk-r26c /opt/android-ndk
+      fi
+    - export ANDROID_NDK_HOME=/opt/android-ndk
   script:
-    - export NDK_HOME=${ANDROID_HOME}/ndk-bundle
-    - export CC=${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++
-    - cd phantom/payloads/beacon
-    - ${CC} -std=c++17 -O2 -s -o beacon_android src/main.cpp -static
+    - *beacon_crypto
+    - export ANDROID_NDK_HOME=/opt/android-ndk
+    - export NDK_PREBUILT=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64
+    - export NDK_SYSROOT=${NDK_PREBUILT}/sysroot
+    - export NDK_CC=${NDK_PREBUILT}/bin/aarch64-linux-android28-clang++
+    - cd ${BEACON_DIR}
+    - ${NDK_CC} -std=c++17 -O2 -s -Isrc -o beacon_android src/main.cpp
+      --sysroot=${NDK_SYSROOT}
+      -I${NDK_SYSROOT}/usr/include
+      -L${NDK_SYSROOT}/usr/lib/aarch64-linux-android
+      -static
   artifacts:
     paths:
       - phantom/payloads/beacon/beacon_android

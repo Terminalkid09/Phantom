@@ -1,6 +1,11 @@
 services:
   phantom:
-    build: .
+    build:
+      context: .
+      args:
+        PHANTOM_C2_KEY: ${PHANTOM_C2_KEY:-}
+        PHANTOM_C2_IV: ${PHANTOM_C2_IV:-}
+        PHANTOM_PAYLOAD_TOKEN: ${PHANTOM_PAYLOAD_TOKEN:-}
     container_name: phantom-framework
     privileged: true # Required for network tools like TShark/Nmap
     # network_mode: host # Uncomment for better WiFi/Scanner compatibility (Linux only)
@@ -11,11 +16,6 @@ services:
       - phantom-plugins:/root/.phantom
     env_file:
       - .env
-    environment:
-      - AI_PROVIDER=${AI_PROVIDER:-}
-      - AI_API_KEY=${AI_API_KEY:-}
-      - AI_ENDPOINT=${AI_ENDPOINT:-}
-      - AI_MODEL=${AI_MODEL:-}
     networks:
       - phantom-net
 

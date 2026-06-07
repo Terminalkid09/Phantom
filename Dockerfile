@@ -6,6 +6,14 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 
+# C2 keys (optional build-args from docker-compose / CI)
+ARG PHANTOM_C2_KEY=
+ARG PHANTOM_C2_IV=
+ARG PHANTOM_PAYLOAD_TOKEN=
+ENV PHANTOM_C2_KEY=${PHANTOM_C2_KEY}
+ENV PHANTOM_C2_IV=${PHANTOM_C2_IV}
+ENV PHANTOM_PAYLOAD_TOKEN=${PHANTOM_PAYLOAD_TOKEN}
+
 # Android NDK
 ENV ANDROID_NDK_VERSION=r26c
 ENV ANDROID_NDK_HOME=/opt/android-ndk
@@ -95,11 +103,6 @@ RUN mkdir -p /opt && \
     rm android-ndk-${ANDROID_NDK_VERSION}-linux.zip && \
     echo "Android NDK installed at ${ANDROID_NDK_HOME}"
 
-# Create symlink for libssl/libcrypto in NDK sysroot (fallback for static linking)
-RUN mkdir -p ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib && \
-    ln -sf /usr/lib/x86_64-linux-gnu/libssl.a ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/ 2>/dev/null || true && \
-    ln -sf /usr/lib/x86_64-linux-gnu/libcrypto.a ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/ 2>/dev/null || true
-
 # Install osxcross (macOS cross-compiler)
 RUN cd /opt && \
     git clone https://github.com/tpoechtrager/osxcross.git ${OSXCROSS_ROOT} && \
@@ -119,7 +122,10 @@ COPY . .
 RUN pip install --no-cache-dir --break-system-packages -e .
 
 # Ensure data directories exist
-RUN mkdir -p data/logs data/sessions data/presets data/beacons
+RUN mkdir -p data/logs data/sessions data/presets data/beacons data/cache data/downloads
 
-# Final setup
-ENTRYPOINT ["python3", "-m", "phantom.main"]
+# Default crypto config for beacon builds inside the container (overridden at runtime via .env)
+RUN python3 -c "import sys; sys.path.insert(0,'.'); from phantom.utils.c2_crypto import write_beacon_crypto_config; write_beacon_crypto_config('phantom/payloads/beacon')"
+
+# Final setup — use docker exec for interactive CLI (see README)
+CMD ["sleep", "infinity"]

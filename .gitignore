@@ -5,6 +5,10 @@ dist/
 build/
 .env
 data/sessions/*.json
+data/cache/
+data/downloads/
+phantom/payloads/beacon/src/crypto_config.h
+phantom/payloads/beacon/.*.crypto_hash
 data/presets/*.json
 *.pcap
 *.pcapng
