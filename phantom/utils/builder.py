@@ -101,8 +101,9 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
     elif platform == "linux":
         console.print(f"[yellow][*] Compiling beacon for Linux ({arch})...[/yellow]")
         try:
-            cmd = ["g++", "-std=c++20", "-O2", "-s", "-o", out_name,
-                   "-Isrc", "src/main.cpp", "-lcurl", "-lssl", "-lcrypto", "-lpthread"]
+            # -static makes the binary portable across different Linux distros/versions
+            cmd = ["g++", "-std=c++20", "-O2", "-s", "-static", "-o", out_name,
+                   "-Isrc", "src/main.cpp", "-lcurl", "-lssl", "-lcrypto", "-lz", "-lpthread", "-ldl"]
             if arch == "x86":
                 cmd.insert(1, "-m32")
                 
