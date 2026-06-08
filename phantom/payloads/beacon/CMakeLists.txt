@@ -35,13 +35,25 @@ if(WIN32)
     endif()
 else()
     # POSIX (Linux, macOS, Android)
+    # Prefer static libraries when available
+    set(CMAKE_FIND_LIBRARY_SUFFIXES .a .so)
+    set(BUILD_STATIC TRUE)   # custom flag we can toggle from the command line
+
     find_package(CURL REQUIRED)
     find_package(OpenSSL REQUIRED)
     find_package(Threads REQUIRED)
 
     target_include_directories(beacon PRIVATE ${CURL_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
-    target_link_libraries(beacon PRIVATE ${CURL_LIBRARIES} ${OPENSSL_LIBRARIES} Threads::Threads)
-    
+
+    # Force static linking of the C/C++ runtime
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -static-libgcc -static-libstdc++")
+
+    # System libs required for a fully static binary
+    set(STATIC_SYSTEM_LIBS -pthread -lrt -ldl -lcrypt -lresolv)
+
+    target_link_libraries(beacon PRIVATE ${CURL_LIBRARIES} ${OPENSSL_LIBRARIES}
+        Threads::Threads ${STATIC_SYSTEM_LIBS})
+
     if(APPLE)
         find_library(CORE_GRAPHICS CoreGraphics)
         target_link_libraries(beacon PRIVATE ${CORE_GRAPHICS})
