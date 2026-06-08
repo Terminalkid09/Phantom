@@ -60,29 +60,65 @@ def install_dependencies(dependencies, manager="apt"):
         console.print(f"[red][!] Comando eseguito: {' '.join(cmd)}\n[red][!] Exit: {getattr(e, 'returncode', 'unknown')}[/]")
         return False
 
-def check_build_env(platform):
+def check_header(header, flags=[]):
+    """Try to compile a tiny snippet to see if a header is available."""
+    try:
+        # Use -c to only compile, -o /dev/null to discard output
+        null_out = "NUL" if os.name == 'nt' else "/dev/null"
+        subprocess.run(["g++"] + flags + ["-x", "c++", "-", "-o", null_out, "-c"], 
+                       input=f"#include <{header}>\nint main(){{}}", 
+                       text=True, capture_output=True, check=True)
+        return True
+    except Exception:
+        return False
+
+def check_build_env(platform, arch="x64"):
     """Verifica dipendenze in base alla piattaforma e propone fix automatico."""
     missing = []
     
     if platform == "linux":
-        if not shutil.which("g++"): missing.append("build-essential")
-        # Header checks for libraries
-        has_curl = os.path.exists("/usr/include/curl/curl.h") or os.path.exists("/usr/include/x86_64-linux-gnu/curl/curl.h")
-        if not has_curl: missing.append("libcurl4-openssl-dev")
+        if os.name != "posix":
+            console.print("[yellow][!] Warning: Cross-compiling for Linux from Windows might fail natively.[/]")
+            console.print("[yellow][!] Use WSL or a Linux container if compilation fails.[/]")
+
+        if not shutil.which("g++"): 
+            missing.append("build-essential")
         
-        has_ssl = os.path.exists("/usr/include/openssl/ssl.h") or os.path.exists("/usr/include/x86_64-linux-gnu/openssl/ssl.h")
-        if not has_ssl: missing.append("libssl-dev")
+        # Determine flags and package suffix for architecture
+        flags = []
+        pkg_suffix = ""
+        if arch == "x86" and os.name == "posix":
+            import platform as py_platform
+            if "64" in py_platform.machine():
+                flags = ["-m32"]
+                pkg_suffix = ":i386"
+                # Check for multilib support
+                if not check_header("bits/c++config.h", flags):
+                    missing.append("g++-multilib")
+
+        # Header checks using test-compilation (more reliable than hardcoded paths)
+        if not check_header("curl/curl.h", flags):
+            missing.append(f"libcurl4-openssl-dev{pkg_suffix}")
+        
+        if not check_header("openssl/ssl.h", flags):
+            missing.append(f"libssl-dev{pkg_suffix}")
         
     elif platform == "windows":
         has_cl = shutil.which("cl") is not None
-        has_mingw = shutil.which("x86_64-w64-mingw32-g++") is not None or shutil.which("mingw32-g++") is not None
+        # Check for mingw cross-compilers on Linux
+        mingw_64 = shutil.which("x86_64-w64-mingw32-g++")
+        mingw_32 = shutil.which("i686-w64-mingw32-g++")
+        
         if os.name == 'nt':
-            if not has_cl and not has_mingw:
-                console.print("[red][!] 'cl.exe' (MSVC) or mingw toolchain not found in PATH. Install Visual Studio Build Tools or mingw-w64.[/]")
+            if not has_cl and not mingw_64 and not mingw_32:
+                console.print("[red][!] 'cl.exe' (MSVC) or mingw toolchain not found in PATH.[/]")
                 return False
         else:
-            if not has_mingw:
-                missing.append("mingw-w64")
+            # On Linux targeting Windows
+            if arch == "x64" and not mingw_64:
+                missing.append("g++-mingw-w64-x86-64")
+            elif arch == "x86" and not mingw_32:
+                missing.append("g++-mingw-w64-i686")
     
     elif platform == "macos":
         # Check for osxcross

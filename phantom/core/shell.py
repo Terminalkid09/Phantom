@@ -10,6 +10,7 @@ from phantom.core.session import session
 from phantom.core.scope import is_in_scope
 from phantom.core.notes import show_notes
 from phantom.utils.notifier import notifier
+import traceback
 
 
 def load_phantom_env() -> None:
@@ -266,6 +267,17 @@ class PhantomShell(cmd.Cmd):
         console.print("[cyan]Available Profiles:[/]")
         for p in profiles:
             console.print(f"  [white]- {p}[/]")
+
+    def onecmd(self, line):
+        try:
+            return super().onecmd(line)
+        except SystemExit:
+            raise
+        except Exception as e:
+            notifier.error(f"Command execution failed: {e}")
+            import traceback
+            console.print(traceback.format_exc())
+            return False  # Continue the loop
 
     def do_set(self, arg: str):
         """set target <ip/domain> | set mode <recon|osint|full|exploit> | set scope <cidr,...> | set lhost <ip> | set lport <port>"""
@@ -545,26 +557,55 @@ class PhantomShell(cmd.Cmd):
         if not (added or removed or changed):
             notifier.info("No changes detected.")
 
+    def do_plugins(self, _):
+        """plugins — list all loaded plugins."""
+        plugin_modules = getattr(self, "_plugin_modules", {})
+        if not plugin_modules:
+            notifier.warn("No plugins loaded.")
+            return
+
+        from rich.table import Table
+        table = Table(title="Loaded Plugins", border_style="cyan")
+        table.add_column("Plugin Name", style="bold green")
+        table.add_column("Source", style="dim")
+
+        for name, cls in plugin_modules.items():
+            source = cls.__module__
+            table.add_row(name, source)
+
+        console.print(table)
+        console.print(f"\n[dim]Use 'use <name>' to enter a plugin module.[/]")
+
     def do_use(self, arg: str):
-        """use <module> — enter a module"""
+        """use <module> — enter a module (built-in or plugin)"""
         module_name = arg.strip().lower()
+        if not module_name:
+            notifier.error("Usage: use <module_name>")
+            return
+
         modules = {
             "scan", "osint", "wifi", "web", "brute", "exploit",
             "payload", "handler", "pivot", "analyzer", "report",
         }
 
         if module_name in modules:
-            instance = self._instantiate_module(module_name)
-            if instance:
-                instance.cmdloop()
+            try:
+                instance = self._instantiate_module(module_name)
+                if instance:
+                    instance.cmdloop()
+            except Exception as e:
+                notifier.error(f"Failed to enter module {module_name}: {e}")
             return
 
         # Plugin modules
         plugin_modules = getattr(self, "_plugin_modules", {})
         if module_name in plugin_modules:
-            cls = plugin_modules[module_name]
-            instance = cls()
-            instance.cmdloop()
+            try:
+                cls = plugin_modules[module_name]
+                instance = cls()
+                instance.cmdloop()
+            except Exception as e:
+                notifier.error(f"Plugin {module_name} crashed: {e}")
             return
 
         notifier.error(f"Unknown module: {module_name}")
@@ -603,6 +644,7 @@ class PhantomShell(cmd.Cmd):
         t2.add_column("Description", style="white")
         t2.add_row("run", "Launch the full mode sequence automatically")
         t2.add_row("use <module>", "Enter a module (scan, osint, wifi, web, ...)")
+        t2.add_row("plugins", "List all loaded external plugins")
         t2.add_row("c2", "Enter the C2 Operations Center")
 
         # ── Persistence ─────────────────────────────────────────────────

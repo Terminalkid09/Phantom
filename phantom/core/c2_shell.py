@@ -270,12 +270,14 @@ class C2Shell(cmd.Cmd):
 
     def do_generate(self, arg):
         """generate [windows|linux|macos|android] - Generate beacon and dropper for a target platform"""
-        import os, subprocess, shutil
+        import os
         from phantom.utils.network import get_lhost
         from phantom.core.session import session
         
-        # Try to guess platform if not provided
-        platform = arg.strip().lower()
+        parts = arg.strip().split()
+        platform = parts[0].lower() if parts else ""
+        arch = parts[1].lower() if len(parts) > 1 else ""
+
         if not platform:
             # Check scan results for OS clues
             scan_res = session.get_result("scan") or {}
@@ -287,7 +289,6 @@ class C2Shell(cmd.Cmd):
                 platform = "windows"
                 notifier.info("Detected Windows target from scan results. Defaulting to 'windows'.")
             else:
-                # No clear detection — ask the user interactively (arrow keys) if possible
                 import sys
                 valid_platforms_local = ["windows", "linux", "macos", "android"]
                 if sys.stdin.isatty():
@@ -310,6 +311,21 @@ class C2Shell(cmd.Cmd):
         if platform not in valid_platforms:
             notifier.error(f"Invalid platform. Choose from: {', '.join(valid_platforms)}")
             return
+            
+        # Architecture selection
+        if not arch:
+            if platform in ["linux", "windows"]:
+                import sys
+                if sys.stdin.isatty():
+                    try:
+                        from phantom.utils.interactive import select_option
+                        arch = select_option(f"Select architecture for {platform}:", ["x64", "x86"], default_index=0)
+                    except Exception:
+                        arch = "x64"
+                else:
+                    arch = "x64"
+            else:
+                arch = "x64"
         
         from phantom.utils.builder import compile_beacon, generate_dropper
         from phantom.utils.payload_manager import add_custom_beacon
@@ -320,7 +336,12 @@ class C2Shell(cmd.Cmd):
         port = int(session.lport) if session.lport else (server_instance.port if (server_instance.thread and server_instance.thread.is_alive()) else 443)
 
         # Compile and generate dropper
-        beacon_path = compile_beacon(platform, pkg_root, force_rebuild=True)
+        try:
+            beacon_path = compile_beacon(platform, pkg_root, force_rebuild=True, arch=arch)
+        except Exception as e:
+            notifier.error(f"Compilation process crashed: {e}")
+            return
+            
         if not beacon_path:
             return
 
@@ -346,8 +367,8 @@ class C2Shell(cmd.Cmd):
             "android": "red"
         }
 
-        console.print(Panel(dropper, title=f"[bold {style_map.get(platform, 'white')}]{title_map.get(platform, 'Dropper')}[/]", border_style=style_map.get(platform, "white")))
-        add_custom_beacon(platform, dropper, "Custom C++ Beacon", source="c2_shell")
+        console.print(Panel(dropper, title=f"[bold {style_map.get(platform, 'white')}]{title_map.get(platform, 'Dropper')} ({arch})[/]", border_style=style_map.get(platform, "white")))
+        add_custom_beacon(platform, dropper, f"Custom C++ Beacon ({arch})", source="c2_shell")
 
         # Ask for automatic deployment
         if session.target:
