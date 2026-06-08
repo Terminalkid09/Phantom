@@ -42,8 +42,12 @@ else()
     find_package(CURL REQUIRED)
     find_package(OpenSSL REQUIRED)
     find_package(Threads REQUIRED)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(NGHTTP2 REQUIRED libnghttp2)
+    pkg_check_modules(BROTLI REQUIRED libbrotlidec libbrotlienc)
+    pkg_check_modules(GSSAPI REQUIRED gssapi_krb5)
 
-    target_include_directories(beacon PRIVATE ${CURL_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+    target_include_directories(beacon PRIVATE ${CURL_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR} ${NGHTTP2_INCLUDE_DIRS} ${BROTLI_INCLUDE_DIRS} ${GSSAPI_INCLUDE_DIRS})
 
     # Force static linking of the C/C++ runtime
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -static-libgcc -static-libstdc++")
@@ -51,7 +55,7 @@ else()
     # System libs required for a fully static binary
     set(STATIC_SYSTEM_LIBS -pthread -lrt -ldl -lcrypt -lresolv)
 
-    target_link_libraries(beacon PRIVATE ${CURL_LIBRARIES} ${OPENSSL_LIBRARIES}
+    target_link_libraries(beacon PRIVATE ${CURL_LIBRARIES} ${OPENSSL_LIBRARIES} ${NGHTTP2_LIBRARIES} ${BROTLI_LIBRARIES} ${GSSAPI_LIBRARIES}
         Threads::Threads ${STATIC_SYSTEM_LIBS})
 
     if(APPLE)
