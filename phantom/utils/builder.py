@@ -101,30 +101,15 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
     elif platform == "linux":
         console.print(f"[yellow][*] Compiling beacon for Linux ({arch})...[/yellow]")
         try:
-            # -static requires ALL transitive dependencies of libcurl to be
-            # explicitly listed.  Order matters: dependents before dependencies.
-            #
-            # Required packages (Debian/Kali):
-            #   sudo apt-get install -y libcurl4-openssl-dev libssl-dev \
-            #       libnghttp2-dev libbrotli-dev libzstd-dev zlib1g-dev \
-            #       libkrb5-dev libgssapi-krb5-dev libidn2-dev \
-            #       libpsl-dev libunistring-dev
+            # Nota: -static è stato rimosso.
+            # Su Debian/Kali, libcurl è compilato con supporto Kerberos/GSSAPI,
+            # ma i pacchetti di sistema NON forniscono le versioni statiche (.a) di Kerberos.
+            # Inoltre, glibc sconsiglia il linking statico per funzioni di rete (getaddrinfo/NSS).
+            # Pertanto, usiamo il linking dinamico standard.
             cmd = [
-                "g++", "-std=c++20", "-O2", "-s", "-static",
+                "g++", "-std=c++20", "-O2", "-s",
                 "-o", out_name, "-Isrc", "src/main.cpp",
-                # --- curl and TLS ---
-                "-lcurl", "-lssl", "-lcrypto",
-                # --- HTTP/2 ---
-                "-lnghttp2",
-                # --- compression ---
-                "-lzstd", "-lbrotlidec", "-lbrotlienc", "-lbrotlicommon", "-lz",
-                # --- GSSAPI / Kerberos (needed by curl's SPNEGO support) ---
-                "-lgssapi_krb5", "-lkrb5", "-lk5crypto", "-lcom_err",
-                "-lkrb5support", "-lkeyutils",
-                # --- IDN / PSL ---
-                "-lidn2", "-lunistring", "-lpsl",
-                # --- system ---
-                "-lresolv", "-lpthread", "-ldl",
+                "-lcurl", "-lssl", "-lcrypto", "-lpthread", "-ldl"
             ]
             if arch == "x86":
                 cmd.insert(1, "-m32")
