@@ -113,6 +113,12 @@ def check_build_env(platform, arch="x64"):
         
         if not check_header("openssl/ssl.h", flags):
             missing.append(f"libssl-dev{pkg_suffix}")
+
+        if not check_header("zstd.h", flags):
+            missing.append(f"libzstd-dev{pkg_suffix}")
+
+        if not check_header("brotli/decode.h", flags):
+            missing.append(f"libbrotli-dev{pkg_suffix}")
         
     elif platform == "windows":
         has_cl = shutil.which("cl") is not None

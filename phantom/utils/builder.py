@@ -101,9 +101,10 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
     elif platform == "linux":
         console.print(f"[yellow][*] Compiling beacon for Linux ({arch})...[/yellow]")
         try:
-            # -static makes the binary portable across different Linux distros/versions
+            # -static requires all sub-dependencies (zstd, brotli, etc.) to be explicitly linked
             cmd = ["g++", "-std=c++20", "-O2", "-s", "-static", "-o", out_name,
-                   "-Isrc", "src/main.cpp", "-lcurl", "-lssl", "-lcrypto", "-lz", "-lpthread", "-ldl"]
+                   "-Isrc", "src/main.cpp", "-lcurl", "-lssl", "-lcrypto", 
+                   "-lzstd", "-lbrotlidec", "-lbrotlienc", "-lz", "-lpthread", "-ldl"]
             if arch == "x86":
                 cmd.insert(1, "-m32")
                 
