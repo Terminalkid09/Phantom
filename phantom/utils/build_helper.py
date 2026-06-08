@@ -72,6 +72,54 @@ def check_header(header, flags=[]):
     except Exception:
         return False
 
+def _find_static_lib(libname: str, arch: str = "x64") -> bool:
+    """Check whether a static archive (lib<name>.a) exists on the system.
+
+    Searches the standard library directories for the host architecture.
+    """
+    if arch == "x86":
+        search_dirs = [
+            "/usr/lib/i386-linux-gnu",
+            "/usr/lib32",
+            "/usr/local/lib32",
+            "/usr/local/lib/i386-linux-gnu",
+        ]
+    else:
+        search_dirs = [
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+            "/usr/local/lib",
+            "/usr/local/lib/x86_64-linux-gnu",
+            "/usr/lib",
+        ]
+    target = f"lib{libname}.a"
+    for d in search_dirs:
+        if os.path.isfile(os.path.join(d, target)):
+            return True
+    return False
+
+# Maps: static library name -> apt dev package that provides the .a file.
+_LINUX_STATIC_DEPS = {
+    "curl":          "libcurl4-openssl-dev",
+    "ssl":           "libssl-dev",
+    "crypto":        "libssl-dev",
+    "nghttp2":       "libnghttp2-dev",
+    "zstd":          "libzstd-dev",
+    "brotlidec":     "libbrotli-dev",
+    "brotlienc":     "libbrotli-dev",
+    "brotlicommon":  "libbrotli-dev",
+    "z":             "zlib1g-dev",
+    "gssapi_krb5":   "libkrb5-dev",
+    "krb5":          "libkrb5-dev",
+    "k5crypto":      "libkrb5-dev",
+    "com_err":       "libkrb5-dev",
+    "krb5support":   "libkrb5-dev",
+    "keyutils":      "libkeyutils-dev",
+    "idn2":          "libidn2-dev",
+    "unistring":     "libunistring-dev",
+    "psl":           "libpsl-dev",
+}
+
 def check_build_env(platform, arch="x64"):
     """Verifica dipendenze in base alla piattaforma e propone fix automatico."""
     missing = []
@@ -119,6 +167,15 @@ def check_build_env(platform, arch="x64"):
 
         if not check_header("brotli/decode.h", flags):
             missing.append(f"libbrotli-dev{pkg_suffix}")
+
+        # ── Static library checks (.a archives for -static linking) ───────
+        # These are the transitive deps of libcurl that must be present as
+        # static archives; header-only checks are not sufficient.
+        for libname, pkg in _LINUX_STATIC_DEPS.items():
+            if not _find_static_lib(libname, arch):
+                full_pkg = f"{pkg}{pkg_suffix}"
+                if full_pkg not in missing:
+                    missing.append(full_pkg)
         
     elif platform == "windows":
         has_cl = shutil.which("cl") is not None
