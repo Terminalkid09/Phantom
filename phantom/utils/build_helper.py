@@ -11,6 +11,8 @@ def install_dependencies(dependencies, manager="apt"):
 
     - Always asks if stdin is a TTY (interactive)
     - Avoids sudo if running as root
+    - Waits for dpkg lock automatically (up to 120 s)
+    - Retries once on transient failures
     - Returns True on success, False otherwise
     """
     console.print(f"[yellow][?] Dipendenze mancanti: {', '.join(dependencies)}[/]")
@@ -37,28 +39,39 @@ def install_dependencies(dependencies, manager="apt"):
         use_sudo = shutil.which('sudo') is not None
     prefix = ["sudo"] if use_sudo else []
 
+    # APT lock-wait option: wait up to 120 s for another apt to finish
+    apt_lock_opt = ["-o", "DPkg::Lock::Timeout=120"]
+
     if manager == 'apt':
-        # Update package lists first
+        # Update package lists first (with lock wait)
         try:
             console.print("[cyan][*] Aggiornamento lista pacchetti (apt-get update)...[/]")
-            upd_cmd = prefix + ["apt-get", "update"]
-            subprocess.run(upd_cmd, check=False)
+            upd_cmd = prefix + ["apt-get"] + apt_lock_opt + ["update"]
+            subprocess.run(upd_cmd, check=True)
         except Exception:
-            pass
+            console.print("[yellow][!] apt-get update non riuscito, continuo con l'installazione...[/]")
 
-        cmd = prefix + ["apt-get", "install", "-y"] + dependencies
+        cmd = prefix + ["apt-get"] + apt_lock_opt + ["install", "-y"] + dependencies
     else:
         cmd = prefix + [manager, "install", "-y"] + dependencies
 
-    console.print(f"[cyan][*] Esecuzione: {' '.join(cmd)}[/]")
-    try:
-        subprocess.run(cmd, check=True)
-        console.print("[green][+] Installazione completata.[/]")
-        return True
-    except subprocess.CalledProcessError as e:
-        console.print("[red][!] Installazione fallita. Controlla i nomi dei pacchetti o installa manualmente.[/]")
-        console.print(f"[red][!] Comando eseguito: {' '.join(cmd)}\n[red][!] Exit: {getattr(e, 'returncode', 'unknown')}[/]")
-        return False
+    import time
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        console.print(f"[cyan][*] Esecuzione ({attempt}/{max_attempts}): {' '.join(cmd)}[/]")
+        try:
+            subprocess.run(cmd, check=True)
+            console.print("[green][+] Installazione completata.[/]")
+            return True
+        except subprocess.CalledProcessError as e:
+            if attempt < max_attempts:
+                console.print(f"[yellow][!] Tentativo {attempt} fallito (exit {e.returncode}), riprovo tra 10 s...[/]")
+                time.sleep(10)
+            else:
+                console.print("[red][!] Installazione fallita. Controlla i nomi dei pacchetti o installa manualmente.[/]")
+                console.print(f"[red][!] Comando eseguito: {' '.join(cmd)}\n[red][!] Exit: {getattr(e, 'returncode', 'unknown')}[/]")
+                return False
+    return False
 
 def check_header(header, flags=[]):
     """Try to compile a tiny snippet to see if a header is available."""
