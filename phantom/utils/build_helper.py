@@ -90,13 +90,24 @@ def check_build_env(platform, arch="x64"):
         if arch == "x86" and os.name == "posix":
             import platform as py_platform
             if "64" in py_platform.machine():
+                # Check if i386 architecture is added to dpkg
+                try:
+                    arch_check = subprocess.run(["dpkg", "--print-foreign-architectures"], capture_output=True, text=True)
+                    if "i386" not in arch_check.stdout:
+                        console.print("[yellow][*] Adding i386 architecture support...[/]")
+                        prefix = ["sudo"] if shutil.which("sudo") else []
+                        subprocess.run(prefix + ["dpkg", "--add-architecture", "i386"], check=True)
+                        subprocess.run(prefix + ["apt-get", "update"], check=False)
+                except Exception:
+                    pass
+
                 flags = ["-m32"]
                 pkg_suffix = ":i386"
                 # Check for multilib support
                 if not check_header("bits/c++config.h", flags):
                     missing.append("g++-multilib")
 
-        # Header checks using test-compilation (more reliable than hardcoded paths)
+        # Header checks using test-compilation
         if not check_header("curl/curl.h", flags):
             missing.append(f"libcurl4-openssl-dev{pkg_suffix}")
         

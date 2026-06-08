@@ -348,7 +348,7 @@ class C2Shell(cmd.Cmd):
         if not (server_instance.thread and server_instance.thread.is_alive()):
             notifier.warn(f"Listener not active. Run: listeners start {port}")
 
-        dropper = generate_dropper(platform, host, port)
+        dropper = generate_dropper(platform, host, port, arch=arch)
         if not dropper:
             notifier.error(f"Failed to generate dropper for {platform}")
             return
