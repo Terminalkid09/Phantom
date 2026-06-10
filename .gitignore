@@ -15,5 +15,15 @@ data/presets/*.json
 *.pdf
 *.xml
 shell.elf
-*.exe
 *.log
+.aider*
+
+# Build artifacts
+phantom/payloads/beacon/beacon.exe
+
+# Temporary test files and scripts
+commands.txt
+manual_test.py
+run_phantom_commands.py
+hash_calc.py
+comando.txt

@@ -283,13 +283,11 @@ class PhantomShell(cmd.Cmd):
         """set target <ip/domain> | set mode <recon|osint|full|exploit> | set scope <cidr,...> | set lhost <ip> | set lport <port>"""
         parts = arg.strip().split(maxsplit=1)
         if len(parts) < 2:
-            notifier.error("Usage: set <target|mode|scope> <value>")
+            notifier.error("Usage: set <target|mode|scope|lhost|lport> <value>")
             return
         key, value = parts[0].lower(), parts[1]
 
         if key == "target":
-            # Validation estesa: ammette lettere, numeri e i caratteri speciali . _ - : @ 
-            # in qualsiasi posizione (inizio/fine inclusi) per supportare gli username social.
             import re
             TARGET_REGEX = re.compile(r'^[@a-zA-Z0-9._\-:]+$')
             URL_TARGET_REGEX = re.compile(r'^https?://[a-zA-Z0-9.\-:/]+$')
@@ -297,7 +295,6 @@ class PhantomShell(cmd.Cmd):
             is_valid = False
             if value.startswith(("http://", "https://")):
                 is_valid = bool(URL_TARGET_REGEX.match(value))
-            # Rimosso il divieto di iniziare/finire con punti o trattini per supportare i formati social
             elif TARGET_REGEX.match(value) and '..' not in value:
                 is_valid = True
                 
@@ -633,6 +630,8 @@ class PhantomShell(cmd.Cmd):
         t1.add_row("set target <ip>", "Define the testing target")
         t1.add_row("set mode <mode>", "Select workflow: recon, osint, full, exploit")
         t1.add_row("set scope <cidr,...>", "Define authorized testing boundaries")
+        t1.add_row("set lhost <ip>", "Set local host IP for callbacks")
+        t1.add_row("set lport <port>", "Set local port for callbacks")
         t1.add_row("show session", "Display current session info")
         t1.add_row("note \"text\"", "Add a timestamped note")
         t1.add_row("notes", "Display all session notes")
@@ -699,12 +698,12 @@ class PhantomShell(cmd.Cmd):
         run_c2()
 
     def do_exit(self, arg: str):
-        """Exit Phantom, optionally save current session and generate report"""
+        """exit - Exit Phantom, optionally save current session and generate report"""
         if session.target:
             # AI Reporting (Optional)
             ai = getattr(session, "ai_connector", None)
             if ai and getattr(ai, "enabled", False):
-                confirm_ai = input("Generate AI Executive Summary for this session? [y/N]: ").strip().lower()
+                confirm_ai = input("\n[?] Generate AI Executive Summary for this session? [y/N]: ").strip().lower()
                 if confirm_ai == "y":
                     notifier.status("Generating AI summary...")
                     summary = session.ai_connector.generate_executive_summary(session.__dict__)
@@ -713,18 +712,18 @@ class PhantomShell(cmd.Cmd):
                         notifier.success("AI Summary added to notes.")
 
             # Auto-Reporting Prompt
-            note = input("\nAdd a final manual note for the report? (empty to skip): ").strip()
+            note = input("\n[?] Add a final manual note for the report? (empty to skip): ").strip()
             if note:
                 session.add_note(note)
 
-            confirm = input("Save session and generate Markdown report? [y/N]: ").strip().lower()
+            confirm = input("[?] Save session and generate Markdown report? [y/N]: ").strip().lower()
             if confirm == "y":
-                name = input("Report/Session name (default: auto): ").strip() or "auto"
+                name = input("[?] Report/Session name (default: auto): ").strip() or "auto"
                 session.save(name)
                 session.export_markdown(f"{name}.md")
-
-        console.print("\n[dim]Phantom closed.[/]\n")
-        return True
+        
+        notifier.status("Exiting Phantom...")
+        sys.exit(0)
 
     def do_quit(self, arg: str):
         return self.do_exit(arg)

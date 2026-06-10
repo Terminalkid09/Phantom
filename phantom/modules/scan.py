@@ -32,26 +32,27 @@ class ScanModule(BaseModule):
         xml_out = scan_xml_path(t)
 
         return {
-            "NMAP": [
+            "NMAP (Basic)": [
                 f"sudo nmap -sS -p- --min-rate 5000 -T4 {t}",
                 f"sudo nmap -sV -sC -p- {t}",
                 f"sudo nmap -sV -sC -p- -oX {xml_out} {t}  # REQUIRED FOR EXPLOIT MODULE",
-                f"sudo nmap -sU --top-ports 200 {t}",
-                f"sudo nmap -sS --top-ports 1000 {t}",
                 f"sudo nmap -O {t}",
-                f"sudo nmap --script vuln {t}",
-                f"sudo nmap --script exploit {t}  AGGRESSIVE",
-                f"sudo nmap -f {t}",
-                f"sudo nmap -D RND:10 {t}",
-                f"sudo nmap -sN {t}",
-                f"sudo nmap -sF {t}",
-                f"sudo nmap -sX {t}",
-                f"sudo nmap -sA {t}",
             ],
-            "NETWORK": [
+            "NMAP (Stealth & Evasion)": [
+                f"sudo nmap -sS -f --mtu 24 {t}  # Fragmented packets",
+                f"sudo nmap -sS --spoof-mac 0 {t}  # Random MAC Address",
+                f"sudo nmap -sS -D RND:10 {t}  # Use 10 Random Decoys",
+                f"sudo nmap -sS --source-port 53 {t}  # Spoof source port (DNS)",
+                f"sudo nmap -sS --data-length 24 {t}  # Append random data to packets",
+                f"sudo nmap -sS --badsum {t}  # Check for firewall/IDS response",
+                f"sudo nmap -sN {t}  # NULL Scan",
+                f"sudo nmap -sF {t}  # FIN Scan",
+                f"sudo nmap -sX {t}  # Xmas Scan",
+            ],
+            "NETWORK & DISCOVERY": [
                 f"traceroute {t}",
-                f"sudo traceroute -I {t}",
-                f"ping -c 4 {t}",
+                f"sudo nmap -sn -PR {t}/24  # ARP Ping sweep",
+                f"sudo nmap -sn -PE {t}/24  # ICMP Echo sweep",
                 f"sudo arp-scan --localnet",
                 f"sudo netdiscover -r {t}/24",
                 f"fping -a -g {t}/24",
@@ -59,14 +60,21 @@ class ScanModule(BaseModule):
             "SERVICE ENUM": [
                 f"nc -nv {t} 22",
                 f"sslscan {t}:443",
-                f"openssl s_client -connect {t}:443",
                 f"enum4linux -a {t}",
                 f"smbclient -L //{t}",
                 f"rpcclient -U '' {t}",
-                f"snmpwalk -c public -v1 {t}",
                 f"snmpwalk -c public -v2c {t}",
                 f"onesixtyone {t} public",
-                f"smtp-user-enum -M VRFY -U /usr/share/seclists/Usernames/top-usernames-shortlist.txt -t {t}",
+            ],
+            "DEEP SCAN (Metasploit)": [
+                f'msfconsole -q -x "use auxiliary/scanner/smb/smb_version; set RHOSTS {t}; run; exit"',
+                f'msfconsole -q -x "use auxiliary/scanner/smb/smb_enumshares; set RHOSTS {t}; run; exit"',
+                f'msfconsole -q -x "use auxiliary/scanner/http/title; set RHOSTS {t}; run; exit"',
+                f'msfconsole -q -x "use auxiliary/scanner/ssh/ssh_version; set RHOSTS {t}; run; exit"',
+                f'msfconsole -q -x "use auxiliary/scanner/snmp/snmp_login; set RHOSTS {t}; run; exit"',
+                f'msfconsole -q -x "use auxiliary/scanner/ftp/ftp_version; set RHOSTS {t}; run; exit"',
+                f'msfconsole -q -x "use auxiliary/scanner/ftp/anonymous; set RHOSTS {t}; run; exit"',
+                f'msfconsole -q -x "use auxiliary/scanner/mssql/mssql_ping; set RHOSTS {t}; run; exit"',
             ],
         }
 

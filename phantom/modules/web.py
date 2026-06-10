@@ -52,33 +52,28 @@ class WebModule(BaseModule):
         wl = session.active_wordlist if session.active_wordlist else "/usr/share/wordlists/dirb/common.txt"
 
         return {
-            "GOBUSTER": [
-                f"gobuster dir -u http://{t} -w /usr/share/wordlists/dirb/common.txt",
-                f"gobuster dir -u http://{t} -w /usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt",
-                f"gobuster dir -u http://{t} -w {wl} -x php,html,txt,js,bak",
-                f"gobuster dir -u https://{t} -w /usr/share/wordlists/dirb/common.txt",
-                f"gobuster dns -d {t} -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt",
+            "SCANNING & VULN": [
+                f"nuclei -u http://{t} -severity critical,high",
+                f"nikto -h {t} -Tuning 123b",
+                f"whatweb http://{t}",
+                f"wafw00f http://{t}",
+            ],
+            "FUZZING (Dir/File)": [
+                f"ffuf -w {wl} -u http://{t}/FUZZ -mc 200,301,302 -t 50",
+                f"gobuster dir -u http://{t} -w {wl} -x php,html,txt,js,bak -k",
+                f"feroxbuster -u http://{t} -w {wl} --silent",
+            ],
+            "FUZZING (VHost/DNS)": [
+                f"ffuf -w {wl} -u http://{t} -H 'Host: FUZZ.{t}' -fs 0",
                 f"gobuster vhost -u http://{t} -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt",
-                f"feroxbuster -u http://{t} -w {wl}",
-                f"dirb http://{t}",
             ],
-            "NIKTO": [
-                f"nikto -h {t}",
-                f"nikto -h {t} -ssl",
-            ],
-            "FUZZING": [
-                f"wfuzz -c -w {wl} http://{t}/FUZZ",
-                f"ffuf -w {wl} -u http://{t}/FUZZ",
-            ],
-            "MANUAL RECON": [
-                f"curl -I http://{t}",
-                f"curl -L http://{t}",
-                f"curl -X OPTIONS http://{t}",
-                f"wget --spider http://{t}",
+            "API & PARAMETERS": [
+                f"ffuf -w {wl} -u http://{t}/api/FUZZ",
+                f"arjun -u http://{t} -m GET",
             ],
             "SQL INJECTION": [
-                f"sqlmap -u http://{t} --forms --batch  AGGRESSIVE",
-                f"sqlmap -u http://{t} --dbs --batch  AGGRESSIVE",
+                f"sqlmap -u http://{t} --forms --batch --random-agent --level 2 --risk 2  AGGRESSIVE",
+                f"sqlmap -u http://{t} --dbs --batch --random-agent  AGGRESSIVE",
             ],
         }
 

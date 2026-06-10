@@ -36,4 +36,10 @@ class LoggerProxy:
     def __getattr__(self, name):
         return getattr(get_logger(), name)
 
+    def success(self, msg, *args, **kwargs):
+        get_logger().info(f"[SUCCESS] {msg}", *args, **kwargs)
+
+    def status(self, msg, *args, **kwargs):
+        get_logger().info(f"[*] {msg}", *args, **kwargs)
+
 logger = LoggerProxy()

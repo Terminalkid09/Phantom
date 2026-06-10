@@ -3,6 +3,10 @@ import hashlib
 import os
 import base64
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 DEFAULT_AES_KEY = b"PhantomC2_SecretKey_32bytes_Long"
 DEFAULT_AES_NONCE = b"PhntmNonce12"  # 12 bytes for GCM

