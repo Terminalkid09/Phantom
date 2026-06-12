@@ -20,10 +20,22 @@ shell.elf
 
 # Build artifacts
 phantom/payloads/beacon/beacon.exe
+phantom/payloads/beacon/beacon_linux
+phantom/payloads/beacon/beacon_linux_x86
+phantom/payloads/beacon/beacon_macos
+phantom/payloads/beacon/beacon_android
+*.exe
+*.bak
 
 # Temporary test files and scripts
 commands.txt
-manual_test.py
 run_phantom_commands.py
 hash_calc.py
 comando.txt
+
+# Untracked directories
+.antigravitycli/
+data/certs/
+data/payload_history.json
+payloads/
+phantom/data/

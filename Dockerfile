@@ -101,7 +101,10 @@ RUN mkdir -p /opt && \
     unzip -q android-ndk-${ANDROID_NDK_VERSION}-linux.zip && \
     mv android-ndk-${ANDROID_NDK_VERSION} ${ANDROID_NDK_HOME} && \
     rm android-ndk-${ANDROID_NDK_VERSION}-linux.zip && \
-    echo "Android NDK installed at ${ANDROID_NDK_HOME}"
+    echo "Android NDK installed at ${ANDROID_NDK_HOME}" && \
+    # Symlinks for OpenSSL/CURL
+    ln -s /usr/lib/aarch64-linux-gnu/libssl.so /opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libssl.so && \
+    ln -s /usr/lib/aarch64-linux-gnu/libcrypto.so /opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libcrypto.so
 
 # Install osxcross (macOS cross-compiler)
 RUN cd /opt && \

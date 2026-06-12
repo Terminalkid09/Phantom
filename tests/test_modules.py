@@ -46,8 +46,8 @@ class TestModuleIntegration:
         # Build scan commands
         scan = ScanModule()
         commands = scan.build_commands()
-        assert "NMAP" in commands
-        assert any("oX" in cmd for cmd in commands["NMAP"])
+        assert "NMAP (Basic)" in commands
+        assert any("oX" in cmd for cmd in commands["NMAP (Basic)"])
 
     def test_exploit_requires_versioned_services(self):
         """Test that exploit module requires services with version info."""

