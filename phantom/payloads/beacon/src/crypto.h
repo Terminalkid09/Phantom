@@ -20,6 +20,7 @@
 #else
     #include <openssl/evp.h>
     #include <openssl/err.h>
+    #include <openssl/rand.h>
     typedef unsigned char BYTE;
     typedef unsigned int ULONG;
 #endif
@@ -104,7 +105,7 @@ inline std::string encrypt(const std::string& plaintext) {
     if (!NT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(hAlg, 0); return ""; }
 
     BYTE nonce[NONCE_LEN];
-    memcpy(nonce, AES_NONCE, NONCE_LEN);
+    BCryptGenRandom(NULL, nonce, NONCE_LEN, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 
     BYTE tag[TAG_LEN];
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
@@ -113,15 +114,20 @@ inline std::string encrypt(const std::string& plaintext) {
     authInfo.cbNonce = NONCE_LEN;
     authInfo.pbTag = tag;
     authInfo.cbTag = TAG_LEN;
+    authInfo.cbData = (ULONG)plaintext.size();
 
     ULONG cbCiphertext = (ULONG)plaintext.size();
     std::vector<BYTE> ciphertext(cbCiphertext);
 
     status = BCryptEncrypt(hKey, (PUCHAR)plaintext.data(), (ULONG)plaintext.size(), &authInfo, nullptr, 0, ciphertext.data(), cbCiphertext, &cbCiphertext, 0);
     if (NT_SUCCESS(status)) {
-        // Append tag to ciphertext (matching Python's cryptography library behavior)
-        ciphertext.insert(ciphertext.end(), tag, tag + TAG_LEN);
-        result = base64_encode(ciphertext);
+        // Format: nonce || ciphertext || tag (each encryption uses a unique nonce)
+        std::vector<BYTE> output;
+        output.reserve(NONCE_LEN + cbCiphertext + TAG_LEN);
+        output.insert(output.end(), nonce, nonce + NONCE_LEN);
+        output.insert(output.end(), ciphertext.begin(), ciphertext.begin() + cbCiphertext);
+        output.insert(output.end(), tag, tag + TAG_LEN);
+        result = base64_encode(output);
     }
 
     if (hKey) BCryptDestroyKey(hKey);
@@ -135,10 +141,12 @@ inline std::string encrypt(const std::string& plaintext) {
     int len = 0;
     int ciphertext_len = 0;
     BYTE tag[TAG_LEN];
+    BYTE nonce[NONCE_LEN];
+    RAND_bytes(nonce, NONCE_LEN);
 
     if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) goto cleanup;
     if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, NONCE_LEN, NULL)) goto cleanup;
-    if (1 != EVP_EncryptInit_ex(ctx, NULL, NULL, AES_KEY, AES_NONCE)) goto cleanup;
+    if (1 != EVP_EncryptInit_ex(ctx, NULL, NULL, AES_KEY, nonce)) goto cleanup;
 
     if (1 != EVP_EncryptUpdate(ctx, ciphertext.data(), &len, (const BYTE*)plaintext.data(), plaintext.size())) goto cleanup;
     ciphertext_len = len;
@@ -149,10 +157,14 @@ inline std::string encrypt(const std::string& plaintext) {
     if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag)) goto cleanup;
     
     ciphertext.resize(ciphertext_len);
-    ciphertext.insert(ciphertext.end(), tag, tag + TAG_LEN);
+    std::vector<BYTE> output;
+    output.reserve(NONCE_LEN + ciphertext_len + TAG_LEN);
+    output.insert(output.end(), nonce, nonce + NONCE_LEN);
+    output.insert(output.end(), ciphertext.begin(), ciphertext.end());
+    output.insert(output.end(), tag, tag + TAG_LEN);
     
     EVP_CIPHER_CTX_free(ctx);
-    return base64_encode(ciphertext);
+    return base64_encode(output);
 
 cleanup:
     if (ctx) EVP_CIPHER_CTX_free(ctx);
@@ -164,12 +176,18 @@ cleanup:
 
 inline std::string decrypt(const std::string& ciphertext_b64) {
     std::vector<BYTE> full_data = base64_decode(ciphertext_b64);
-    if (full_data.size() < TAG_LEN) return "";
+    if (full_data.size() < NONCE_LEN + TAG_LEN) return "";
+
+    // Extract nonce from the beginning
+    BYTE nonce[NONCE_LEN];
+    memcpy(nonce, full_data.data(), NONCE_LEN);
 
     // Extract tag from the end
-    std::vector<BYTE> ciphertext(full_data.begin(), full_data.end() - TAG_LEN);
     BYTE tag[TAG_LEN];
-    memcpy(tag, full_data.data() + ciphertext.size(), TAG_LEN);
+    memcpy(tag, full_data.data() + full_data.size() - TAG_LEN, TAG_LEN);
+
+    // Ciphertext is in the middle
+    std::vector<BYTE> ciphertext(full_data.begin() + NONCE_LEN, full_data.end() - TAG_LEN);
 
 #ifdef _WIN32
     BCRYPT_ALG_HANDLE hAlg = nullptr;
@@ -185,9 +203,6 @@ inline std::string decrypt(const std::string& ciphertext_b64) {
 
     status = BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0, (PUCHAR)AES_KEY, KEY_LEN, 0);
     if (!NT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(hAlg, 0); return ""; }
-
-    BYTE nonce[NONCE_LEN];
-    memcpy(nonce, AES_NONCE, NONCE_LEN);
 
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
     BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
@@ -217,7 +232,7 @@ inline std::string decrypt(const std::string& ciphertext_b64) {
 
     if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) goto cleanup;
     if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, NONCE_LEN, NULL)) goto cleanup;
-    if (1 != EVP_DecryptInit_ex(ctx, NULL, NULL, AES_KEY, AES_NONCE)) goto cleanup;
+    if (1 != EVP_DecryptInit_ex(ctx, NULL, NULL, AES_KEY, nonce)) goto cleanup;
 
     if (1 != EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext.data(), ciphertext.size())) goto cleanup;
     plaintext_len = len;

