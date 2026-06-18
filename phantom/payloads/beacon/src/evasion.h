@@ -266,7 +266,9 @@ constexpr uint32_t FN_UNMAPVIEWOFFILE   = 0xd3107a34; // UnmapViewOfFile
 constexpr uint32_t FN_CLOSEHANDLE       = 0x163212e5; // CloseHandle
 constexpr uint32_t FN_GETMODULEINFORMATION = 0x57932a8f; // GetModuleInformation
 
+#ifdef _WIN32
 #include <psapi.h>
+#endif
 #include "syscalls.h"
 
 namespace anti {
