@@ -1,41 +1,96 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 dist/
 build/
+
+# Environment & secrets
 .env
+.env.local
+*.key
+*.pem
+*.cert
+
+# Phantom runtime data
 data/sessions/*.json
 data/cache/
 data/downloads/
-phantom/payloads/beacon/src/crypto_config.h
-phantom/payloads/beacon/.*.crypto_hash
 data/presets/*.json
-*.pcap
-*.pcapng
-*.pdf
-*.xml
-shell.elf
-*.log
-.aider*
+data/certs/
+data/payload_history.json
+data/logs/
 
-# Build artifacts
-phantom/payloads/beacon/beacon.exe
+# Payload artifacts
+phantom/payloads/beacon/*.exe
+phantom/payloads/beacon/*.exe.tmp
+phantom/payloads/beacon/*.o
+phantom/payloads/beacon/src/*.o
+phantom/payloads/beacon/*.pe
+phantom/payloads/beacon/*.bin
+phantom/payloads/beacon/*.rva
+phantom/payloads/beacon/*.map
+phantom/payloads/beacon/*.pdb
+phantom/payloads/beacon/*.ilk
+phantom/payloads/beacon/*.exp
+phantom/payloads/beacon/*.lib
+
+# Reflective loader build artifacts
+phantom/payloads/beacon/src/reflective_loader.o
+phantom/payloads/beacon/src/reflective_loader.exe
+phantom/payloads/beacon/src/reflective_loader.exe.tmp
+phantom/payloads/beacon/src/reflective_loader.map
+phantom/payloads/beacon/src/reflective_loader.bin
+phantom/payloads/beacon/src/reflective_loader_bootstrap.o
+
+# Cross-compiled beacons (all platforms)
 phantom/payloads/beacon/beacon_linux
 phantom/payloads/beacon/beacon_linux_x86
 phantom/payloads/beacon/beacon_macos
 phantom/payloads/beacon/beacon_android
-*.exe
-*.bak
 
-# Temporary test files and scripts
+# Crypto & build config (auto-generated)
+phantom/payloads/beacon/src/crypto_config.h
+phantom/payloads/beacon/src/build_id.h
+phantom/payloads/beacon/.*.crypto_hash
+
+# Builder output
+*_payload.bin
+
+# Temp / test / cache
 commands.txt
 run_phantom_commands.py
 hash_calc.py
 comando.txt
+*.bak
+.pytest_cache/
+.pytest_tmp/
+report.html
 
 # Untracked directories
 .antigravitycli/
-data/certs/
-data/payload_history.json
-payloads/
+/payloads/
 phantom/data/
+
+# OS artifacts
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Packet captures
+*.pcap
+*.pcapng
+
+# Documents
+*.pdf
+*.xml
+
+# System & temp files
+*.log
+shell.elf
+beacon_debug.log
+
+# .aider
+.aider*

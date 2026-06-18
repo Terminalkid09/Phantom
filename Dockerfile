@@ -1,134 +1,138 @@
 # syntax=docker/dockerfile:1
-FROM kalilinux/kali-rolling
+# =============================================================================
+#  Phantom — Offensive Security Framework
+#  Multi-stage Docker build for cross-platform C2 beacon compilation
+# =============================================================================
 
-# Environment variables
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV DEBIAN_FRONTEND=noninteractive
+# ── Stage 1: Cross-compilation toolchain ────────────────────────────────────
+FROM kalilinux/kali-rolling AS builder
 
-# C2 keys (optional build-args from docker-compose / CI)
-ARG PHANTOM_C2_KEY=
-ARG PHANTOM_C2_IV=
-ARG PHANTOM_PAYLOAD_TOKEN=
-ENV PHANTOM_C2_KEY=${PHANTOM_C2_KEY}
-ENV PHANTOM_C2_IV=${PHANTOM_C2_IV}
-ENV PHANTOM_PAYLOAD_TOKEN=${PHANTOM_PAYLOAD_TOKEN}
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# Android NDK
-ENV ANDROID_NDK_VERSION=r26c
-ENV ANDROID_NDK_HOME=/opt/android-ndk
-ENV ANDROID_NDK_CC=aarch64-linux-android28-clang++
+WORKDIR /build
 
-# osxcross (macOS cross-compile)
-ENV OSXCROSS_ROOT=/opt/osxcross
-ENV PATH=${OSXCROSS_ROOT}/bin:${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
-
-# Set working directory
-WORKDIR /app
-
-# Install system dependencies (security tools + C++ build chain)
-RUN echo "wireshark-common wireshark-common/install-setuid boolean true" | debconf-set-selections
+# Install cross-compilation dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Essential for group management
-    adduser \
-    # Core
-    git \
-    sudo \
-    python3 \
-    python3-pip \
-    # Recon & Scanning
-    nmap \
-    dnsutils \
-    whois \
-    netcat-openbsd \
-    tshark \
-    iputils-ping \
-    traceroute \
-    # Web Testing
-    gobuster \
-    nikto \
-    sqlmap \
-    ffuf \
-    # Brute Force
-    hydra \
-    medusa \
-    john \
-    hashcat \
-    # WiFi
-    aircrack-ng \
-    reaver \
-    hcxdumptool \
-    hcxtools \
-    # OSINT & Exploit
-    sherlock \
-    exploitdb \
-    # C++ Beacon Build Chain
-    g++ \
+    # C++ build chain
+    g++ gcc make cmake pkg-config \
+    # MinGW (Windows cross-compiler)
     mingw-w64 \
-    cmake \
-    make \
-    clang \
-    llvm \
-    pkg-config \
-    libcurl4-openssl-dev \
-    libssl-dev \
-    default-jdk \
-    android-tools-adb \
-    wget \
-    unzip \
-    ca-certificates \
-    libxml2-dev \
-    libxslt1-dev \
-    bison \
-    flex \
-    texinfo \
-    help2man \
-    # RCE Deployer dependencies
-    sshpass \
-    smbclient \
-    curl \
-    default-mysql-client \
-    postgresql-client \
-    python3-impacket \
-    python3-psycopg2 \
+    # Assembly & LLVM
+    clang llvm binutils \
+    # Libraries for Linux/macOS beacon
+    libcurl4-openssl-dev libssl-dev \
+    # Utilities
+    wget ca-certificates unzip xz-utils \
+    # Python
+    python3 python3-pip \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Android NDK
+# ── Stage 2: Final runtime image ────────────────────────────────────────────
+FROM kalilinux/kali-rolling
+
+LABEL org.opencontainers.image.title="Phantom Framework" \
+      org.opencontainers.image.description="Offensive Security CLI & C2 Framework" \
+      org.opencontainers.image.version="2.0.0" \
+      org.opencontainers.image.licenses="MIT"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    ANDROID_NDK_VERSION=r26c \
+    ANDROID_NDK_HOME=/opt/android-ndk \
+    OSXCROSS_ROOT=/opt/osxcross
+
+# ── Install runtime tools ────────────────────────────────────────────────────
+RUN echo "wireshark-common wireshark-common/install-setuid boolean true" | debconf-set-selections
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Core
+    python3 python3-pip git sudo adduser \
+    # Recon & Scan
+    nmap dnsutils whois netcat-openbsd tshark iputils-ping traceroute \
+    # Web testing
+    gobuster nikto sqlmap ffuf \
+    # Brute force
+    hydra medusa john hashcat \
+    # WiFi
+    aircrack-ng reaver hcxdumptool hcxtools \
+    # OSINT
+    sherlock exploitdb \
+    # C++ build chain (for beacon compilation inside container)
+    g++ gcc make cmake pkg-config mingw-w64 clang llvm binutils \
+    libcurl4-openssl-dev libssl-dev \
+    # RCE deployer
+    sshpass smbclient curl default-mysql-client postgresql-client \
+    python3-impacket python3-psycopg2 \
+    # Android
+    android-tools-adb default-jdk \
+    # Utilities
+    wget unzip ca-certificates xz-utils bison flex texinfo help2man \
+    libxml2-dev libxslt1-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Android NDK ──────────────────────────────────────────────────────────────
 RUN mkdir -p /opt && \
     cd /tmp && \
     wget -q https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_VERSION}-linux.zip && \
     unzip -q android-ndk-${ANDROID_NDK_VERSION}-linux.zip && \
     mv android-ndk-${ANDROID_NDK_VERSION} ${ANDROID_NDK_HOME} && \
     rm android-ndk-${ANDROID_NDK_VERSION}-linux.zip && \
-    echo "Android NDK installed at ${ANDROID_NDK_HOME}" && \
-    # Symlinks for OpenSSL/CURL
-    ln -s /usr/lib/aarch64-linux-gnu/libssl.so /opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libssl.so && \
-    ln -s /usr/lib/aarch64-linux-gnu/libcrypto.so /opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libcrypto.so
+    ln -sf /usr/lib/aarch64-linux-gnu/libssl.so \
+        ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libssl.so && \
+    ln -sf /usr/lib/aarch64-linux-gnu/libcrypto.so \
+        ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libcrypto.so
 
-# Install osxcross (macOS cross-compiler)
+# ── osxcross (macOS cross-compiler skeleton) ─────────────────────────────────
 RUN cd /opt && \
-    git clone https://github.com/tpoechtrager/osxcross.git ${OSXCROSS_ROOT} && \
-    cd ${OSXCROSS_ROOT} && \
-    git checkout master && \
-    echo "osxcross cloned. SDK must be added manually or via build process." && \
-    mkdir -p ${OSXCROSS_ROOT}/SDK
+    git clone --depth=1 https://github.com/tpoechtrager/osxcross.git ${OSXCROSS_ROOT} && \
+    mkdir -p ${OSXCROSS_ROOT}/SDK && \
+    echo "osxcross SDK must be added manually (see osxcross docs)"
 
-# Install Python dependencies
+# ── C2 keys (optional build-args, expected from .env or docker-compose) ─────
+ARG PHANTOM_C2_KEY=
+ARG PHANTOM_C2_IV=
+ARG PHANTOM_PAYLOAD_TOKEN=
+ENV PHANTOM_C2_KEY=${PHANTOM_C2_KEY} \
+    PHANTOM_C2_IV=${PHANTOM_C2_IV} \
+    PHANTOM_PAYLOAD_TOKEN=${PHANTOM_PAYLOAD_TOKEN} \
+    PATH=${OSXCROSS_ROOT}/bin:${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
+
+# ── Application setup ────────────────────────────────────────────────────────
+WORKDIR /app
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
-# Copy the rest of the application
 COPY . .
 
-# Install the package
 RUN pip install --no-cache-dir --break-system-packages -e .
 
-# Ensure data directories exist
+# ── Pre-build beacon assembly objects & reflective loader ────────────────────
+RUN BEACON_SRC=phantom/payloads/beacon/src && \
+    # PIC bootstrap & helpers
+    for asm in syscalls pic_bootstrap peb_walker api_resolver stack_spoofer; do \
+        x86_64-w64-mingw32-as --64 ${BEACON_SRC}/${asm}.asm -o ${BEACON_SRC}/${asm}.o; \
+    done && \
+    # Reflective loader bootstrap
+    x86_64-w64-mingw32-as --64 ${BEACON_SRC}/reflective_loader_bootstrap.asm \
+        -o ${BEACON_SRC}/reflective_loader_bootstrap.o && \
+    # Reflective loader C core (PIC, no CRT)
+    x86_64-w64-mingw32-gcc -c -O2 -fPIC -nostdlib -ffreestanding \
+        -fno-stack-protector ${BEACON_SRC}/reflective_loader.c \
+        -o ${BEACON_SRC}/reflective_loader.o
+
+# ── Create runtime data directories ──────────────────────────────────────────
 RUN mkdir -p data/logs data/sessions data/presets data/beacons data/cache data/downloads
 
-# Default crypto config for beacon builds inside the container (overridden at runtime via .env)
-RUN python3 -c "import sys; sys.path.insert(0,'.'); from phantom.utils.c2_crypto import write_beacon_crypto_config; write_beacon_crypto_config('phantom/payloads/beacon')"
+# ── Generate default crypto config ───────────────────────────────────────────
+RUN python3 -c "import sys; sys.path.insert(0,'.'); \
+    from phantom.utils.c2_crypto import write_beacon_crypto_config; \
+    write_beacon_crypto_config('phantom/payloads/beacon')"
 
-# Final setup — use docker exec for interactive CLI (see README)
+# ── Entry point ──────────────────────────────────────────────────────────────
 CMD ["sleep", "infinity"]
