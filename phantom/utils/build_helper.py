@@ -6,28 +6,36 @@ from rich.console import Console
 
 console = Console()
 
-def install_dependencies(dependencies, manager="apt"):
-    """Prompt the user and install dependencies. Works in container.
+def _in_container():
+    return os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv')
 
-    - Always asks if stdin is a TTY (interactive)
+def install_dependencies(dependencies, manager="apt"):
+    """Prompt the user and install dependencies.
+
+    - Inside Docker/container: auto-installs silently (no prompt)
+    - Outside container: asks if stdin is a TTY, else prints instructions
     - Avoids sudo if running as root
     - Returns True on success, False otherwise
     """
     console.print(f"[yellow][?] Dipendenze mancanti: {', '.join(dependencies)}[/]")
 
+    # Inside Docker: auto-install without prompting
+    if _in_container():
+        console.print("[cyan][*] Container detected, installing dependencies automatically...[/]")
+        choice = 'y'
     # Only skip interactive prompt if truly non-interactive (CI env, no tty)
-    if not sys.stdin.isatty():
+    elif not sys.stdin.isatty():
         console.print("[yellow][!] Non-interactive session.\n    Please install the following packages manually:")
         if manager == 'apt':
             console.print(f"    sudo apt-get update && sudo apt-get install -y {' '.join(dependencies)}")
         else:
             console.print(f"    {manager} install {' '.join(dependencies)}")
         return False
-
-    # Interactive: ask the user
-    choice = input("Vuoi installarle automaticamente ora? [y/N]: ").strip().lower()
-    if choice != 'y':
-        return False
+    else:
+        # Interactive: ask the user
+        choice = input("Vuoi installarle automaticamente ora? [y/N]: ").strip().lower()
+        if choice != 'y':
+            return False
 
     # Determine command prefix (avoid sudo if running as root)
     try:
