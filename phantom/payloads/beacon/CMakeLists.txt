@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 project(PhantomBeacon LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ── Release optimizations ─────────────────────────────────────────────────
@@ -29,7 +29,7 @@ endif()
 # ── Link libraries ────────────────────────────────────────────────────────
 if(WIN32)
     # Windows native - zero external deps
-    target_link_libraries(beacon PRIVATE winhttp bcrypt ws2_32)
+    target_link_libraries(beacon PRIVATE winhttp bcrypt ws2_32 bthprops wlanapi iphlpapi)
     if(MSVC)
         set_target_properties(beacon PROPERTIES LINK_FLAGS_RELEASE "/SUBSYSTEM:WINDOWS")
     endif()
