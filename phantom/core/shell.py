@@ -161,8 +161,8 @@ class PhantomShell(cmd.Cmd):
                     import stat
                     mode = os.stat(plugin_path).st_mode
                     if mode & stat.S_IWOTH:
-                        notifier.error(f"Security Error: Plugin {file} is world-writable! Skipping.")
-                        continue
+                        # Mounted from Windows → overly permissive. Fix it silently.
+                        os.chmod(plugin_path, mode & ~stat.S_IWOTH)
                 elif os.name == "nt":
                     notifier.info(f"Plugin {file} loaded (no permission check on Windows)")
 

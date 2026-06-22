@@ -111,7 +111,7 @@ class TestC2ServerInstance:
     def test_server_instance_exists(self):
         from phantom.core.c2_server import server_instance
         assert server_instance is not None
-        assert server_instance.port == 443
+        assert server_instance.port == 8080
 
     def test_server_can_change_port(self):
         from phantom.core.c2_server import C2Server

@@ -1,10 +1,11 @@
 #pragma once
 
-#ifdef _WIN32
-#include <windows.h>
 #include <vector>
 #include <string>
 #include "crypto.h"
+
+#ifdef _WIN32
+#include <windows.h>
 
 namespace screenshot {
 
@@ -72,6 +73,98 @@ inline std::string capture() {
     bmp.insert(bmp.end(), pixels.begin(), pixels.end());
 
     return "SCREENSHOT_B64:" + crypto::base64_encode(bmp);
+}
+
+} // namespace screenshot
+
+#elif defined(__linux__)
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+namespace screenshot {
+
+inline std::string capture() {
+    // Try X11 first (requires -lX11 at link time)
+    // If X11 is not available, fall back to import or screencap
+
+    // Try using ImageMagick's "import" command
+    // or scrot, or xwd
+    // Most reliable: use popen to run a command
+
+    // Method 1: import (ImageMagick)
+    std::string cmd = "import -window root -quality 85 PNG:- 2>/dev/null";
+    FILE* f = popen(cmd.c_str(), "re");
+    if (f) {
+        std::vector<unsigned char> png_data;
+        char buf[4096];
+        int n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+            png_data.insert(png_data.end(), buf, buf + n);
+        }
+        int ret = pclose(f);
+        if (ret == 0 && !png_data.empty()) {
+            return "SCREENSHOT_B64:" + crypto::base64_encode(png_data);
+        }
+    }
+
+    // Method 2: xwd + convert
+    cmd = "xwd -root -silent 2>/dev/null | convert xwd:- PNG:- 2>/dev/null";
+    f = popen(cmd.c_str(), "re");
+    if (f) {
+        std::vector<unsigned char> png_data;
+        char buf[4096];
+        int n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+            png_data.insert(png_data.end(), buf, buf + n);
+        }
+        int ret = pclose(f);
+        if (ret == 0 && !png_data.empty()) {
+            return "SCREENSHOT_B64:" + crypto::base64_encode(png_data);
+        }
+    }
+
+    // Method 3: Android screencap
+    cmd = "screencap -p 2>/dev/null";
+    f = popen(cmd.c_str(), "re");
+    if (f) {
+        std::vector<unsigned char> png_data;
+        char buf[4096];
+        int n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+            png_data.insert(png_data.end(), buf, buf + n);
+        }
+        int ret = pclose(f);
+        if (ret == 0 && !png_data.empty()) {
+            return "SCREENSHOT_B64:" + crypto::base64_encode(png_data);
+        }
+    }
+
+    return "SCREENSHOT_ERROR: No screenshot tool available (import, xwd, screencap)";
+}
+
+} // namespace screenshot
+
+#else
+// Android or other POSIX - use screencap or import
+namespace screenshot {
+
+inline std::string capture() {
+    // Try Android's screencap
+    FILE* f = popen("screencap -p 2>/dev/null", "re");
+    if (f) {
+        std::vector<unsigned char> png_data;
+        char buf[4096];
+        int n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+            png_data.insert(png_data.end(), buf, buf + n);
+        }
+        int ret = pclose(f);
+        if (ret == 0 && !png_data.empty()) {
+            return "SCREENSHOT_B64:" + crypto::base64_encode(png_data);
+        }
+    }
+    return "SCREENSHOT_ERROR: No screenshot tool available.";
 }
 
 } // namespace screenshot

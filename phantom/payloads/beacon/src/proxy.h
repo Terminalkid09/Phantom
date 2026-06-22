@@ -7,6 +7,26 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
+#else
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include <cerrno>
+#ifndef SOCKET
+#define SOCKET int
+#endif
+#ifndef INVALID_SOCKET
+#define INVALID_SOCKET (-1)
+#endif
+#ifndef SOCKET_ERROR
+#define SOCKET_ERROR (-1)
+#endif
+#ifndef closesocket
+#define closesocket(s) ::close(s)
+#endif
 #endif
 #include <string>
 #include <thread>
@@ -23,7 +43,11 @@ inline void socks5_relay(SOCKET a, SOCKET b, std::atomic<bool>& running) {
         FD_SET(a, &fds);
         FD_SET(b, &fds);
         timeval tv = {1, 0};
+#ifdef _WIN32
+        int maxFd = 0;
+#else
         int maxFd = static_cast<int>((a > b ? a : b) + 1);
+#endif
         int sel = select(maxFd, &fds, nullptr, nullptr, &tv);
         if (sel <= 0) continue;
         if (FD_ISSET(a, &fds)) {
@@ -40,15 +64,13 @@ inline void socks5_relay(SOCKET a, SOCKET b, std::atomic<bool>& running) {
 }
 
 inline bool socks5_handshake(SOCKET s, std::string& targetHost, int& targetPort) {
-    // --- Auth negotiation ---
     unsigned char buf[1024];
     int n = recv(s, (char*)buf, sizeof(buf), 0);
     if (n < 2 || buf[0] != 5) return false;
     if (n < 2 + buf[1]) return false;
-    unsigned char authResp[] = {5, 0};   // No auth
+    unsigned char authResp[] = {5, 0};
     send(s, (const char*)authResp, 2, 0);
 
-    // --- Request ---
     n = recv(s, (char*)buf, sizeof(buf), 0);
     if (n < 7 || buf[0] != 5 || buf[1] != 1) return false;
 
@@ -79,7 +101,6 @@ inline bool socks5_handshake(SOCKET s, std::string& targetHost, int& targetPort)
 
     targetPort = (buf[4 + addrLen] << 8) | buf[5 + addrLen];
 
-    // Send success response
     unsigned char resp[] = {5, 0, 0, 1, 0, 0, 0, 0, 0, 0};
     send(s, (const char*)resp, 10, 0);
     return true;
@@ -121,6 +142,9 @@ private:
 #ifdef _WIN32
         u_long nonBlocking = 1;
         ioctlsocket(listenSock, FIONBIO, &nonBlocking);
+#else
+        int flags = fcntl(listenSock, F_GETFL, 0);
+        fcntl(listenSock, F_SETFL, flags | O_NONBLOCK);
 #endif
         while (running) {
             SOCKET clientSock = accept(listenSock, nullptr, nullptr);

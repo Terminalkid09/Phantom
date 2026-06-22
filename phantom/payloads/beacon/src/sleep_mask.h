@@ -1,4 +1,5 @@
 #pragma once
+#ifdef _WIN32
 #include <windows.h>
 #include "evasion.h"
 #include "syscalls.h"
@@ -70,3 +71,4 @@ inline void sleep_mask(DWORD sleep_ms) {
 
 } // namespace mem
 } // namespace anti
+#endif

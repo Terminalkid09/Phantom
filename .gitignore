@@ -42,6 +42,7 @@ phantom/payloads/beacon/src/reflective_loader.exe.tmp
 phantom/payloads/beacon/src/reflective_loader.map
 phantom/payloads/beacon/src/reflective_loader.bin
 phantom/payloads/beacon/src/reflective_loader_bootstrap.o
+phantom/payloads/beacon/src/beacon.exe
 
 # Cross-compiled beacons (all platforms)
 phantom/payloads/beacon/beacon_linux
@@ -66,6 +67,10 @@ comando.txt
 .pytest_cache/
 .pytest_tmp/
 report.html
+coverage.xml
+.coverage
+.coverage.*
+htmlcov/
 
 # Untracked directories
 .antigravitycli/
@@ -94,3 +99,6 @@ beacon_debug.log
 
 # .aider
 .aider*
+
+# opencode config
+.opencode/

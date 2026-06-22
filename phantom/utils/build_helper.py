@@ -128,8 +128,101 @@ _LINUX_STATIC_DEPS = {
     "psl":           "libpsl-dev",
 }
 
+def _install_openssl_android(ndk_home):
+    """Cross-compile OpenSSL 3.4.x for Android NDK (aarch64)."""
+    ndk_prebuilt = os.path.join(ndk_home, "toolchains", "llvm", "prebuilt", "linux-x86_64")
+    ndk_sysroot = os.path.join(ndk_prebuilt, "sysroot")
+    ndk_lib = os.path.join(ndk_sysroot, "usr", "lib", "aarch64-linux-android")
+    ndk_include = os.path.join(ndk_sysroot, "usr", "include", "openssl")
+    arch_include = os.path.join(ndk_sysroot, "usr", "include", "aarch64-linux-android", "openssl")
+    os.makedirs(ndk_lib, exist_ok=True)
+    os.makedirs(ndk_include, exist_ok=True)
+    os.makedirs(os.path.dirname(arch_include), exist_ok=True)
+
+    ssl_a = os.path.join(ndk_lib, "libssl.a")
+    crypto_a = os.path.join(ndk_lib, "libcrypto.a")
+    if os.path.exists(ssl_a) and os.path.exists(crypto_a) and os.path.exists(os.path.join(ndk_include, "evp.h")):
+        return  # already installed
+
+    import subprocess, tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    tgz = os.path.join(tmp, "openssl.tgz")
+    try:
+        import urllib.request
+        url = "https://github.com/openssl/openssl/releases/download/openssl-3.4.1/openssl-3.4.1.tar.gz"
+        console.print(f"[blue]  Downloading OpenSSL 3.4.1...[/blue]")
+        urllib.request.urlretrieve(url, tgz)
+        shutil.unpack_archive(tgz, tmp)
+        src = os.path.join(tmp, "openssl-3.4.1")
+        env = os.environ.copy()
+        toolchain_bin = os.path.join(ndk_prebuilt, "bin")
+        env["PATH"] = toolchain_bin + os.pathsep + env.get("PATH", "")
+        env["ANDROID_NDK_ROOT"] = ndk_home
+        env["CC"] = "aarch64-linux-android28-clang"
+        env["AR"] = "llvm-ar"
+        env["RANLIB"] = "llvm-ranlib"
+        console.print(f"[blue]  Configuring OpenSSL for android-arm64...[/blue]")
+        subprocess.run(
+            ["./Configure", "android-arm64", "no-shared", "no-asm",
+             "-D__ANDROID_API__=28", f"--prefix={tmp}/install",
+             f"--openssldir={tmp}/install"],
+            cwd=src, env=env, capture_output=True, check=True)
+        console.print(f"[blue]  Building OpenSSL (this may take a few minutes)...[/blue]")
+        subprocess.run(["make", "-j4"], cwd=src, env=env, capture_output=True, check=True)
+        # Copy libs
+        for f in ["libssl.a", "libcrypto.a"]:
+            shutil.copy2(os.path.join(src, f), os.path.join(ndk_lib, f))
+        # Copy headers
+        for d in [ndk_include, arch_include]:
+            os.makedirs(d, exist_ok=True)
+            for f in os.listdir(os.path.join(src, "include", "openssl")):
+                srcf = os.path.join(src, "include", "openssl", f)
+                dstf = os.path.join(d, f)
+                try:
+                    shutil.copy2(srcf, dstf)
+                except OSError:
+                    pass  # skip if dest already has a conflicting file
+        # Fix CONFIGURED_API mismatch
+        cfg_h = os.path.join(ndk_include, "configuration.h")
+        if os.path.exists(cfg_h):
+            with open(cfg_h) as f: content = f.read()
+            content = content.replace("30600", "30400")
+            with open(cfg_h, "w") as f: f.write(content)
+        cfg_h_arch = os.path.join(arch_include, "configuration.h")
+        if os.path.exists(cfg_h_arch):
+            with open(cfg_h_arch) as f: content = f.read()
+            content = content.replace("30600", "30400")
+            with open(cfg_h_arch, "w") as f: f.write(content)
+        console.print(f"[green][+] OpenSSL for Android installed.[/green]")
+    except Exception as e:
+        console.print(f"[red][!] OpenSSL build failed: {e}[/red]")
+        console.print("[yellow][!] You may need to manually cross-compile OpenSSL for Android.[/yellow]")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+_DEPS_MARKER = "/tmp/.phantom_deps_ok"
+
+
+def _deps_ready(platform):
+    """Check if we already validated deps for this platform in this session."""
+    import os
+    return os.path.exists(f"{_DEPS_MARKER}_{platform}")
+
+
+def _mark_deps_ready(platform):
+    import os
+    try:
+        with open(f"{_DEPS_MARKER}_{platform}", "w") as f: f.write("1")
+    except OSError:
+        pass
+
+
 def check_build_env(platform, arch="x64"):
     """Verifica dipendenze in base alla piattaforma e propone fix automatico."""
+    if _deps_ready(platform):
+        return True
+
     missing = []
     
     if platform == "linux":
@@ -164,9 +257,6 @@ def check_build_env(platform, arch="x64"):
                     missing.append("g++-multilib")
 
         # Header checks using test-compilation
-        if not check_header("curl/curl.h", flags):
-            missing.append(f"libcurl4-openssl-dev{pkg_suffix}")
-        
         if not check_header("openssl/ssl.h", flags):
             missing.append(f"libssl-dev{pkg_suffix}")
 
@@ -220,11 +310,30 @@ def check_build_env(platform, arch="x64"):
         if not os.path.exists(ndk_cc):
             console.print(f"[red][!] Android NDK not found at {ndk_home}. Download from: https://developer.android.com/ndk/downloads[/]")
             return False
+        # Check for OpenSSL headers in NDK sysroot
+        ndk_ssl_h = os.path.join(ndk_home, "toolchains", "llvm", "prebuilt", "linux-x86_64", "sysroot", "usr", "include", "openssl", "evp.h")
+        if not os.path.exists(ndk_ssl_h):
+            console.print("[yellow][*] OpenSSL headers not found in NDK. Cross-compiling OpenSSL for Android...[/yellow]")
+            _install_openssl_android(ndk_home)
         
     if missing:
-        if os.name == 'posix':
-            return install_dependencies(missing)
-        else:
-            console.print(f"[red][!] Dipendenze mancanti: {', '.join(missing)}. Installale manualmente.[/]")
-            return False
+        # Skip static lib checks for dynamic builds — these .a files are not needed
+        # unless linking with -static (which we don't use on Linux).
+        # Only check headers + compiler.
+        runtime_needed = [m for m in missing if not any(
+            m.startswith(p) for p in ["libkrb5", "libkeyutils", "libidn2", "libunistring", "libpsl"]
+        )]
+        if runtime_needed:
+            if os.name == 'posix':
+                ok = install_dependencies(runtime_needed)
+                if ok:
+                    _mark_deps_ready(platform)
+                return ok
+            else:
+                console.print(f"[red][!] Dipendenze mancanti: {', '.join(runtime_needed)}. Installale manualmente.[/]")
+                return False
+        # Only static libs missing — not an issue for dynamic linking
+        _mark_deps_ready(platform)
+        return True
+    _mark_deps_ready(platform)
     return True

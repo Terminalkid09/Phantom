@@ -1,5 +1,4 @@
 #pragma once
-
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -9,6 +8,26 @@
 #include <ws2tcpip.h>
 #include <tlhelp32.h>
 #pragma comment(lib, "ws2_32.lib")
+#else
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#ifndef SOCKET
+#define SOCKET int
+#endif
+#ifndef INVALID_SOCKET
+#define INVALID_SOCKET (-1)
+#endif
+#ifndef SOCKET_ERROR
+#define SOCKET_ERROR (-1)
+#endif
+#ifndef closesocket
+#define closesocket(s) ::close(s)
+#endif
 #endif
 #include <string>
 #include <vector>
@@ -20,8 +39,6 @@
 #include <cstdlib>
 
 namespace cdp_pivot {
-
-// ─── Minimal JSON helpers ──────────────────────────────────────────────────
 
 inline std::string json_get_string(const std::string& json, const std::string& key) {
     std::string search = "\"" + key + "\":\"";
@@ -51,8 +68,6 @@ inline int json_get_int(const std::string& json, const std::string& key) {
     return neg ? -v : v;
 }
 
-// ─── WebSocket Client ──────────────────────────────────────────────────────
-
 struct WsConnection {
     SOCKET sock = INVALID_SOCKET;
     bool connected = false;
@@ -74,7 +89,6 @@ struct WsConnection {
             closesocket(sock); sock = INVALID_SOCKET; return false;
         }
 
-        // Generate WebSocket key
         for (int i = 0; i < 16; i++) key_buf[i] = (char)(rand() % 256);
         std::string wsKey;
         for (int i = 0; i < 24; i += 3) {
@@ -111,7 +125,7 @@ struct WsConnection {
         if (!connected || sock == INVALID_SOCKET) return false;
 
         std::vector<unsigned char> frame;
-        frame.push_back(0x81); // FIN + text opcode
+        frame.push_back(0x81);
 
         size_t len = payload.size();
         unsigned char maskKey[4];
@@ -144,7 +158,11 @@ struct WsConnection {
         FD_ZERO(&fds);
         FD_SET(sock, &fds);
         timeval tv = {timeoutMs / 1000, (int)(timeoutMs % 1000) * 1000};
-        int sel = select((int)sock + 1, &fds, nullptr, nullptr, &tv);
+#ifdef _WIN32
+        int sel = select(0, &fds, nullptr, nullptr, &tv);
+#else
+        int sel = select(sock + 1, &fds, nullptr, nullptr, &tv);
+#endif
         if (sel <= 0) return "";
 
         unsigned char header[2];
@@ -171,13 +189,12 @@ struct WsConnection {
         if (masked) extraHeader += 4;
 
         size_t total = extraHeader + (size_t)payloadLen;
-        if (total > 1024 * 1024) return ""; // Sanity check
+        if (total > 1024 * 1024) return "";
 
         std::vector<unsigned char> frame(total);
         n = recv(sock, (char*)frame.data(), (int)total, MSG_WAITALL);
         if ((size_t)n < total) return "";
 
-        // Parse mask key
         size_t pos = 2;
         if (payloadLen == 126) pos = 4;
         else if (payloadLen == 127) pos = 10;
@@ -190,7 +207,6 @@ struct WsConnection {
             pos += 4;
         }
 
-        // Unmask payload
         std::string result((const char*)frame.data() + pos, (size_t)payloadLen);
         if (masked) {
             for (size_t i = 0; i < payloadLen; i++) {
@@ -198,19 +214,18 @@ struct WsConnection {
             }
         }
 
-        if (opcode == 8) { connected = false; return ""; } // Close frame
-        if (opcode == 9) return ""; // Ping — ignore
+        if (opcode == 8) { connected = false; return ""; }
+        if (opcode == 9) return "";
         return result;
     }
 
-    void close() {
+    void ws_close() {
         connected = false;
         if (sock != INVALID_SOCKET) { closesocket(sock); sock = INVALID_SOCKET; }
     }
 };
 
-// ─── Chrome Process Management ─────────────────────────────────────────────
-
+#ifdef _WIN32
 inline void kill_chrome() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return;
@@ -233,11 +248,9 @@ inline bool launch_chrome_with_debug(int port) {
     kill_chrome();
     Sleep(200);
 
-    char* appData = nullptr;
-    size_t sz = 0;
-    if (_dupenv_s(&appData, &sz, "LOCALAPPDATA") != 0 || !appData) return false;
+    const char* appData = getenv("LOCALAPPDATA");
+    if (!appData) return false;
     std::string userData = std::string(appData) + "\\Google\\Chrome\\User Data";
-    free(appData);
 
     std::string cmdline = "\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\" "
         "--remote-debugging-port=" + std::to_string(port) + " "
@@ -252,6 +265,28 @@ inline bool launch_chrome_with_debug(int port) {
     CloseHandle(pi.hProcess);
     return true;
 }
+#else
+inline void kill_chrome() {
+    // Kill existing Chrome processes
+    int r = system("pkill -9 chrome 2>/dev/null; pkill -9 chromium 2>/dev/null; pkill -9 chromium-browser 2>/dev/null");
+    (void)r;
+    usleep(500000);
+}
+
+inline bool launch_chrome_with_debug(int port) {
+    kill_chrome();
+    usleep(200000);
+    const char* home = getenv("HOME");
+    if (!home) return false;
+    std::string userData = std::string(home) + "/.config/google-chrome-PhantomCDP";
+    std::string cmd = "google-chrome --remote-debugging-port=" + std::to_string(port) +
+        " --user-data-dir=\"" + userData + "\""
+        " --no-first-run --no-default-browser-check --no-sandbox --disable-gpu"
+        " >/dev/null 2>&1 &";
+    int r = system(cmd.c_str());
+    return r == 0;
+}
+#endif
 
 inline std::string http_get(const std::string& host, int port, const std::string& path) {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -277,13 +312,10 @@ inline std::string http_get(const std::string& host, int port, const std::string
     while ((n = recv(s, buf, sizeof(buf), 0)) > 0) resp.append(buf, n);
     closesocket(s);
 
-    // Extract body after \r\n\r\n
     size_t hdrEnd = resp.find("\r\n\r\n");
     if (hdrEnd == std::string::npos) return resp;
     return resp.substr(hdrEnd + 4);
 }
-
-// ─── CDP Session ───────────────────────────────────────────────────────────
 
 struct CdpSession {
     WsConnection ws;
@@ -294,21 +326,17 @@ struct CdpSession {
     std::string lastResult;
 
     bool connect(int port = 9222) {
-        // Get WebSocket URL from Chrome
         std::string versionInfo = http_get("127.0.0.1", port, "/json/version");
         if (versionInfo.empty()) return false;
 
         std::string wsUrl = json_get_string(versionInfo, "webSocketDebuggerUrl");
         if (wsUrl.empty()) {
-            // Fallback: get from /json list
             std::string listInfo = http_get("127.0.0.1", port, "/json");
             if (listInfo.empty()) return false;
-            // Extract first devtoolsFrontendUrl-like URL
             wsUrl = json_get_string(listInfo, "webSocketDebuggerUrl");
             if (wsUrl.empty()) return false;
         }
 
-        // Parse ws://host:port/path from URL
         std::string host, path;
         int wsPort = port;
         if (wsUrl.find("ws://") == 0) {
@@ -339,7 +367,6 @@ struct CdpSession {
         std::string cmd = "{\"id\":" + std::to_string(id) + ",\"method\":\"" + method + "\",\"params\":" + params + "}";
         if (!ws.send_frame(cmd)) return "";
 
-        // Read responses until we get our id
         int timeout = 0;
         while (timeout < 300) {
             std::string resp = ws.recv_frame(1000);
@@ -350,7 +377,6 @@ struct CdpSession {
                 lastResult = resp;
                 return resp;
             }
-            // Handle events — check for Target.targetCreated
             if (resp.find("\"method\":\"Target.targetCreated\"") != std::string::npos) {
                 std::string tInfo = json_get_string(resp, "targetInfo");
                 if (!tInfo.empty()) {
@@ -367,12 +393,20 @@ struct CdpSession {
     }
 
     std::string evaluate(const std::string& expression) {
-        std::string params = "{\"expression\":\"" + expression + "\",\"returnByValue\":true}";
+        std::string escaped;
+        for (char c : expression) {
+            if (c == '"') escaped += "\\\"";
+            else if (c == '\\') escaped += "\\\\";
+            else if (c == '\n') escaped += "\\n";
+            else if (c == '\r') escaped += "\\r";
+            else if (c == '\t') escaped += "\\t";
+            else escaped += c;
+        }
+        std::string params = "{\"expression\":\"" + escaped + "\",\"returnByValue\":true}";
         std::string resp = send_command("Runtime.evaluate", params);
         if (resp.empty()) return "";
         std::string result = json_get_string(resp, "result");
         if (result.empty()) {
-            // Try to find value directly
             size_t valPos = resp.find("\"value\":\"");
             if (valPos != std::string::npos) {
                 valPos += 9;
@@ -396,7 +430,6 @@ struct CdpSession {
                     }
                     return val;
                 }
-                // Number
                 std::string val;
                 while (valPos < resp.size() && (resp[valPos] >= '0' && resp[valPos] <= '9' || resp[valPos] == '-')) {
                     val += resp[valPos++];
@@ -409,11 +442,9 @@ struct CdpSession {
 
     void disconnect() {
         ready = false;
-        ws.close();
+        ws.ws_close();
     }
 };
-
-// ─── High-Level Operations ─────────────────────────────────────────────────
 
 inline std::string launch_and_connect(int port = 9222) {
     if (!launch_chrome_with_debug(port)) return "Failed to launch Chrome with remote debugging.";
@@ -429,13 +460,11 @@ inline std::string cdp_cookies(int port = 9222) {
     CdpSession session;
     if (!session.connect(port)) return "CDP connection failed. Ensure Chrome is running with --remote-debugging-port=" + std::to_string(port);
 
-    // Get cookies via CDP
     std::string resp = session.send_command("Network.getAllCookies");
     session.disconnect();
 
     if (resp.empty()) return "Failed to get cookies via CDP.";
 
-    // Format: extract cookies from response
     std::string result;
     size_t pos = 0;
     int count = 0;
@@ -503,7 +532,6 @@ inline std::string cdp_fetch(const std::string& url, int port = 9222) {
     CdpSession session;
     if (!session.connect(port)) return "CDP connection failed.";
 
-    // Use Runtime.evaluate with fetch() to make an authenticated request
     std::string escapedUrl;
     for (char c : url) {
         if (c == '"') escapedUrl += "\\\"";

@@ -52,7 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Core
     python3 python3-pip git sudo adduser \
     # Recon & Scan
-    nmap dnsutils whois netcat-openbsd tshark iputils-ping traceroute \
+    nmap dnsutils whois netcat-openbsd tshark iputils-ping traceroute netdiscover arp-scan fping \
     # Web testing
     gobuster nikto sqlmap ffuf \
     # Brute force
@@ -82,10 +82,32 @@ RUN mkdir -p /opt && \
     unzip -q android-ndk-${ANDROID_NDK_VERSION}-linux.zip && \
     mv android-ndk-${ANDROID_NDK_VERSION} ${ANDROID_NDK_HOME} && \
     rm android-ndk-${ANDROID_NDK_VERSION}-linux.zip && \
-    ln -sf /usr/lib/aarch64-linux-gnu/libssl.so \
-        ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libssl.so && \
-    ln -sf /usr/lib/aarch64-linux-gnu/libcrypto.so \
-        ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libcrypto.so
+    ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang --version >/dev/null 2>&1
+
+# ── Cross-compile OpenSSL for Android ──────────────────────────────────────
+RUN NDK_HOME=${ANDROID_NDK_HOME} && \
+    TOOLCHAIN=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64 && \
+    export PATH=$TOOLCHAIN/bin:$PATH && \
+    export ANDROID_NDK_ROOT=$NDK_HOME && \
+    export CC=aarch64-linux-android28-clang && \
+    export AR=llvm-ar && \
+    export RANLIB=llvm-ranlib && \
+    cd /tmp && \
+    curl -sL https://github.com/openssl/openssl/releases/download/openssl-3.4.1/openssl-3.4.1.tar.gz -o openssl.tgz && \
+    tar xzf openssl.tgz && \
+    cd openssl-3.4.1 && \
+    ./Configure android-arm64 no-shared no-asm -D__ANDROID_API__=28 --prefix=/tmp/openssl-install && \
+    make -j$(nproc) && \
+    make install_sw && \
+    NDK_SYSROOT=$TOOLCHAIN/sysroot && \
+    NDK_LIB=$NDK_SYSROOT/usr/lib/aarch64-linux-android && \
+    cp libcrypto.a libssl.a $NDK_LIB/ && \
+    cp -r include/openssl $NDK_SYSROOT/usr/include/openssl && \
+    mkdir -p $NDK_SYSROOT/usr/include/aarch64-linux-android/openssl && \
+    cp include/openssl/configuration.h include/openssl/opensslv.h $NDK_SYSROOT/usr/include/aarch64-linux-android/openssl/ && \
+    sed -i 's/30600/30400/' $NDK_SYSROOT/usr/include/openssl/configuration.h && \
+    sed -i 's/30600/30400/' $NDK_SYSROOT/usr/include/aarch64-linux-android/openssl/configuration.h && \
+    rm -rf /tmp/openssl*
 
 # ── osxcross (macOS cross-compiler skeleton) ─────────────────────────────────
 RUN cd /opt && \
@@ -110,7 +132,8 @@ RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 COPY . .
 
-RUN pip install --no-cache-dir --break-system-packages -e .
+RUN pip install --no-cache-dir --break-system-packages -e . \
+ && pip install --no-cache-dir --break-system-packages pytest pytest-asyncio pytest-cov
 
 # ── Pre-build beacon assembly objects & reflective loader ────────────────────
 RUN BEACON_SRC=phantom/payloads/beacon/src && \

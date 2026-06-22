@@ -1,4 +1,5 @@
 #pragma once
+#ifdef _WIN32
 #include <windows.h>
 
 extern "C" void* peb_get_ntdll();
@@ -76,3 +77,4 @@ inline BOOL spoof_CreateProcessA(LPCSTR lpApplicationName, LPSTR lpCommandLine,
 
 } // namespace stack
 } // namespace anti
+#endif

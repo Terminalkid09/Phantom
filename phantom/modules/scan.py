@@ -53,9 +53,9 @@ class ScanModule(BaseModule):
                 f"traceroute {t}",
                 f"sudo nmap -sn -PR {t}/24  # ARP Ping sweep",
                 f"sudo nmap -sn -PE {t}/24  # ICMP Echo sweep",
-                f"sudo arp-scan --localnet",
-                f"sudo netdiscover -r {t}/24",
-                f"fping -a -g {t}/24",
+                f"sudo arp-scan --localnet 2>/dev/null || sudo nmap -sn -PR {t}/24",
+                f"sudo nmap -sn -PR {t}/24  # Host discovery via ARP",
+                f"nmap -sn -PE {t}/24  # ICMP ping sweep (replaces fping)",
             ],
             "SERVICE ENUM": [
                 f"nc -nv {t} 22",

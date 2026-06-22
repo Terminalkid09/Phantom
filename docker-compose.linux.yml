@@ -1,0 +1,6 @@
+# Linux-specific override: use host networking for LAN visibility
+# Usage: docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d
+services:
+  phantom:
+    network_mode: host
+    ports: []

@@ -88,11 +88,11 @@ The reflective loader is appended to the beacon PE and loaded entirely in memory
 | `sleep` | `<ms>` | Set beacon sleep interval (min 1000ms) | All |
 | `persist` | `[name]` | Establish persistence (RunKey / autostart) | Win/Linux |
 | `exit` / `kill` | - | Terminate beacon | All |
-| `screenshot` | - | Capture screen (BMP Base64) | Win |
-| `keylog` | `<start\|stop\|dump>` | Context-aware keylogger | Win |
-| `inject` | `<pid> <b64>` | Inject shellcode into remote process | Win |
-| `migrate` | `<b64>` | Migrate beacon to new process | Win |
-| `mem-run` | `<b64>` | Execute shellcode/binary in memory | Win/Linux |
+| `screenshot` | - | Capture screen (BMP Base64) | Win/Linux |
+| `keylog` | `<start\|stop\|dump>` | Context-aware keylogger | Win/Linux |
+| `inject` | `<pid> <b64>` | Inject shellcode/binary into remote process | Win/Linux/Android |
+| `migrate` | `<b64>` | Migrate beacon to new process | Win/Linux/Android |
+| `mem-run` | `<b64>` | Execute shellcode/binary in memory | Win/Linux/Android |
 | `portfwd` | `<lport> <rhost> <rport>` | TCP port forward | All |
 | `portfwd-stop` | - | Stop all port forwards | All |
 | `socks` | `<port>` | Start SOCKS5 proxy | Win |
@@ -142,9 +142,19 @@ phantom --c2
 
 ### Docker (Recommended)
 
+Choose the right command for your OS:
+
+**Linux** (host networking — full LAN access for scan modules):
 ```bash
 cp .env.example .env
 # Edit PHANTOM_C2_KEY, PHANTOM_C2_IV, PHANTOM_PAYLOAD_TOKEN
+docker compose -f docker-compose.yml -f docker-compose.linux.yml up --build -d
+docker exec -it phantom-framework python3 -m phantom.main
+```
+
+**Windows / macOS** (port mapping — limited to container's network namespace):
+```bash
+cp .env.example .env
 docker compose up --build -d
 docker exec -it phantom-framework python3 -m phantom.main
 ```
@@ -452,15 +462,15 @@ phantom/
 | :--- | :---: | :--- |
 | **Sysinfo / Pwd / Ls / Cd** | ✅ Verified | Works on all platforms |
 | **Shell / Exec** | ✅ Verified | stdout captured correctly |
-| **Screenshot** | ✅ Verified | Full resolution BMP (no downscale), ~5MB |
-| **Netstat / Netstat-JSON** | ✅ Verified | Real TCP connections with PID/process name |
-| **Keylogger** | ✅ Verified | LL keyboard hook (`SetWindowsHookEx WH_KEYBOARD_LL`), `ToUnicode` for proper char conversion, async capture via separate thread with message pump. Captures all keystrokes, window titles, keyboard-layout-agnostic. |
+| **Screenshot** | ✅ Verified | Full resolution BMP (no downscale). Win: GDI. Linux: `import`/`gnome-screenshot`/`scrot`. |
+| **Netstat / Netstat-JSON** | ✅ Verified | Real TCP connections with PID/process name. Win: `GetExtendedTcpTable`. Linux: `/proc/net/tcp`. |
+| **Keylogger** | ✅ Verified | Win: `GetAsyncKeyState` polling. Linux: evdev `/dev/input/event*` via `select()`. |
 | **WLAN Scan** | ⚠️ Needs hardware | Full diagnostics at every failure point (LoadLibrary, WlanOpenHandle, WlanEnumInterfaces, WlanScan, WlanGetNetworkBssList). 0-interface detection, per-interface GUID/state reporting, error codes. |
 | **WLAN Locate** | ⚠️ Needs hardware | Diagnostic output mirrors WLAN Scan; reports "No access points found" with debug info instead of empty `[]`. |
 | **BLuetooth Scan** | ⚠️ Needs hardware | No error entries pushed as devices. Returns real MAC addresses on hardware with BT. |
 | **Cookies (Chrome DPAPI)** | ⚠️ Needs Chrome | Code compiles and runs; requires Chrome installed + cookies DB accessible. |
 | **CDP Browser Pivot** | ⚠️ Needs Chrome | Chrome/Chromium only; WebSocket CDP protocol implemented. |
-| **Inject / Migrate** | ✅ Verified | File paths fixed (`beacon.bin` / `beacon.pe`); C2 shell import error resolved (`notifier` from wrong module). |
+| **Inject / Migrate** | ✅ Verified | Win: process hollowing + remote thread injection via indirect syscalls. Linux/Android: ptrace + `process_vm_writev`, ELF binary detection writes to `/tmp/.ph_*` and injects `execve` shellcode. |
 | **Autopersist (RunKey)** | ✅ Verified | Downloads `beacon_xored.bin` from C2 (GET `/x`) → saves to `%APPDATA%\Microsoft\Phantom\phantom.dat` → writes PowerShell loader `phantom.ps1` (Add-Type + VirtualAlloc) → Run key executes PS1 on logon. PS1 here-string syntax fixed. |
 | **ntdll Unhooking** | ✅ Implemented | Reloads clean `.text` from disk via indirect syscalls |
 | **AMSI / ETW Patch** | ✅ Implemented | Patches via indirect syscalls at startup |

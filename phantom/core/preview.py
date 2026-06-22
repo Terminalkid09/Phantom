@@ -56,10 +56,11 @@ class PreviewSession:
 
     def run_group(self, group_name: str) -> List[str]:
         group_name = group_name.upper()
-        if group_name not in self.groups:
-            console.print(f"[red]Group '{group_name}' not found.[/]")
-            return []
-        return self.groups[group_name]
+        for key, cmds in self.groups.items():
+            if key.upper() == group_name:
+                return cmds
+        console.print(f"[red]Group '{group_name}' not found. Available: {', '.join(self.groups)}[/]")
+        return []
 
     def run_all(self) -> List[str]:
         return [cmd for _, cmd in self._flat]

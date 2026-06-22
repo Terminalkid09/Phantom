@@ -8,31 +8,17 @@ services:
         PHANTOM_PAYLOAD_TOKEN: ${PHANTOM_PAYLOAD_TOKEN:-}
     container_name: phantom-framework
     privileged: true # Required for network tools like TShark/Nmap
-    # network_mode: host # Uncomment for better WiFi/Scanner compatibility (Linux only)
+    ports:
+      - "8443:8080"    # Beacon C2 comms & payload download
+      - "8080:8080"    # Legacy / alternate HTTP API
     stdin_open: true # Allow interactive shell
     tty: true        # Allow interactive shell
     volumes:
       - ./data:/app/data
+      - ./phantom:/app/phantom
       - phantom-plugins:/root/.phantom
     env_file:
       - .env
-    networks:
-      - phantom-net
-
-  # Local AI Provider (Optional - Uncomment to use)
-  # ollama:
-  #   image: ollama/ollama:latest
-  #   container_name: phantom-ollama
-  #   ports:
-  #     - "11434:11434"
-  #   volumes:
-  #     - ./ollama:/root/.ollama
-  #   networks:
-  #     - phantom-net
-
-networks:
-  phantom-net:
-    driver: bridge
 
 volumes:
   phantom-plugins:

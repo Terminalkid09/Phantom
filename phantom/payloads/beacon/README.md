@@ -69,8 +69,8 @@ beacon.exe <c2_host> <c2_port>
 | `keylog <start\|stop\|dump>` | Context-aware keylogger (Windows) |
 | `sleep <ms>` | Change beacon sleep interval |
 | `exit` | Terminate the beacon |
-| `inject <pid>` | Inject beacon shellcode into running PID. Original STAYS → 2 beacons |
-| `migrate` | Process hollow: spawn RuntimeBroker.exe, replace with beacon. Original EXITS → 1 beacon |
+| `inject <pid>` | Inject beacon shellcode/binary into running PID. Original STAYS → 2 beacons |
+| `migrate` | Process hollow (Win) / fork+inject (Linux): spawn sacrificial process, replace with beacon. Original EXITS → 1 beacon |
 
 ## Architecture
 ```

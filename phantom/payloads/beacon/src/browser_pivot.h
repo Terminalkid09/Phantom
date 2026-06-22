@@ -8,12 +8,33 @@
 #include <ws2tcpip.h>
 #include <tlhelp32.h>
 #pragma comment(lib, "ws2_32.lib")
+#else
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <cstring>
+#include <cerrno>
+#ifndef SOCKET
+#define SOCKET int
+#endif
+#ifndef INVALID_SOCKET
+#define INVALID_SOCKET (-1)
+#endif
+#ifndef SOCKET_ERROR
+#define SOCKET_ERROR (-1)
+#endif
+#ifndef closesocket
+#define closesocket(s) ::close(s)
+#endif
 #endif
 #include <string>
 #include <thread>
 #include <atomic>
 #include <vector>
-#include <cstring>
 
 namespace browser_pivot {
 
@@ -25,7 +46,11 @@ inline void pivot_relay(SOCKET a, SOCKET b, std::atomic<bool>& running) {
         FD_SET(a, &fds);
         FD_SET(b, &fds);
         timeval tv = {1, 0};
+#ifdef _WIN32
+        int maxFd = 0;
+#else
         int maxFd = static_cast<int>((a > b ? a : b) + 1);
+#endif
         int sel = select(maxFd, &fds, nullptr, nullptr, &tv);
         if (sel <= 0) continue;
         if (FD_ISSET(a, &fds)) {
@@ -41,6 +66,7 @@ inline void pivot_relay(SOCKET a, SOCKET b, std::atomic<bool>& running) {
     }
 }
 
+#ifdef _WIN32
 inline DWORD find_browser_pid() {
     const char* targets[] = {"chrome.exe", "msedge.exe", "firefox.exe", "iexplore.exe"};
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -61,7 +87,41 @@ inline DWORD find_browser_pid() {
     CloseHandle(snap);
     return 0;
 }
+#else
+inline pid_t find_browser_pid() {
+    const char* targets[] = {"chrome", "chromium", "firefox", "msedge", "opera", "brave"};
+    DIR* proc = opendir("/proc");
+    if (!proc) return 0;
+    struct dirent* entry;
+    pid_t found = 0;
+    while ((entry = readdir(proc)) != nullptr) {
+        pid_t pid = 0;
+        bool isNum = true;
+        for (char* p = entry->d_name; *p; p++) {
+            if (*p < '0' || *p > '9') { isNum = false; break; }
+        }
+        if (!isNum) continue;
+        pid = static_cast<pid_t>(std::atol(entry->d_name));
+        std::string commPath = std::string("/proc/") + entry->d_name + "/comm";
+        FILE* f = fopen(commPath.c_str(), "r");
+        if (!f) continue;
+        char comm[256];
+        if (fgets(comm, sizeof(comm), f)) {
+            size_t len = strlen(comm);
+            if (len > 0 && comm[len-1] == '\n') comm[len-1] = '\0';
+            for (const char* t : targets) {
+                if (strcmp(comm, t) == 0) { found = pid; break; }
+            }
+        }
+        fclose(f);
+        if (found) break;
+    }
+    closedir(proc);
+    return found;
+}
+#endif
 
+#ifdef _WIN32
 inline std::string list_browsers() {
     std::string result;
     const char* targets[] = {"chrome.exe", "msedge.exe", "firefox.exe", "iexplore.exe"};
@@ -84,16 +144,54 @@ inline std::string list_browsers() {
     if (result.empty()) return "No browser processes found.";
     return result;
 }
+#else
+inline std::string list_browsers() {
+    std::string result;
+    const char* targets[] = {"chrome", "chromium", "firefox", "msedge", "opera", "brave"};
+    DIR* proc = opendir("/proc");
+    if (!proc) return "No browser processes found.";
+    struct dirent* entry;
+    while ((entry = readdir(proc)) != nullptr) {
+        bool isNum = true;
+        for (char* p = entry->d_name; *p; p++) {
+            if (*p < '0' || *p > '9') { isNum = false; break; }
+        }
+        if (!isNum) continue;
+        std::string commPath = std::string("/proc/") + entry->d_name + "/comm";
+        FILE* f = fopen(commPath.c_str(), "r");
+        if (!f) continue;
+        char comm[256];
+        if (fgets(comm, sizeof(comm), f)) {
+            size_t len = strlen(comm);
+            if (len > 0 && comm[len-1] == '\n') comm[len-1] = '\0';
+            for (const char* t : targets) {
+                if (strcmp(comm, t) == 0) {
+                    result += std::string(entry->d_name) + " " + comm + "\n";
+                    break;
+                }
+            }
+        }
+        fclose(f);
+    }
+    closedir(proc);
+    if (result.empty()) return "No browser processes found.";
+    return result;
+}
+#endif
 
 struct BrowserPivotProxy {
     int localPort;
+#ifdef _WIN32
     DWORD targetPid;
+#else
+    pid_t targetPid;
+#endif
     std::atomic<bool> running{false};
     std::thread thread;
 
-    void start(int port, DWORD pid = 0) {
+    void start(int port, unsigned long pid = 0) {
         localPort = port;
-        targetPid = (pid != 0) ? pid : find_browser_pid();
+        targetPid = (pid != 0) ? static_cast<decltype(targetPid)>(pid) : find_browser_pid();
         running = true;
         thread = std::thread([this]() { run(); });
         thread.detach();
@@ -124,6 +222,9 @@ private:
 #ifdef _WIN32
         u_long nonBlocking = 1;
         ioctlsocket(listenSock, FIONBIO, &nonBlocking);
+#else
+        int flags = fcntl(listenSock, F_GETFL, 0);
+        fcntl(listenSock, F_SETFL, flags | O_NONBLOCK);
 #endif
         while (running) {
             SOCKET clientSock = accept(listenSock, nullptr, nullptr);
@@ -174,7 +275,6 @@ private:
                     pivot_relay(clientSock, remoteSock, this->running);
                     closesocket(remoteSock);
                 } else {
-                    // Not CONNECT — forward as-is to target
                     size_t hostBeg = request.find("Host: ");
                     if (hostBeg == std::string::npos) {
                         closesocket(clientSock); return;
@@ -221,7 +321,7 @@ private:
 
 inline BrowserPivotProxy* active_pivot = nullptr;
 
-inline std::string start_pivot(int localPort, DWORD pid = 0) {
+inline std::string start_pivot(int localPort, unsigned long pid = 0) {
     if (active_pivot) return "Browser pivot already running on port " + std::to_string(active_pivot->localPort);
     if (pid == 0) {
         pid = find_browser_pid();
