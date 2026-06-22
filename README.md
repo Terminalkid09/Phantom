@@ -148,21 +148,24 @@ phantom --c2
 
 Choose the right command for your OS:
 
-**Linux** (host networking — full LAN access for scan, beacon connects on any `LPORT`):
+**Windows** (port mapping — apri firewall per connessioni esterne):
 ```bash
 cp .env.example .env
 # Edit PHANTOM_C2_KEY, PHANTOM_C2_IV, PHANTOM_PAYLOAD_TOKEN
 docker compose up --build -d
 docker exec -it phantom-framework python3 -m phantom.main
 ```
+> **Firewall:** esegui da PowerShell **amministratore** una volta:
+> ```powershell
+> netsh advfirewall firewall add rule name="Phantom C2 8080" dir=in action=allow protocol=TCP localport=8080
+> ```
 
-**Windows / macOS** (port mapping — open firewall for external connections):
+**Linux / Kali** (host networking — full LAN access):
 ```bash
 cp .env.example .env
-docker compose up --build -d
+docker compose -f docker-compose.yml -f docker-compose.linux.yml up --build -d
 docker exec -it phantom-framework python3 -m phantom.main
 ```
-> Windows: run `netsh advfirewall firewall add rule name="Phantom C2 8080" dir=in action=allow protocol=TCP localport=8080` as admin once.
 
 The Docker image includes Kali Rolling with the full cross-compilation toolchain (MinGW-w64, Android NDK r26c, osxcross), plus tools for every pentest phase.
 

@@ -415,6 +415,9 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                     kernel32_paths = [
                         r"C:\Windows\System32\kernel32.dll",
                         os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32", "kernel32.dll"),
+                        os.path.join(beacon_dir, "..", "..", "..", "kernel32.dll.bin"),
+                        os.path.join(pkg_root, "kernel32.dll.bin"),
+                        "/app/kernel32.dll.bin",
                     ]
                     for kp in kernel32_paths:
                         if os.path.exists(kp):

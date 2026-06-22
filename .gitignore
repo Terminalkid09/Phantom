@@ -58,6 +58,10 @@ phantom/payloads/beacon/.*.crypto_hash
 # Builder output
 *_payload.bin
 
+# Windows kernel32.dll copy for VA RVA detection in Docker builds
+kernel32.dll.bin
+phantom/kernel32.dll.bin
+
 # Temp / test / cache
 commands.txt
 run_phantom_commands.py

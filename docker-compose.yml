@@ -8,11 +8,8 @@ services:
         PHANTOM_PAYLOAD_TOKEN: ${PHANTOM_PAYLOAD_TOKEN:-}
     container_name: phantom-framework
     privileged: true # Required for network tools like TShark/Nmap
-    network_mode: host
-    # Windows: rimuovi 'network_mode: host' e decommenta:
-    #ports:
-    #  - "8443:8080"
-    #  - "8080:8080"
+    ports:
+      - "8080:8080"
     stdin_open: true # Allow interactive shell
     tty: true        # Allow interactive shell
     volumes:
