@@ -658,6 +658,15 @@ class C2Shell(cmd.Cmd):
         else:
             notifier.info("No target set. Run the command manually or set target first with 'set target <ip>'")
 
+    def do_telegram(self, arg):
+        """telegram — Avvia il bot Telegram per gestire beacon da mobile"""
+        try:
+            from phantom.modules.telegram import run
+            run()
+            notifier.success("Telegram bot avviato in background. /start su @your_bot")
+        except Exception as e:
+            notifier.error(f"Telegram bot: {e}")
+
     def do_exit(self, arg):
         """exit - Close C2 and return to main Phantom CLI (or exit completely)"""
         console.print("[dim]Stopping listener...[/]")
