@@ -551,9 +551,12 @@ Phantom includes a Telegram bot for remote beacon control from any device.
 **Setup:**
 1. Create a bot via [@BotFather](https://t.me/BotFather) and get the token
 2. Add `PHANTOM_TELEGRAM_BOT_TOKEN=your_token_here` to `.env`
-3. In C2 shell: `telegram`
+3. *(Optional)* Restrict access: add `PHANTOM_TELEGRAM_ALLOWED_USERS=123456,789012` to `.env` (get your ID from [@userinfobot](https://t.me/userinfobot); leave empty to deny all)
+4. The bot starts **automatically** when entering the C2 shell (no manual `telegram` command needed)
 
 **Available commands inside Telegram:**
-`/beacons` `/interact <id>` `/sysinfo` `/whoami` `/pwd` `/ls [path]` `/shell <cmd>` `/screenshot` `/download <path>` `/keylog` `/results`
+`/beacons` `/interact <id|number>` `/sysinfo` `/whoami` `/pwd` `/cd <path>` `/ls [path]`
+`/shell <cmd>` `/screenshot` `/download <path>` `/keylog <start|stop|status|dump>`
+`/wlan-locate` `/persist` `/results` `/help`
 
-Forward results to your Telegram chat automatically when using the C2 shell.
+Any unrecognized command is forwarded directly to the active beacon (fallback).
