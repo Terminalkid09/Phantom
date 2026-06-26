@@ -376,12 +376,9 @@ def start_bot():
         app = Application.builder().token(BOT_TOKEN).build()
         bot_app = app
 
-        auth_filter = filters.User(user_id=list(ALLOWED_USERS)) if ALLOWED_USERS else None
+        auth_filter = filters.User(user_id=list(ALLOWED_USERS))
         allowed_count = len(ALLOWED_USERS)
-        if allowed_count:
-            print(f"[Telegram] Accesso ristretto a {allowed_count} utenti autorizzati")
-        else:
-            print("[Telegram] Nessuna restrizione utente (PHANTOM_TELEGRAM_ALLOWED_USERS non impostato)")
+        print(f"[Telegram] auth_filter applied. Allowed users: {allowed_count}")
 
         app.add_handler(CommandHandler("start", _cmd_start, filters=auth_filter))
         app.add_handler(CommandHandler("beacons", _cmd_beacons, filters=auth_filter))
