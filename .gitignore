@@ -68,6 +68,11 @@ run_phantom_commands.py
 hash_calc.py
 comando.txt
 *.bak
+_test_*.py
+
+# Runtime data
+data/*.db
+data/*.pid
 .pytest_cache/
 .pytest_tmp/
 report.html
