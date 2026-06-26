@@ -679,6 +679,13 @@ class C2Shell(cmd.Cmd):
 def run_c2():
     try:
         shell = C2Shell()
+        # Auto-start Telegram bot if configured
+        try:
+            from phantom.modules.telegram import run
+            run()
+            notifier.info("Telegram bot avviato automaticamente in background")
+        except Exception as e:
+            notifier.warning(f"Telegram bot non avviato: {e}")
         shell.cmdloop()
     except KeyboardInterrupt:
         print()
