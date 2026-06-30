@@ -46,8 +46,8 @@ class TestModuleIntegration:
         # Build scan commands
         scan = ScanModule()
         commands = scan.build_commands()
-        assert "NMAP" in commands
-        assert any("oX" in cmd for cmd in commands["NMAP"])
+        assert "NMAP (Basic)" in commands
+        assert any("oX" in cmd for cmd in commands["NMAP (Basic)"])
 
     def test_exploit_requires_versioned_services(self):
         """Test that exploit module requires services with version info."""
@@ -156,3 +156,19 @@ class TestModuleIntegration:
         # Verify we can access by module name
         assert session.get_result("scan") is not None
         assert session.get_result("exploit") is not None
+
+    def test_osint_module_features(self):
+        """Test new features in OSINT module."""
+        from phantom.modules.osint import OsintModule
+        osint = OsintModule()
+        assert hasattr(osint, '_extract_dns_intel')
+        assert hasattr(osint, 'do_sherlock')
+        
+    def test_wifi_module_initialization(self):
+        """Test WiFi module initialization and basic structure."""
+        from phantom.modules.wifi import WifiModule
+        wifi = WifiModule()
+        assert wifi.module_name == "wifi"
+        assert hasattr(wifi, 'do_airmon')
+        assert hasattr(wifi, 'do_scan_aps')
+        assert hasattr(wifi, 'do_crack')

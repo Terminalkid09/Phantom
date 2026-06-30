@@ -2,10 +2,11 @@ from setuptools import setup, find_packages
 
 setup(
     name="phantom",
-    version="1.1.0",
+    version="2.0.0",
     description="Offensive Security Framework — CLI shell per penetration testing",
     author="Terminalkid09",
     packages=find_packages(),
+    include_package_data=True,
     install_requires=[
         "rich>=13.0.0",
         "requests>=2.31.0",
@@ -14,6 +15,9 @@ setup(
         "reportlab>=4.0.0",
         "python-whois>=0.8.0",
         "dnspython>=2.4.0",
+        "python-dotenv>=1.0.0",
+        "aiohttp>=3.9.0",
+        "cryptography>=41.0.0",
     ],
     entry_points={
         "console_scripts": [

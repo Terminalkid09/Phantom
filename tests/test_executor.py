@@ -63,6 +63,11 @@ class TestIsSafeTarget:
         """Backslash should fail."""
         assert _is_safe_target("10.0.0.1\\\\cmd") is False
 
+    def test_unsafe_target_with_space_injection(self):
+        """Spaces allow shell argument injection and must be rejected."""
+        assert _is_safe_target("127.0.0.1 --extra-flag") is False
+        assert _is_safe_target("10.0.0.1 -p-") is False
+
 
 class TestRunCommand:
     """Tests for run_command() function."""

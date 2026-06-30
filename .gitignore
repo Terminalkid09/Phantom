@@ -1,15 +1,113 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 dist/
 build/
+
+# Environment & secrets
 .env
+.env.local
+*.key
+*.pem
+*.cert
+
+# Phantom runtime data
 data/sessions/*.json
+data/cache/
+data/downloads/
 data/presets/*.json
+data/certs/
+data/payload_history.json
+data/logs/
+
+# Payload artifacts
+phantom/payloads/beacon/*.exe
+phantom/payloads/beacon/*.exe.tmp
+phantom/payloads/beacon/*.o
+phantom/payloads/beacon/src/*.o
+phantom/payloads/beacon/*.pe
+phantom/payloads/beacon/*.bin
+phantom/payloads/beacon/*.rva
+phantom/payloads/beacon/*.map
+phantom/payloads/beacon/*.pdb
+phantom/payloads/beacon/*.ilk
+phantom/payloads/beacon/*.exp
+phantom/payloads/beacon/*.lib
+
+# Reflective loader build artifacts
+phantom/payloads/beacon/src/reflective_loader.o
+phantom/payloads/beacon/src/reflective_loader.exe
+phantom/payloads/beacon/src/reflective_loader.exe.tmp
+phantom/payloads/beacon/src/reflective_loader.map
+phantom/payloads/beacon/src/reflective_loader.bin
+phantom/payloads/beacon/src/reflective_loader_bootstrap.o
+phantom/payloads/beacon/src/beacon.exe
+
+# Cross-compiled beacons (all platforms)
+phantom/payloads/beacon/beacon_linux
+phantom/payloads/beacon/beacon_linux_x86
+phantom/payloads/beacon/beacon_macos
+phantom/payloads/beacon/beacon_android
+
+# Crypto & build config (auto-generated)
+phantom/payloads/beacon/src/crypto_config.h
+phantom/payloads/beacon/src/build_id.h
+phantom/payloads/beacon/.*.crypto_hash
+
+# Builder output
+*_payload.bin
+
+# Windows kernel32.dll copy for VA RVA detection in Docker builds
+kernel32.dll.bin
+phantom/kernel32.dll.bin
+
+# Temp / test / cache
+commands.txt
+run_phantom_commands.py
+hash_calc.py
+comando.txt
+*.bak
+_test_*.py
+
+# Runtime data
+data/*.db
+data/*.pid
+.pytest_cache/
+.pytest_tmp/
+report.html
+coverage.xml
+.coverage
+.coverage.*
+htmlcov/
+
+# Untracked directories
+.antigravitycli/
+/payloads/
+phantom/data/
+
+# OS artifacts
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Packet captures
 *.pcap
 *.pcapng
+
+# Documents
 *.pdf
 *.xml
-shell.elf
-*.exe
+
+# System & temp files
 *.log
+shell.elf
+beacon_debug.log
+
+# .aider
+.aider*
+
+# opencode config
+.opencode/

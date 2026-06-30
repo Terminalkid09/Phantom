@@ -55,11 +55,14 @@ class TestSession:
 
         self.session.target = "127.0.0.1"
         self.session.mode = "full"
+        from phantom.utils.paths import sessions_dir
+        sdir = sessions_dir()
+
         self.session.save("testsession")
 
         # Verify NamedTemporaryFile called with correct parameters
         mock_named_temp.assert_called_once_with(
-            mode='w', dir='data/sessions', delete=False, suffix='.json', encoding='utf-8'
+            mode='w', dir=sdir, delete=False, suffix='.json', encoding='utf-8'
         )
         # Verify json.dump called on the temporary file
         json_dump_mock.assert_called_once_with(
@@ -67,7 +70,7 @@ class TestSession:
         )
         # Verify os.replace called with temp path and final path
         mock_replace.assert_called_once_with(
-            mock_temp.name, "data/sessions/testsession.json"
+            mock_temp.name, os.path.join(sdir, "testsession.json")
         )
 
     def test_load_reads_json_file(self, monkeypatch):
@@ -80,8 +83,8 @@ class TestSession:
             "notes": [],
             "history": [],
         }
-        mocked_open = mock_open(read_data=json.dumps(sample_data))
-        monkeypatch.setattr("builtins.open", mocked_open)
+        monkeypatch.setattr("os.path.exists", lambda p: True)
+        monkeypatch.setattr("builtins.open", mock_open(read_data=json.dumps(sample_data)))
         monkeypatch.setattr("phantom.core.session.json.load", lambda f: sample_data)
 
         self.session.load("testsession")

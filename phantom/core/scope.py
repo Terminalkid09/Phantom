@@ -20,13 +20,14 @@ def is_in_scope(target: str, scope_list: List[str]) -> bool:
             resolved_ip = socket.gethostbyname(target)
             ip_obj = ipaddress.ip_address(resolved_ip)
         except (socket.gaierror, ValueError):
-            # If resolution fails, domain is always allowed (backward compatibility)
-            return True
+            # If resolution fails, we can't verify against IP networks.
+            # We'll check if it matches any hostname in the scope_list later.
+            ip_obj = None
+            # Return False here would be too aggressive if it's in the list as a hostname.
+            # So we just let it fall through to the loop.
+            pass
         
-        # If resolution succeeds, we proceed to check the IP against scope,
-        # BUT the original project logic favored allowing domains.
-        # To pass tests and keep it robust:
-        return True
+        # If resolution succeeds, we proceed to check the IP against scope.
 
     for entry in scope_list:
         entry = entry.strip()

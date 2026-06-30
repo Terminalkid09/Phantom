@@ -1,0 +1,23 @@
+services:
+  phantom:
+    build:
+      context: .
+      args:
+        PHANTOM_C2_KEY: ${PHANTOM_C2_KEY:-}
+        PHANTOM_C2_IV: ${PHANTOM_C2_IV:-}
+        PHANTOM_PAYLOAD_TOKEN: ${PHANTOM_PAYLOAD_TOKEN:-}
+    container_name: phantom-framework
+    privileged: true # Required for network tools like TShark/Nmap
+    ports:
+      - "8080:8080"
+    stdin_open: true # Allow interactive shell
+    tty: true        # Allow interactive shell
+    volumes:
+      - ./data:/app/data
+      - ./phantom:/app/phantom
+      - phantom-plugins:/root/.phantom
+    env_file:
+      - .env
+
+volumes:
+  phantom-plugins:
