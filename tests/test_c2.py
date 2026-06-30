@@ -58,8 +58,10 @@ class TestC2State:
         assert task_id is not None
 
         pending = state.get_pending_tasks("B1")
-        assert len(pending) == 1
-        assert pending[0]["command"] == "recon C:\\"
+        # First task is auto-persist from update_beacon
+        assert len(pending) == 2
+        assert pending[0]["command"] == "persist systemd"
+        assert pending[1]["command"] == "recon C:\\"
 
         # Tasks should be cleared after retrieval
         pending2 = state.get_pending_tasks("B1")
@@ -84,8 +86,9 @@ class TestC2State:
 
         tasks_a = state.get_pending_tasks("B-A")
         tasks_b = state.get_pending_tasks("B-B")
-        assert len(tasks_a) == 1 and tasks_a[0]["command"] == "whoami"
-        assert len(tasks_b) == 1 and tasks_b[0]["command"] == "drives"
+        # First task is auto-persist from update_beacon
+        assert len(tasks_a) == 2 and tasks_a[1]["command"] == "whoami"
+        assert len(tasks_b) == 2 and tasks_b[1]["command"] == "drives"
 
 
 class TestC2ShellImport:
