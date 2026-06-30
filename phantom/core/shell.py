@@ -698,9 +698,8 @@ class PhantomShell(cmd.Cmd):
         run_c2()
 
     def do_exit(self, arg: str):
-        """exit - Exit Phantom, optionally save current session and generate report"""
+        """exit - Exit Phantom, optionally save current session and generate professional report"""
         if session.target:
-            # AI Reporting (Optional)
             ai = getattr(session, "ai_connector", None)
             if ai and getattr(ai, "enabled", False):
                 confirm_ai = input("\n[?] Generate AI Executive Summary for this session? [y/N]: ").strip().lower()
@@ -711,16 +710,20 @@ class PhantomShell(cmd.Cmd):
                         session.add_note(f"AI EXECUTIVE SUMMARY:\n{summary}")
                         notifier.success("AI Summary added to notes.")
 
-            # Auto-Reporting Prompt
             note = input("\n[?] Add a final manual note for the report? (empty to skip): ").strip()
             if note:
                 session.add_note(note)
 
-            confirm = input("[?] Save session and generate Markdown report? [y/N]: ").strip().lower()
+            confirm = input("[?] Save session and generate professional report? [y/N]: ").strip().lower()
             if confirm == "y":
                 name = input("[?] Report/Session name (default: auto): ").strip() or "auto"
                 session.save(name)
+                # Generate professional markdown report with full context
+                from phantom.modules.report import ReportModule
+                rm = ReportModule()
+                rm.export("json", f"{name}.json")
                 session.export_markdown(f"{name}.md")
+                notifier.success(f"Professional report saved: {name}.md")
         
         notifier.status("Exiting Phantom...")
         sys.exit(0)
