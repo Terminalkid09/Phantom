@@ -1,0 +1,39 @@
+appId: com.phantom.framework
+productName: Phantom
+artifactName: Phantom-${version}-${os}-${arch}.${ext}
+directories:
+  output: dist-release
+files:
+  - dist/**
+  - dist-electron/**
+  - electron/assets/icon256.png
+extraResources:
+  - from: backend
+    to: backend
+    filter:
+      - '**/*'
+  - from: electron/assets
+    to: assets
+    filter:
+      - icon256.png
+      - icon.ico
+      - icon.png
+win:
+  target:
+    - nsis
+  executableName: Phantom
+  icon: electron/assets/icon.ico
+mac:
+  target:
+    - dmg
+  icon: electron/assets/icon.png
+linux:
+  target:
+    - AppImage
+  icon: electron/assets/icon.png
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+publish: null
