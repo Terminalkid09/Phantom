@@ -640,6 +640,7 @@ scapy>=2.5.0          # Packet analysis per modulo analyzer
 reportlab>=4.0.0      # Generazione PDF per report
 python-whois>=0.8.0   # Whois lookup
 dnspython>=2.4.0      # DNS queries avanzate
+phonenumbers>=8.13.0  # Carrier/regione per OSINT su numeri di telefono
 ```
 
 **Tool di sistema richiesti (presenti su Kali di default):** nmap, gobuster, hydra, sqlmap, metasploit-framework, nikto, enum4linux, sslscan, traceroute, arp-scan, netdiscover, amass, subfinder, whatweb, wafw00f, feroxbuster, ffuf, wfuzz, john, hashcat, medusa, dirb, dnsenum, dnsrecon, fierce
