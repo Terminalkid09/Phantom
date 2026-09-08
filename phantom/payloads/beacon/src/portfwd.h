@@ -32,11 +32,12 @@
 #include <thread>
 #include <atomic>
 #include <vector>
+#include <memory>
 
 namespace portfwd {
 
 // Relay data between two sockets until one closes
-inline void relay(SOCKET a, SOCKET b, std::atomic<bool>& running) {
+inline void relay(SOCKET a, SOCKET b, std::shared_ptr<std::atomic<bool>> running) {
     char buf[4096];
     while (running) {
         fd_set readFds;
@@ -69,17 +70,18 @@ struct PortForward {
     int           localPort;
     std::string   remoteHost;
     int           remotePort;
-    std::atomic<bool> running{false};
+    std::shared_ptr<std::atomic<bool>> stop_flag;
     std::thread   thread;
 
     void start() {
-        running = true;
+        stop_flag = std::make_shared<std::atomic<bool>>(false);
         thread = std::thread([this]() { run(); });
-        thread.detach();
     }
 
     void stop() {
-        running = false;
+        if (stop_flag) *stop_flag = true;
+        // join before destruction so the thread never touches freed memory
+        if (thread.joinable()) thread.join();
     }
 
 private:
@@ -90,7 +92,7 @@ private:
 #endif
 
         SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (listenSock == INVALID_SOCKET) { running = false; return; }
+        if (listenSock == INVALID_SOCKET) { *stop_flag = true; return; }
 
         int opt = 1;
         setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
@@ -102,13 +104,13 @@ private:
 
         if (bind(listenSock, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
             closesocket(listenSock);
-            running = false;
+            *stop_flag = true;
             return;
         }
 
         if (listen(listenSock, SOMAXCONN) == SOCKET_ERROR) {
             closesocket(listenSock);
-            running = false;
+            *stop_flag = true;
             return;
         }
 
@@ -120,7 +122,7 @@ private:
         fcntl(listenSock, F_SETFL, flags | O_NONBLOCK);
 #endif
 
-        while (running) {
+        while (!*stop_flag) {
             SOCKET clientSock = accept(listenSock, nullptr, nullptr);
             if (clientSock == INVALID_SOCKET) {
                 Sleep(100);
@@ -153,9 +155,9 @@ private:
             }
             freeaddrinfo(result);
 
-            // Start relay in a detached thread
-            std::thread([this, clientSock, remoteSock]() {
-                relay(clientSock, remoteSock, this->running);
+            // Per-connection relay thread keeps the stop flag alive via shared_ptr
+            std::thread([clientSock, remoteSock, stop_flag = this->stop_flag]() {
+                relay(clientSock, remoteSock, stop_flag);
                 closesocket(clientSock);
                 closesocket(remoteSock);
             }).detach();

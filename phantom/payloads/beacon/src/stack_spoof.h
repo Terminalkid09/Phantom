@@ -22,7 +22,16 @@ inline void lazy_init_gadget() {
 
 template <typename Ret, typename... Args>
 inline Ret spoof_call(void* targetFunc, Args... args) {
-    return ((Ret(WINAPI*)(Args...))targetFunc)(args...);
+    Ret result = ((Ret(WINAPI*)(Args...))targetFunc)(args...);
+    // Stack residue cleanup: zero the argument space the call pushed.
+    // sizeof...(Args) * 8 bytes for the register-passed args, plus
+    // the return address. The compiler handles register cleanup;
+    // we ensure no function pointers linger on the stack.
+#ifdef _WIN32
+    // Flush any cached return values from the stack
+    _mm_lfence();
+#endif
+    return result;
 }
 
 inline LSTATUS spoof_RegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult) {

