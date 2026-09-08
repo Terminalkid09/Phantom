@@ -1,0 +1,44 @@
+# Phantom Lab — DMZ + internal hosts on an isolated docker network.
+# Authorized LOCAL testing only: never expose these networks to anything
+# you do not control.
+services:
+  dmz:
+    build: .
+    container_name: phantom-lab-dmz
+    hostname: dmz
+    ports:
+      - "2222:2222"   # SSH (non-standard)
+      - "2121:21"     # FTP anonymous
+      - "8081:8081"   # Web app
+    networks:
+      lab_net:
+        ipv4_address: 172.28.0.10
+    restart: "no"
+
+  internal:
+    build: ./internal
+    container_name: phantom-lab-internal
+    hostname: internal
+    networks:
+      lab_net:
+        ipv4_address: 172.28.0.20
+    restart: "no"
+
+  dc:
+    build: ./dc
+    container_name: phantom-lab-dc
+    hostname: dc
+    # Samba persists security.NTACL xattrs on sysvol during provision and
+    # runtime; that write needs CAP_SYS_ADMIN, which Docker drops by default.
+    cap_add:
+      - SYS_ADMIN
+    networks:
+      lab_net:
+        ipv4_address: 172.28.0.30
+    restart: "no"
+
+networks:
+  lab_net:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

