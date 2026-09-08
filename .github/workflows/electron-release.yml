@@ -1,0 +1,156 @@
+name: Electron Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build, for example v3.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  backend:
+    name: Build Python backend (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: windows-backend
+            executable: phantom-backend.exe
+          - os: macos-latest
+            artifact: macos-backend
+            executable: phantom-backend
+          - os: ubuntu-latest
+            artifact: linux-backend
+            executable: phantom-backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      # onedir (not onefile): the onefile bootloader is a well-known AV
+      # heuristic trigger (false positives on Windows Defender / McAfee).
+      - name: Build backend executable
+        run: |
+          python -m PyInstaller --clean --noconfirm phantom/api/phantom-backend-onedir.spec
+
+      - name: Normalize backend artifact
+        shell: bash
+        run: |
+          mkdir -p release-backend
+          cd dist/phantom-backend
+          zip -qr ../../release-backend/${{ matrix.artifact }}.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release-backend/${{ matrix.artifact }}.zip
+          if-no-files-found: error
+
+  electron:
+    name: Build Electron installer (${{ matrix.os }})
+    needs: backend
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            backend-artifact: windows-backend
+            backend-file: phantom-backend.exe
+            npm-script: electron:build
+          - os: macos-latest
+            backend-artifact: macos-backend
+            backend-file: phantom-backend
+            npm-script: electron:build
+          - os: ubuntu-latest
+            backend-artifact: linux-backend
+            backend-file: phantom-backend
+            npm-script: electron:build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: electron/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: electron
+        run: npm ci
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.backend-artifact }}
+          path: electron/backend
+
+      - name: Unpack onedir backend
+        shell: bash
+        run: |
+          cd electron/backend
+          zip -q ${{ matrix.backend-artifact }}.zip
+          rm ${{ matrix.backend-artifact }}.zip
+
+      - name: Make backend executable
+        if: runner.os != 'Windows'
+        run: chmod +x electron/backend/${{ matrix.backend-file }}
+
+      - name: Build and package Electron
+        working-directory: electron
+        run: npm run ${{ matrix.npm-script }} -- --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phantom-${{ runner.os }}-installer
+          path: electron/dist-release/**
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: electron
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: phantom-*-installer
+          path: release-assets
+          merge-multiple: true
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release and upload installers
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          files: release-assets/**
