@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="phantom",
-    version="2.0.0",
+    version="3.7.3",
     description="Offensive Security Framework — CLI shell per penetration testing",
     author="Terminalkid09",
     packages=find_packages(),
@@ -18,10 +18,13 @@ setup(
         "python-dotenv>=1.0.0",
         "aiohttp>=3.9.0",
         "cryptography>=41.0.0",
+        "phonenumbers>=8.13.0",
     ],
     entry_points={
         "console_scripts": [
             "phantom=phantom.main:main",
+            "phantom.c2=phantom.main:main",
+            "phantom.auto=phantom.main:main",
         ],
     },
     python_requires=">=3.10",
