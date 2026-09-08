@@ -6,6 +6,20 @@ from rich.console import Console
 
 console = Console()
 
+# Every subprocess here gets a hard timeout so a slow apt mirror (or a
+# network drop) can never leave the build flow hanging.
+_INSTALL_TIMEOUT = 300   # apt-get install
+_UPDATE_TIMEOUT = 120    # apt-get update
+
+
+def _safe_choice(prompt: str, default: str = "n") -> str:
+    """Read y/N input without ever hanging (EOF -> default, then skip)."""
+    try:
+        return input(prompt).strip().lower() or default
+    except (EOFError, KeyboardInterrupt):
+        return default
+
+
 def _in_container():
     return os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv')
 
@@ -25,16 +39,24 @@ def install_dependencies(dependencies, manager="apt"):
         choice = 'y'
     # Only skip interactive prompt if truly non-interactive (CI env, no tty)
     elif not sys.stdin.isatty():
-        console.print("[yellow][!] Non-interactive session.\n    Please install the following packages manually:")
+        console.print("[yellow][!] Non-interactive session — cannot prompt.\n    Please install the following packages manually:")
         if manager == 'apt':
             console.print(f"    sudo apt-get update && sudo apt-get install -y {' '.join(dependencies)}")
         else:
             console.print(f"    {manager} install {' '.join(dependencies)}")
         return False
     else:
-        # Interactive: ask the user
-        choice = input("Vuoi installarle automaticamente ora? [y/N]: ").strip().lower()
+        # Interactive: ask the user. Declining is NOT a hang or a dead end:
+        # we print what is missing and how to install it later, and return
+        # False so callers can skip the step gracefully.
+        choice = _safe_choice("Vuoi installarle automaticamente ora? [y/N]: ")
         if choice != 'y':
+            console.print(
+                "[yellow][!] Installazione saltata. Puoi installarle dopo con:")
+            if manager == 'apt':
+                console.print(f"    sudo apt-get install -y {' '.join(dependencies)}")
+            else:
+                console.print(f"    {manager} install {' '.join(dependencies)}")
             return False
 
     # Determine command prefix (avoid sudo if running as root)
@@ -46,11 +68,13 @@ def install_dependencies(dependencies, manager="apt"):
     prefix = ["sudo"] if use_sudo else []
 
     if manager == 'apt':
-        # Update package lists first
+        # Update package lists first (bounded: a slow mirror must not hang)
         try:
             console.print("[cyan][*] Aggiornamento lista pacchetti (apt-get update)...[/]")
             upd_cmd = prefix + ["apt-get", "update"]
-            subprocess.run(upd_cmd, check=False)
+            subprocess.run(upd_cmd, check=False, timeout=_UPDATE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            console.print("[yellow][!] apt-get update timed out — continuing with install.[/]")
         except Exception:
             pass
 
@@ -60,27 +84,93 @@ def install_dependencies(dependencies, manager="apt"):
 
     console.print(f"[cyan][*] Esecuzione: {' '.join(cmd)}[/]")
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, timeout=_INSTALL_TIMEOUT)
         console.print("[green][+] Installazione completata.[/]")
         return True
+    except subprocess.TimeoutExpired:
+        console.print("[red][!] Installazione scaduta dopo "
+                      f"{_INSTALL_TIMEOUT}s. Rilancia il comando o installa "
+                      "manualmente.[/]")
+        return False
     except subprocess.CalledProcessError as e:
         console.print("[red][!] Installazione fallita. Controlla i nomi dei pacchetti o installa manualmente.[/]")
         console.print(f"[red][!] Comando eseguito: {' '.join(cmd)}\n[red][!] Exit: {getattr(e, 'returncode', 'unknown')}[/]")
         return False
+
+def _wsl_cmd(args: list) -> list:
+    """Wrap an argv through the Kali WSL distro (Windows hosts only).
+
+    The Linux beacon is compiled INSIDE the WSL toolchain: the Windows
+    host has no native g++/headers, but the Kali distro carries the full
+    build environment. Returns [] when WSL is unavailable.
+    """
+    if os.name != "nt":
+        return []
+    import subprocess as _sp
+    try:
+        r = _sp.run(["wsl", "--list", "--quiet"], capture_output=True, timeout=15)
+        names = (r.stdout or b"").decode("utf-16-le", errors="ignore")
+        if "\x00" in names:
+            names = names.replace("\x00", "")
+        for d in [x.strip() for x in names.splitlines() if x.strip()]:
+            if "kali" in d.lower():
+                return ["wsl", "-d", d, "-e"] + args
+    except Exception:
+        pass
+    return []
+
 
 def check_header(header, flags=[]):
     """Try to compile a tiny snippet to see if a header is available."""
     try:
         # Use -c to only compile, -o /dev/null to discard output
         null_out = "NUL" if os.name == 'nt' else "/dev/null"
-        subprocess.run(["g++"] + flags + ["-x", "c++", "-", "-o", null_out, "-c"], 
-                       input=f"#include <{header}>\nint main(){{}}", 
+        cmd = ["g++"] + flags + ["-x", "c++", "-", "-o", null_out, "-c"]
+        if os.name == "nt":
+            cmd = _wsl_cmd(cmd)
+            if not cmd:
+                return False
+        subprocess.run(cmd,
+                       input=f"#include <{header}>\nint main(){{}}",
                        text=True, capture_output=True, check=True)
         return True
     except Exception:
         return False
 
 def _find_static_lib(libname: str, arch: str = "x64") -> bool:
+    """Check whether a static archive (lib<name>.a) exists on the system.
+
+    Searches the standard library directories for the host architecture.
+    On Windows, the search runs inside the Kali WSL filesystem.
+    """
+    if arch == "x86":
+        search_dirs = [
+            "/usr/lib/i386-linux-gnu",
+            "/usr/lib32",
+            "/usr/local/lib32",
+            "/usr/local/lib/i386-linux-gnu",
+        ]
+    else:
+        search_dirs = [
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+            "/usr/local/lib",
+            "/usr/local/lib/x86_64-linux-gnu",
+            "/usr/lib",
+        ]
+    target = f"lib{libname}.a"
+    if os.name == "nt":
+        probe = " || ".join(f"test -f {d}/{target}" for d in search_dirs)
+        try:
+            r = subprocess.run(_wsl_cmd(["sh", "-c", probe]),
+                               capture_output=True, timeout=20)
+            return r.returncode == 0
+        except Exception:
+            return False
+    for d in search_dirs:
+        if os.path.isfile(os.path.join(d, target)):
+            return True
+    return False
     """Check whether a static archive (lib<name>.a) exists on the system.
 
     Searches the standard library directories for the host architecture.
@@ -227,10 +317,21 @@ def check_build_env(platform, arch="x64"):
     
     if platform == "linux":
         if os.name != "posix":
-            console.print("[yellow][!] Warning: Cross-compiling for Linux from Windows might fail natively.[/]")
-            console.print("[yellow][!] Use WSL or a Linux container if compilation fails.[/]")
-
-        if not shutil.which("g++"): 
+            # Windows host: the Linux toolchain lives in the Kali WSL distro.
+            # g++/headers/static libs are probed THROUGH WSL (check_header /
+            # _find_static_lib are WSL-aware); g++ presence is checked the
+            # same way instead of the Windows PATH.
+            gxx = _wsl_cmd(["sh", "-c", "command -v g++"])
+            gxx_ok = False
+            if gxx:
+                try:
+                    gxx_ok = subprocess.run(gxx, capture_output=True,
+                                            timeout=20).returncode == 0
+                except Exception:
+                    gxx_ok = False
+            if not gxx_ok:
+                missing.append("build-essential (in WSL: apt install build-essential)")
+        elif not shutil.which("g++"):
             missing.append("build-essential")
         
         # Determine flags and package suffix for architecture
@@ -328,6 +429,11 @@ def check_build_env(platform, arch="x64"):
                 ok = install_dependencies(runtime_needed)
                 if ok:
                     _mark_deps_ready(platform)
+                else:
+                    console.print(
+                        "[yellow][!] Toolchain non pronta — il build del beacon "
+                        f"per {platform} sarà saltato. Puoi riprovare con "
+                        f"'deploy-agent' dopo l'installazione dei pacchetti.[/]")
                 return ok
             else:
                 console.print(f"[red][!] Dipendenze mancanti: {', '.join(runtime_needed)}. Installale manualmente.[/]")

