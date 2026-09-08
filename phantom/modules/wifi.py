@@ -227,23 +227,31 @@ class WifiModule(BaseModule):
     def build_commands(self) -> dict:
         """Return preset WiFi command groups."""
         iface = self.interface or "wlan0"
-        return {
-            "SETUP": [
-                "sudo airmon-ng check kill",
-                f"sudo airmon-ng start {iface}",
-            ],
-            "SCAN": [
-                f"sudo airodump-ng {iface}mon",
-            ],
-            "ATTACK": [
-                f"sudo aireplay-ng --deauth 15 -a <BSSID> {iface}mon",
-            ],
-            "WPS": [
-                f"sudo reaver -i {iface}mon -b <BSSID> -vv",
-            ]
-        }
+        return self._with_suggestions(
+            {
+                "SETUP": [
+                    "sudo airmon-ng check kill",
+                    f"sudo airmon-ng start {iface}",
+                ],
+                "SCAN": [
+                    f"sudo airodump-ng {iface}mon",
+                ],
+                "ATTACK": [
+                    f"sudo aireplay-ng --deauth 15 -a <BSSID> {iface}mon",
+                ],
+                "WPS": [
+                    f"sudo reaver -i {iface}mon -b <BSSID> -vv",
+                ],
+            },
+            self.suggest_commands(),
+        )
 
-    def do_preview(self, _):
+    def suggest_commands(self) -> dict:
+        """First WiFi steps (interface setup before any attack)."""
+        from phantom.modules.suggest import wifi_suggestion_group
+        return wifi_suggestion_group()
+
+    def _execute_flow(self, _):
         """Interactive command builder."""
         groups = self.build_commands()
         preview = PreviewSession(groups)
@@ -251,5 +259,3 @@ class WifiModule(BaseModule):
         if chosen:
             run_commands(chosen)
 
-    def do_run(self, _):
-        self.do_preview(_)

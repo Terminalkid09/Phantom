@@ -57,8 +57,8 @@ active_beacon = None
 bot_app = None
 _bot_thread = None
 
-
-API_TOKEN = os.getenv("PHANTOM_API_TOKEN", "")
+from phantom.utils.c2_crypto import get_api_token
+API_TOKEN = get_api_token()
 
 def _headers():
     h = {"Content-Type": "application/json"}

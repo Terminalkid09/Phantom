@@ -69,7 +69,12 @@ class OsintModule(BaseModule):
                 f"sherlock {username} --timeout 5 --print-found"
             ]
 
-        return groups
+        return self._with_suggestions(groups, self.suggest_commands())
+
+    def suggest_commands(self) -> dict:
+        """Identity/domain/IP-aware OSINT commands from the session state."""
+        from phantom.modules.suggest import osint_suggestion_group
+        return osint_suggestion_group()
 
     def _get_username(self, target: str) -> str:
         """Extract a potential username from the target string without breaking social handles."""
@@ -87,6 +92,55 @@ class OsintModule(BaseModule):
             
             # Se è un dominio classico (es. azienda.com), prendiamo solo la prima parte
             return target.split('.')[0] if '.' in target else target
+
+    def do_phone(self, _):
+        """phone — phone-number OSINT: carrier + region via phonenumbers
+        (offline, never the subscriber's identity). Writes an `identity`
+        finding to the shared knowledge."""
+        t = session.target
+        if not t or not (t.startswith("+") or t.replace("+", "").isdigit()):
+            notifier.error("Set target to a phone number (e.g. +391234567890) first.")
+            return
+        import phonenumbers
+        from phonenumbers import carrier, geocoder
+        try:
+            num = phonenumbers.parse(t, None)
+        except Exception as e:
+            notifier.error(f"Invalid phone number: {e}")
+            return
+        if not phonenumbers.is_valid_number(num):
+            notifier.warn("Number parses but is not valid for its region.")
+        name = carrier.name_for_number(num, "en") or "unknown"
+        region = phonenumbers.region_code_for_number(num) or "unknown"
+        from phantom.core.knowledge import session_wm
+        wm = session_wm()
+        wm.add_finding(
+            "identity", "phone",
+            {"node_type": "phone", "value": t, "carrier": name,
+             "region": region},
+            confidence=0.8, source="osint")
+        notifier.success(f"Phone OSINT: carrier={name}, region={region} "
+                         "— identity written to shared knowledge.")
+        notifier.info("'suggest' will now propose SMS-phish / carrier moves.")
+
+    def _harvest_identity(self):
+        """Write emails/subdomains/social profiles discovered by OSINT into
+        the shared WorldModel as identity findings."""
+        from phantom.core.knowledge import session_wm
+        wm = session_wm()
+        osint_res = session.get_result("osint") or {}
+        for e in (osint_res.get("dns_intel", {}) or {}).get("emails", []) or []:
+            wm.add_finding("identity", f"email:{e}",
+                           {"node_type": "email", "value": e},
+                           confidence=0.6, source="osint")
+        for sd in osint_res.get("crt_sh_subdomains", []) or []:
+            wm.add_finding("subdomain", sd, {"name": sd},
+                           confidence=0.6, source="osint")
+        for p in osint_res.get("social_profiles", []) or []:
+            wm.add_finding("social_profile", p, {"url": p},
+                           confidence=0.6, source="osint")
+        if osint_res:
+            wm.target = session.target or wm.target
 
     def do_sherlock(self, args):
         """sherlock [username] - Search social media for a username."""
@@ -110,6 +164,8 @@ class OsintModule(BaseModule):
                 console.print(f"  [cyan]{link}[/]")
             if len(links) > 10:
                 notifier.info(f"... and {len(links)-10} more.")
+            self._harvest_identity()
+            notifier.info("Profiles written to shared knowledge (show knowledge).")
         else:
             notifier.info("No social profiles found with Sherlock.")
 
@@ -149,7 +205,7 @@ class OsintModule(BaseModule):
             table.add_row(m.get("ip_str"), str(m.get("port")), m.get("data", "")[:50].replace("\n", " "))
         console.print(table)
 
-    def do_preview(self, _):
+    def _execute_flow(self, _):
         """Show preview, let user edit, then execute selected commands."""
         if not session.target:
             notifier.error("No target set. Use 'set target <domain/ip/username>' first.")
@@ -175,10 +231,7 @@ class OsintModule(BaseModule):
             self._run_api_lookups()
         else:
             notifier.info("Social handle detected. Automated DNS/Network lookups skipped.")
-
-    def do_run(self, _):
-        """Alias for do_preview."""
-        self.do_preview(_)
+        self._harvest_identity()
 
     def _extract_dns_intel(self, domain):
         """Extract emails/phones/intel from TXT and MX records using dnspython."""

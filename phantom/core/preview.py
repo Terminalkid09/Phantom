@@ -18,12 +18,16 @@ class PreviewSession:
         for group, cmds in self.groups.items():
             if not cmds:
                 continue
-            console.print(f"  [bold cyan]-- {group} {'-' * (55 - len(group))}[/]")
+            suggested = group.upper().startswith("SUGGESTED")
+            header_style = "bold green" if suggested else "bold cyan"
+            console.print(f"  [{header_style}]-- {group} {'-' * (55 - len(group))}[/]")
             for cmd in cmds:
                 is_aggressive = "AGGRESSIVE" in cmd
                 clean_cmd = cmd.replace(" AGGRESSIVE", "").strip()
                 warning = " [bold red]⚠ AGGRESSIVE[/]" if is_aggressive else ""
-                console.print(f"  [{idx:2}] [yellow]{clean_cmd}[/]{warning}")
+                prefix = "▶ " if suggested else ""
+                cmd_style = "green" if suggested else "yellow"
+                console.print(f"  [{idx:2}] [{cmd_style}]{prefix}{clean_cmd}[/]{warning}")
                 idx += 1
         console.print("\n  [dim]edit <n> | remove <n> | add | run-group <name> | run <n> | run-all | cancel[/]\n")
 
@@ -71,6 +75,13 @@ class PreviewSession:
             return [self._flat[index - 1][1]]
         console.print("[red]Invalid index.[/]")
         return None
+
+    def review(self) -> None:
+        """Display-only: show the command plan WITHOUT executing anything.
+        `preview` shows, `run` executes — no more 'run == preview'."""
+        self._display()
+        console.print(
+            "  [dim]Execute with: run | run <n> | run-group <name> | run-all | cancel[/]")
 
     def interactive(self) -> Optional[List[str]]:
         self._display()

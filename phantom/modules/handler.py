@@ -140,22 +140,30 @@ class HandlerModule(BaseModule):
             notifier.warn(f"No active listener on port {port}.")
 
     def build_commands(self) -> dict:
-        return {
-            "MSF HANDLER": [
-                "listen --port 4444 --payload linux/x64/shell_reverse_tcp  AGGRESSIVE",
-                "listen --port 4443 --type https  AGGRESSIVE",
-                "listen --port 8080 --type http  AGGRESSIVE",
-            ],
-            "NETCAT": [
-                "nc 4444",
-                "ncat 4444 --ssl",
-            ],
-        }
+        return self._with_suggestions(
+            {
+                "MSF HANDLER": [
+                    "listen --port 4444 --payload linux/x64/shell_reverse_tcp  AGGRESSIVE",
+                    "listen --port 4443 --type https  AGGRESSIVE",
+                    "listen --port 8080 --type http  AGGRESSIVE",
+                ],
+                "NETCAT": [
+                    "nc 4444",
+                    "ncat 4444 --ssl",
+                ],
+            },
+            self.suggest_commands(),
+        )
+
+    def suggest_commands(self) -> dict:
+        """Listener commands matching the detected target platform."""
+        from phantom.modules.suggest import handler_suggestion_group
+        return handler_suggestion_group()
 
     def do_run(self, _):
         port = input("  Port [4444]: ").strip() or "4444"
         bg = input("  Background? [y/N]: ").strip().lower() == "y"
         self.start_listener(port, background=bg)
 
-    def do_preview(self, _):
+    def _execute_flow(self, _):
         self.do_run(_)

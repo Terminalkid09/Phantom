@@ -20,8 +20,21 @@ console = Console()
 class ScanModule(BaseModule):
     module_name = "scan"
 
+    def suggest_commands(self) -> dict:
+        """Targeted enumeration for the services already found, or first scans."""
+        from phantom.modules.suggest import (
+            service_suggestion_group, first_steps_suggestion_group)
+        from phantom.automation.exploit.hunter import (
+            vuln_hunt_suggestion_group, misconfig_suggestion_group)
+        groups = {}
+        groups.update(service_suggestion_group())
+        groups.update(first_steps_suggestion_group())
+        groups.update(vuln_hunt_suggestion_group())
+        groups.update(misconfig_suggestion_group())
+        return groups
+
     def build_commands(self) -> dict:
-        """Return the command groups for network scanning."""
+        """Return the command groups for network scanning (static + state)."""
         from phantom.utils.paths import scan_xml_path, sessions_dir
 
         t = session.target
@@ -31,7 +44,7 @@ class ScanModule(BaseModule):
         os.makedirs(sessions_dir(), exist_ok=True)
         xml_out = scan_xml_path(t)
 
-        return {
+        groups = {
             "NMAP (Basic)": [
                 f"sudo nmap -sS -p- --min-rate 5000 -T4 {t}",
                 f"sudo nmap -sV -sC -p- {t}",
@@ -77,8 +90,9 @@ class ScanModule(BaseModule):
                 f'msfconsole -q -x "use auxiliary/scanner/mssql/mssql_ping; set RHOSTS {t}; run; exit"',
             ],
         }
+        return self._with_suggestions(groups, self.suggest_commands())
 
-    def do_preview(self, _):
+    def _execute_flow(self, _):
         """Show preview, let user edit, then execute selected commands."""
         if not session.target:
             notifier.error("No target set. Use 'set target <ip>' first.")
@@ -135,11 +149,43 @@ class ScanModule(BaseModule):
             table.add_row(svc["port"], svc["service"], svc["version"] or "—")
         console.print(table)
         session.add_result("service_summary", services)
-        console.print("[dim]    Run 'use exploit' → 'run' for full CVE correlation (cached NVD).[/]")
 
-    def do_run(self, _):
-        """Alias for do_preview."""
-        self.do_preview(_)
+        # Write every service to the shared WorldModel so exploit/brute/web
+        # read them and the reasoning engine builds live hypotheses on them.
+        from phantom.core.knowledge import add_service, session_wm
+        for svc in services:
+            add_service(svc.get("port"), svc.get("service"),
+                        product="", version=svc.get("version") or "",
+                        confidence=0.7, source="scan")
+        wm = session_wm()
+        wm.target = session.target or wm.target
+
+        # Feed the enterprise knowledge base for the professional report and
+        # the sequence engine (workflow.py): services, OS, AD hints, WAF.
+        kb = session.knowledge_base
+        kb["services"] = services
+        kb["status"]["scan_done"] = True
+        if services:
+            kb["status"]["classified"] = True
+        kb["status"]["scan_stealth_done"] = kb["status"].get("scan_stealth_done", False)
+
+        all_output = "\n".join(results.values()).lower()
+        kb["os_info"] = kb.get("os_info") or {}
+        os_m = re.search(r"os details[^\n]*\n?\s*([^\n]+)", all_output, re.I)
+        if os_m:
+            kb["os_info"]["os"] = os_m.group(1).strip()[:120]
+            kb["status"]["os_detected"] = True
+        running_m = re.search(r"running:\s*([^\n]+)", all_output, re.I)
+        if running_m:
+            kb["os_info"].setdefault("os", running_m.group(1).strip()[:120])
+            kb["status"]["os_detected"] = True
+
+        svc_names = " ".join(s.get("service", "") for s in services).lower()
+        if any(k in svc_names for k in ("microsoft-ds", "netbios", "kerberos", "ldap", "kpasswd")):
+            kb["domain_environment"] = True
+        if "http" in svc_names or "https" in svc_names:
+            kb["status"]["web_recon_done"] = kb["status"].get("web_recon_done", False)
+        console.print("[dim]    Run 'use exploit' → 'run' for full CVE correlation (cached NVD).[/]")
 
     def _conditional_suggestions(self, results: dict):
         all_output = " ".join(results.values()).lower()
