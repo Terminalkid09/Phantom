@@ -33,7 +33,12 @@ class TestWebModule:
     def test_build_commands_with_target(self):
         from phantom.modules.web import WebModule
         from phantom.core.session import session
+        # isolate: other test files (e.g. test_hunter) may have left scan
+        # results in the global session, which adds a "SUGGESTED (web:...)"
+        # group and makes the static-group count order-dependent.
         session.target = "test.local"
+        session.results = {}
+        session.notes = []
         w = WebModule()
         cmds = w.build_commands()
         assert "SCANNING & VULN" in cmds
@@ -134,3 +139,59 @@ class TestPersistenceFix:
         with open(src) as f:
             content = f.read()
         assert ".local/bin" in content
+
+
+class TestManualCredsToBeaconBridge:
+    """The manual core must expose the creds→ssh→pivot bridge commands that
+    let a red teamer drive the kill chain by hand (not only via auto-mode)."""
+
+    def test_web_has_do_creds(self):
+        from phantom.modules.web import WebModule
+        assert hasattr(WebModule(), "do_creds"), "web should expose 'creds'"
+
+    def test_web_creds_no_target(self):
+        from phantom.modules.web import WebModule
+        from phantom.core.session import session
+        session.target = ""
+        w = WebModule()
+        w.do_creds("")  # must not raise, just notify no target
+
+    def test_exploit_has_do_ssh(self):
+        from phantom.modules.exploit import ExploitModule
+        assert hasattr(ExploitModule(), "do_ssh"), "exploit should expose 'ssh'"
+
+    def test_exploit_ssh_no_target(self):
+        from phantom.modules.exploit import ExploitModule
+        from phantom.core.session import session
+        session.target = ""
+        ExploitModule().do_ssh("")  # must not raise
+
+    def test_pivot_has_do_ssh(self):
+        from phantom.modules.pivot import PivotModule
+        assert hasattr(PivotModule(), "do_ssh"), "pivot should expose ssh lateral move"
+
+    def test_pivot_ssh_no_target(self):
+        from phantom.modules.pivot import PivotModule
+        from phantom.core.session import session
+        session.target = ""
+        PivotModule().do_ssh("10.0.0.2")  # must not raise (no creds → notify)
+
+    def test_web_build_commands_mentions_creds(self):
+        from phantom.modules.web import WebModule
+        from phantom.core.session import session
+        session.target = "test.local"
+        cmds = WebModule().build_commands()
+        assert any("creds" in c for grp in cmds.values()
+                   for c in (grp if isinstance(grp, list) else []))
+
+    def test_pivot_build_commands_mentions_ssh(self):
+        from phantom.modules.pivot import PivotModule
+        cmds = PivotModule().build_commands()
+        flat = [c for grp in cmds.values() for c in (grp if isinstance(grp, list) else [])]
+        assert any("ssh" in c for c in flat)
+
+    def test_payload_build_commands_mentions_privesc(self):
+        from phantom.modules.payload import PayloadModule
+        cmds = PayloadModule().build_commands()
+        flat = [c for grp in cmds.values() for c in (grp if isinstance(grp, list) else [])]
+        assert any("privesc" in c for c in flat)

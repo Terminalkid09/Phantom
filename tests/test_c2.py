@@ -58,23 +58,37 @@ class TestC2State:
         assert task_id is not None
 
         pending = state.get_pending_tasks("B1")
-        # First task is auto-persist from update_beacon
+        # First task is auto-persist from update_beacon: `persist` with no
+        # argument so the beacon uses its default unit name (PhantomBeacon)
+        # instead of creating a unit literally called "systemd"/"runkey".
         assert len(pending) == 2
-        assert pending[0]["command"] == "persist systemd"
+        assert pending[0]["command"] == "persist"
         assert pending[1]["command"] == "recon C:\\"
 
         # Tasks should be cleared after retrieval
         pending2 = state.get_pending_tasks("B1")
         assert len(pending2) == 0
 
-    def test_add_and_retrieve_results(self):
+    def test_result_acknowledges_leased_task(self):
         from phantom.core.c2_server import C2State
         state = C2State()
         state.update_beacon("B2", {"ip": "10.0.0.2"})
-        state.add_result("B2", "task-001", "=== DRIVES ===\nC:\\ Fixed")
+        task_id = state.queue_task("B2", "sysinfo")
+        pending = state.get_pending_tasks("B2")
+        assert any(task["task_id"] == task_id for task in pending)
+        state.add_result("B2", task_id, "SYSINFO_OK")
+        assert not any(task["task_id"] == task_id
+                       for task in state.tasks["B2"])
+
+    def test_duplicate_result_is_idempotent(self):
+        from phantom.core.c2_server import C2State
+        state = C2State()
+        state.update_beacon("B2", {"ip": "10.0.0.2"})
+        state.add_result("B2", "task-001", "OK")
+        state.add_result("B2", "task-001", "OK")
         results = state.get_results("B2")
         assert len(results) == 1
-        assert results[0]["output"] == "=== DRIVES ===\nC:\\ Fixed"
+        assert results[0]["output"] == "OK"
 
     def test_multiple_beacons_isolation(self):
         from phantom.core.c2_server import C2State
@@ -120,3 +134,14 @@ class TestC2ServerInstance:
         from phantom.core.c2_server import C2Server
         s = C2Server(port=8443)
         assert s.port == 8443
+
+
+@pytest.mark.asyncio
+async def test_pic_payload_requires_authentication():
+    from phantom.core.c2_server import handle_payload_pic
+    request = MagicMock()
+    request.query = {}
+    request.headers = {}
+    request.remote = "127.0.0.1"
+    response = await handle_payload_pic(request)
+    assert response.status == 403

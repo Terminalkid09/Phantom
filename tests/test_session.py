@@ -64,10 +64,14 @@ class TestSession:
         mock_named_temp.assert_called_once_with(
             mode='w', dir=sdir, delete=False, suffix='.json', encoding='utf-8'
         )
-        # Verify json.dump called on the temporary file
-        json_dump_mock.assert_called_once_with(
-            self.session.__dict__, mock_temp, indent=2, default=str
-        )
+        # Verify json.dump called with the session dict (serialized) plus
+        # the embedded shared WorldModel (`_wm`)
+        json_dump_mock.assert_called_once()
+        dumped = json_dump_mock.call_args[0][0]
+        assert dumped["target"] == "127.0.0.1"
+        assert dumped["mode"] == "full"
+        assert "knowledge_base" in dumped
+        assert "_wm" in dumped   # shared knowledge survives save
         # Verify os.replace called with temp path and final path
         mock_replace.assert_called_once_with(
             mock_temp.name, os.path.join(sdir, "testsession.json")
