@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage } from 'electron'
+import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog } from 'electron'
 import { spawn, ChildProcess } from 'child_process'
 import path from 'path'
 import fs from 'fs'
@@ -6,6 +6,7 @@ const { existsSync } = fs
 let mainWindow: BrowserWindow | null = null
 let apiProcess: ChildProcess | null = null
 let tray: Tray | null = null
+let pmSavedOnQuit = false
 
 const API_PORT = 9876
 const isDev = !app.isPackaged || process.env.NODE_ENV === 'development'
@@ -251,6 +252,66 @@ app.whenReady().then(() => {
 
   ipcMain.handle('get-version', () => app.getVersion())
 
+  // ── Save artifact to disk (Recordings / screenshots) ──────────────────
+  // The renderer asks WHERE to save; the main process writes the bytes so
+  // the renderer never touches fs directly (contextIsolation stays intact).
+  ipcMain.handle('save-artifact', async (_event, payload: { name: string; data: string }, dir?: string) => {
+    try {
+      const win = BrowserWindow.getFocusedWindow() ?? mainWindow
+      if (!win) return { saved: false, error: 'no window' }
+      const ext = (payload.name.match(/\.[a-z0-9]+$/i) || [''])[0]
+      const res = await dialog.showSaveDialog(win, {
+        title: 'Save artifact',
+        defaultPath: path.join(app.getPath('videos'), payload.name),
+        filters: [
+          { name: ext === '.mp4' ? 'Video' : 'All files', extensions: [ext.replace('.', '') || '*'] },
+        ],
+      })
+      if (res.canceled || !res.filePath) return { saved: false }
+      // dir is an API-relative subdir (recordings, recordings/live, ...);
+      // only names coming straight from the artifacts list are accepted.
+      let url = `/api/c2/artifact?name=${encodeURIComponent(payload.name)}`
+      if (dir) url += `&dir=${encodeURIComponent(dir)}`
+      const token = getApiToken()
+      const r = await fetch(`${getApiUrl()}${url}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (!r.ok) return { saved: false, error: `fetch ${r.status}` }
+      const buf = Buffer.from(await r.arrayBuffer())
+      fs.writeFileSync(res.filePath, buf)
+      return { saved: true, path: res.filePath }
+    } catch (err) {
+      return { saved: false, error: String(err) }
+    }
+  })
+
+  // ── Auto-save artifact to the Desktop (setting-driven) ────────────────
+  // Same byte path as save-artifact, but with NO dialog: the renderer only
+  // calls this when the "Save recordings to disk" preference is ON, so a
+  // finished recording lands in ~/Desktop/Phantom Recordings.
+  ipcMain.handle('save-artifact-auto', async (_event, payload: { name: string; data: string }, dir?: string) => {
+    try {
+      if (!payload?.name || payload.name.includes('/') || payload.name.includes('\\')) {
+        return { saved: false, error: 'invalid name' }
+      }
+      const destDir = path.join(app.getPath('desktop'), 'Phantom Recordings')
+      fs.mkdirSync(destDir, { recursive: true })
+      let url = `/api/c2/artifact?name=${encodeURIComponent(payload.name)}`
+      if (dir) url += `&dir=${encodeURIComponent(dir)}`
+      const token = getApiToken()
+      const r = await fetch(`${getApiUrl()}${url}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (!r.ok) return { saved: false, error: `fetch ${r.status}` }
+      const buf = Buffer.from(await r.arrayBuffer())
+      const filePath = path.join(destDir, payload.name)
+      fs.writeFileSync(filePath, buf)
+      return { saved: true, path: filePath }
+    } catch (err) {
+      return { saved: false, error: String(err) }
+    }
+  })
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
@@ -263,6 +324,27 @@ app.on('window-all-closed', () => {
   }
 })
 
-app.on('before-quit', () => {
+app.on('before-quit', async (event) => {
+  // Auto-save the engagement as a .pm bundle on close (fire-and-forget:
+  // the backend mirrors the live session to _auto.json regardless, this
+  // adds the full portable bundle on top).
+  if (!pmSavedOnQuit) {
+    pmSavedOnQuit = true
+    try {
+      const token = getApiToken()
+      const controller = new AbortController()
+      const t = setTimeout(() => controller.abort(), 2500)
+      await fetch(`${getApiUrl()}/api/pm/export`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({}),
+        signal: controller.signal,
+      })
+      clearTimeout(t)
+    } catch { /* best effort — quit anyway */ }
+  }
   stopApiServer()
 })

@@ -3,7 +3,7 @@ import { useStore } from '@/store'
 import { useApi } from '@/hooks/useApi'
 import {
   Settings, Cpu, Server, Shield, Key, Eye, EyeOff,
-  RotateCw, CheckCircle2, AlertTriangle
+  RotateCw, CheckCircle2, AlertTriangle, Film
 } from 'lucide-react'
 
 export default function SettingsPanel() {
@@ -46,6 +46,14 @@ export default function SettingsPanel() {
     })
     setSaved(true)
     setTimeout(() => setSaved(false), 2500)
+  }
+
+  const toggleSaveRecordings = () => {
+    const next = !settings.save_recordings_to_disk
+    setSettings({ save_recordings_to_disk: next })
+    try {
+      localStorage.setItem('phantom.saveRecordingsToDisk', next ? '1' : '0')
+    } catch { /* localStorage can be unavailable — preference stays session-only */ }
   }
 
   return (
@@ -189,6 +197,33 @@ export default function SettingsPanel() {
                 {listener.certs_present ? '✓ Present' : '⚠ Missing'}
               </span>
             </div>
+          </div>
+        </div>
+
+        {/* Preferences */}
+        <div className="bg-surface-card border border-surface-border rounded-lg p-3 col-span-2">
+          <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-3 flex items-center gap-1.5">
+            <Film size={13} /> Preferences
+          </h2>
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-xs font-medium text-text-primary">Save recordings to disk</p>
+              <p className="text-[10px] text-text-dim">
+                Auto-copy every finished screen recording to your Desktop
+                (folder &quot;Phantom Recordings&quot;). When OFF, recordings stay
+                inside Electron and are saved only on demand.
+              </p>
+            </div>
+            <button
+              onClick={toggleSaveRecordings}
+              className={`px-3 py-1 rounded text-xs font-medium transition-colors
+                ${settings.save_recordings_to_disk
+                  ? 'bg-phantom-green/20 text-phantom-green hover:bg-phantom-green/30'
+                  : 'bg-surface-border text-text-dim hover:bg-surface-hover'
+                }`}
+            >
+              {settings.save_recordings_to_disk ? 'ON' : 'OFF'}
+            </button>
           </div>
         </div>
 

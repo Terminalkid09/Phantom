@@ -14,6 +14,10 @@ import TimelinePanel from '@/components/TimelinePanel'
 import VaultPanel from '@/components/VaultPanel'
 import NetworkMap from '@/components/NetworkMap'
 import AuditViewer from '@/components/AuditViewer'
+import RecordingsPanel from '@/components/RecordingsPanel'
+import BundlesPanel from '@/components/BundlesPanel'
+import LearningPanel from '@/components/LearningPanel'
+import AdGraphPanel from '@/components/AdGraphPanel'
 import { ToastContainer } from '@/components/Toast'
 
 export default function App() {
@@ -84,6 +88,10 @@ export default function App() {
     { id: 'vault', node: <VaultPanel standalone /> },
     { id: 'network', node: <NetworkMap standalone /> },
     { id: 'audit', node: <AuditViewer standalone /> },
+    { id: 'recordings', node: <RecordingsPanel /> },
+    { id: 'bundles', node: <BundlesPanel /> },
+    { id: 'learning', node: <LearningPanel /> },
+    { id: 'adgraph', node: <AdGraphPanel /> },
   ]
   for (const m of MODULE_TABS) panels.push({ id: m, node: <ModulePanel moduleId={m} /> })
   const active = panels.find((p) => p.id === activeTab) ?? panels[0]
@@ -118,7 +126,7 @@ export default function App() {
             PHANTOM
           </span>
           <span className="ml-2 text-xs text-text-dim">
-            v3.7.3
+            v3.0.0
           </span>
         </div>
 

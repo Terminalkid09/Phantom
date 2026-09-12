@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useStore, type Beacon, type C2Task } from '@/store'
 import { useApi } from '@/hooks/useApi'
+import RemoteCanvas from '@/components/RemoteCanvas'
 import {
   Radio, Power, Play, Square, Plus, RefreshCw, Download,
   Terminal, X, ChevronRight, Clock, Globe, Monitor,
@@ -15,7 +16,7 @@ export default function C2Dashboard() {
   } = useStore()
   const { api, pollC2 } = useApi()
   const [taskInput, setTaskInput] = useState('')
-  const [interactView, setInteractView] = useState<'tasks' | 'results'>('tasks')
+  const [interactView, setInteractView] = useState<'tasks' | 'results' | 'remote'>('tasks')
   const [rightPanel, setRightPanel] = useState<'interact' | 'generate' | 'auth' | 'certs' | 'help'>('interact')
   const [healthText, setHealthText] = useState('')
   const [beaconCmds, setBeaconCmds] = useState<BeaconCommand[]>([])
@@ -347,8 +348,8 @@ function InteractPanel({
   taskInput: string
   setTaskInput: (v: string) => void
   handleQueueTask: () => void
-  interactView: 'tasks' | 'results'
-  setInteractView: (v: 'tasks' | 'results') => void
+  interactView: 'tasks' | 'results' | 'remote'
+  setInteractView: (v: 'tasks' | 'results' | 'remote') => void
   handleHealth: () => void
   handleSetSleep: (ms: string, jitter: string) => void
   healthText: string
@@ -396,11 +397,11 @@ function InteractPanel({
       </div>
 
       <div className="flex border-b border-surface-border">
-        {(['tasks', 'results'] as const).map((t) => (
-          <button key={t} onClick={() => setInteractView(t)}
+        {(['tasks', 'results', 'remote'] as const).map((t) => (
+          <button key={t} onClick={() => setInteractView(t as 'tasks' | 'results' | 'remote')}
             className={`px-3 py-1.5 text-xs font-medium border-b-2 transition-colors
               ${interactView === t ? 'border-phantom-magenta text-phantom-magenta' : 'border-transparent text-text-secondary hover:text-text-primary'}`}>
-            {t === 'tasks' ? 'Tasks' : 'Results'}
+            {t === 'tasks' ? 'Tasks' : t === 'results' ? 'Results' : 'Remote'}
           </button>
         ))}
       </div>
@@ -489,6 +490,7 @@ function InteractPanel({
       )}
 
       {interactView === 'results' && <ResultsView beaconId={beacon.id} api={api} tasks={tasks} />}
+      {interactView === 'remote' && <RemoteCanvas beacon={beacon} api={api} />}
     </>
   )
 }

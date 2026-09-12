@@ -4,7 +4,7 @@ import {
   Radio, Target, Bot, FileText, Settings, Terminal,
   Globe, Wifi, Search, Shield, AlertTriangle,
   Wrench, Monitor, Key, Layers, MapPin, Clock, ScrollText,
-  Radar, BookOpen, PieChart
+  Radar, BookOpen, PieChart, Film, Package, Brain, Network
 } from 'lucide-react'
 
 const SECTIONS = [
@@ -14,6 +14,7 @@ const SECTIONS = [
       { id: 'c2', icon: Radio, label: 'C2 Dashboard' },
       { id: 'session', icon: Target, label: 'Session' },
       { id: 'automode', icon: Bot, label: 'Auto-Mode' },
+      { id: 'adgraph', icon: Network, label: 'AD Graph' },
     ],
   },
   {
@@ -23,6 +24,9 @@ const SECTIONS = [
       { id: 'vault', icon: Key, label: 'Vault' },
       { id: 'network', icon: MapPin, label: 'Network Map' },
       { id: 'audit', icon: ScrollText, label: 'Audit Log' },
+      { id: 'recordings', icon: Film, label: 'Recordings' },
+      { id: 'bundles', icon: Package, label: 'Bundles' },
+      { id: 'learning', icon: Brain, label: 'Learning' },
     ],
   },
   {

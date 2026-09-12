@@ -11,6 +11,8 @@ interface NodeMeta {
   os?: string
   services?: string
   ports?: number[]
+  alive?: boolean
+  last_seen?: string
   source?: string
   is_target?: boolean
 }
@@ -208,6 +210,21 @@ export default function NetworkMap({ standalone }: { standalone?: boolean }) {
 
   const [scanning, setScanning] = useState(false)
   const [scanMsg, setScanMsg] = useState('')
+  const [probingLive, setProbingLive] = useState(false)
+
+  // Liveness probe: after a scan (and periodically while the map is open)
+  // every discovered device gets a quick ping; dead hosts render faded and
+  // live hosts get the red-dot badge, so a powered-off device never looks
+  // like a valid target.
+  const probeLiveness = async () => {
+    setProbingLive(true)
+    try {
+      await api('POST', '/api/network/liveness', {})
+    } catch { /* best effort */ }
+    setProbingLive(false)
+    await load()
+  }
+
   const handleScan = async () => {
     setScanning(true)
     setScanMsg('Mapping network…')
@@ -218,7 +235,7 @@ export default function NetworkMap({ standalone }: { standalone?: boolean }) {
       const hosts = (d.hosts || []) as Array<Record<string, string>>
       const named = hosts.filter((h) => h.hostname || h.vendor).length
       setScanMsg(`Found ${hosts.length} device(s) via ${d.method || '?'} — ${named} identified, added to the map`)
-      await load()
+      await probeLiveness()
     } else {
       setScanMsg('Scan failed — see console')
     }
@@ -237,7 +254,13 @@ export default function NetworkMap({ standalone }: { standalone?: boolean }) {
     }
   }
 
-  useEffect(() => { load(); const t = setInterval(load, 8000); return () => clearInterval(t) }, [])
+  useEffect(() => {
+    load()
+    const t = setInterval(load, 8000)
+    // refresh liveness every 30s while the map is open (devices go offline)
+    const l = setInterval(probeLiveness, 30000)
+    return () => { clearInterval(t); clearInterval(l) }
+  }, [])
 
   const copy = (text: string) => {
     navigator.clipboard?.writeText(text)
@@ -381,12 +404,17 @@ export default function NetworkMap({ standalone }: { standalone?: boolean }) {
     const isSelected = selected?.id === n.id
     const isSessionTarget = !!n.meta?.is_target
     const Icon = TYPE_ICON[n.type]
+    // liveness: only host nodes carry alive; anything else renders normal
+    const isHostNode = n.type === 'host'
+    const alive = isHostNode ? n.meta?.alive !== false : true
+    const dead = isHostNode && !alive
+    const nodeColor = dead ? '#6E7681' : n.color
     return (
       <g key={n.id}
         onMouseEnter={() => setHoveredNode(n.id)}
         onMouseLeave={() => setHoveredNode(null)}
         onClick={(e) => { e.stopPropagation(); if (!didPan.current) setSelected(n) }}
-        style={{ cursor: 'pointer' }}
+        style={{ cursor: 'pointer', opacity: dead ? 0.38 : 1 }}
       >
         {/* red aura marks the session target — bound to THIS node, so it
             moves with the device when the target changes */}
@@ -405,28 +433,34 @@ export default function NetworkMap({ standalone }: { standalone?: boolean }) {
           <circle cx={pos.x} cy={pos.y} r={r + 6} fill="none" stroke="#E6EDF3"
             strokeWidth={1.5} strokeDasharray="4,3" />
         )}
-        <circle cx={pos.x} cy={pos.y} r={r} fill={n.color} opacity={0.15}
-          stroke={n.color} strokeWidth={2} />
-        <circle cx={pos.x} cy={pos.y} r={r} fill={n.color} opacity={isHovered ? 0.3 : 0.1} />
+        <circle cx={pos.x} cy={pos.y} r={r} fill={nodeColor} opacity={0.15}
+          stroke={nodeColor} strokeWidth={2} />
+        <circle cx={pos.x} cy={pos.y} r={r} fill={nodeColor} opacity={isHovered ? 0.3 : 0.1} />
+        {/* live host badge: red dot on the bubble corner so alive devices
+            stand out at a glance (dead hosts render faded instead) */}
+        {isHostNode && alive && (
+          <circle cx={pos.x + r - 1} cy={pos.y - r + 1} r={4}
+            fill="#FF3333" stroke="#0D1117" strokeWidth={1} />
+        )}
         {Icon ? (
           <g transform={`translate(${pos.x - 8},${pos.y - 8})`}>
-            <Icon size={16} color={n.color} />
+            <Icon size={16} color={nodeColor} />
           </g>
         ) : (
-          <text x={pos.x} y={pos.y + 4} textAnchor="middle" fill={n.color}
+          <text x={pos.x} y={pos.y + 4} textAnchor="middle" fill={nodeColor}
             fontSize={n.type === 'attacker' ? 9 : 8} fontWeight={700} fontFamily="Inter, sans-serif">
             {n.type === 'attacker' ? 'C2' : n.type === 'host' ? 'T' : n.type === 'beacon' ? 'B' : ''}
           </text>
         )}
-        <text x={pos.x} y={pos.y - r - 6} textAnchor="middle" fill="#E6EDF3"
+        <text x={pos.x} y={pos.y - r - 6} textAnchor="middle" fill={dead ? '#6E7681' : '#E6EDF3'}
           fontSize={11.5} fontWeight={600} fontFamily="Inter, sans-serif">
           {n.label}
         </text>
         {n.type === 'host' && n.meta?.ip && (
           <>
-            <text x={pos.x} y={pos.y + r + 13} textAnchor="middle" fill="#8B949E"
+            <text x={pos.x} y={pos.y + r + 13} textAnchor="middle" fill={dead ? '#4A5568' : '#8B949E'}
               fontSize={9} fontFamily="JetBrains Mono, monospace">
-              {n.meta.ip}
+              {n.meta.ip}{dead ? ' · offline' : ''}
             </text>
             {n.meta.os && (
               <text x={pos.x} y={pos.y + r + 25} textAnchor="middle" fill="#6E7681"
@@ -467,6 +501,22 @@ export default function NetworkMap({ standalone }: { standalone?: boolean }) {
               </span>
             </div>
             <div className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
+              {selected.type === 'host' && (
+                <>
+                  <span className="text-text-dim">Status</span>
+                  {selected.meta?.alive === false ? (
+                    <span className="flex items-center gap-1 text-[#8B949E]">
+                      <span className="w-2 h-2 rounded-full bg-[#6E7681] inline-block" />
+                      Offline {selected.meta.last_seen && <span className="text-text-dim">(last seen {selected.meta.last_seen.slice(11, 19)})</span>}
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1 text-phantom-green">
+                      <span className="w-2 h-2 rounded-full bg-[#FF3333] inline-block" />
+                      Online
+                    </span>
+                  )}
+                </>
+              )}
               {ip && (
                 <>
                   <span className="text-text-dim">IP</span>
@@ -802,6 +852,8 @@ export default function NetworkMap({ standalone }: { standalone?: boolean }) {
               <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-[#3FB950]" /> Service</span>
               <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-[#D29922]" /> Finding</span>
               <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-[#BD34FE]" /> Beacon</span>
+              <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full border-2 border-[#FF3333]" /> Live host</span>
+              <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-[#6E7681]" /> Offline</span>
             </div>
             <div className="flex items-center gap-1 text-[9.5px] text-text-dim">
               <Move size={9} /> drag to pan · scroll to zoom · {(view.k * 100).toFixed(0)}%

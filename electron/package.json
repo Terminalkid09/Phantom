@@ -1,6 +1,6 @@
 {
   "name": "phantom-electron",
-  "version": "3.7.3",
+  "version": "3.0.0",
   "description": "Phantom Offensive Security Framework — Electron Desktop App",
   "main": "dist-electron/main.js",
   "scripts": {

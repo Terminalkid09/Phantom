@@ -26,6 +26,34 @@ export default function SessionPanel() {
   // Knowledge state
   const [knowledge, setKnowledge] = useState<{ summary: Record<string, number>; hypotheses: Array<{ kind: string; text: string }>; target: string } | null>(null)
 
+  // Core-sync state: what the auto-mode bridged into the manual session
+  // (services/creds/OS, internal peers, cloud, EDR gaps, mobile surfaces)
+  type CoreKnowledge = {
+    services?: Array<{ port: number; service?: string; version?: string; host?: string }>
+    os_info?: { name?: string; accuracy?: number }
+    creds_found?: Array<{ username: string; service?: string; host?: string }>
+    next_targets?: Array<{ ip: string; service?: string; via?: string }>
+    beacon_deployed?: boolean
+    persistence_set?: boolean
+    cloud_findings?: Record<string, unknown[]>
+    edr_gaps?: string[]
+    mobile_surface?: { platforms?: string[]; mdm?: unknown[]; surface?: unknown[] }
+    k8s_escape?: boolean
+  }
+  const [coreKnow, setCoreKnow] = useState<CoreKnowledge | null>(null)
+
+  const loadCoreKnowledge = async () => {
+    const res = await api('GET', '/api/session')
+    if (res.status === 200 && res.data) {
+      const d = res.data as { knowledge?: CoreKnowledge }
+      setCoreKnow(d.knowledge || {})
+    } else {
+      setCoreKnow({})
+    }
+  }
+
+  useEffect(() => { void loadCoreKnowledge() }, [])
+
   // Craft-lure state
   const [crafting, setCrafting] = useState(false)
   const [craftOut, setCraftOut] = useState<{ kind?: string; url?: string; code?: string; html?: string; payload_url?: string; hint?: string; video_title?: string; error?: string } | null>(null)
@@ -345,6 +373,43 @@ export default function SessionPanel() {
             )}
           </div>
 
+          {/* Core sync — facts the auto-mode bridged into the manual session */}
+          {coreKnow && (
+            <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 3 }}>
+              <div className="flex items-center justify-between mb-2">
+                <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
+                  <Brain size={13} className="text-phantom-green" /> Core Sync
+                </h2>
+                <button onClick={loadCoreKnowledge}
+                  className="text-[10px] text-text-dim hover:text-text-primary px-2 py-0.5 rounded bg-surface border border-surface-border">
+                  Refresh
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px]">
+                <div className="flex justify-between"><span className="text-text-dim">Services</span><span className="text-text-primary font-mono">{(coreKnow.services || []).length}</span></div>
+                <div className="flex justify-between"><span className="text-text-dim">Credentials</span><span className="text-text-primary font-mono">{(coreKnow.creds_found || []).length}</span></div>
+                <div className="flex justify-between"><span className="text-text-dim">OS</span><span className="text-text-primary">{coreKnow.os_info?.name || '—'}</span></div>
+                <div className="flex justify-between"><span className="text-text-dim">Pivot peers</span><span className="text-text-primary font-mono">{(coreKnow.next_targets || []).length}</span></div>
+                <div className="flex justify-between"><span className="text-text-dim">EDR gaps</span><span className="text-text-primary font-mono">{(coreKnow.edr_gaps || []).length}</span></div>
+                <div className="flex justify-between"><span className="text-text-dim">Beacon</span><span className={coreKnow.beacon_deployed ? 'text-phantom-green' : 'text-text-dim'}>{coreKnow.beacon_deployed ? 'UP' : '—'}</span></div>
+                <div className="flex justify-between"><span className="text-text-dim">Persistence</span><span className={coreKnow.persistence_set ? 'text-phantom-green' : 'text-text-dim'}>{coreKnow.persistence_set ? 'SET' : '—'}</span></div>
+                <div className="flex justify-between"><span className="text-text-dim">Mobile</span><span className="text-text-primary">{(coreKnow.mobile_surface?.platforms || []).join(', ') || '—'}</span></div>
+              </div>
+              {(coreKnow.next_targets || []).length > 0 && (
+                <div className="mt-2 pt-2 border-t border-surface-border">
+                  <div className="text-phantom-yellow text-[10px] font-semibold mb-1">▶ Internal pivot candidates</div>
+                  {(coreKnow.next_targets || []).slice(0, 6).map((n, i) => (
+                    <div key={i} className="flex items-center justify-between text-[10px] text-text-secondary">
+                      <span className="font-mono">{n.ip}{n.service ? ` · ${n.service}` : ''}</span>
+                      <button onClick={async () => { await api('POST', '/api/session/set', { key: 'target', value: n.ip }) }}
+                        className="text-[9px] text-text-dim hover:text-phantom-green">Use as target</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Preflight */}
           <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 4 }}>
             <div className="flex items-center justify-between mb-2">
@@ -411,6 +476,8 @@ export default function SessionPanel() {
                 className="py-1.5 rounded text-[10px] font-medium bg-surface border border-surface-border text-text-secondary hover:text-text-primary disabled:opacity-50 transition-colors">Pixel (zero-click)</button>
               <button onClick={() => handleCraft('beacon')} disabled={crafting}
                 className="py-1.5 rounded text-[10px] font-medium bg-surface border border-surface-border text-text-secondary hover:text-text-primary disabled:opacity-50 transition-colors">Beacon link</button>
+              <button onClick={() => handleCraft('beacon-player')} disabled={crafting}
+                className="py-1.5 rounded text-[10px] font-medium bg-surface border border-surface-border text-text-secondary hover:text-text-primary disabled:opacity-50 transition-colors">Beacon Player</button>
             </div>
             <div className="space-y-1.5 mb-2">
               <div className="flex gap-1.5">

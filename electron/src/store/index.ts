@@ -66,6 +66,9 @@ export interface AutoModeState {
   reasoning: Array<{
     time: string
     text: string
+    command?: string
+    reason?: string
+    stealth?: string
   }>
   agents: number
   mode: 'default' | 'stealth' | 'aggressive' | 'speed'
@@ -73,6 +76,7 @@ export interface AutoModeState {
   profile: string
   goal: string
   llm: boolean
+  verbose: boolean
 }
 
 export interface SettingsState {
@@ -81,6 +85,10 @@ export interface SettingsState {
   ssh_port: number
   ssh_user: string
   wsl_distro: string
+  /** When ON, finished screen recordings are auto-copied to the Desktop
+   *  (folder "Phantom Recordings"). When OFF (default) they stay inside
+   *  Electron / data/recordings and are only saved on demand. */
+  save_recordings_to_disk: boolean
 }
 
 interface PhantomStore {
@@ -105,7 +113,11 @@ interface PhantomStore {
   // Auto-mode
   autoMode: AutoModeState
   setAutoMode: (a: Partial<AutoModeState>) => void
-  appendReasoning: (time: string, text: string) => void
+  appendReasoning: (
+    time: string,
+    text: string,
+    extra?: { command?: string; reason?: string; stealth?: string }
+  ) => void
   updateStep: (index: number, status: string, detail?: string) => void
 
   // Settings
@@ -172,14 +184,19 @@ export const useStore = create<PhantomStore>((set, get) => ({
     targets: [],
     profile: 'enterprise',
     goal: 'deliver',
-    llm: false
+    llm: false,
+    verbose: false
   },
   setAutoMode: (a) => set((s) => ({ autoMode: { ...s.autoMode, ...a } })),
-  appendReasoning: (time, text) =>
+  appendReasoning: (
+    time: string,
+    text: string,
+    extra?: { command?: string; reason?: string; stealth?: string }
+  ) =>
     set((s) => ({
       autoMode: {
         ...s.autoMode,
-        reasoning: [...s.autoMode.reasoning, { time, text }]
+        reasoning: [...s.autoMode.reasoning, { time, text, ...extra }]
       }
     })),
   updateStep: (index, status, detail) =>
@@ -197,7 +214,12 @@ export const useStore = create<PhantomStore>((set, get) => ({
     ssh_host: '',
     ssh_port: 22,
     ssh_user: 'root',
-    wsl_distro: 'kali-linux'
+    wsl_distro: 'kali-linux',
+    // persisted in localStorage so the preference survives a restart
+    save_recordings_to_disk:
+      typeof localStorage !== 'undefined'
+        ? localStorage.getItem('phantom.saveRecordingsToDisk') === '1'
+        : false
   },
   setSettings: (s) => set((st) => ({ settings: { ...st.settings, ...s } })),
 

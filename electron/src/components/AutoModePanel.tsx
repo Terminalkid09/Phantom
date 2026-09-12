@@ -117,7 +117,8 @@ export default function AutoModePanel() {
       profile: autoMode.profile,
       goal: autoMode.goal,
       agents: autoMode.agents,
-      llm: autoMode.llm
+      llm: autoMode.llm,
+      verbose: autoMode.verbose
     })
 
     if (res.status === 200) {
@@ -138,7 +139,14 @@ export default function AutoModePanel() {
           done: boolean
           step_updates?: Array<{ step: number; status: string; detail: string }>
           current_step?: number
-          log?: Array<{ time: string; text: string; level?: 'info' | 'success' | 'warn' | 'error' | 'dim' }>
+          log?: Array<{
+            time: string
+            text: string
+            level?: 'info' | 'success' | 'warn' | 'error' | 'dim'
+            command?: string
+            reason?: string
+            stealth?: string
+          }>
         }
 
         if (d.step_updates) {
@@ -148,7 +156,11 @@ export default function AutoModePanel() {
           setAutoMode({ current_step: d.current_step })
         }
         if (d.log) {
-          d.log.forEach((l) => appendReasoning(l.time, l.text))
+          d.log.forEach((l) => appendReasoning(l.time, l.text, {
+            command: l.command || undefined,
+            reason: l.reason || undefined,
+            stealth: l.stealth || undefined
+          }))
         }
 
         if (d.done) {
@@ -356,6 +368,19 @@ export default function AutoModePanel() {
                 never gates or executes, data never leaves the machine.
               </p>
             </div>
+            <div>
+              <label className="flex items-center justify-between cursor-pointer">
+                <span className="text-[10px] text-text-dim">Verbose reasoning trace</span>
+                <input type="checkbox" checked={autoMode.verbose}
+                  onChange={(e) => setAutoMode({ verbose: e.target.checked })}
+                  disabled={autoMode.running}
+                  className="accent-phantom-cyan" />
+              </label>
+              <p className="text-[9px] text-text-dim mt-0.5">
+                Every run already shows the real command + why. Verbose adds the
+                full trace: inferences, hypotheses, hunt probes.
+              </p>
+            </div>
           </div>
 
           {/* Action buttons */}
@@ -483,11 +508,34 @@ export default function AutoModePanel() {
                   else if (r.text.includes('[!]')) colorClass = 'text-phantom-yellow font-medium'
                   else if (r.text.includes('[~]') || r.text.includes('[?]')) colorClass = 'text-text-dim'
                   else if (r.text.includes('[▶]')) colorClass = 'text-phantom-cyan'
-                  
+
+                  const showCmd = r.command && r.command.length > 0
+                  const showWhy = r.reason && r.reason.length > 0
+                  const stealth = r.stealth || ''
+                  const stealthLabel =
+                    stealth === 'paranoid' ? '⚡ paranoid' :
+                    stealth === 'active' ? '● active' :
+                    stealth === 'aggressive' ? '🎯 aggressive' : ''
+
                   return (
                     <div key={i} className="animate-stream-fade flex gap-3 hover:bg-surface-hover/50 px-1 py-0.5 rounded transition-colors">
                       <span className="text-text-dim flex-shrink-0 w-14">{r.time}</span>
-                      <span className={`break-all ${colorClass}`}>{r.text}</span>
+                      <div className="min-w-0 flex-1">
+                        <div className={`break-all ${colorClass}`}>
+                          {r.text}
+                          {stealthLabel && <span className="text-text-dim ml-2">{stealthLabel}</span>}
+                        </div>
+                        {showCmd && (
+                          <div className="text-phantom-cyan/90 font-mono text-[10.5px] mt-0.5 break-all">
+                            <span className="text-text-dim select-none">$ </span>{r.command}
+                          </div>
+                        )}
+                        {showWhy && (
+                          <div className="text-text-dim text-[10.5px] mt-0.5 break-all">
+                            <span className="select-none">why: </span>{r.reason}
+                          </div>
+                        )}
+                      </div>
                     </div>
                   )
                 })
