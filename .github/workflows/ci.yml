@@ -38,39 +38,93 @@ jobs:
       - name: Run unit tests (core + enterprise + automation)
         run: |
           set -o pipefail
-          python -m pytest \
-            tests/test_wordlist_engine.py tests/test_automode_engine.py tests/test_media_features.py \
-            tests/test_workflow_refactor.py tests/test_persistence.py \
-            tests/test_calibration.py tests/test_attack_mapping.py tests/test_risk_engine.py \
-            tests/test_history.py tests/test_threatintel.py \
-            tests/test_refactoring_stability.py tests/test_enterprise_scoring.py \
-            tests/test_anomaly.py tests/test_anomaly_enterprise.py \
-            tests/test_fingerprint.py tests/test_attack_chain.py \
-            tests/test_differential.py tests/test_ad_awareness.py tests/test_fallback.py \
-            tests/test_automation_agent.py tests/test_automation_belief.py \
-            tests/test_automation_planner.py tests/test_automation_strategy.py \
-            tests/test_automation_runtime.py tests/test_automation_stealth_runtime.py \
-            tests/test_automation_preflight.py tests/test_automation_tailoring.py \
-            tests/test_automation_targets.py tests/test_automation_toolchain.py \
-            tests/test_automation_exploit.py tests/test_automation_exploit_system.py \
-            tests/test_automation_rce_bridge.py tests/test_automation_sandbox.py \
-            tests/test_automation_reporting.py tests/test_automation_guidance.py \
-            tests/test_automation_harvest.py tests/test_automation_impact.py \
-            tests/test_automation_post.py tests/test_automation_deliver.py \
-            tests/test_automation_resume.py tests/test_automation_social.py \
-            tests/test_automation_attack_path.py tests/test_automation_reasoning.py \
-            tests/test_automation_enterprise.py \
-            tests/test_execute_quiet.py tests/test_dynamic_exploits.py \
-            tests/test_cve_resolver.py tests/test_exploitability.py \
-            tests/test_dynamics_quality.py tests/test_hunter.py \
-            tests/test_modules_dynamic_ux.py tests/test_modules_enhanced.py \
-            tests/test_audit_log.py tests/test_pm_c2_intel.py \
-            tests/test_suggest_meta.py tests/test_noise_breaker.py \
-            tests/test_ad_awareness.py tests/test_cloud_k8s_mobile.py \
-            tests/test_cloud_lateral.py tests/test_c2_manual_flows.py \
-            tests/test_api_auth.py tests/test_c2_ux.py \
-            -v --timeout=120 -x \
-            2>&1 | head -300
+          # One test path per line on purpose: the set is checked BEFORE pytest
+          # starts. A renamed or deleted test file used to make pytest exit with
+          # a usage error that reads like a test failure and hides the cause.
+          TEST_FILES=$(cat <<'EOF'
+          tests/test_wordlist_engine.py
+          tests/test_automode_engine.py
+          tests/test_media_features.py
+          tests/test_workflow_refactor.py
+          tests/test_calibration.py
+          tests/test_attack_mapping.py
+          tests/test_risk_engine.py
+          tests/test_history.py
+          tests/test_threatintel.py
+          tests/test_refactoring_stability.py
+          tests/test_enterprise_scoring.py
+          tests/test_anomaly.py
+          tests/test_anomaly_enterprise.py
+          tests/test_fingerprint.py
+          tests/test_attack_chain.py
+          tests/test_differential.py
+          tests/test_ad_awareness.py
+          tests/test_fallback.py
+          tests/test_automation_agent.py
+          tests/test_automation_belief.py
+          tests/test_automation_planner.py
+          tests/test_automation_strategy.py
+          tests/test_automation_runtime.py
+          tests/test_automation_stealth_runtime.py
+          tests/test_automation_preflight.py
+          tests/test_automation_tailoring.py
+          tests/test_automation_targets.py
+          tests/test_automation_toolchain.py
+          tests/test_automation_exploit.py
+          tests/test_automation_exploit_system.py
+          tests/test_automation_rce_bridge.py
+          tests/test_automation_sandbox.py
+          tests/test_automation_reporting.py
+          tests/test_automation_guidance.py
+          tests/test_automation_harvest.py
+          tests/test_automation_impact.py
+          tests/test_automation_post.py
+          tests/test_automation_deliver.py
+          tests/test_automation_resume.py
+          tests/test_automation_social.py
+          tests/test_automation_attack_path.py
+          tests/test_automation_reasoning.py
+          tests/test_automation_enterprise.py
+          tests/test_execute_quiet.py
+          tests/test_dynamic_exploits.py
+          tests/test_cve_resolver.py
+          tests/test_exploitability.py
+          tests/test_dynamics_quality.py
+          tests/test_hunter.py
+          tests/test_modules_dynamic_ux.py
+          tests/test_modules_enhanced.py
+          tests/test_audit_log.py
+          tests/test_pm_c2_intel.py
+          tests/test_suggest_meta.py
+          tests/test_noise_breaker.py
+          tests/test_cloud_k8s_mobile.py
+          tests/test_cloud_lateral.py
+          tests/test_c2_manual_flows.py
+          tests/test_api_auth.py
+          tests/test_c2_ux.py
+          tests/test_aitm.py
+          tests/test_dm_delivery_strategy.py
+          tests/test_brain_targets_doctrine.py
+          tests/test_evolution.py
+          tests/test_phase_contract.py
+          tests/test_manual_core_upgrades.py
+          tests/test_timeline.py
+          tests/test_network_triage.py
+          EOF
+          )
+          MISSING=""
+          for f in $TEST_FILES; do
+            [ -f "$f" ] || MISSING="$MISSING $f"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "ERROR: ci.yml references test files that do not exist:$MISSING"
+            echo "Fix the list — a stale path must not red the build."
+            exit 1
+          fi
+          # `tail`, never `head`: with pipefail a truncated pipe sends SIGPIPE to
+          # pytest and fails the step even when every test passed. `--maxfail`
+          # instead of `-x` so one flake does not hide the rest of the run.
+          python -m pytest $TEST_FILES -v --timeout=120 --maxfail=25 2>&1 | tail -200
 
       - name: Verify core module imports
         run: |
@@ -92,15 +146,19 @@ jobs:
           from phantom.core.attack_mapping import attack_mapper, AttackMapper
           from phantom.core.risk_engine import risk_engine, RiskEngine
           from phantom.core.history import history_analyzer, HistoricalAnalyzer
-          from phantom.automation.fingerprint.probes import FingerprintEngine, PROTOCOL_PROBES
+          from phantom.automation.fingerprint.probes import FingerprintEngine, PROBE_MAP
           from phantom.automation.attack_chain import AttackGraph
           from phantom.automation.exploit.differential import DifferentialEngine
           from phantom.automation.ad_awareness import ADAwareness
           from phantom.automation.fallback import FallbackEngine, HistoricalLearner
           print('All enterprise + automation modules imported successfully')
-          print(f'ATT&CK techniques: {len(attack_mapper.known_techniques)}')
+          # smoke counts: verify the mappers still expose real data, using the
+          # CURRENT accessors (a rename here is a real breakage worth catching)
+          techniques = attack_mapper.get_enterprise_techniques()
+          assert techniques, 'ATT&CK mapper returned no techniques'
+          print(f'ATT&CK techniques: {len(techniques)}')
           print(f'Risk service types: {len(risk_engine.business_criticality)}')
-          print(f'Protocol probes: {len(PROTOCOL_PROBES)}')
+          print(f'Protocol probes: {len(PROBE_MAP)}')
           "
 
   electron-build:
