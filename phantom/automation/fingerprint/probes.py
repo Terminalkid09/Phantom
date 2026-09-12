@@ -801,7 +801,7 @@ PROBE_MAP: Dict[str, Tuple[Callable, int]] = {
 
 # Port-to-service mapping (for nmap output parsing)
 PORT_SERVICE_MAP: Dict[int, str] = {
-    22: "ssh", 21: "ftp", 25: "smtp", 53: "dns",
+    22: "ssh", 21: "ftp", 25: "smtp", 53: "dns", 80: "http",
     135: "rpc", 139: "netbios", 161: "snmp",
     389: "ldap", 443: "https", 445: "smb",
     636: "ldaps", 1433: "mssql", 1521: "oracle",

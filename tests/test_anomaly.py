@@ -43,11 +43,13 @@ class TestProbeLibrary(unittest.TestCase):
 
     def test_all_classes_have_baseline_and_payloads(self):
         lib = probe_library()
-        # core classes + the 8 professional-grade additions
+        # core classes + the professional-grade additions incl. the
+        # deserialization and GraphQL surface classes
         self.assertEqual(set(lib.keys()),
                          {"traversal", "sqli", "ssti", "xxe", "ssrf",
                           "cmdi", "open_redirect", "crlf", "nosqli",
-                          "header_ssti", "jndi", "exposure", "verb"})
+                          "header_ssti", "jndi", "exposure", "verb",
+                          "deser", "graphql"})
         for cls, probes in lib.items():
             baselines = [p for p in probes if p.baseline]
             payloads = [p for p in probes if not p.baseline]
