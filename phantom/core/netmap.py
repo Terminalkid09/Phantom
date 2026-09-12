@@ -16,6 +16,7 @@ import shutil
 import socket
 import subprocess
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
@@ -327,6 +328,132 @@ def _enrich_hosts(hosts: List[Dict[str, str]], timeout: float = 12.0) -> None:
         pass
 
 
+# ── Senior network triage (one engine for auto-mode + `map`) ────────────────
+# The auto-mode CIDR input used to duplicate host discovery + surface
+# ranking inside automode.py. Everything now lives here: discovery,
+# enrichment, liveness and exposure ranking are ONE engine, so the map,
+# Electron and the auto-mode assault pool always see the same truth.
+
+
+def triage_networks(networks: List[str], timeout: float = 60.0) -> Dict[str, Any]:
+    """Senior pre-assault triage for one or more CIDRs.
+
+    * host discovery with `nmap -sn` (works for local AND remote ranges),
+      falling back to the classic local sweep when nmap is missing;
+    * enrichment (vendor / hostname / OS guess / service ports);
+    * liveness (freshly discovered hosts are alive by definition);
+    * exposure ranking (the richest surface first) via the same
+      `rank_hosts_exposure` the `map` command and the Electron
+      "find weak spot" use.
+
+    Returns ``{hosts, ranked, method, elapsed}`` — ``hosts`` is every
+    discovered device (enriched dicts, ``alive=True``), ``ranked`` is the
+    attack-surface-ordered subset for the assault pool. Empty when nothing
+    answers (the caller degrades to classic CIDR expansion).
+    """
+    started = time.time()
+    hosts: List[Dict[str, Any]] = []
+    method = ""
+    nmap = shutil.which("nmap")
+    for net in networks or []:
+        if nmap:
+            out = _run([nmap, "-sn", net], timeout=timeout)
+            found = _parse_nmap_sn(out or "")
+            if found:
+                method = method or "nmap -sn"
+                for h in found:
+                    if h.get("ip") and not any(
+                            x.get("ip") == h["ip"] for x in hosts):
+                        hosts.append(h)
+        else:
+            # nmap-less: the classic sweep only reaches the local segment
+            res = discover_network(target=net, timeout=timeout)
+            for h in res.get("hosts", []) or []:
+                if h.get("ip") and not any(
+                        x.get("ip") == h["ip"] for x in hosts):
+                    hosts.append(h)
+            method = method or res.get("method", "ping sweep")
+    if not hosts:
+        return {"hosts": [], "ranked": [], "method": method or "none",
+                "elapsed": round(time.time() - started, 1)}
+    _enrich_hosts(hosts, timeout=min(12.0, max(4.0, timeout / 4)))
+    _quick_probe_hosts(hosts, timeout=min(15.0, max(6.0, timeout / 5)))
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    for h in hosts:
+        h["alive"] = True
+        h["last_seen"] = now
+    ranked = rank_hosts_exposure(hosts, timeout=timeout)
+    save_discovered_hosts(hosts)
+    return {"hosts": hosts, "ranked": ranked,
+            "method": method or "none",
+            "elapsed": round(time.time() - started, 1)}
+
+
+_LIVENESS_CACHE: Dict[str, Any] = {}
+
+
+def check_hosts_alive(hosts: List[Dict[str, Any]], timeout: float = 8.0,
+                      force: bool = False) -> Dict[str, bool]:
+    """Quick liveness probe for a list of hosts (parallel ping, bounded).
+
+    Sets ``alive`` (bool) + ``last_seen`` on each host dict IN PLACE and
+    returns ``{ip: alive}``. Cached for 25s so the Electron poll never
+    hammers the network; ``force=True`` for an explicit re-check (right
+    after a scan / on operator demand). Never raises: a host we cannot
+    reach is marked dead, a missing ping binary degrades to optimistic
+    (keeps the map usable on stripped systems).
+    """
+    if not hosts:
+        return {}
+    now = time.time()
+    key = tuple(sorted(h.get("ip", "") for h in hosts))
+    if (not force and _LIVENESS_CACHE.get("at", 0)
+            and now - _LIVENESS_CACHE.get("at", 0) < 25
+            and _LIVENESS_CACHE.get("key") == key):
+        return dict(_LIVENESS_CACHE.get("status", {}))
+    ping = shutil.which("ping")
+    result: Dict[str, bool] = {}
+    if not ping:
+        for h in hosts:
+            if h.get("ip"):
+                result[h["ip"]] = True
+    else:
+        import platform
+        is_win = "win" in platform.system().lower()
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _one(h: Dict[str, Any]) -> tuple:
+                ip = h.get("ip", "")
+                if not ip:
+                    return ip, False
+                try:
+                    cmd = ([ping, "-n", "1", "-w", "700", ip] if is_win
+                           else [ping, "-c", "1", "-W", "1", ip])
+                    proc = subprocess.run(cmd, capture_output=True,
+                                          timeout=2)
+                    return ip, proc.returncode == 0
+                except Exception:
+                    return ip, False
+
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                for ip, ok in pool.map(_one, hosts):
+                    result[ip] = ok
+        except Exception:
+            for h in hosts:
+                if h.get("ip"):
+                    result[h["ip"]] = True
+    stamp = datetime.utcnow().isoformat(timespec="seconds")
+    for h in hosts:
+        ip = h.get("ip", "")
+        if ip and ip in result:
+            h["alive"] = result[ip]
+            if result[ip]:
+                h["last_seen"] = stamp
+    _LIVENESS_CACHE.update({"at": now, "key": key, "status": result})
+    return result
+
+
 def discover_network(target: Optional[str] = None,
                      timeout: float = 90.0) -> Dict[str, Any]:
     """Discover live hosts. `target` may be a CIDR (sweep that) or None
@@ -380,10 +507,15 @@ def discover_network(target: Optional[str] = None,
     # fingerprint each device a little deeper: quick TCP probe of the top
     # service ports (so every card shows WHAT is listening) + an OS guess
     _quick_probe_hosts(unique, timeout=min(15.0, max(6.0, timeout / 5)))
+    stamp = datetime.utcnow().isoformat(timespec="seconds")
     for h in unique:
         v = _mac_vendor(h.get("mac", ""))
         if v and not h.get("vendor"):
             h["vendor"] = v
+        # freshly discovered = alive right now (the discovery methods only
+        # answer for hosts that are actually up)
+        h["alive"] = True
+        h["last_seen"] = stamp
         # a device without a hostname is what the UI renders as "unknown" —
         # fall back to vendor, then a readable label, never a bare "unknown"
         if not h.get("hostname"):
@@ -561,6 +693,8 @@ def seed_worldmodel(hosts: List[Dict[str, str]], source: str = "netmap") -> int:
                                   "vendor": h.get("vendor", ""),
                                   "hostname": h.get("hostname", ""),
                                   "os": h.get("os_guess", ""),
+                                  "alive": bool(h.get("alive", True)),
+                                  "last_seen": h.get("last_seen", ""),
                                   "ports": h.get("ports", []),
                                   "services": h.get("services", ""),
                                   "detail": detail},
@@ -670,7 +804,9 @@ def rank_hosts_exposure(hosts: List[Dict[str, Any]],
 
         def _assess(h: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             ip = h.get("ip", "")
-            if not ip or ip in local_ips:
+            # a host we know is offline right now is never ranked: probing
+            # a dead device wastes time and would mislead the operator
+            if not ip or ip in local_ips or h.get("alive") is False:
                 return None
             open_ports = _probe_ports(ip, port_list)
             if not open_ports:

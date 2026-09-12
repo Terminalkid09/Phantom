@@ -37,6 +37,64 @@ from phantom.utils.paths import data_dir
 MARKER = "RANSOM_SIM:"
 ENC_SUFFIX = ".phnt"
 
+# Filesystem areas a simulation must NEVER touch without an explicit
+# opt-out: the operator's home, OS system dirs, the Phantom install and
+# its data dir. The sim is real-reversible, but a typo like dir="." in a
+# home/root context would still encrypt operator files — the guard turns
+# that into a hard error instead of damage.
+_UNSAFE_PATH_MARKERS = (
+    "/etc", "/usr", "/bin", "/sbin", "/lib", "/boot", "/var", "/opt",
+    "/tmp", "/proc", "/sys", "/dev", "/run", "/snap", "/System",
+    "/Library", "/Applications",
+    "\\windows", "\\program files", "\\programdata", "\\system32",
+    "\\users\\", "\\appdata", "\\program files (x86)",
+)
+
+
+def _unsafe_dir_reason(target_dir: str) -> str:
+    """Human reason when target_dir must not be encrypted, else ""."""
+    abspath = os.path.abspath(target_dir)
+    root = os.path.abspath(os.sep)
+    home = os.path.expanduser("~")
+    if abspath == root:
+        return f"filesystem root ({abspath})"
+    # OS scratch space (%TEMP% on Windows, /tmp on POSIX) is the natural
+    # simulation target (tests, lab dirs) — NOT refused. Checked BEFORE the
+    # home/marker guards so AppData\Local\Temp is allowed while
+    # AppData\Roaming (real configs/cookies) stays guarded.
+    low = abspath.lower()
+    try:
+        import tempfile as _tf
+        scratch = os.path.abspath(_tf.gettempdir())
+        if low == scratch.lower() or low.startswith(scratch.lower() + os.sep):
+            return ""
+    except Exception:
+        pass
+    if home and (abspath == home or abspath.startswith(home + os.sep)):
+        return f"the operator home directory ({home})"
+    for marker in _UNSAFE_PATH_MARKERS:
+        if marker in low:
+            return f"system path ({abspath})"
+    try:
+        import phantom
+        pkg = os.path.dirname(os.path.abspath(phantom.__file__))
+        if abspath == pkg or abspath.startswith(pkg + os.sep):
+            return f"the Phantom install ({pkg})"
+        from phantom.utils.paths import data_dir
+        dd = os.path.abspath(data_dir())
+        if abspath == dd or abspath.startswith(dd + os.sep):
+            return f"the Phantom data dir ({dd})"
+    except Exception:
+        pass
+    return ""
+
+
+def _ransom_sim_allowed() -> bool:
+    from phantom.utils import config as cfg
+    v = str(cfg.get("engagement.ransom_sim_allow", "",
+                    env="PHANTOM_RANSOM_SIM_ALLOW"))
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
 
 def ransom_sim_command(dir_path: str = ".") -> str:
     """The command a beacon executes to run the simulation."""
@@ -75,37 +133,51 @@ class RansomSimulator:
 
     def encrypt(self, target_dir: str,
                 run_id: str = "") -> Dict[str, Any]:
-        """AES-256-GCM-encrypt every regular file of target_dir in place."""
+        """AES-256-GCM-encrypt every regular file of target_dir in place.
+
+        Crash-safe by construction:
+          1. the target dir is guarded (system/home/Phantom dirs refused
+             unless PHANTOM_RANSOM_SIM_ALLOW=1),
+          2. the manifest (master key + nonce + sha256 of EVERY file) is
+             written and fsynced BEFORE any file is touched,
+          3. only then are files encrypted and replaced in place.
+        A crash mid-run leaves the manifest on disk with everything needed
+        for rollback() — files are never encrypted with a lost key.
+        """
         run_id = run_id or time.strftime("rs%Y%m%d%H%M%S")
         if not os.path.isdir(target_dir):
             raise NotADirectoryError(target_dir)
+        reason = _unsafe_dir_reason(target_dir)
+        if reason and not _ransom_sim_allowed():
+            raise PermissionError(
+                f"refusing to simulate ransomware on {reason} "
+                "(set PHANTOM_RANSOM_SIM_ALLOW=1 to override)")
 
         master_key = secrets.token_bytes(32)
         aesgcm = AESGCM(master_key)
         entries: List[ManifestEntry] = []
 
+        # Phase 1 — scan + metadata ONLY (hash/nonce/size computed without
+        # touching a file). Every entry is recoverable from this point on.
         for name in sorted(os.listdir(target_dir)):
             src = os.path.join(target_dir, name)
             if not os.path.isfile(src) or os.path.islink(src):
                 continue
             if name.endswith(ENC_SUFFIX):
                 continue  # never double-encrypt an artifact
-            with open(src, "rb") as f:
-                plain = f.read()
             nonce = secrets.token_bytes(12)
-            ct = aesgcm.encrypt(nonce, plain, None)  # ct = ciphertext + tag
-            enc_path = src + ENC_SUFFIX
-            with open(enc_path, "wb") as f:
-                f.write(nonce + ct)
-            os.remove(src)  # original content replaced by the ciphertext
-            entries.append(ManifestEntry(
+            entry = ManifestEntry(
                 orig_rel=name,
                 orig_abspath=os.path.abspath(src),
-                encrypted=enc_path,
+                encrypted=src + ENC_SUFFIX,
                 nonce=base64.b64encode(nonce).decode(),
-                sha256=hashlib.sha256(plain).hexdigest(),
-                size=len(plain)))
+                sha256=_sha256_file(src),
+                size=os.path.getsize(src))
+            entry._nonce = nonce  # runtime-only, excluded from asdict()
+            entries.append(entry)
 
+        # Phase 2 — persist the manifest (master key + every entry) BEFORE
+        # any os.remove: rollback is always possible, even after a crash.
         manifest = {
             "run_id": run_id,
             "target_dir": os.path.abspath(target_dir),
@@ -114,12 +186,36 @@ class RansomSimulator:
             "master_key": base64.b64encode(master_key).decode(),
             "cipher": "aes-256-gcm",
             "entries": [asdict(e) for e in entries],
+            "status": "encrypting",
         }
         run_dir = os.path.join(self.vault_dir, run_id)
         os.makedirs(run_dir, exist_ok=True)
         manifest_path = os.path.join(run_dir, "manifest.json")
-        with open(manifest_path, "w", encoding="utf-8") as f:
+        tmp_manifest = manifest_path + ".tmp"
+        with open(tmp_manifest, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_manifest, manifest_path)
+
+        # Phase 3 — encrypt + replace in place.
+        for e in entries:
+            src = e.orig_abspath
+            with open(src, "rb") as f:
+                plain = f.read()
+            ct = aesgcm.encrypt(e._nonce, plain, None)  # ct = ciphertext+tag
+            with open(e.encrypted, "wb") as f:
+                f.write(e._nonce + ct)
+            os.remove(src)  # original content replaced by the ciphertext
+
+        # finalize: mark the run complete (rollback uses entries only, but
+        # the status makes the audit trail unambiguous)
+        manifest["status"] = "complete"
+        with open(tmp_manifest, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_manifest, manifest_path)
         return manifest
 
     def rollback(self, manifest_path: str) -> int:
