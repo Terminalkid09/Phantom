@@ -46,10 +46,15 @@ try:
 except ImportError:
     TELEGRAM_AVAILABLE = False
 
-BOT_TOKEN = os.getenv("PHANTOM_TELEGRAM_BOT_TOKEN", "")
-C2_API = os.getenv("PHANTOM_C2_API", "http://127.0.0.1:8080")
+from phantom.utils import config as cfg
+
+BOT_TOKEN = str(cfg.get("transports.telegram_bot_token", "",
+                         env="PHANTOM_TELEGRAM_BOT_TOKEN"))
+C2_API = str(cfg.get("c2.api", "http://127.0.0.1:8080",
+                     env="PHANTOM_C2_API"))
 ALLOWED_USERS = set()
-_allowed_str = os.getenv("PHANTOM_TELEGRAM_ALLOWED_USERS", "").strip()
+_allowed_str = str(cfg.get("transports.telegram_allowed_users", "",
+                            env="PHANTOM_TELEGRAM_ALLOWED_USERS")).strip()
 if _allowed_str:
     ALLOWED_USERS = set(int(x.strip()) for x in _allowed_str.split(",") if x.strip())
 

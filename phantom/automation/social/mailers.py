@@ -29,22 +29,28 @@ class MailConfig:
 
 
 def env_mail_config() -> MailConfig:
-    """MailConfig from PHANTOM_SMTP_* environment variables.
+    """MailConfig from data/config.json (transports.smtp) with legacy
+    PHANTOM_SMTP_* environment variables taking precedence.
 
-    SMTP2GO and Brevo both offer free tiers; the operator sets the host,
-    port, username and password once in .env.
+    SMTP2GO and Brevo both offer free tiers; ``phantom setup`` writes the
+    credentials into config.json so a .env is never required.
     """
-    host = os.getenv("PHANTOM_SMTP_HOST", SMTP2GO_HOST)
+    from phantom.utils import config as cfg
+    host = cfg.get("transports.smtp.host", SMTP2GO_HOST, env="PHANTOM_SMTP_HOST")
     try:
-        port = int(os.getenv("PHANTOM_SMTP_PORT", "2525"))
-    except ValueError:
+        port = int(cfg.get("transports.smtp.port", "2525",
+                           env="PHANTOM_SMTP_PORT"))
+    except (TypeError, ValueError):
         port = 2525
-    use_tls = os.getenv("PHANTOM_SMTP_TLS", "1") not in ("0", "false", "no", "")
+    use_tls = str(cfg.get("transports.smtp.tls", "1",
+                          env="PHANTOM_SMTP_TLS")) not in ("0", "false", "no", "")
     return MailConfig(
-        smtp_host=host,
+        smtp_host=str(host),
         smtp_port=port,
-        username=os.getenv("PHANTOM_SMTP_USER", ""),
-        password=os.getenv("PHANTOM_SMTP_PASSWORD", ""),
+        username=str(cfg.get("transports.smtp.username", "",
+                             env="PHANTOM_SMTP_USER")),
+        password=str(cfg.get("transports.smtp.password", "",
+                             env="PHANTOM_SMTP_PASSWORD")),
         use_tls=use_tls,
     )
 
@@ -58,11 +64,14 @@ class Mailer:
         injectable for tests (a 4-arg transport keeps working)."""
         self.config = config if config is not None else env_mail_config()
         self._transport = transport or self._smtp_send
+        self._jitter = False
 
     def _build_message(self, sender: str, to: str, subject: str, body: str,
-                       html: Optional[str] = None,
-                       reply_to: Optional[str] = None) -> bytes:
+                   html: Optional[str] = None,
+                   reply_to: Optional[str] = None) -> bytes:
         import email.utils
+        import random as _random
+        import string as _string
         from email.mime.multipart import MIMEMultipart
         from email.mime.text import MIMEText
         msg = MIMEMultipart("alternative")
@@ -70,7 +79,23 @@ class Mailer:
         msg["To"] = to
         msg["Subject"] = subject
         msg["Date"] = email.utils.formatdate(localtime=True)
-        msg["Message-ID"] = email.utils.make_msgid(domain="phantom.local")
+        # Message-ID on the SENDING domain (phantom.local is an instant
+        # spam signal); random left-part like real MUAs generate
+        mid_domain = "mail.com"
+        try:
+            from_addr = sender.split("<")[-1].rstrip(">").strip()
+            if "@" in from_addr:
+                mid_domain = from_addr.split("@", 1)[1]
+        except (IndexError, AttributeError):
+            pass
+        msg["Message-ID"] = f"<{_random.randbytes(8).hex()}.{''.join(_random.choices(_string.ascii_lowercase, k=6))}@{mid_domain}>"
+        # headers real MUAs set and spam filters expect: their ABSENCE is
+        # the loudest phishing signal, more than any content filter
+        msg["MIME-Version"] = "1.0"
+        msg["X-Mailer"] = "Microsoft Outlook 16.0"
+        msg["Thread-Index"] = _random.randbytes(11).hex()
+        msg["Content-Language"] = "en-US"
+        msg["Accept-Language"] = "en-US"
         if reply_to:
             msg["Reply-To"] = reply_to
         msg.attach(MIMEText(body, "plain", "utf-8"))
@@ -101,12 +126,24 @@ class Mailer:
                    reply_to: Optional[str] = None) -> bool:
         """Send plain (and optionally HTML) email. `sender` may be
         `"Display Name <addr>"` — delivery hardening keeps the display name
-        consistent with the pretext role."""
+        consistent with the pretext role.
+
+        Campaign mode: send_email(..., jitter=True) sleeps a human-paced
+        random delay before relaying so a burst of identical-moment
+        submissions (the classic bulk-phish signature) never hits the MX."""
+        if getattr(self, "_jitter", False):
+            import random
+            import time as _t
+            _t.sleep(random.uniform(1.0, 4.5))
         try:
             return self._transport(sender, to, subject, body, html, reply_to)
         except TypeError:
             # 4-arg injected transport (legacy tests): degrade to plain text
             return self._transport(sender, to, subject, body)
+
+    def set_jitter(self, enabled: bool) -> None:
+        """Enable human-paced send jitter for campaigns (anti-burst)."""
+        self._jitter = bool(enabled)
 
     def send_sms(self, from_name: str, phone: str, carrier: str,
                  message: str) -> bool:

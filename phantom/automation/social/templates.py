@@ -242,27 +242,60 @@ def render_pretext(pretext_id: str, context: Dict[str, str],
 # HTML body builder (delivery hardening)
 # ---------------------------------------------------------------------------
 
-_HTML_BASE = """<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#222;max-width:560px;margin:0 auto;padding:24px">
-<p>{intro}</p>
-<p style="margin:28px 0"><a href="{link}" style="background:#0a5bd3;color:#fff;text-decoration:none;padding:10px 18px;border-radius:4px;display:inline-block">{link_label}</a></p>
-<p>{tail}</p>
+_HTML_BASE = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"></head><body style="font-family:{font},sans-serif;color:#222;max-width:560px;margin:0 auto;padding:24px">
+<!-- {noise} -->
+<p style="font-size:14px;line-height:1.5">{intro}</p>
+<p style="margin:28px 0"><a href="{link}" style="background:{btn};color:#fff;text-decoration:none;padding:{pad}px 18px;border-radius:{radius}px;display:inline-block;font-size:14px">{link_label}</a></p>
+<p style="font-size:14px;line-height:1.5">{tail}</p>
+<p style="font-size:11px;color:#999;margin-top:32px;border-top:1px solid #eee;padding-top:12px">{footer}</p>
 {tracking}
 </body></html>"""
+
+# per-send variation so a campaign never shares one HTML fingerprint
+_BRANDS = ("#0a5bd3", "#1a73e8", "#0066cc", "#2e5aac", "#0057b8")
+_FONTS = ("Arial", "Helvetica", "Segoe UI", "Verdana", "Tahoma")
+_FOOTERS = (
+    "You are receiving this message because you have an active account. "
+    "If you believe this was sent in error, you can adjust your "
+    "notification preferences in account settings.",
+    "This is an automated service message. To stop receiving these "
+    "emails, update your communication preferences from your profile.",
+    "Sent by the notifications service. Manage your alert settings in "
+    "your account dashboard at any time.",
+)
 
 
 def build_html_body(subject: str, body_text: str, link: str,
                     link_label: str, tracking_pixel: str = "") -> str:
-    """Convert a plain-text pretext body into a minimal HTML email.
+    """Convert a plain-text pretext body into a realistic HTML email.
 
     Keeps the visible text identical to the plain version (delivery
-    consistency), adds one action button, and injects the open-tracking
+    consistency), adds one action button and injects the open-tracking
     pixel before </body>.
-    """
+
+    Delivery hardening: per-send randomized button color / font / paddings
+    and a rotating legitimate-looking footer, so a multi-target campaign
+    never shares one template fingerprint (bulk-template detectors group
+    identical HTML across recipients; real mail never matches 1:1)."""
+    import random
     paras = [p.strip() for p in body_text.split("\n\n") if p.strip()]
     intro = " ".join(paras[:-1]) if len(paras) > 1 else (paras[0] if paras else body_text)
     tail = paras[-1] if paras else ""
+    # NEVER display:none: a hidden image is a classic spam marker, and Gmail
+    # strips it — which silently kills open tracking on top of hurting
+    # delivery. The pixel is a normal inline 1x1 with a plausible alt, the
+    # way real service mail carries one.
     tracking = (f'<img src="{tracking_pixel}" width="1" height="1" '
-                f'style="display:none" alt="">') if tracking_pixel else ""
+                f'style="border:0;outline:none" alt="status">'
+                ) if tracking_pixel else ""
+    noise = "".join(random.choices(
+        "abcdefghijklmnopqrstuvwxyz0123456789", k=10))
     return _HTML_BASE.format(
         intro=intro, link=link, link_label=link_label,
-        tail=tail, tracking=tracking)
+        tail=tail, tracking=tracking,
+        font=random.choice(_FONTS),
+        btn=random.choice(_BRANDS),
+        pad=random.choice((9, 10, 11, 12)),
+        radius=random.choice((3, 4, 4, 5, 6)),
+        footer=random.choice(_FOOTERS),
+        noise=noise)
