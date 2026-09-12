@@ -16,8 +16,31 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from phantom.core.executor import QuietResult, _is_safe_target, execute_quiet
-from phantom.core.scope import is_in_scope
+from phantom.core.scope import is_in_scope, scope_status
 from phantom.core.session import session
+
+
+def _is_identity_target(target: str) -> bool:
+    """Identity targets (email/username/phone) are the engagement SUBJECT,
+    not machines to authorize — the scope list gates hosts, never people."""
+    try:
+        from phantom.automation.guidance.targets import (
+            classify_target, is_identity_target)
+        return is_identity_target(classify_target(target))
+    except Exception:
+        return False
+
+
+def _unscoped_allowed() -> bool:
+    """Explicit opt-out for running targeted commands without an engagement
+    scope. Default OFF: the API gate refuses; the documented escape hatch
+    for lab/CTF work is ``phantom setup`` → engagement.allow_unscoped or
+    PHANTOM_ALLOW_UNSCOPED=1. Never set by default: an authorization gate
+    must fail closed."""
+    from phantom.utils import config as cfg
+    v = str(cfg.get("engagement.allow_unscoped", "",
+                    env="PHANTOM_ALLOW_UNSCOPED"))
+    return v.strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass
@@ -76,9 +99,28 @@ class BackendDispatcher:
         }
 
     def run(self, command: str, target: str = "", timeout: float = 120.0) -> QuietResult:
-        """Execute one command after scope and target validation."""
-        if target and session.scope and not is_in_scope(target, session.scope):
-            return QuietResult(command, error=f"out of scope: {target}", returncode=-1)
+        """Execute one command after scope and target validation.
+
+        Scope policy is FAIL CLOSED for targeted commands:
+          * scope declared + target out of scope -> refused
+          * NO scope declared + remote target      -> refused unless the
+            operator explicitly opted out (PHANTOM_ALLOW_UNSCOPED=1)
+        An empty scope list must never mean "everything is allowed" — the
+        whole point of an engagement scope is that the absence of one is a
+        decision the operator makes deliberately.
+        """
+        if target and not _is_identity_target(target):
+            status = scope_status(target, session.scope)
+            if status == "out_of_scope":
+                return QuietResult(command, error=f"out of scope: {target}",
+                                   returncode=-1)
+            if status == "unscoped" and not _unscoped_allowed():
+                return QuietResult(
+                    command,
+                    error=("no engagement scope defined — set the session "
+                           "scope (e.g. 10.0.0.0/8,172.16.0.0/12) or set "
+                           "PHANTOM_ALLOW_UNSCOPED=1 to run without a scope"),
+                    returncode=-1)
         if target and not _is_safe_target(target):
             return QuietResult(command, error=f"unsafe target: {target}", returncode=-1)
         if not command.strip():

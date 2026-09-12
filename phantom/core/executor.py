@@ -269,6 +269,8 @@ def _is_tool_installed(cmd: str) -> bool:
 # turn into `apt-get install handler`.
 _PHANTOM_COMMANDS = frozenset({
     "deploy-agent", "privesc-run", "list-exploits", "msf-search",
+    "msf-fire", "msf-status", "msf-interact", "remote-deploy",
+    "chain", "poc-sync", "remote-view", "remote-open",
     "generate-shellcode", "mem-run", "inject-tl", "inject-eb",
     "beacon-auth", "beacon-help", "autopersist", "interact", "results",
     "back", "payloads", "console", "migrate", "run", "use", "set",

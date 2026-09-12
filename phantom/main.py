@@ -29,8 +29,36 @@ def main():
     parser.add_argument("--resume", default="", metavar="CHECKPOINT",
                         help="resume from an auto-mode checkpoint (auto-mode)")
     parser.add_argument("--llm", action="store_true", help="optional local-LLM advisor (auto-mode)")
+    parser.add_argument("--experience", action="store_true",
+                        help="CROSS-ENGAGEMENT learning memory (auto-mode): "
+                             "keep cause->repair experience between runs "
+                             "(default: learning is scoped to this run only)")
+    parser.add_argument("--evolution", action="store_true",
+                        help="SELF-IMPROVEMENT (auto-mode): stable uncovered "
+                             "failure patterns spawn a background sub-agent "
+                             "that authors a new capability and opens a "
+                             "reviewable PR (lab required; max 2 PRs/day)")
+    parser.add_argument("--beta", action="store_true",
+                        help="BETA CAPABILITIES (auto-mode): fetch open "
+                             "auto-evolution PRs, gate them locally and use "
+                             "the ones that pass (same full gate, lab "
+                             "included; working tree untouched)")
     parser.add_argument("-y", "--yes", action="store_true", help="Run mode sequences without confirmation prompts")
+    parser.add_argument("--setup", nargs="?", const="", metavar="TARGET",
+                        help="guided setup: 'wsl' for the Windows WSL toolbox "
+                             "flow, none for the full wizard (tools, doctor)")
+    parser.add_argument("--doctor", action="store_true",
+                        help="diagnostics only: python, tools, docker, WSL, "
+                             "LLM transport — installs nothing")
     args, extra = parser.parse_known_args()
+
+    if args.doctor:
+        from phantom.utils.setup_wizard import doctor
+        doctor()
+        return
+    if args.setup is not None:
+        from phantom.utils.setup_wizard import run_wizard
+        sys.exit(run_wizard(args.setup, assume_yes=args.yes))
 
     # Direct entry points: `phantom.c2` / `phantom.auto` land in the right
     # shell immediately (no flag), matching the `phantom` default.
@@ -69,6 +97,9 @@ def main():
             goal=args.goal,
             profile=args.profile_auto,
             llm=args.llm,
+            experience=args.experience,
+            evolution=args.evolution,
+            beta=args.beta,
             resume=args.resume,
         )
         return

