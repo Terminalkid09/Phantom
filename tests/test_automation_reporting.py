@@ -386,5 +386,46 @@ class TestReportWriter(unittest.TestCase):
                 self.assertIn("Campaign Assessment", f.read())
 
 
+class TestEnterpriseSurfacesInReports(unittest.TestCase):
+    """Fase 4: internal recon, cloud, EDR gaps and mobile used to be dropped
+    from the client report (fixed kind list). They must surface now."""
+
+    def _agent(self):
+        agent = AutonomousAgent(
+            target="10.0.0.5", profile="enterprise",
+            registry=make_registry())
+        agent.wm = WorldModel(target="10.0.0.5")
+        agent.wm.add_finding("internal_service", "10.0.0.9",
+                             {"host": "10.0.0.9", "service": "smb"},
+                             confidence=0.8, source="internal_probe")
+        agent.wm.add_finding("cloud_lateral", "roles",
+                             {"role_arns": ["arn:aws:iam::1:role/a"],
+                              "provider": "aws"},
+                             confidence=0.8, source="cloud_iam_enum")
+        agent.wm.add_finding("defensive_gap", "wd",
+                             {"control": "defender"},
+                             confidence=0.8, source="edr_disable")
+        agent.wm.add_finding("mdm_vendor", "fingerprint",
+                             {"vendors": ["intune"]},
+                             confidence=0.8, source="mobile_mdm_fingerprint")
+        agent.goal = "complete_kill_chain"
+        return agent
+
+    def test_client_report_mentions_new_surfaces(self):
+        client = ClientReport.from_agent(self._agent(), "enterprise")
+        titles = " | ".join(f.title for f in client.findings)
+        self.assertIn("Internal network", titles)
+        self.assertIn("Cloud identity", titles)
+        self.assertIn("Endpoint protection", titles)
+        self.assertIn("Mobile", titles)
+
+    def test_raw_report_counts_new_kinds(self):
+        raw = RawReport.from_agent(self._agent())
+        md = raw.to_markdown()
+        self.assertIn("internal hosts", md)
+        self.assertIn("cloud lateral", md)
+        self.assertIn("defensive gaps", md)
+
+
 if __name__ == "__main__":
     unittest.main()

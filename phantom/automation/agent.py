@@ -53,7 +53,12 @@ from phantom.core.executor import execute_quiet
 #   crack        -> crack the harvested hashes offline
 #   lateral      -> pivot to in-scope peer hosts when any exist
 DEEP_GOAL = "deep"
-DEEP_STAGES = ("deliver", "post_exploit", "ad", "crack", "lateral")
+# the deep ladder: beacon+persistence -> privesc -> INTERNAL expansion
+# (recon + pivot-service probing, which also feeds the lateral hosts) ->
+# AD -> crack -> lateral movement. "evasion" is NOT in the static tuple:
+# it is inserted at run time only for aggressive runs (edr_disable is
+# aggressive-only), so a stealth/deep run never touches the defensive stack.
+DEEP_STAGES = ("deliver", "post_exploit", "expand", "ad", "crack", "lateral")
 
 
 def _in_scope(target: str, scope_list: List[str]) -> bool:
@@ -72,10 +77,23 @@ class ShareContext:
     lateral-movement candidates. Thread-safe: sub-agents run concurrently.
     """
 
+    # findings worth broadcasting to peers: the firehose of every service /
+    # header finding would drown them and duplicate their own scans
+    SHARED_KINDS = {
+        "victim_ip", "ad_domain", "os", "environment", "beacon",
+        "cloud_creds", "rce_foothold", "follow_accepted",
+    }
+
     def __init__(self, peers: Optional[List[str]] = None) -> None:
         self.peers: List[str] = list(peers or [])
         self._lock = threading.Lock()
         self._creds: List[tuple] = []  # (service, username, password, source)
+        # (kind, key) -> {"value": dict, "target": source_target}
+        self._findings: Dict[tuple, dict] = {}
+        # (entity, capability) -> already probed by SOME worker in this
+        # campaign: prevents two sub-agents re-running the same single-shot
+        # probe against the same entity
+        self._tried: set = set()
 
     def add_creds(self, service: str, username: str, password: str,
                   source_target: str) -> None:
@@ -99,6 +117,49 @@ class ShareContext:
             if p != exclude:
                 return p
         return None
+
+    def publish_finding(self, kind: str, key: str, value: dict,
+                        source_target: str) -> None:
+        """Broadcast a high-value finding to the other sub-agents.
+
+        Only SHARED_KINDS are published — the firehose of every service/
+        header finding would drown the peers and duplicate their own scans.
+        """
+        if kind not in self.SHARED_KINDS:
+            return
+        with self._lock:
+            self._findings[(kind, key)] = {
+                "value": value, "target": source_target,
+            }
+
+    def shared_finding(self, kind: str,
+                       key: Optional[str] = None) -> Optional[tuple]:
+        """A peer's high-value finding: (value_dict, source_target) or None."""
+        with self._lock:
+            for (k, kk), entry in self._findings.items():
+                if k != kind:
+                    continue
+                if key is None or kk == key:
+                    return (entry["value"], entry["target"])
+        return None
+
+    def shared_findings(self, kind: str) -> List[tuple]:
+        """All peers' findings of a kind: [(value_dict, source_target), ...]."""
+        with self._lock:
+            return [(e["value"], e["target"])
+                    for (k, _kk), e in self._findings.items() if k == kind]
+
+    def mark_tried(self, entity: str, capability: str) -> None:
+        with self._lock:
+            self._tried.add((entity, capability))
+
+    def was_tried(self, entity: str, capability: str) -> bool:
+        with self._lock:
+            return (entity, capability) in self._tried
+
+    def tried_count(self) -> int:
+        with self._lock:
+            return len(self._tried)
 
 
 # ---------------------------------------------------------------------------
@@ -179,9 +240,13 @@ class AutonomousAgent:
                  shared_wm: Optional["WorldModel"] = None,
                  hunt_runner: Optional[Callable[[str, str, str, float], Any]] = None,
                  hunt_delay: Optional[float] = None,
+                 fuzz_sender: Optional[Callable[[str, str], Any]] = None,
                  threat_intel=None,
                  persist_learning: bool = False,
-                 llm: bool = False) -> None:
+                 experience: bool = False,
+                 evolution: bool = False,
+                 llm: bool = False,
+                 stop_event=None) -> None:
         self.target = target
         if target_type in ("", "auto"):
             from phantom.automation.guidance.targets import classify_target
@@ -193,6 +258,13 @@ class AutonomousAgent:
         self.paranoid = paranoid
         self.speed = speed
         self.scope_list = scope_list or []
+        # target ledger: the single source of truth for the ACTIVE target
+        # set (initial + mid-run pivots), their classification, and the
+        # scope/provenance authorization of every discovered pivot.
+        # The doctrine gate reads `ledger.chain_class()` so a username
+        # never opens with a port scan and an IP never gets a breach lookup.
+        from phantom.automation.brain.targets import TargetLedger
+        self.ledger = TargetLedger(target, scope_list=list(self.scope_list))
 
         self.wm = (shared_wm if shared_wm is not None
                    else WorldModel(target=target, target_type=target_type))
@@ -218,6 +290,20 @@ class AutonomousAgent:
         self.reasoning = ReasoningEngine(self.registry, paranoid=paranoid)
         self.enterprise = EnterpriseBrain(profile, threat_intel=threat_intel)
         self.persist_learning = persist_learning
+        # self-improvement loop flag: when True, stable uncovered failure
+        # patterns are closed by an authoring sub-agent (background, never
+        # blocking) that opens a reviewable PR. Off by default.
+        self.evolution = evolution
+        self._evolution_spawned = False
+        # case-based EXPERIENCE memory (brain/experience): remembers the
+        # situation, the technique's OUTCOME, WHY it failed and which move
+        # unblocked it, so a wall hit earlier is not hit the same way again.
+        # Like the priors it only REORDERS moves that already passed every
+        # gate — it can never authorise anything. Default is
+        # engagement-scoped: nothing is written to disk unless the operator
+        # opts into cross-engagement memory (`--experience`).
+        self.experience = _make_experience(experience)
+        self.planner.experience = self.experience
         self.runtime = runtime or StealthRuntime(self.stealth_engine)
         self.sandbox = sandbox if sandbox is not None else SandboxEngine()
         self.toolchain = toolchain if toolchain is not None else ToolRegistry()
@@ -247,19 +333,43 @@ class AutonomousAgent:
             from phantom.automation.fallback import init_historical_learner
             self._history = init_historical_learner()
             self._fallback = FallbackEngine(history=self._history)
+            # cross-session technique priors (brain/priors.py): earned
+            # success rates reorder equally-ready moves in the planner.
+            from phantom.automation.brain.priors import TechniquePriors
+            self._priors = TechniquePriors()
+            self.planner.priors = self._priors
         else:
             self._fallback = FallbackEngine()
+            self._priors = None
         self._dyn = DynCommandBuilder(seed=command_seed)
         self.hunt_runner = hunt_runner
         self.hunt_delay = hunt_delay
+        # optional in-process fuzz sender (tests / campaigns inject a
+        # scripted sender); None means the bounded urllib sender is used
+        self.fuzz_sender = fuzz_sender
         self.sink = EventSink()
         self._on_event = on_event
         # optional local-LLM advisor: non-gating, injection-hardened
         from phantom.automation.llm_advisor import LLMAdvisor
         self.llm_advisor = LLMAdvisor(enabled=llm, paranoid=paranoid)
+        # only when the operator actually enabled the advisor: let it name
+        # the failure cause for the ambiguous tail (rules always run first,
+        # so the deterministic path is never dependent on a model).
+        if getattr(self.llm_advisor, "enabled", False):
+            try:
+                self.experience.set_classifier(
+                    self.llm_advisor.classify_failure)
+            except Exception:
+                pass
         self.goal: Optional[str] = None
         self.result: Dict[str, Any] = {}
         self._stage_outcomes: Dict[str, bool] = {}
+        # campaign cooperation: peers' findings are absorbed ONCE per run
+        self._absorbed_shared: bool = False
+        # cooperative stop flag (set by the orchestrator / frontends); a
+        # missing attribute means "never stop" so bare constructions in
+        # tests need no setup
+        self._stop_event = stop_event
 
     # ------------------------------------------------------------- plumbing
 
@@ -275,6 +385,44 @@ class AutonomousAgent:
         if is_identity_target(self.target_type):
             return True
         return _in_scope(self.target, self.scope_list)
+
+    def _stop_requested(self) -> bool:
+        """True when the operator (or another frontend) requested a stop.
+        Cooperative: checked between planner iterations and inside the
+        phase-wait poll, so a long scan already in flight finishes and the
+        loop exits at the next boundary instead of mid-action."""
+        ev = getattr(self, "_stop_event", None)
+        return ev is not None and ev.is_set()
+
+    def _absorb_shared(self) -> None:
+        """Import high-value findings peers discovered into this WorldModel.
+
+        Runs at the top of every planning pass. Shared kinds are imported
+        only when THIS agent has no equal-or-better fact of its own (a
+        peer's victim_ip never overrides a locally validated one), with
+        source="peer" so the report can attribute campaign cooperation.
+        """
+        if not self.share or self._absorbed_shared:
+            return
+        for kind in ShareContext.SHARED_KINDS:
+            entry = self.share.shared_finding(kind)
+            if entry is None:
+                continue
+            value, src_target = entry
+            if src_target == self.target:
+                continue
+            own = self.wm.find(kind)
+            if own and kind == "victim_ip":
+                # a locally validated identity outranks a peer's
+                continue
+            key = f"peer:{src_target}:{kind}"
+            try:
+                if self.wm.get(kind, key) is None:
+                    self.wm.add_finding(kind, key, value,
+                                        confidence=0.8, source="peer")
+                    self._emit("shared", kind=kind, from_target=src_target)
+            except Exception:
+                continue
 
     def _emit(self, kind: str, **data) -> None:
         self.sink.emit(kind, **data)
@@ -330,13 +478,16 @@ class AutonomousAgent:
                     pass
         # toolchain: a capability whose tools are missing fails cleanly
         # (checked BEFORE autofill so no side effects are recorded)
-        if cap.tools:
+        if cap.tools and self.toolchain.resolve(cap.tools) is None:
+            # tools is an ALTERNATES list (nmap|masscan|nc): the capability
+            # only fails when NONE is installed. Failing on the first
+            # absent alternate made every multi-tool capability dead even
+            # with a perfectly good primary tool present.
             missing = self.toolchain.missing(cap.tools)
-            if missing:
-                self._mark_failed(cap.id)
-                self._emit("tool_missing", capability=cap.id, tools=missing)
-                self.wm.record_failure(cap.id, f"tool unavailable: {', '.join(missing)}")
-                return False
+            self._mark_failed(cap.id)
+            self._emit("tool_missing", capability=cap.id, tools=missing)
+            self.wm.record_failure(cap.id, f"tool unavailable: {', '.join(missing)}")
+            return False
         # senior red-teamer behavior: fill in what the plan didn't specify
         try:
             slots = self._autofill_slots(cap, slots)
@@ -361,6 +512,10 @@ class AutonomousAgent:
         # (baseline + statistical scoring + mutation escalation, in-process)
         if cap.category == "hunt":
             return self._execute_hunt_capability(cap, slots)
+        # IDOR detection executes through the differential engine channel
+        # (baseline + reference walk + distinct-object oracle, in-process)
+        if cap.id == "idor_scan":
+            return self._execute_idor_capability(cap, slots)
         # web credential extraction is an in-process engine (SSRF/SQLi
         # probes against the discovered web services) — the adapter returns
         # WEBCREDS: markers, never a shell command
@@ -412,8 +567,34 @@ class AutonomousAgent:
                 self._emit("blocked", capability=cap.id,
                            reason=verdict.summary())
                 return False
+        # a BIND shell listens on the target — anyone can connect to it and
+        # the EDR signature is unmistakable. Hard-gated behind --aggressive
+        # exactly like online brute: stealth/default/paranoid never open a
+        # listening backdoor. (Reverse shells dial OUT and stay allowed.)
+        if cap.id == "payload_bind" and not self.aggressive:
+            self._mark_failed(cap.id)
+            self._emit("blocked", capability=cap.id,
+                       reason="bind shell requires --aggressive")
+            self.wm.record_failure(cap.id, "bind shell requires --aggressive")
+            return False
+        # brute capabilities are hard-gated behind --aggressive: online
+        # credential attacks are the loudest move in the tool and the
+        # noise budget never buys this one (stealth/default/paranoid only)
+        if cap.category == "brute" and not self.stealth_engine.online_brute_allowed():
+            self._mark_failed(cap.id)
+            self._emit("blocked", capability=cap.id,
+                       reason="online brute force requires --aggressive")
+            self.wm.record_failure(cap.id, "online brute requires --aggressive")
+            return False
+        # the live stream carries the REAL command plus the planner's WHY,
+        # the stealth badge and the detection risk: the operator (and the
+        # report) can audit the action, not just its name
         self._emit("run", capability=cap.id, banner=cap.banner,
-                   category=cap.category, cost=cap.opsec_cost)
+                   category=cap.category, cost=cap.opsec_cost,
+                   command=cmd,
+                   reason=getattr(step, "reason", "") or "",
+                   stealth_level=cap.stealth_level,
+                   detection_risk=cap.detection_risk)
         # noise circuit breaker: account the detection risk of loud moves
         self._account_noise(cap)
         # stealth-aware execution (human timing + opsec spend + egress)
@@ -540,6 +721,36 @@ class AutonomousAgent:
             self.wm.add_finding(f.kind, f.key, f.value,
                                 confidence=f.confidence, source=cap_id,
                                 evidence=f.evidence)
+            # internal recon discoveries join the target ledger so pivot
+            # selection can authorize them. They are registered under the
+            # NORMAL scope rule (NOT scope-inherited): an ARP neighbor is
+            # not authorization, so a neighbor outside the engagement scope
+            # stays unregistered and can never become a pivot target.
+            if f.kind in ("internal_host", "internal_service"):
+                try:
+                    v = f.value if isinstance(f.value, dict) else {}
+                    host = str(v.get("host") or v.get("ip") or "")
+                    if host:
+                        self.ledger.register(
+                            host, source=f"discovered:{f.kind}",
+                            fact_kind=f.kind, origin=self.target,
+                            reason="internal recon candidate")
+                except Exception:
+                    pass
+            # cross-platform identity candidates feed the identity-
+            # confidence gate: PROBABLE/UNRELATED handles can never become
+            # actionable pivots (the wrong-person guardrail).
+            if f.kind == "identity_conf":
+                try:
+                    v = f.value if isinstance(f.value, dict) else {}
+                    handle = str(v.get("handle") or "")
+                    tier = str(v.get("tier") or "unrelated")
+                    if handle:
+                        aggressive = bool(getattr(self, "aggressive", False))
+                        self.ledger.set_identity_tiers({handle: tier},
+                                                       aggressive=aggressive)
+                except Exception:
+                    pass
         return new
 
     # ------------------------------------------------- retry discipline
@@ -634,6 +845,49 @@ class AutonomousAgent:
         return any(f.ts > failed_at for kind in fact_kinds
                    for f in self.wm.find(kind))
 
+    # which service a pivot needs on the peer (matches internal_probe ports)
+    _PIVOT_SERVICE = {"lateral_pivot": "ssh", "smb_pivot": "smb",
+                      "winrm_pivot": "winrm"}
+
+    def _internal_pivot_host(self, cap_id: str) -> str:
+        """A peer host for a pivot, chosen from the internal recon findings.
+
+        Prefers an `internal_service` peer that speaks the pivot's own
+        service (ssh/smb/winrm); falls back to any in-scope `internal_host`
+        neighbor. Only ACTIVE (ledger-authorized) peers are eligible: an
+        ARP neighbor is NOT authorization, so an out-of-scope neighbor is
+        never selected as a pivot target.
+        """
+        service = self._PIVOT_SERVICE.get(cap_id, "")
+        if not service:
+            return ""
+        for f in self.wm.find("internal_service"):
+            v = f.value if isinstance(f.value, dict) else {}
+            host = str(v.get("host") or "")
+            if host and host != self.target \
+                    and str(v.get("service")) == service \
+                    and self.ledger.activatable(host):
+                return host
+        for f in self.wm.find("internal_host"):
+            v = f.value if isinstance(f.value, dict) else {}
+            host = str(v.get("ip") or v.get("host") or "")
+            if host and host != self.target and self.ledger.activatable(host):
+                return host
+        return ""
+
+    def _cloud_provider(self) -> str:
+        """The cloud provider for the current foothold (aws|gcp|azure).
+        Delegates to the capability kit so the manual-core, the auto-mode
+        and the adapters all resolve the provider identically."""
+        from phantom.automation.guidance.kit import _cloud_provider
+        return _cloud_provider(self.wm)
+
+    def _cloud_assumable_identity(self) -> str:
+        """The identity `cloud_assume_role` should assume, from the
+        `cloud_lateral:roles` finding produced by `cloud_iam_enum`."""
+        from phantom.automation.guidance.kit import _cloud_assumable_identity
+        return _cloud_assumable_identity(self.wm)
+
     def _autofill_slots(self, cap, slots: Dict[str, Any]) -> Dict[str, Any]:
         """Senior behavior: supply what the plan left unspecified.
 
@@ -646,14 +900,31 @@ class AutonomousAgent:
         """
         if cap.id in ("lateral_pivot", "smb_pivot", "winrm_pivot") \
                 and "host" not in slots:
-            # host is an OPTIONAL input (peers may be absent) — still
-            # autofill it from the campaign share when available
-            peer = self.share.first_peer(self.target)
-            if peer:
-                slots["host"] = peer
+            # host is an OPTIONAL input (peers may be absent) — autofill it
+            # from the engagement's OWN internal recon first (a peer the
+            # beacon discovered and probed), then from the campaign share.
+            host = self._internal_pivot_host(cap.id)
+            if not host:
+                host = self.share.first_peer(self.target)
+            if host:
+                slots["host"] = host
 
         required = {s.name for s in cap.inputs if s.required}
         missing = required - set(slots)
+        # cloud/IAM chain: the lateral-movement primitives take their inputs
+        # from the PREVIOUS stage's findings, so an operator never has to
+        # copy a role ARN across manually.
+        #   provider   <- cloud_creds finding (aws|gcp|azure)
+        #   role_arn   <- cloud_lateral:roles finding (assumable identity)
+        if cap.id in ("cloud_iam_enum", "cloud_s3_enum",
+                      "cloud_assume_role", "cloud_cross_account"):
+            if "provider" not in slots:
+                slots["provider"] = self._cloud_provider()
+            if cap.id == "cloud_assume_role" and not slots.get("role_arn"):
+                ident = self._cloud_assumable_identity()
+                if ident:
+                    slots["role_arn"] = ident
+
         if cap.id == "trojan_deliver" and "carrier" not in slots \
                 and "payload" not in slots and self._trojan_assets:
             carrier = self._trojan_assets.get("carrier")
@@ -1018,6 +1289,11 @@ class AutonomousAgent:
                 cookies = build_cookie_header(v.get("cookies", []))
         if self.hunt_delay is not None:
             delay_fn = (lambda: self.hunt_delay)
+        elif self.hunt_runner is not None:
+            # An injected runner REPLACES the transport (tests / offline /
+            # a caller-supplied prober): there is no live target to pace
+            # against, so the human-cadence delay would only burn time.
+            delay_fn = (lambda: 0.0)
         else:
             # Human operators drive a web scanner at a steady fast cadence
             # (sub-second), not the 1.5s action cadence used between
@@ -1056,6 +1332,124 @@ class AutonomousAgent:
                 f"score={a.score:.2f} confirmed={str(a.confirmed).lower()} "
                 f"severity={a.severity()} evidence={a.evidence}")
         output = "\n".join(lines)
+        findings = cap.interpret(output, self.wm, slots)
+        learned = self._register_findings(cap.id, findings)
+        self._emit("found", capability=cap.id,
+                   findings=[f"{f.kind}:{f.key}" for f in findings],
+                   values={f"{f.kind}:{f.key}": (
+                       ", ".join(str(x) for x in list(f.value.values())[:3])
+                       if isinstance(f.value, dict) else str(f.value))
+                       for f in findings})
+        if not learned:
+            self._mark_failed(cap.id)
+            self.wm.record_failure(cap.id, "no new facts learned")
+            return False
+        return True
+
+    def _run_web_fuzz(self) -> None:
+        """Generative fuzz pass (brain/fuzz): mutate input grammar on the
+        mapped web app, judge by differential oracles. Findings land as
+        hunt_anomaly facts so the composition engine can pivot on them.
+        Bounded requests; never blocks the chain."""
+        from phantom.automation.brain.fuzz.engine import FuzzEngine
+        from phantom.automation.brain.fuzz.oracles import Response
+        from phantom.automation.guidance.kit import _effective_target
+        host = _effective_target(self.wm)
+        # an injected sender (tests / campaigns) replaces the default
+        # urllib one; the bounded budget wrapper still applies when the
+        # default is used
+        fuzz_sender = self.fuzz_sender
+        port, scheme = 80, "http"
+        for f in self.wm.find("service"):
+            v = f.value if isinstance(f.value, dict) else {}
+            try:
+                port = int(str(v.get("port", "80")).split("/")[0])
+            except (TypeError, ValueError):
+                pass
+            svc = str(v.get("service", "")).lower()
+            if svc in ("https", "ssl") or port == 443:
+                scheme = "https"
+        base = f"{scheme}://{host}:{port}"
+
+        def _send(param: str, payload: str) -> Response:
+            import urllib.request as urllib
+            url = (f"{base}/?{param}="
+                   f"{urllib.parse.quote(payload, safe='')}")
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": (
+                    self.stealth_engine.current_user_agent()
+                    if hasattr(self.stealth_engine, "current_user_agent")
+                    else "Mozilla/5.0")})
+            t0 = time.time()
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    body = resp.read(65536).decode("utf-8", errors="replace")
+                    return Response(status=resp.status, body=body,
+                                    elapsed=time.time() - t0)
+            except urllib.error.HTTPError as e:
+                body = (e.read(65536) or b"").decode("utf-8", errors="replace")
+                return Response(status=e.code, body=body,
+                                elapsed=time.time() - t0)
+
+        deadline = time.time() + 90
+        state = {"over": False}
+
+        def _budgeted(param: str, payload: str) -> Optional[Response]:
+            if state["over"] or time.time() > deadline:
+                state["over"] = True
+                return None
+            return _send(param, payload)
+
+        engine = FuzzEngine(
+            fuzz_sender if fuzz_sender is not None else _budgeted,
+            rounds=2, max_requests=48, seed=None)
+        findings = engine.run(["id", "q", "file", "page", "url"])
+        for f in findings[:8]:
+            self.wm.add_finding(
+                "hunt_anomaly",
+                f"fuzz:{f.mutation.param}",
+                {"class": f.verdict.family_hint,
+                 "param": f.mutation.param,
+                 "oracle": f.verdict.oracle,
+                 "endpoint": f"?{f.mutation.param}=",
+                 "detail": f.verdict.detail},
+                confidence=0.6, source="fuzz")
+        if findings:
+            covered = getattr(engine, "requests_sent", 0)
+            self._emit("fuzz_complete", requests=covered,
+                       findings=len(findings),
+                       families=sorted({f.verdict.family_hint
+                                        for f in findings}))
+
+    def _execute_idor_capability(self, cap, slots: Dict[str, Any]) -> bool:
+        """IDOR detection runs through the differential engine channel:
+        baseline + reference walk on web endpoints, distinct-object oracle
+        (identity markers / size delta / status delta), bounded GETs. The
+        LLM gate withholds the leaked body when the advisor is enabled."""
+        from phantom.automation.exploit.idor import run_idor_dump
+        self._emit("run", capability=cap.id, banner=cap.banner,
+                   category=cap.category, cost=cap.opsec_cost)
+        llm_on = bool(getattr(self, "llm_advisor", None)
+                      and self.llm_advisor.enabled)
+        try:
+            signals = run_idor_dump(self.wm, self.target,
+                                    extract_data=not llm_on)
+        except Exception as e:
+            self.wm.record_action(cap.id, slots, "idor://web", ok=False,
+                                  note=str(e))
+            self.wm.record_failure(cap.id, str(e))
+            self._mark_failed(cap.id)
+            self._emit("failed", capability=cap.id, output=str(e))
+            return False
+        self.wm.record_action(cap.id, slots, "idor://web", ok=True,
+                              note=f"{len(signals)} IDOR signal(s)")
+        if not signals:
+            self.wm.record_failure(cap.id, "no IDOR signals")
+            self._mark_failed(cap.id)
+            self._emit("failed", capability=cap.id, output="no IDOR signals")
+            return False
+        output = "\n".join(s.to_marker() for s in signals)
         findings = cap.interpret(output, self.wm, slots)
         learned = self._register_findings(cap.id, findings)
         self._emit("found", capability=cap.id,
@@ -1118,6 +1512,15 @@ class AutonomousAgent:
         """
         if not self._require_beacon_session(
                 cap, "no beacon session to run post-exploitation"):
+            return False
+        # disabling the defensive stack is destructive and loud: only an
+        # aggressive run may do it (its precondition already requires a
+        # SYSTEM-level session on top of this gate).
+        if cap.id == "edr_disable" and not self.aggressive:
+            self._mark_failed(cap.id)
+            self._emit("blocked", capability=cap.id,
+                       reason="EDR/AV disable requires --aggressive")
+            self.wm.record_failure(cap.id, "EDR/AV disable requires --aggressive")
             return False
         # injection requires SYSTEM-level privileges confirmed first
         if cap.id == "inject_beacon" and not self.wm.find("system_privilege"):
@@ -1295,6 +1698,28 @@ class AutonomousAgent:
             self._emit("blocked", capability=cap.id,
                        reason="no social engine available")
             self.wm.record_failure(cap.id, "no social engine")
+            return False
+        # delivery transports (SMTP/IMAP, a DM gateway, an SMS API) are an
+        # OPERATOR secret: a phish is never attempted against a real victim
+        # when the channel is unconfigured — it would either fail opaquely
+        # or fall back to something that leaks. Block with a precise reason
+        # so the operator sees exactly which env vars are missing. Only the
+        # REAL engine is gated: an injected engine (tests / a custom sender)
+        # owns its own delivery and must not be second-guessed here.
+        missing = []
+        if isinstance(self.social_engine, SocialEngine):
+            try:
+                from phantom.automation.social.transports import (
+                    missing_transports,
+                )
+                missing = missing_transports(cap.id)
+            except Exception:
+                missing = []
+        if missing:
+            self._mark_failed(cap.id)
+            self._emit("blocked", capability=cap.id,
+                       reason="transport not configured: " + ", ".join(missing))
+            self.wm.record_failure(cap.id, "transport not configured")
             return False
         self._emit("run", capability=cap.id, banner=cap.banner,
                    category=cap.category, cost=cap.opsec_cost)
@@ -1523,6 +1948,12 @@ class AutonomousAgent:
                 pretext=slots.get("pretext") or None,
                 use_video=not self.aggressive,
                 use_login_page=self.aggressive)
+        elif capability_id == "dm_stage2":
+            # stage 2 of the two-stage contact: the link held by dm_launch is
+            # sent here, once the target replied (or --aggressive pushes it).
+            # The wait state is PERSISTED, so a chain started in an earlier
+            # session still finishes.
+            ok, lines = engine.dm_second_stage([self.target])
         elif capability_id == "dm_follow":
             ok, lines = engine.dm_follow(
                 [self.target], platform=slots.get("platform", ""))
@@ -1762,7 +2193,7 @@ class AutonomousAgent:
             # a missing tool is a DETERMINISTIC failure, not a transient:
             # re-arming the capability can never install the tool, so it would
             # only burn the recovery budget and postpone the clean halt.
-            if cap.tools and self.toolchain.missing(cap.tools):
+            if cap.tools and self.toolchain.resolve(cap.tools) is None:
                 continue
             # repeat-guard: a recon capability that already ran cleanly must
             # not be re-armed just because an identical attempt later timed
@@ -1815,15 +2246,16 @@ class AutonomousAgent:
                             worker=self._orchestrator_worker)
         try:
             if goal == DEEP_GOAL:
+                stages = self._deep_ladder()
                 stage_results: Dict[str, bool] = {}
-                for _idx, _sg in enumerate(DEEP_STAGES, 1):
+                for _idx, _sg in enumerate(stages, 1):
                     self._recoveries = 0  # fresh stall budget per stage
                     _ok = self._drive_stage(
                         _sg, max_iterations, checkpoint_path, orch,
                         phase_wait, phase_wait_timeout)
                     stage_results[_sg] = _ok
                     self._emit("stage", index=_idx, stage=_sg,
-                               satisfied=_ok, total=len(DEEP_STAGES),
+                               satisfied=_ok, total=len(stages),
                                detail="stage goal satisfied" if _ok else
                                "no further move viable in this stage")
                 self._stage_outcomes = dict(stage_results)
@@ -1866,6 +2298,39 @@ class AutonomousAgent:
                     self._history.persist()
                 except Exception:
                     pass
+        # cross-session technique priors: flush every REAL action of this
+        # run as a win/loss for its (technique, fingerprint-class) bucket so
+        # the next engagement plans cheaper wins first (opt-in).
+        if self._priors is not None:
+            try:
+                for _act in self.wm.actions_taken:
+                    _cap = _act.get("capability")
+                    if _cap:
+                        self._priors.record_from_worldmodel(
+                            self.wm, _cap, bool(_act.get("ok")))
+            except Exception:
+                pass
+        # experience memory: ingest the tail of the run, consolidate
+        # (prune + promote strong patterns into the priors) and persist
+        # only when cross-engagement memory was opted into.
+        try:
+            self.experience.sync(self.wm)
+            exp_result = self.experience.finish(priors=self._priors)
+            self._emit("experience", **self.experience.stats())
+            if exp_result.get("promoted"):
+                self._emit("note", capability="experience",
+                           detail=(f"{exp_result['promoted']} pattern(s) "
+                                   "promoted into the global priors"))
+        except Exception:
+            pass
+        # self-improvement loop (opt-in): stable uncovered failure patterns
+        # spawn a BACKGROUND authoring sub-agent — the run never blocks on
+        # it. The main chain continues; the PR appears when it's ready.
+        if self.evolution:
+            try:
+                self._spawn_evolution()
+            except Exception:
+                pass
         # v3.0: attack graph summary for reporting
         try:
             from phantom.automation.attack_chain import build_attack_summary
@@ -1884,6 +2349,53 @@ class AutonomousAgent:
         self._emit("done", **self.result)
         return self.result
 
+    def _spawn_evolution(self) -> None:
+        """Close uncovered failure patterns by authoring new capabilities.
+
+        Gated on: the LLM transport being available (the author IS the
+        LLM), the lab being reachable (no proof, no PR), and the daily
+        budgets inside loop.maybe_spawn. One shot per run.
+        """
+        if self._evolution_spawned:
+            return
+        self._evolution_spawned = True
+        if not (self.llm_advisor and self.llm_advisor.available()):
+            return
+        from phantom.automation.evolution import gate as evo_gate
+        if not evo_gate.lab_available():
+            self._emit("note", capability="evolution",
+                       detail="evolution skipped: lab unreachable — "
+                              "no proof, no PR, no auto-load")
+            return
+        from phantom.automation.evolution import loop as evo_loop
+        patterns = self.experience.authorable_patterns()
+        if not patterns:
+            return
+        for p in patterns:
+            p["sig_hash"] = evo_loop._sig_hash(p)
+        spawned = evo_loop.maybe_spawn(
+            patterns, self.llm_advisor, self.wm, emit=self._emit,
+            lab_ok=True)
+        if spawned:
+            self._emit("note", capability="evolution",
+                       detail=(f"{len(spawned)} authoring sub-agent(s) "
+                               "running in background — PR(s) will appear "
+                               "on auto-evolution/* for review"))
+
+    def _deep_ladder(self) -> List[str]:
+        """The deep run's stage order for THIS run profile.
+
+        `evasion` is deliberately NOT in the static DEEP_STAGES: disabling
+        the defensive stack (edr_disable) is aggressive-only, so it is
+        inserted at run time right after privesc (which grants the SYSTEM
+        session it needs) and before the loud AD/pivot stages. A
+        stealth/default deep run never touches the defensive stack.
+        """
+        stages = list(DEEP_STAGES)
+        if self.aggressive:
+            stages.insert(stages.index("post_exploit") + 1, "evasion")
+        return stages
+
     def _drive_stage(self, goal: str, max_iterations: int,
                      checkpoint_path: Optional[str], orch,
                      phase_wait: Optional[str],
@@ -1893,6 +2405,13 @@ class AutonomousAgent:
         (bounded recoveries) without reaching them. Shared by single-goal
         runs (goal != deep) and every stage of a deep run."""
         for _ in range(max_iterations):
+            # operator stop is cooperative and observed at every boundary:
+            # an in-flight capability finishes, the loop then exits
+            if self._stop_requested():
+                self._emit("halt", reason="stopped by operator")
+                return False
+            # campaign cooperation: import peers' high-value findings once
+            self._absorb_shared()
             if phase_wait and not self.wm.has_any(phase_wait):
                 if not self._wait_phase(phase_wait, phase_wait_timeout):
                     self._emit("halt", reason=(
@@ -1921,9 +2440,17 @@ class AutonomousAgent:
                 for cid in llm_prefs:
                     if cid not in prefs:
                         prefs.append(cid)
+            # ingest any new actions into the experience memory BEFORE
+            # planning, so the current run's own failures already inform
+            # the next move (that is the "it got stuck before, now it does
+            # not" behaviour, within a single engagement).
+            try:
+                self.experience.sync(self.wm)
+            except Exception:
+                pass
             plan = self.planner.plan_strategic(
                 self.wm, goal=goal, dead=self._dead_cap_ids(),
-                preference=prefs)
+                preference=prefs, ledger=self.ledger)
             # degradation tracking: when the planner could not reach this
             # goal for the target TYPE and fell back (identity->footprint on
             # an IP, network->OSINT on an email), record the fallback so
@@ -1987,6 +2514,16 @@ class AutonomousAgent:
             # close the loop: facts just produced confirm/refute the
             # pending hypotheses (fact-based, so ordering never matters)
             self._resolve_hypotheses()
+            # ONE-SHOT generative fuzz pass once a web surface exists:
+            # the findings land as hunt_anomaly facts the planner pivots on.
+            # Bounded (48 requests / 90s) and never blocks the chain.
+            try:
+                if (self.wm.find("web_app") or self.wm.find("web_header")) \
+                        and not getattr(self, "_fuzzed", False):
+                    self._fuzzed = True
+                    self._run_web_fuzz()
+            except Exception:
+                pass
             if checkpoint_path:
                 try:
                     self.save_state(checkpoint_path)
@@ -2128,6 +2665,17 @@ class AutonomousAgent:
         }
 
 
+def _make_experience(enabled: bool):
+    """Build the case-based experience memory (see brain/experience).
+
+    `enabled=True` means GLOBAL/cross-engagement persistence; False keeps
+    the memory inside the current engagement (in memory only), so no
+    client's data is ever written to disk unless the operator opts in.
+    """
+    from phantom.automation.brain.experience import Experience
+    return Experience(enabled=bool(enabled))
+
+
 def _run_target_with_workers(target: str, profile: str, aggressive: bool,
                              goal: str, on_event: Optional[Callable[[str, dict], None]],
                              max_iterations: int,
@@ -2143,7 +2691,11 @@ def _run_target_with_workers(target: str, profile: str, aggressive: bool,
                              speed: bool = False,
                              threat_intel=None,
                              persist_learning: bool = False,
-                             llm: bool = False) -> tuple:
+                             experience: bool = False,
+                             evolution: bool = False,
+                             llm: bool = False,
+                             stop_event=None,
+                             seed_findings=None) -> tuple:
     """Same-target parallel workers sharing ONE WorldModel (stealth design).
 
     The lead runs the full kill chain as usual; extra workers deepen single
@@ -2184,7 +2736,8 @@ def _run_target_with_workers(target: str, profile: str, aggressive: bool,
             beacon_builder=beacon_builder, social_engine=social_engine,
             shared_wm=wm, hunt_runner=hunt_runner, hunt_delay=hunt_delay,
             threat_intel=threat_intel, persist_learning=persist_learning,
-            llm=llm)
+            experience=experience, evolution=evolution, llm=llm,
+            stop_event=stop_event)
         if runner is not None:
             from phantom.automation.runtime.stealth_runtime import TimingGovernor
             agent.runtime = StealthRuntime(
@@ -2195,22 +2748,28 @@ def _run_target_with_workers(target: str, profile: str, aggressive: bool,
 
     worker_specs = []
     if workers_per_target >= 2:
-        worker_specs.append(("deepen", "enrich", ""))
+        worker_specs.append(("deepen", "enrich", "", 1200.0))
     if workers_per_target >= 2:
-        worker_specs.append(("exploit", "exploit", "service"))
+        worker_specs.append(("exploit", "exploit", "service", 1200.0))
     if workers_per_target >= 3:
-        worker_specs.append(("post", "post_exploit", "beacon"))
+        worker_specs.append(("post", "post_exploit", "beacon", 1200.0))
+    if workers_per_target >= 4:
+        # a 4th worker owns the AD phase (dual-channel: beacon or direct)
+        worker_specs.append(("ad", "ad", "ad_domain", 240.0))
+    if workers_per_target >= 5:
+        # a 5th worker owns the cloud/IAM phase (metadata + STS + cross-account)
+        worker_specs.append(("cloud", "cloud_creds", "environment", 240.0))
 
     threads = []
     worker_results: Dict[str, Any] = {}
-    for role, wgoal, gate in worker_specs:
-        def _worker(role=role, wgoal=wgoal, gate=gate):
+    for role, wgoal, gate, wtimeout in worker_specs:
+        def _worker(role=role, wgoal=wgoal, gate=gate, wtimeout=wtimeout):
             time.sleep(_r.uniform(3.0, 9.0))  # staggered start (stealth)
             try:
                 wagent = _build(worker=role)
                 worker_results[role] = wagent.run(
                     goal=wgoal, max_iterations=max_iterations,
-                    phase_wait=gate, phase_wait_timeout=1200.0)
+                    phase_wait=gate, phase_wait_timeout=wtimeout)
             except Exception as e:
                 worker_results[role] = {"error": str(e)}
         th = threading.Thread(target=_worker, daemon=True)
@@ -2218,6 +2777,7 @@ def _run_target_with_workers(target: str, profile: str, aggressive: bool,
         threads.append(th)
 
     lead = _build()
+    _seed_agent(lead, seed_findings)
     result = lead.run(goal=goal, max_iterations=max_iterations,
                       checkpoint_path=state_path)
     for th in threads:
@@ -2252,7 +2812,11 @@ def run_autonomous(target: str, target_type: str = "auto",
                    hunt_delay: Optional[float] = None,
                    threat_intel=None,
                    persist_learning: bool = False,
-                   llm: bool = False):
+                   experience: bool = False,
+                   evolution: bool = False,
+                   llm: bool = False,
+                   seed_findings: Optional[List[Dict[str, Any]]] = None,
+                   stop_event=None):
     """Full autonomous kill-chain run against a target.
 
     target_type defaults to "auto": the target is classified at runtime as
@@ -2283,10 +2847,23 @@ def run_autonomous(target: str, target_type: str = "auto",
         agent.enterprise = EnterpriseBrain(agent.profile,
                                            threat_intel=threat_intel)
         agent.persist_learning = persist_learning
+        # the checkpoint restore path must honour the same experience and
+        # evolution policy as a fresh run, or resuming would silently change it
+        agent.evolution = evolution
+        agent.experience = _make_experience(experience)
+        agent.planner.experience = agent.experience
+        if llm and getattr(agent, "llm_advisor", None) is not None:
+            try:
+                agent.experience.set_classifier(
+                    agent.llm_advisor.classify_failure)
+            except Exception:
+                pass
         if llm:
             from phantom.automation.llm_advisor import LLMAdvisor
             agent.llm_advisor = LLMAdvisor(enabled=True,
                                            paranoid=agent.paranoid)
+        agent._stop_event = stop_event
+        _seed_agent(agent, seed_findings)
         result = agent.run(goal=goal, max_iterations=max_iterations,
                            checkpoint_path=state_path)
         if return_agent:
@@ -2303,7 +2880,9 @@ def run_autonomous(target: str, target_type: str = "auto",
             social_engine=social_engine, state_path=state_path,
             workers_per_target=workers_per_target, hunt_runner=hunt_runner,
             hunt_delay=hunt_delay, threat_intel=threat_intel,
-            persist_learning=persist_learning, llm=llm)
+            persist_learning=persist_learning, experience=experience,
+            llm=llm,
+            stop_event=stop_event, seed_findings=seed_findings)
         if return_agent:
             return result, agent
         return result
@@ -2321,18 +2900,50 @@ def run_autonomous(target: str, target_type: str = "auto",
                             hunt_delay=hunt_delay,
                             threat_intel=threat_intel,
                             persist_learning=persist_learning,
-                            llm=llm)
+                            experience=experience,
+                            evolution=evolution,
+                            llm=llm,
+                            stop_event=stop_event)
     if runner is not None:
         from phantom.automation.runtime.stealth_runtime import TimingGovernor
         agent.runtime = StealthRuntime(
             agent.stealth_engine, runner=runner,
             cost_per_action=0.5,
             governor=TimingGovernor(base_delay=0.0, jitter=0.0))
+    _seed_agent(agent, seed_findings)
     result = agent.run(goal=goal, max_iterations=max_iterations,
                        checkpoint_path=state_path)
     if return_agent:
         return result, agent
     return result
+
+
+def _seed_agent(agent, seed_findings: Optional[List[Dict[str, Any]]]) -> int:
+    """Inject pre-existing facts (from the manual core) into an agent's
+    WorldModel. Never overwrites a stronger fact the agent already owns, so
+    re-seeding is always safe."""
+    if not seed_findings:
+        return 0
+    wm = getattr(agent, "wm", None)
+    if wm is None:
+        return 0
+    applied = 0
+    for s in seed_findings:
+        kind = s.get("kind")
+        key = s.get("key")
+        if not kind or key is None:
+            continue
+        if wm.get(kind, key) is not None:
+            continue
+        try:
+            wm.add_finding(kind, key, s.get("value"),
+                           confidence=float(s.get("confidence", 0.6)),
+                           source=s.get("source", "seed"),
+                           target=getattr(agent, "target", ""))
+            applied += 1
+        except Exception:
+            continue
+    return applied
 
 
 def run_campaign(targets: List[str], profile: str = "enterprise",
@@ -2356,7 +2967,10 @@ def run_campaign(targets: List[str], profile: str = "enterprise",
                  hunt_delay: Optional[float] = None,
                  threat_intel=None,
                  persist_learning: bool = False,
-                 llm: bool = False) -> Dict[str, Any]:
+                 experience: bool = False,
+                 evolution: bool = False,
+                 llm: bool = False,
+                 stop_event=None) -> Dict[str, Any]:
     """Multi-target campaign: one sub-agent per target, fanned out through a
     bounded pool (`max_agents` concurrent sub-agents).
 
@@ -2407,7 +3021,9 @@ def run_campaign(targets: List[str], profile: str = "enterprise",
                     workers_per_target=workers_per_target,
                     hunt_runner=hunt_runner, hunt_delay=hunt_delay,
                     threat_intel=threat_intel,
-                    persist_learning=persist_learning, llm=llm)
+                    persist_learning=persist_learning, experience=experience,
+                    evolution=evolution, llm=llm, stop_event=stop_event)
+
             else:
                 result, agent = run_autonomous(
                     target=target, profile=profile, aggressive=aggressive,
@@ -2420,7 +3036,8 @@ def run_campaign(targets: List[str], profile: str = "enterprise",
                     social_engine=social_engine,
                     state_path=state_path, hunt_runner=hunt_runner,
                     hunt_delay=hunt_delay, threat_intel=threat_intel,
-                    persist_learning=persist_learning, llm=llm)
+                    persist_learning=persist_learning, experience=experience,
+                    evolution=evolution, llm=llm, stop_event=stop_event)
         with lock:
             results[target] = result
             agents[target] = agent

@@ -22,6 +22,11 @@ def _full_wm():
     wm.add_finding("ad_creds", "svc", {"username": "svc", "hash": "h"}, source="kerberoast")
     wm.add_finding("cracked", "svc:pw", {"username": "svc", "password": "pw"}, source="hash_crack")
     wm.add_finding("pivot", "peer1", {"host": "10.0.0.9"}, source="lateral_pivot")
+    wm.add_finding("internal_host", "10.0.0.9", {"ip": "10.0.0.9"},
+                   source="internal_recon")
+    wm.add_finding("internal_service", "10.0.0.9:22",
+                   {"host": "10.0.0.9", "port": 22, "service": "ssh"},
+                   source="internal_probe")
     return wm
 
 
@@ -34,7 +39,8 @@ class TestDeepLadderConstants(unittest.TestCase):
     def test_stages_order_and_terminal(self):
         self.assertEqual(DEEP_GOAL, "deep")
         self.assertEqual(DEEP_STAGES,
-                         ("deliver", "post_exploit", "ad", "crack", "lateral"))
+                         ("deliver", "post_exploit", "expand", "ad", "crack",
+                          "lateral"))
         # the last stage is lateral movement — impact/cleanup stay manual
         self.assertNotIn("cleanup", DEEP_STAGES)
         self.assertNotIn("impact", DEEP_STAGES)
@@ -70,10 +76,10 @@ class TestDeepModeRun(unittest.TestCase):
         self.assertEqual(result["goal"], "deep")
         self.assertEqual(
             result["stages"],
-            {"deliver": True, "post_exploit": True, "ad": True,
-             "crack": True, "lateral": True})
+            {"deliver": True, "post_exploit": True, "expand": True,
+             "ad": True, "crack": True, "lateral": True})
         # every stage surfaced as an event + exactly ONE terminal done
-        self.assertEqual(sum(1 for k in events if k == "stage"), 5)
+        self.assertEqual(sum(1 for k in events if k == "stage"), 6)
         self.assertEqual(sum(1 for k in events if k == "done"), 1)
 
     def test_single_goal_run_has_no_stage_ladder(self):

@@ -27,13 +27,32 @@ def _p(**kw) -> Dict[str, Any]:
 _NMAP_PORT_RE = re.compile(
     r"(\d+)/(tcp|udp)[ \t]+open[ \t]+([\w\-\.]+)(?:[ \t]+([^\n]*))?"
 )
+# nc -zv floor sweep: "Connection to 10.0.0.9 22 port [tcp/ssh] succeeded!"
+# (BSD netcat) or "connect to 10.0.0.9 22 port 22 tcp: Connection refused"-style
+# open report (traditional / OpenBSD variants). Only SUCCEEDED connects
+# count as open ports.
+_NC_PORT_RE = re.compile(
+    r"(?:Connection to|connect to)[ \t]+[\d\.]+[ \t]+(\d+)[ \t]+port[ \t]+"
+    r"(?:\[tcp/([\w\-]+)\][ \t]+)?succeeded",
+    re.IGNORECASE,
+)
+# masscan: "Discovered open port 80/tcp on 10.0.0.9"
+_MASSCAN_PORT_RE = re.compile(
+    r"Discovered open port (\d+)/(tcp|udp) on ([\d\.]+)", re.IGNORECASE
+)
 _OS_DETAILS_RE = re.compile(r"OS details: (.*)", re.IGNORECASE)
 _OS_MATCH_RE = re.compile(r"OS:\s*([^\n]+)", re.IGNORECASE)
 _SCRIPT_RE = re.compile(r"\|\s*([\w\-\.]+):\s*\n?((?:\|.*\n?)+)")
 
 
 def parse_nmap_ports(output: str, source: str = "nmap") -> List[Dict[str, Any]]:
-    """Extract open ports/services/versions from text output."""
+    """Extract open ports/services/versions from text output.
+
+    Accepts nmap's classic table, the toolbelt's `nc -zv` floor sweep and
+    masscan 'Discovered open port' lines — so every scan implementer feeds
+    the same `service` facts downstream. nc/masscan lines carry no service
+    label; the well-known-port table fills the gap (weak labels are fine:
+    version_detect and the fingerprint engine re-probe and correct)."""
     if not output:
         return []
     findings = []
@@ -49,6 +68,34 @@ def parse_nmap_ports(output: str, source: str = "nmap") -> List[Dict[str, Any]]:
             value["product"] = ver.split()[0] if ver else ""
         findings.append(_p(kind="service", key=f"{proto}/{port}", value=value,
                            confidence=0.9, evidence=m.group(0), source=source))
+    if findings:
+        return findings
+    # toolbelt floor sweep (nc -zv)
+    from phantom.automation.fingerprint.probes import PORT_SERVICE_MAP
+    for m in _NC_PORT_RE.finditer(output):
+        port = m.group(1)
+        if port in seen:
+            continue
+        seen.add(port)
+        svc = m.group(2) or PORT_SERVICE_MAP.get(int(port), "unknown")
+        findings.append(_p(kind="service", key=f"tcp/{port}",
+                           value={"port": port, "protocol": "tcp",
+                                  "service": svc, "version": "", "product": ""},
+                           confidence=0.7, evidence=m.group(0), source=source or "nc"))
+    if findings:
+        return findings
+    # masscan full-range sweep
+    for m in _MASSCAN_PORT_RE.finditer(output):
+        port, proto, host = m.group(1), m.group(2), m.group(3)
+        if port in seen:
+            continue
+        seen.add(port)
+        svc = PORT_SERVICE_MAP.get(int(port), "unknown")
+        findings.append(_p(kind="service", key=f"{proto}/{port}",
+                           value={"port": port, "protocol": proto,
+                                  "service": svc, "version": "", "product": ""},
+                           confidence=0.7, evidence=m.group(0),
+                           source=source or "masscan"))
     return findings
 
 

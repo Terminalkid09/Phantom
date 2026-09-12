@@ -472,6 +472,19 @@ class TestAutonomousAgent(unittest.TestCase):
         for w in workers.values():
             self.assertNotIn("error", w)
 
+    def test_five_workers_add_ad_and_cloud_roles(self):
+        from phantom.automation.agent import _run_target_with_workers
+        from phantom.automation.guidance.targets import classify_target
+        from phantom.automation.belief import WorldModel
+        # inspect the worker spec table WITHOUT launching threads: the
+        # role/gate/timeout layout is what the parallel run uses
+        import inspect
+        src = inspect.getsource(_run_target_with_workers)
+        self.assertIn('("ad", "ad", "ad_domain", 240.0)', src)
+        self.assertIn('("cloud", "cloud_creds", "environment", 240.0)', src)
+        self.assertIn('workers_per_target >= 4', src)
+        self.assertIn('workers_per_target >= 5', src)
+
     # ---------------------------------------------------- sandbox materialization
 
     def test_beacon_payload_materialized_for_sandbox(self):

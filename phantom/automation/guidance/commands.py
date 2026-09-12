@@ -119,9 +119,33 @@ class Registry:
 
 
 def make_registry() -> Registry:
-    """Instantiate the built-in capability set."""
+    """Instantiate the built-in capability set plus any machine-authored
+    capabilities living in guidance/learned/ (the evolution loop's
+    production location — see phantom/automation/evolution).
+
+    Learned capabilities import AFTER built-ins: a learned id colliding
+    with a built-in id would silently shadow it, which must never happen,
+    so collisions are refused loudly.
+    """
     from phantom.automation.guidance import kit as _kit
     reg = Registry()
     for cap in _kit.CAPABILITIES:
         reg.register(cap)
+    try:
+        from phantom.automation.guidance.learned import load_learned
+        for cap in load_learned():
+            if reg.get(cap.id) is not None:
+                raise ValueError(
+                    f"learned capability {cap.id!r} collides with an "
+                    "existing capability id — refusing to shadow it")
+            reg.register(cap)
+    except ImportError:
+        pass  # learned/ package absent (trimmed install)
+    try:
+        from phantom.automation.evolution import beta as _beta
+        for cap in _beta.pending():   # --beta staged in this process
+            if reg.get(cap.id) is None:
+                reg.register(cap)
+    except ImportError:
+        pass
     return reg

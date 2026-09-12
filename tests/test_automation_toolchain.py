@@ -114,9 +114,18 @@ class TestToolGatingInAgent(unittest.TestCase):
         agent = self._agent(installed=set())
         result = agent.run(goal="complete_kill_chain", max_iterations=5)
         self.assertFalse(result["beacon_established"])
-        self.assertEqual(result["actions_taken"], 0)
+        # multi-tool era: ZERO external binaries does not mean zero moves —
+        # in-process capabilities (ssh_banner via the fingerprint engine)
+        # still run and cleanly produce nothing. What must NOT happen:
+        # tool-dependent capabilities executing, a beacon, or a crash.
         kinds = [k for k, _ in self.events]
-        self.assertIn("tool_missing", kinds)
+        self.assertIn("tool_missing", kinds)          # scan blocked (nmap/masscan/nc)
+        blocked_caps = {d.get("capability") for k, d in self.events
+                        if k == "tool_missing"}
+        self.assertIn("scan_tcp", blocked_caps)
+        ran = {d.get("capability") for k, d in self.events if k == "run"}
+        self.assertFalse(ran & {"scan_tcp", "version_detect", "os_detect",
+                                "smb_enum", "http_probe", "ssh_login"})
         halts = [d for k, d in self.events if k == "halt"]
         self.assertTrue(halts)
 

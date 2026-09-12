@@ -8,11 +8,14 @@ import re
 import json
 import time
 import ipaddress
+import threading
 from datetime import datetime
 from typing import Callable, Optional, List
 
 from rich.console import Console
 from phantom.core.session import session, KB_STATUS_DEFAULT
+from phantom.core.session_bridge import (merge_agent_into_session,
+                                         seed_findings_from_session)
 from phantom.core.executor import run_commands, run_command
 from phantom.utils.notifier import notifier
 from phantom.utils.network import get_lhost
@@ -254,7 +257,9 @@ def _auto_breach_check() -> bool:
     """
     target = session.target
     kb = session.knowledge_base
-    api_key = os.getenv("PHANTOM_HIBP_API_KEY", "")
+    from phantom.utils import config as cfg
+    api_key = str(cfg.get("breach.hibp_api_key", "",
+                          env="PHANTOM_HIBP_API_KEY"))
     if not api_key:
         notifier.warn("Breach check saltato: PHANTOM_HIBP_API_KEY non configurato "
                       "(settabile in .env).")
@@ -641,6 +646,21 @@ def run_sequence_mode(target: str = "", stealth: bool = True,
 _MAX_CIDR_HOSTS = 256
 
 
+def _extract_networks(raw_targets: List[str]) -> List[str]:
+    """CIDR/subnet tokens in the raw target list (e.g. 10.0.0.0/24)."""
+    nets = []
+    for raw in raw_targets or []:
+        for token in raw.split(","):
+            token = token.strip()
+            if "/" in token:
+                try:
+                    ipaddress.ip_network(token, strict=False)
+                    nets.append(token)
+                except ValueError:
+                    continue
+    return nets
+
+
 def _expand_targets(raw_targets: List[str],
                     scope_list: Optional[List[str]] = None) -> List[str]:
     """Expand CIDR ranges and comma lists into a deduped target list,
@@ -678,12 +698,20 @@ def _expand_targets(raw_targets: List[str],
                 except ValueError:
                     _add(token)  # e.g. a URL path, not a CIDR
                     continue
-                hosts = list(net.hosts()) or [str(net.network_address)]
-                if len(hosts) > _MAX_CIDR_HOSTS:
+                # Bound the iteration BEFORE materializing: a /8 input would
+                # otherwise allocate 16M strings in RAM just to truncate
+                # them to the first 256. Never build the full host list.
+                hosts = []
+                for i, h in enumerate(net.hosts()):
+                    if i >= _MAX_CIDR_HOSTS:
+                        break
+                    hosts.append(str(h))
+                if not hosts:
+                    hosts = [str(net.network_address)]
+                if net.num_addresses > _MAX_CIDR_HOSTS:
                     notifier.warn(
-                        f"{token}: {len(hosts)} host, espansione limitata "
-                        f"a {_MAX_CIDR_HOSTS}")
-                    hosts = hosts[:_MAX_CIDR_HOSTS]
+                        f"{token}: {net.num_addresses} host, espansione "
+                        f"limitata a {_MAX_CIDR_HOSTS}")
                 for h in hosts:
                     _add(str(h))
             else:
@@ -694,8 +722,28 @@ def _expand_targets(raw_targets: List[str],
 def _stream_agent_event(kind: str, data: dict, verbose: bool = False) -> None:
     tag = f"[bold blue]{data.get('target', '')}[/] " if data.get("target") else ""
     if kind == "run":
-        notifier.info(f"{tag}{data.get('banner', data.get('capability'))} "
-                      f"(cost {data.get('cost', '?')})")
+        # the operator must see WHAT is running, the REAL command and WHY:
+        # capability banner + stealth badge + actual command + planner reason
+        cap_name = data.get("banner") or data.get("capability")
+        stealth = data.get("stealth_level") or ""
+        badge = {"paranoid": "⚡paranoid", "active": "●active",
+                 "aggressive": "🎯aggressive"}.get(stealth, "")
+        line = f"{tag}{cap_name}"
+        if badge:
+            line += f"  [dim]{badge}[/]"
+        line += f"  (cost {data.get('cost', '?')})"
+        notifier.info(line)
+        cmd = data.get("command") or ""
+        reason = data.get("reason") or ""
+        if cmd and reason:
+            # real command + planner reason on the same line: the operator
+            # sees both the action and the thinking behind it
+            notifier.info(f"{tag}    $ {cmd[:200]}")
+            notifier.info(f"{tag}      why: {reason[:180]}")
+        elif cmd:
+            notifier.info(f"{tag}    $ {cmd[:200]}")
+        elif reason and verbose:
+            notifier.info(f"{tag}      why: {reason[:180]}")
     elif kind == "plan":
         steps = data.get("steps", [])
         notifier.info(f"{tag}plan: {' -> '.join(steps)} "
@@ -735,8 +783,10 @@ def _stream_agent_event(kind: str, data: dict, verbose: bool = False) -> None:
         notifier.warn(f"{tag}{data.get('capability')}: tool mancanti "
                       f"{', '.join(data.get('tools', []))}")
     elif kind == "failed":
-        notifier.error(f"{tag}{data.get('capability')}: "
-                       f"{data.get('output', '')[:120]}")
+        # prefer the human reason; fall back to raw output, then a generic
+        # line so a failed step never prints as a bare "Failed:"
+        out = data.get("reason") or data.get("output") or "execution failed"
+        notifier.error(f"{tag}{data.get('capability')}: {str(out)[:120]}")
     elif kind == "beacon_up":
         notifier.success(f"{tag}BEACON UP in C2 ({data.get('beacon_id', '')})")
     elif kind == "handoff":
@@ -835,7 +885,10 @@ def _auto_workers(target, goal, profile, aggressive, paranoid, speed) -> int:
 def _run_agent_single(target, goal, profile, aggressive, paranoid, speed,
                       scope_list, agents, verbose=False,
                       on_event: Optional[Callable[[str, dict], None]] = None,
-                      llm: bool = False, state_path: str = ""):
+                      llm: bool = False, state_path: str = "",
+                      experience: bool = False,
+                      evolution: bool = False,
+                      stop_event: Optional[threading.Event] = None):
     from phantom.automation.agent import run_autonomous
     workers = agents if agents > 0 else _auto_workers(
         target, goal, profile, aggressive, paranoid, speed)
@@ -843,19 +896,32 @@ def _run_agent_single(target, goal, profile, aggressive, paranoid, speed,
         notifier.info(
             f"Auto-decide: {workers} same-target workers "
             "(lead + exploit/deepen deepening).")
+    # core -> auto-mode: whatever the operator already found by hand
+    # (services, OS, creds, chain facts) seeds the agent's WorldModel, so
+    # the autonomous chain builds on manual recon instead of redoing it.
+    seed = seed_findings_from_session(target)
+    if seed:
+        notifier.info(
+            f"Seed dal core manuale: {len(seed)} fact già noti "
+            "(l'auto-mode non li riscopre da zero).")
     return run_autonomous(
         target=target, profile=profile, aggressive=aggressive,
         paranoid=paranoid, speed=speed, goal=goal,
         on_event=_make_agent_stream(verbose, on_event), scope_list=scope_list,
         workers_per_target=workers, return_agent=True,
         state_path=state_path or None,
-        threat_intel=_threat_intel_feed(), persist_learning=True, llm=llm)
+        threat_intel=_threat_intel_feed(), persist_learning=True, llm=llm,
+        experience=experience, evolution=evolution, stop_event=stop_event,
+        seed_findings=seed)
 
 
 def _run_agent_campaign(targets, goal, profile, aggressive, paranoid, speed,
                         scope_list, agents, verbose=False,
                         on_event: Optional[Callable[[str, dict], None]] = None,
-                        llm: bool = False, state_dir: str = ""):
+                        llm: bool = False, state_dir: str = "",
+                        experience: bool = False,
+                        evolution: bool = False,
+                        stop_event: Optional[threading.Event] = None):
     from phantom.automation.agent import run_campaign
     n = len(targets)
     # -aN on a campaign is the concurrent fan-out pool; when N exceeds the
@@ -879,7 +945,8 @@ def _run_agent_campaign(targets, goal, profile, aggressive, paranoid, speed,
         workers_per_target=workers_per_target,
         on_event=_make_agent_stream(verbose, on_event),
         state_dir=state_dir or None,
-        threat_intel=_threat_intel_feed(), persist_learning=True, llm=llm)
+        threat_intel=_threat_intel_feed(), persist_learning=True, llm=llm,
+        experience=experience, evolution=evolution, stop_event=stop_event)
 
 
 def _handoff_c2(beacon_id: str) -> None:
@@ -899,6 +966,16 @@ def _report_out_dir() -> str:
 
 def _safe_target_dir(target: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", target)
+
+
+def _merge_results_to_session(agent, target: str) -> dict:
+    """Bridge an auto-mode agent's findings into the manual session. Never
+    raises: a bridge failure must not abort a finished engagement."""
+    try:
+        return merge_agent_into_session(agent, target) or {}
+    except Exception as exc:            # pragma: no cover - defensive
+        notifier.warn(f"Core sync fallita ({target}): {exc}")
+        return {}
 
 
 def _write_agent_reports(agent, profile: str, out_root: str, target: str):
@@ -935,7 +1012,11 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                   on_event: Optional[Callable[[str, dict], None]] = None,
                   handoff_c2: bool = True,
                   llm: bool = False,
-                  resume: str = "") -> None:
+                  experience: bool = False,
+                  evolution: bool = False,
+                  beta: bool = False,
+                  resume: str = "",
+                  stop_event: Optional[threading.Event] = None) -> None:
     """Autonomous kill chain (planner agent) — the `auto` entry point.
 
     Classifies each target (ip/domain/url/email/username/phone) and drives
@@ -975,6 +1056,47 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
         notifier.error("Nessun target specificato. Usa: auto <target> [target2, ...]")
         return
 
+    # senior network triage: a CIDR/subnet input gets host discovery +
+    # surface ranking BEFORE the assault, so the agent pool works the
+    # richest hosts first instead of spraying full chains on random IPs
+    # from the address range. Discovery only runs when a network token
+    # was actually given; identity targets are never triaged.
+    networks = _extract_networks(raw)
+    if networks:
+        # ONE engine: discovery + enrichment + exposure ranking all live
+        # in netmap (the same code the `map` command and Electron use), so
+        # the assault pool and the network map always see the same truth.
+        from phantom.core.netmap import triage_networks
+        notifier.info(
+            f"Network triage: host discovery su {', '.join(networks)}...")
+        tri = triage_networks(networks)
+        ranked = [r["ip"] for r in tri.get("ranked", [])]
+        if ranked:
+            alive_n = len(tri.get("hosts", []))
+            notifier.success(
+                f"Host discovery: {alive_n} vivi, ordinati per "
+                f"superficie d'attacco (top: {', '.join(ranked[:5])})")
+            # senior semantics: the CIDR expansion is REPLACED by the
+            # discovered + ranked hosts. Only the operator's explicit
+            # per-host tokens survive the swap (operator intent first,
+            # then discovered hosts ranked by attack surface). This avoids
+            # the trap where the 256-host expansion already contains the
+            # discovered IPs, which would silently keep the whole range.
+            explicit = [
+                t.strip()
+                for tok in raw for t in tok.split(",")
+                if t.strip() and "/" not in t
+                and t.strip() not in networks
+            ]
+            seen = set(explicit)
+            ranked = [h for h in ranked
+                      if not (h in seen or seen.add(h))]
+            resolved = explicit + ranked
+        else:
+            notifier.warn(
+                "Nessun host esposto rilevato o nmap assente: espansione "
+                "CIDR classica (host a caso nella rete)")
+
     notifier.success("=" * 25 + " PHANTOM AUTO-MODE (agent) " + "=" * 25)
     # auto-profile: a phone-number target (or any mobile-classified
     # target) defaults to the mobile defender model when the operator left
@@ -990,7 +1112,8 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                   f"stealth={'paranoid' if stealth else 'on'} | "
                   f"aggressive={aggressive} | speed={speed} | "
                   f"verbose={verbose} | agents={agents or 'auto'} | "
-                  f"llm={'on' if llm else 'off'}")
+                  f"llm={'on' if llm else 'off'} | "
+                  f"experience={'global' if experience else 'run-only'}")
 
     if plan:
         for t in resolved:
@@ -1028,13 +1151,51 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
         # resuming: reuse the checkpoint's own directory for reports so the
         # engagement artifacts stay together
         out_root = os.path.dirname(os.path.abspath(resume))
+    if evolution or beta:
+        # self-improvement / beta: both are gated on the LLM transport and
+        # the lab (no proof, no authoring, no beta load) — surface early.
+        _note = []
+        if evolution and not llm:
+            _note.append("--evolution richiede --llm (l'author è l'LLM): "
+                         "flag ignorata")
+        if beta:
+            _note.append("--beta: le capability dalle PR auto-evolution "
+                         "aperte verranno caricate dopo il gate (lab "
+                         "incluso)")
+        for n in _note:
+            notifier.warn(n)
+
+    if beta:
+        # fetch open auto-evolution PRs, gate them locally (lab included)
+        # and stage what passes — every agent registry built after this
+        # point includes the beta capabilities for THIS session only.
+        try:
+            from phantom.automation.evolution import beta as _beta_mod
+            _b = _beta_mod.load_beta(
+                emit=lambda _kind, **d: notifier.info(
+                    f"[beta] {d.get('detail', _kind)}"))
+            if _b.checked == 0:
+                notifier.info("[beta] nessuna PR auto-evolution aperta")
+        except Exception as _exc:
+            notifier.warn(f"[beta] load fallito: {_exc}")
+
     if len(resolved) == 1:
         state_path = resume or os.path.join(out_root, "checkpoint.json")
         result, agent = _run_agent_single(
             resolved[0], goal, profile, aggressive, stealth, speed,
             scope_list, agents, verbose, on_event, llm,
-            state_path=state_path)
+            state_path=state_path, experience=experience,
+            evolution=evolution, stop_event=stop_event)
         tdir, paths = _write_agent_reports(agent, profile, out_root, resolved[0])
+        # auto-mode -> manual core: everything the agent learned is merged
+        # into the session + manual WorldModel, so `map`, `suggest`,
+        # `exploit`, `payload` and the report all see the same truth.
+        _merged = _merge_results_to_session(agent, resolved[0])
+        if _merged:
+            notifier.info(
+                "Core sync: " + ", ".join(
+                    f"{k}={v}" for k, v in sorted(_merged.items())) +
+                " (visibili ora anche nel core manuale)")
         elapsed = _fmt_elapsed(time.time() - started_wall)
         if goal == "deep":
             st = result.get("stages") or {}
@@ -1081,13 +1242,15 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
     campaign = _run_agent_campaign(
         resolved, goal, profile, aggressive, stealth, speed,
         scope_list, agents, verbose, on_event, llm,
-        state_dir=out_root)
+        state_dir=out_root, experience=experience, evolution=evolution,
+        stop_event=stop_event)
     elapsed = _fmt_elapsed(time.time() - started_wall)
     per_target = {}
     for t in resolved:
         a = campaign.get("_agents", {}).get(t)
         if a is not None:
             tdir, paths = _write_agent_reports(a, profile, out_root, t)
+            merge_agent_into_session(a, t)
             per_target[t] = {"dir": tdir, **paths}
     from phantom.automation.reporting import CampaignReport, ReportWriter
     cpaths = ReportWriter(out_root).write_campaign(

@@ -11,6 +11,7 @@ from phantom.automation.sandbox.sandbox import (
     SandboxVerdict,
     DockerBackend,
     DefenderBackend,
+    StaticCheckBackend,
 )
 
 
@@ -62,7 +63,7 @@ class TestSandboxEngine(unittest.TestCase):
         verdict = engine.preflight("sample.bin")
         self.assertTrue(verdict.skipped)
         self.assertTrue(verdict.approved)
-        self.assertIn("no sandbox backend", verdict.reason)
+        self.assertIn("no applicable sandbox backend", verdict.reason)
 
     def test_unavailable_backends_skipped_but_others_run(self):
         engine = SandboxEngine(backends=[
@@ -81,6 +82,50 @@ class TestSandboxEngine(unittest.TestCase):
         verdict = SandboxEngine(backends=[_Boom()]).preflight("x")
         self.assertFalse(verdict.approved)
         self.assertIn("boom", verdict.reason)
+
+
+class TestStaticCheckBackend(unittest.TestCase):
+
+    def _sample(self, data):
+        fd, path = tempfile.mkstemp(prefix="phantom_static_")
+        os.write(fd, data)
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_static_elf_approved(self):
+        # ET_EXEC (type 2) without .dynamic = static ELF, portable
+        data = (b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 8 +
+                b"\x02\x00" + b"\x00" * 44)
+        res = StaticCheckBackend().run_sample(self._sample(data))
+        self.assertTrue(res.ok)
+        self.assertIn("portable", res.output)
+
+    def test_dynamic_elf_denied(self):
+        # ET_DYN (type 3) + .dynamic marker = needs target glibc
+        data = (b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 8 +
+                b"\x03\x00" + b"\x00" * 44 + b".dynamic")
+        res = StaticCheckBackend().run_sample(self._sample(data))
+        self.assertFalse(res.ok)
+        self.assertIn("glibc", res.error)
+
+    def test_pe_approved(self):
+        res = StaticCheckBackend().run_sample(self._sample(b"MZ\x90\x00"))
+        self.assertTrue(res.ok)
+        self.assertIn("Windows", res.output)
+
+    def test_garbage_denied(self):
+        res = StaticCheckBackend().run_sample(self._sample(b"not an executable at all"))
+        self.assertFalse(res.ok)
+        self.assertIn("refusing", res.error)
+
+    def test_empty_sample_denied(self):
+        res = StaticCheckBackend().run_sample(self._sample(b""))
+        self.assertFalse(res.ok)
+
+    def test_script_with_shebang_approved(self):
+        res = StaticCheckBackend().run_sample(self._sample(b"#!/bin/sh\necho ok\n"))
+        self.assertTrue(res.ok)
 
 
 class TestDockerBackend(unittest.TestCase):
@@ -220,6 +265,71 @@ class TestDefenderBackend(unittest.TestCase):
             self.assertTrue(res.detected)
 
 
+class TestMultiEngineBackends(unittest.TestCase):
+    """ClamAV + YARA are the second/third engines beside Defender: a sample
+    must be clean under every available engine, not just Microsoft's."""
+
+    def _sample(self):
+        fd, p = tempfile.mkstemp(suffix=".exe")
+        os.write(fd, b"MZ\x90\x00" + b"\x00" * 64)
+        os.close(fd)
+        return p
+
+    def test_clamav_detects(self):
+        from phantom.automation.sandbox.sandbox import ClamAVBackend
+        b = ClamAVBackend()
+        with patch("phantom.automation.sandbox.sandbox.execute_quiet") as eq:
+            eq.return_value = Mock(returncode=1, stdout="", stderr="", ok=False,
+                                   timed_out=False)
+            res = b.run_sample(self._sample())
+        self.assertFalse(res.ok)
+        self.assertTrue(res.detected)
+
+    def test_clamav_clean(self):
+        from phantom.automation.sandbox.sandbox import ClamAVBackend
+        b = ClamAVBackend()
+        with patch("phantom.automation.sandbox.sandbox.execute_quiet") as eq:
+            eq.return_value = Mock(returncode=0, stdout="", stderr="", ok=True,
+                                   timed_out=False)
+            res = b.run_sample(self._sample())
+        self.assertTrue(res.ok)
+
+    def test_yara_flags_matching_rule(self):
+        from phantom.automation.sandbox.sandbox import YaraBackend
+        rules = os.path.join(tempfile.mkdtemp(), "r.yar")
+        with open(rules, "w", encoding="utf-8") as f:
+            f.write("rule phantom_test { strings: $a = \"MZ\" condition: $a }\n")
+        b = YaraBackend(rules_path=rules)
+        with patch("phantom.automation.sandbox.sandbox.shutil.which",
+                   return_value="/usr/bin/yara"), \
+             patch("phantom.automation.sandbox.sandbox.execute_quiet") as eq:
+            eq.return_value = Mock(returncode=0,
+                                   stdout="phantom_test sample.exe\n",
+                                   stderr="", ok=True, timed_out=False)
+            self.assertTrue(b.available())
+            res = b.run_sample(self._sample())
+        self.assertFalse(res.ok)
+        self.assertIn("phantom_test", res.error)
+
+    def test_yara_unavailable_without_rules(self):
+        from phantom.automation.sandbox.sandbox import YaraBackend
+        b = YaraBackend(rules_path="/nonexistent/rules.yar")
+        with patch("phantom.automation.sandbox.sandbox.shutil.which",
+                   return_value="/usr/bin/yara"):
+            self.assertFalse(b.available())
+
+    def test_default_engine_includes_new_engines(self):
+        names = [b.name for b in SandboxEngine().backends]
+        self.assertIn("clamav", names)
+        self.assertIn("yara", names)
+        self.assertIn("defender", names)
+
+    def test_vm_label_reports_edr(self):
+        from phantom.automation.sandbox.sandbox import VmBackend
+        b = VmBackend(vm_exec="ssh vm", edr="CrowdStrike")
+        self.assertEqual(b.label, "vm_windows:CrowdStrike")
+
+
 class TestVerdict(unittest.TestCase):
 
     def test_summary(self):
@@ -227,7 +337,63 @@ class TestVerdict(unittest.TestCase):
                          "no sandbox backend available — sample not pre-flighted")
         v = SandboxVerdict(approved=True,
                            results=[SandboxResult(backend="docker", ok=True)])
-        self.assertEqual(v.summary(), "approved by all available sandbox backends")
+        self.assertEqual(v.summary(), "approved by all applicable sandbox backends")
+
+    def test_summary_includes_coverage(self):
+        v = SandboxVerdict(approved=True,
+                           results=[SandboxResult(backend="docker", ok=True)],
+                           coverage="kind=elf; tested by docker")
+        self.assertIn("kind=elf", v.summary())
+
+
+class TestKindAwarePreflight(unittest.TestCase):
+    """A backend must only judge the sample kinds it can actually evaluate:
+    the Linux container must not deny a Windows PE (exec-format failure), and
+    the Windows VM must not judge a shell script."""
+
+    def _elf(self):
+        fd, p = tempfile.mkstemp(suffix=".elf")
+        os.write(fd, b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 64)
+        os.close(fd)
+        return p
+
+    def _pe(self):
+        fd, p = tempfile.mkstemp(suffix=".exe")
+        os.write(fd, b"MZ\x90\x00" + b"\x00" * 64)
+        os.close(fd)
+        return p
+
+    def _script(self):
+        fd, p = tempfile.mkstemp(suffix=".sh")
+        os.write(fd, b"#!/bin/sh\necho hi\n")
+        os.close(fd)
+        return p
+
+    def test_sample_kind(self):
+        from phantom.automation.sandbox.sandbox import sample_kind
+        self.assertEqual(sample_kind(self._elf()), "elf")
+        self.assertEqual(sample_kind(self._pe()), "pe")
+        self.assertEqual(sample_kind(self._script()), "script")
+
+    def test_pe_not_judged_by_linux_backend(self):
+        linux_only = _FakeBackend("docker", ok=False)   # would deny
+        linux_only.kinds = frozenset({"elf", "script"})
+        win_only = _FakeBackend("defender", ok=True)
+        win_only.kinds = frozenset({"pe"})
+        engine = SandboxEngine(backends=[linux_only, win_only])
+        verdict = engine.preflight(self._pe())
+        self.assertTrue(verdict.approved)      # linux backend skipped, not deny
+        self.assertEqual(linux_only.runs, 0)
+        self.assertEqual(win_only.runs, 1)
+        self.assertIn("not applicable", verdict.coverage)
+
+    def test_elf_is_judged_by_linux_backend(self):
+        linux_only = _FakeBackend("docker", ok=False)
+        linux_only.kinds = frozenset({"elf", "script"})
+        engine = SandboxEngine(backends=[linux_only])
+        verdict = engine.preflight(self._elf())
+        self.assertFalse(verdict.approved)
+        self.assertEqual(linux_only.runs, 1)
 
 
 if __name__ == "__main__":

@@ -55,6 +55,8 @@ class RawReport:
     campaign_trail: List[Dict[str, Any]] = field(default_factory=list)
     opsec_spent: float = 0.0
     c2_evidence: List[Dict[str, Any]] = field(default_factory=list)
+    # chronological narrative: findings + actions + failures + noise + C2
+    timeline: List[Dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_agent(cls, agent) -> "RawReport":
@@ -70,7 +72,18 @@ class RawReport:
             campaign_trail=list(agent.sink.events),
             opsec_spent=wm.opsec_spent,
             c2_evidence=cls._c2_evidence(agent),
+            timeline=cls._timeline(agent),
         )
+
+    @staticmethod
+    def _timeline(agent) -> List[Dict[str, Any]]:
+        """Chronological narrative merged from every recorded event."""
+        try:
+            from phantom.automation.timeline import build_timeline, to_dicts
+            return to_dicts(build_timeline(
+                agent.wm, c2_evidence=RawReport._c2_evidence(agent)))
+        except Exception:
+            return []
 
     @staticmethod
     def _c2_evidence(agent) -> List[Dict[str, Any]]:
@@ -178,6 +191,7 @@ class RawReport:
             "hypotheses": self.hypotheses,
             "campaign_trail": self.campaign_trail,
             "c2_evidence": self.c2_evidence,
+            "timeline": self.timeline,
         }
 
     def to_json(self, indent: int = 2) -> str:
@@ -214,13 +228,37 @@ class RawReport:
             f"- hunt anomalies: {kind_count('hunt_anomaly')}",
             f"- RCE footholds: {kind_count('rce_foothold')}",
             f"- cloud IAM creds: {kind_count('cloud_creds')}",
+            f"- cloud access: {kind_count('cloud_access')}",
+            f"- cloud lateral: {kind_count('cloud_lateral')}",
             f"- environment: {kind_count('environment')}",
+            f"- internal hosts: {kind_count('internal_host')}",
+            f"- internal services: {kind_count('internal_service')}",
+            f"- defensive gaps (EDR/AV): {kind_count('defensive_gap')}",
+            f"- mobile surfaces: {kind_count('mobile')}",
+            f"- MDM vendors: {kind_count('mdm_vendor')}",
+            f"- k8s escapes: {kind_count('k8s_escape')}",
             f"- inferences: {sum(1 for f in self.findings if f.source == 'reasoning')}",
             f"- hypotheses: {len(self.hypotheses)}",
             f"- actions: {len(self.actions)}",
             f"- failures: {len(self.failures)}",
             "",
         ]
+        # the timeline goes early: "what happened when" is the first question
+        try:
+            from phantom.automation.timeline import (
+                TimelineEntry, render_markdown, timeline_stats)
+            entries = [TimelineEntry(**{k: v for k, v in e.items()
+                                        if k != "iso"})
+                       for e in self.timeline]
+            if entries:
+                lines += render_markdown(entries, client=False)
+                stats = timeline_stats(entries)
+                crit = stats["by_severity"].get("critical", 0)
+                high = stats["by_severity"].get("high", 0)
+                lines += [f"**Timeline roll-up:** {stats['total']} events, "
+                          f"{crit} critical, {high} high severity.", ""]
+        except Exception:
+            pass
         if self.hypotheses:
             lines += ["## Reasoning & Hypotheses", ""]
             for h in self.hypotheses:
@@ -327,6 +365,8 @@ class ClientReport:
         self.target_risk: Optional[float] = None
         self.executive_summary: str = ""
         self.c2_evidence: List[Dict[str, Any]] = []
+        # client-safe chronology: phase + outcome, never a command line
+        self.timeline: List[Dict[str, Any]] = []
         self.blue_team = BlueTeamModel.for_profile(profile)
 
     @classmethod
@@ -340,6 +380,12 @@ class ClientReport:
         system_priv = wm.find("system_privilege")
         injection = wm.find("injection")
         report.c2_evidence = cls._c2_evidence(agent)
+        try:
+            from phantom.automation.timeline import build_timeline, to_dicts
+            report.timeline = to_dicts(build_timeline(
+                wm, c2_evidence=report.c2_evidence))
+        except Exception:
+            report.timeline = []
 
         # NOTE: no credentials ever leave this report. Creds live in the raw
         # operator report only; the client sees impact, never secrets.
@@ -398,6 +444,53 @@ class ClientReport:
                 detail=f"Version: {version or 'unknown'}. Assessed for exposure.",
                 remediation=("Confirm the service is required, restrict source "
                              "networks, and keep it patched."),
+            ))
+        # ── post-exploitation / enterprise surfaces (were dropped before:
+        # the report only read a fixed kind list, so internal recon, cloud,
+        # EDR gaps and mobile never reached the client) ─────────────────
+        internal = wm.find("internal_service") or wm.find("internal_host")
+        if internal:
+            report.findings.append(ClientFinding(
+                severity="high",
+                title="Internal network reachable from the foothold",
+                detail=(f"{len(internal)} internal peer(s) were discovered "
+                        "from the compromised host, i.e. the segmentation "
+                        "does not contain the breach."),
+                remediation=("Enforce east-west segmentation and monitor "
+                             "internal service discovery from endpoints."),
+            ))
+        cloud_acc = wm.find("cloud_access") + wm.find("cloud_lateral")
+        if cloud_acc:
+            report.findings.append(ClientFinding(
+                severity="critical",
+                title="Cloud identity plane exposed",
+                detail=(f"{len(cloud_acc)} cloud access/lateral fact(s) were "
+                        "collected: instance/workload credentials were "
+                        "reusable beyond the host."),
+                remediation=("Rotate the exposed keys, scope roles to "
+                             "least privilege, and require session policies "
+                             "for cross-account assumption."),
+            ))
+        gaps = wm.find("defensive_gap")
+        if gaps:
+            report.findings.append(ClientFinding(
+                severity="high",
+                title="Endpoint protection was bypassed/disabled",
+                detail=(f"{len(gaps)} defensive gap(s) were recorded on the "
+                        "compromised host (AV/EDR control lost)."),
+                remediation=("Verify endpoint protection health monitoring, "
+                             "enable tamper protection, and alert on "
+                             "protection-state changes."),
+            ))
+        mobile = wm.find("mdm_vendor") + wm.find("mobile")
+        if mobile:
+            report.findings.append(ClientFinding(
+                severity="medium",
+                title="Mobile / MDM attack surface exposed",
+                detail=(f"{len(mobile)} mobile-management fact(s) were "
+                        "identified (enrolment endpoint / managed device)."),
+                remediation=("Require device compliance, restrict enrolment "
+                             "endpoints, and review BYOD policy."),
             ))
         # reasoning trail: every hypothesis the inference engine formed, with
         # its final status (confirmed/refuted/pending/abandoned) — sanitized,
@@ -592,6 +685,7 @@ class ClientReport:
             "mitre": self.mitre,
             "target_risk": self.target_risk,
             "c2_evidence": self.c2_evidence,
+            "timeline": self.timeline,
             "recommended_hardening": getattr(self, "_remediations", []),
         }
 
@@ -627,6 +721,17 @@ class ClientReport:
                 f"{self.attack_path.get('accounts', 0)} account(s), and "
                 f"{self.attack_path.get('domains', 0)} domain(s).")
             lines.append("")
+        # client timeline: the phases in order, no tradecraft detail
+        try:
+            from phantom.automation.timeline import (
+                TimelineEntry, render_markdown)
+            entries = [TimelineEntry(**{k: v for k, v in e.items()
+                                        if k != "iso"})
+                       for e in self.timeline]
+            if entries:
+                lines += render_markdown(entries, client=True)
+        except Exception:
+            pass
         lines += [
             "## Findings",
             "",

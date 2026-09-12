@@ -523,8 +523,12 @@ class TestAllModulesDynamic:
                                              "accuracy": 95}
         groups = suggest.payload_suggestion_group()
         cmds = groups["SUGGESTED (payload)"]
-        assert any("windows/x64" in c for c in cmds)
+        # engine-backed reverse first, then the classic wizard
+        assert any("reverse" in c for c in cmds)
         assert any("generate windows" in c for c in cmds)
+        # classic msfvenom stays available in its own group
+        msf = groups.get("MSF (classic)", [])
+        assert any("windows/x64" in c for c in msf)
 
     def test_payload_no_suggestions_without_os(self):
         _reset()

@@ -167,6 +167,17 @@ class Orchestrator:
                     time.sleep(0.1)
                     continue
                 idle_since = None
+                # bounded pool: never spawn past max_agents. A saturated pool
+                # returns the action to the queue (status back to QUEUED,
+                # entity lock released) and waits for a free slot — this is
+                # what keeps a campaign from spawning a thread per action.
+                if self._agents_active() >= self.max_agents:
+                    action.status = ActionStatus.QUEUED
+                    with self._lock_guard:
+                        heapq.heappush(self._queue, action)
+                    self._unlock_entity(action.entity)
+                    time.sleep(0.1)
+                    continue
                 t = threading.Thread(target=self._run_one, args=(action,), daemon=True)
                 with self._agents_guard:
                     self._agents.append(t)
@@ -175,7 +186,11 @@ class Orchestrator:
             self._running = False
 
     def stop(self) -> None:
-        """Signal the run-loop to stop draining (does not kill agents)."""
+        """Signal the run-loop to stop draining (does not kill agents).
+        Sets BOTH the stop flag and the pause event: the run loop blocks on
+        `self._pause.wait()` while draining, so a stop during an idle wait
+        must wake it or the loop never exits (the previous double-definition
+        of stop() only set _stop and could hang a paused run)."""
         self._stop.set()
         self._pause.set()
 
@@ -209,9 +224,6 @@ class Orchestrator:
     def resume(self) -> None:
         self._paused_requested = False
         self._pause.set()
-
-    def stop(self) -> None:
-        self._stop.set()
 
     def wait(self) -> None:
         """Block until the queue is empty and all agents finished."""

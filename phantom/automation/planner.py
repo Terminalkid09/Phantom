@@ -13,7 +13,7 @@ Capability + slot_values). The orchestrator executes them.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from phantom.automation.belief import WorldModel, Finding
 from phantom.automation.guidance.commands import Capability, Registry
@@ -38,6 +38,15 @@ GOAL_FACTS = {
     "ad": ["ad_domain", "ad_creds"],
     "crack": ["ad_domain", "ad_creds", "cracked"],
     "lateral": ["pivot"],
+    # expand: post-beacon INTERNAL expansion. The beacon snapshots the
+    # internal network (interfaces/routes/ARP) and bounds-probes the
+    # neighbors for pivot services — without this stage the internal recon
+    # capabilities would never be planned and lateral movement would have
+    # no host to aim at outside a multi-target campaign.
+    "expand": ["internal_host", "internal_service"],
+    # evasion: neutralize the defensive stack before the loud stages. Its
+    # only source (edr_disable) is aggressive-only + SYSTEM-gated.
+    "evasion": ["defensive_gap"],
     "cleanup": ["cleanup"],
     "impact": ["ransom_sim"],
     "trojan": ["trojan_bundle"],
@@ -58,7 +67,7 @@ _FACT_SOURCES = {
     "differential_anomaly": ["differential_analysis"],
     "rce_foothold": ["web_rce", "rce_foothold"],
     "environment": ["env_probe", "env_probe_internal", "cloud_creds_harvest"],
-    "cloud_creds": ["rce_foothold", "cloud_creds_harvest"],
+    "cloud_creds": ["rce_foothold", "cloud_creds_harvest", "loot_triage"],
     "cloud_access": ["cloud_s3_enum", "cloud_iam_enum"],
     "cloud_lateral": ["cloud_assume_role", "cloud_cross_account", "cloud_iam_enum"],
     "mobile": ["mobile_probe", "mobile_mdm_fingerprint"],
@@ -69,7 +78,8 @@ _FACT_SOURCES = {
     "web_app": ["http_probe"],
     "smb_share": ["smb_enum"],
     "redis": ["redis_info"],
-    "creds": ["web_creds", "ssh_login", "breach_check", "harvest_campaign"],
+    "creds": ["web_creds", "ssh_login", "breach_check", "harvest_campaign",
+              "cred_spray", "loot_triage"],
     "identity": ["osint_identity", "persona_create"],
     "breach_exposure": ["breach_check"],
     "persona_profile": ["persona_profile"],
@@ -77,7 +87,9 @@ _FACT_SOURCES = {
     "profile": ["profile_recon"],
     "account_link": ["profile_recon"],
     "phish": ["phish_identity", "campaign_launch", "dm_launch"],
-    "dm_sent": ["dm_launch"],
+    "dm_sent": ["dm_launch", "dm_stage2"],
+    "dm_stage": ["dm_launch"],
+    "dm_plan": ["dm_launch"],
     "follow_sent": ["dm_follow"],
     "follow_accepted": ["wait_follow"],
     "victim_ip": ["poll_hits", "harvest_campaign"],
@@ -89,6 +101,9 @@ _FACT_SOURCES = {
     "ad_creds": ["kerberoast", "as_rep_roast", "dc_sync"],
     "cracked": ["hash_crack"],
     "pivot": ["lateral_pivot", "smb_pivot", "winrm_pivot"],
+    "internal_host": ["internal_recon"],
+    "internal_service": ["internal_probe"],
+    "defensive_gap": ["edr_disable"],
     "stolen_cookies": ["cookie_stealer"],
     "bt_device": ["bt_scan"],
     "cdp_cookies": ["cdp_pivot"],
@@ -127,6 +142,21 @@ class PlanStep:
 
 
 @dataclass
+class RejectedPath:
+    """A planner-transparency record: a capability that was CONSIDERED for
+    a fact but not chosen, with the concrete reason. Shown to the operator
+    so the plan is auditable ('why not X?' has a real answer)."""
+    fact: str
+    capability: str
+    reason: str
+    priority_hint: str = ""   # 'preferred' | 'alternative' | 'stealth-gated'
+
+    def to_dict(self) -> dict:
+        return {"fact": self.fact, "capability": self.capability,
+                "reason": self.reason, "hint": self.priority_hint}
+
+
+@dataclass
 class Plan:
     steps: List[PlanStep] = field(default_factory=list)
     goal: str = ""
@@ -136,6 +166,7 @@ class Plan:
     strategy: str = ""          # the strategic stage driving this plan
     strategy_chain: List[str] = field(default_factory=list)  # all applicable stages
     strategic: bool = False     # True when selected by the strategy layer
+    rejected: List[RejectedPath] = field(default_factory=list)  # transparency
 
     def total_cost(self) -> float:
         return sum(s.capability.opsec_cost for s in self.steps)
@@ -156,6 +187,14 @@ class Planner:
         self.registry = registry
         self.stealth = stealth
         self.tailoring = tailoring
+        # case-based experience memory (optional; set by the agent). Like
+        # the priors it is a pure REORDERING signal over already-allowed
+        # moves: it can never add, remove or authorise a move.
+        self.experience: Any = None
+        # cross-session technique priors (optional; set by the agent when
+        # persist_learning is on). Equal-viability moves are reordered by
+        # earned success rate against this target fingerprint class.
+        self.priors: Any = None
 
     def plan(self, wm: WorldModel, goal: str = "complete_kill_chain",
              max_steps: int = 12, dead: Optional[frozenset] = None,
@@ -189,6 +228,9 @@ class Planner:
         # facts that will be produced by a capability already in the plan
         # (so a precondition depending on them doesn't re-enter the frontier)
         _produced: set = set()
+        # transparency ledger: every capability considered for a fact but
+        # NOT chosen, with the concrete reason the operator can read
+        rejected: List[RejectedPath] = []
         for _ in range(max_steps):
             if not frontier:
                 break
@@ -198,7 +240,8 @@ class Planner:
             if fact in _produced:
                 continue
             cap = self._pick_source(fact, used, dead, wm, preference,
-                                    _tried=_source_attempts.get(fact, set()))
+                                    _tried=_source_attempts.get(fact, set()),
+                                    rejected=rejected)
             if cap is None:
                 # no source for this fact: try backtracking to the parent
                 # (e.g. creds unsourceable -> retry beacon with next source)
@@ -222,6 +265,11 @@ class Planner:
             if not self._stealth_ok(cap):
                 # stealth-gated: record attempt so backtracking skips it
                 _source_attempts.setdefault(fact, set()).add(cap.id)
+                rejected.append(RejectedPath(
+                    fact=fact, capability=cap.id,
+                    reason="stealth-gated for the current profile (too loud "
+                           "until de-escalation allows it)",
+                    priority_hint="stealth-gated"))
                 # re-add fact to try next source
                 frontier.insert(0, fact)
                 continue
@@ -245,12 +293,14 @@ class Planner:
             exploit_hint = self.tailoring.suggest_exploit(wm)
         return Plan(steps=steps, goal=goal, complete=complete,
                     blocked_reason="" if complete else "no affordable path to goal",
-                    exploit_hint=exploit_hint)
+                    exploit_hint=exploit_hint, rejected=rejected)
 
     def _pick_source(self, fact: str, used: set, dead: frozenset = frozenset(),
                      wm: Optional["WorldModel"] = None,
                      preference: Optional[List[str]] = None,
-                     _tried: Optional[set] = None) -> Optional[Capability]:
+                     _tried: Optional[set] = None,
+                     rejected: Optional[List[RejectedPath]] = None
+                     ) -> Optional[Capability]:
         order = _FACT_SOURCES.get(fact, [])
         if self.tailoring is not None:
             allow_banned = wm is not None and wm.has_any("beacon")
@@ -266,6 +316,16 @@ class Planner:
         candidates = []
         for cap_id in order:
             if cap_id in used or cap_id in dead or cap_id in _tried:
+                if rejected is not None:
+                    if cap_id in dead:
+                        reason = "already failed this engagement without new facts"
+                    elif cap_id in _tried:
+                        reason = "already tried for this fact (backtracking)"
+                    else:
+                        reason = "already in the plan (single use per wave)"
+                    rejected.append(RejectedPath(
+                        fact=fact, capability=cap_id, reason=reason,
+                        priority_hint="alternative"))
                 continue
             cap = self.registry.get(cap_id)
             if cap is None:
@@ -274,6 +334,12 @@ class Planner:
                 # the gate can never become true (e.g. breach_check is
                 # gated on email/username targets only): skip it so the
                 # planner falls to the next source instead of looping
+                if rejected is not None:
+                    rejected.append(RejectedPath(
+                        fact=fact, capability=cap_id,
+                        reason="preconditions unplannable for this target type "
+                               "(gate can never become true here)",
+                        priority_hint="alternative"))
                 continue
             candidates.append(cap)
         if not candidates:
@@ -314,6 +380,35 @@ class Planner:
                     first_scan = [c for c in ready if "service" in c.effects]
                     if first_scan:
                         return first_scan[0]
+                # cross-session priors: among equally-ready moves, prefer
+                # the techniques that historically worked against this
+                # fingerprint class (multiplier 1.0 for unknown = no-op,
+                # stable sort preserves the senior priority order)
+                if self.priors is not None or self.experience is not None:
+                    # combine the coarse global average (priors) with the
+                    # situation-scoped cause/repair signal (experience).
+                    # Both are "lower = preferred" multipliers, so they
+                    # multiply; 1.0 anywhere means "no opinion".
+                    emap: Dict[str, float] = {}
+                    if self.experience is not None:
+                        try:
+                            emap = self.experience.multipliers(
+                                wm, candidates=[c.id for c in ready])
+                        except Exception:
+                            emap = {}
+
+                    def _rank(cap):
+                        rank = 1.0
+                        if self.priors is not None:
+                            try:
+                                rank *= float(
+                                    self.priors.multiplier_for(wm, cap.id))
+                            except Exception:
+                                pass
+                        rank *= float(emap.get(cap.id, 1.0))
+                        return rank
+
+                    ready = sorted(ready, key=_rank)
                 return ready[0]
         return candidates[0]
 
@@ -418,7 +513,8 @@ class Planner:
                        goal: Optional[str] = None,
                        max_steps: int = 12,
                        dead: Optional[frozenset] = None,
-                       preference: Optional[List[str]] = None) -> Plan:
+                       preference: Optional[List[str]] = None,
+                       ledger=None) -> Plan:
         """Strategic planning: pick the best stage for THIS target.
 
         Profiles the target (TargetModel via ProfileDetector), filters the
@@ -440,6 +536,19 @@ class Planner:
 
         model = ProfileDetector.detect(wm)
         candidates = applicable_strategies(model)
+        # class doctrine: the target class may FORBID stage goals outright
+        # (a person never gets a port scan, an IP never gets a breach
+        # lookup). The strategy layer guides; doctrine decides.
+        if ledger is not None:
+            from phantom.automation.brain.doctrine import allows
+            # platform branch: an unmanaged iOS device is refused the
+            # beacon stage (no sideload, no supervision)
+            _plat = (model.mobile_platforms[0]
+                     if model.mobile_platforms else None)
+            candidates = [s for s in candidates
+                          if allows(ledger.chain_class(), s.goal,
+                                    platform=_plat,
+                                    managed=model.mobile_managed)]
         goal = goal or "complete_kill_chain"
         if goal != "complete_kill_chain":
             for s in candidates:

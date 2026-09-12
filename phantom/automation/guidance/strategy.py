@@ -29,6 +29,39 @@ from phantom.automation.belief import WorldModel
 _IDENTITY_TYPES = ("email", "username", "phone")
 _NETWORK_TYPES = ("ip", "domain", "url")
 
+# tokens that mark a MOBILE surface on a host. Deliberately specific:
+# "mobile"/"mdm"/vendor names/enrolment paths — NOT generic web services.
+_MOBILE_HINT_TOKENS = (
+    "mdm", "mobileiron", "airwatch", "intune", "jamf", "kandji",
+    "simplemdm", "apns", "gcm", "fcm", "enroll", "byod", "mobile",
+    "device-management", "scim",
+)
+
+
+def _detect_mobile_hint(wm: WorldModel) -> bool:
+    """Concrete evidence that the host fronts a mobile/MDM surface.
+
+    Looks at service names/versions and web-surface facts. A plain
+    `tcp/443 http` is NOT a hint, so the MDM probe is only planned when the
+    scan actually saw mobile management software.
+    """
+    try:
+        for f in wm.find("service"):
+            v = f.value if isinstance(f.value, dict) else {}
+            blob = " ".join(str(v.get(k, "")) for k in
+                            ("service", "version", "banner", "product"))
+            blob = (blob + " " + str(f.key)).lower()
+            if any(t in blob for t in _MOBILE_HINT_TOKENS):
+                return True
+        for kind in ("web_app", "web_header", "environment", "mobile"):
+            for f in wm.find(kind):
+                blob = (str(f.key) + " " + str(f.value)).lower()
+                if any(t in blob for t in _MOBILE_HINT_TOKENS):
+                    return True
+    except Exception:
+        return False
+    return False
+
 
 @dataclass
 class TargetModel:
@@ -40,6 +73,22 @@ class TargetModel:
     has_creds: bool = False
     has_ad: bool = False
     has_os: bool = False
+    # mobile surface: a device identity (phone) OR a confirmed mobile/MDM
+    # fact OR a network/web host whose services are known (an MDM
+    # enrollment endpoint is a web service, so it only becomes reachable
+    # once services are visible)
+    is_mobile: bool = False
+    has_mobile: bool = False
+    # a MOBILE HINT is concrete evidence that the host fronts a mobile
+    # surface (an MDM/APNS/GCM/enrolment service or a mobile-web app). It is
+    # deliberately narrower than "has any open port": planning the MDM probe
+    # against every scanned host would hijack the chain from the beacon stage.
+    mobile_hint: bool = False
+    # platform branch of the mobile surface ("ios" / "android"), learned
+    # from the MDM enrolment probe: the two platforms have different
+    # delivery doctrine (Android sideloads, iOS needs MDM supervision)
+    mobile_platforms: List[str] = field(default_factory=list)
+    mobile_managed: bool = False
     open_services: List[str] = field(default_factory=list)
     software: Dict[str, str] = field(default_factory=dict)
 
@@ -67,8 +116,18 @@ class ProfileDetector:
         model.has_creds = bool(wm.find("creds", valid=True))
         model.has_ad = bool(wm.find("ad_domain"))
         model.has_os = bool(wm.find("os"))
+        model.is_mobile = wm.target_type == "phone"
+        model.has_mobile = bool(wm.find("mobile") or wm.find("mdm_vendor"))
+        for f in wm.find("mobile_platform"):
+            v = f.value if isinstance(f.value, dict) else {}
+            for p in (v.get("platforms") or []):
+                if p not in model.mobile_platforms:
+                    model.mobile_platforms.append(str(p))
+            if v.get("mdm"):
+                model.mobile_managed = True
         model.open_services = sorted(
             {str(f.key) for f in wm.find("service")})
+        model.mobile_hint = _detect_mobile_hint(wm)
         for f in wm.find("service") + wm.find("web_app"):
             software = (f.value.get("software") or f.value.get("name")
                         or f.value.get("product"))
@@ -114,6 +173,21 @@ def _exploitable(model: TargetModel) -> bool:
     return model.is_network and bool(model.software)
 
 
+def _mobile_device(model: TargetModel) -> bool:
+    """The TARGET is a device (phone identity) or a mobile/MDM surface is
+    already confirmed: probe/expand it. Ranked ABOVE the beacon stage so a
+    phone still does OSINT first, then mobile, then converges."""
+    return model.is_mobile or model.has_mobile
+
+
+def _mobile_host(model: TargetModel) -> bool:
+    """A network/web host that shows a CONCRETE mobile/MDM hint (MDM or
+    APNS/GCM service, enrolment path, mobile-web app) may front an MDM
+    enrolment endpoint. Ranked BELOW the beacon stage so the mobile probe
+    can never hijack the terminal stage of the chain."""
+    return model.is_network and model.mobile_hint
+
+
 STRATEGIES: List[Strategy] = [
     Strategy("identity_osint", "Identity OSINT discovery",
              "identity", _identity, weight=90,
@@ -130,6 +204,19 @@ STRATEGIES: List[Strategy] = [
     Strategy("network_footprint", "Network footprinting",
              "footprint", _network, weight=75,
              description="scan_tcp / version_detect / os_detect"),
+    # mobile surface: its own stage so `mobile_probe` ->
+    # `mobile_mdm_fingerprint` are actually PLANNED (they were orphaned
+    # capabilities before). Two entries, same goal:
+    #   * device -> above the beacon stage (phone: OSINT, then mobile)
+    #   * host   -> just under the footprint stage (scan, then mobile probe)
+    Strategy("mobile_surface_device", "Mobile device / MDM surface",
+             "mobile", _mobile_device, weight=82,
+             description="mobile_probe -> mobile_mdm_fingerprint "
+                         "(MDM vendor -> mobile attack tree)"),
+    Strategy("mobile_surface_host", "MDM surface on host",
+             "mobile", _mobile_host, weight=67,
+             description="MDM enrollment probe on a host showing a "
+                         "mobile/MDM hint (before the beacon stage)"),
     Strategy("exploit_chain", "Version-matched exploitation",
              "exploit", _exploitable, weight=72,
              description="service_exploit: CVE module matched to the "
