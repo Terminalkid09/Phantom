@@ -19,22 +19,47 @@ data/downloads/
 data/presets/*.json
 data/certs/
 data/calibrated_weights.json
+data/technique_priors.json
+data/experience_cases.json
+
+# Self-improvement loop state + beta temp checkouts (machine-authored
+# code lives in phantom/automation/guidance/learned/ and IS committed via
+# PR review — only the runtime state stays local)
+data/evolution/
 data/scan_history/
 data/reports/
 data/beacons/beacon_registry.json
 data/phantom_state.json
+data/config.json
 data/network_hosts.json
+# BloodHound/AD graph built from a live engagement (target topology)
+data/ad_graph.json
+# Social-engineering runtime: persona + conversation state, and the capture
+# artefacts generated per target (they name the targets and the lure codes)
+data/social_state.json
+data/social_attachments/
 data/beacons/*.key
 data/beacons/*.crt
 # C2 audit/runtime state; never commit keys, certificates, or delivery tokens
 .data-c2/
 data/payload_history.json
+data/c2_audit.log.lock
 
 data/logs/
 data/engagement_history.json
 
 # Generated persona covers + avatar cache (local, per-engagement)
 data/personas/
+
+# Beacon screen recordings + remote-session frames (large binary artifacts)
+data/recordings/
+data/remote/
+# Victim screenshots / camera captures (per-engagement, sensitive)
+data/screenshots/
+
+# Stray build artifacts (a toolchain run can create host-named dirs)
+/127.0.0.1/
+/*.*.*.*/
 
 # Malleable C2 profiles (user-generated, auto-recommended)
 data/malleable_profile.json
@@ -79,11 +104,37 @@ phantom/payloads/beacon/beacon_linux_static
 phantom/payloads/beacon/beacon_linux_x86
 phantom/payloads/beacon/beacon_macos
 phantom/payloads/beacon/beacon_android
+phantom/payloads/beacon/beacon_ios.dylib
 
 # Crypto & build config (auto-generated)
 phantom/payloads/beacon/src/crypto_config.h
 phantom/payloads/beacon/src/c2_config.h
 phantom/payloads/beacon/src/beacon_auth.h
+
+# Remote Session module (GUI takeover) build artifacts
+phantom/payloads/remote/*.exe
+phantom/payloads/remote/remote_linux
+phantom/payloads/remote/remote_macos
+phantom/payloads/remote/remote.apk
+phantom/payloads/remote/remote_ios.dylib
+# iOS remote-session build products (Xcode build dir, signing material)
+phantom/payloads/remote/ios/build/
+phantom/payloads/remote/ios/DerivedData/
+phantom/payloads/remote/ios/*.mobileprovision
+phantom/payloads/remote/ios/*.p12
+phantom/payloads/remote/src/beacon_auth.h
+phantom/payloads/remote/src/crypto_config.h
+phantom/payloads/remote/src/c2_config.h
+
+# Android remote module (APK) — Gradle/NDK build output + local SDK path
+phantom/payloads/remote/android/.gradle/
+phantom/payloads/remote/android/build/
+phantom/payloads/remote/android/app/build/
+phantom/payloads/remote/android/app/.cxx/
+phantom/payloads/remote/android/local.properties
+phantom/payloads/remote/android/.idea/
+phantom/payloads/remote/android/*.iml
+phantom/payloads/remote/android/app/src/main/jni/*.o
 phantom/payloads/beacon/src/build_id.h
 phantom/payloads/beacon/src/config_encrypted.h
 phantom/payloads/beacon/src/malleable_config.h
@@ -154,6 +205,9 @@ data/wordlists/*.lst
 data/sessions/auto_*/
 data/sessions/auto_*.json
 data/sessions/auto_*.md
+# Per-target engagement deliverables: data/sessions/report_<target>_<ts>/
+# holds client_report.html + raw_audit.html (full engagement content)
+data/sessions/report_*/
 # Portable .pm session bundles + imported checkpoints (sensitive engagement data)
 data/sessions/*.pm
 data/sessions/imported_checkpoint.json
@@ -193,3 +247,4 @@ lab/new_beacon.txt
 lab/beacon_client.crt
 lab/beacon_client.key
 lab/beacon_ca.crt
+data/msf_rpc_password
