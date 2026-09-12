@@ -5,7 +5,8 @@ services:
     container_name: phantom-framework
     privileged: true # Required for network tools like TShark/Nmap
     ports:
-      - "8080:8080"
+      - "8080:8080"   # C2 listener
+      - "8081:8081"   # tracker / lure links
     stdin_open: true # Allow interactive shell
     tty: true        # Allow interactive shell
     volumes:
