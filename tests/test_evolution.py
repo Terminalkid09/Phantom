@@ -190,12 +190,23 @@ class TestGate:
     def test_lab_required(self, tmp_path):
         """No lab -> the lab stage must fail with the policy message and
         run_gate must return False (never skip silently). Static must be
-        green first so we actually REACH the lab stage."""
+        green first so we actually REACH the lab stage.
+
+        The unavailability is injected where `check_lab` actually looks for
+        it: no endpoint already up, and `lab_session()` refusing to start one.
+        (Patching `_lab_reachable` proved nothing — `check_lab` never calls
+        it, so on any host WITH docker the stage happily started the managed
+        lab and the test failed for an unrelated reason.)
+        """
+        from phantom.automation.evolution import lab as lab_mod
         cap = tmp_path / "learned_labprobe.py"
         cap.write_text(
             GOOD_CAP.split("# FILE:", 1)[1].split("\n", 1)[1],
             encoding="utf-8")
-        with patch.object(gate_mod, "_lab_reachable", return_value=False), \
+        with patch.object(gate_mod, "_existing_lab_port", return_value=None), \
+                patch.object(lab_mod, "lab_session",
+                             side_effect=lab_mod.LabUnavailable(
+                                 "no docker and no lab endpoint")), \
                 patch.object(gate_mod, "check_registry",
                              return_value=gate_mod.GateResult(
                                  "registry", True, "ok")), \
@@ -205,11 +216,39 @@ class TestGate:
             ok, results = gate_mod.run_gate(str(cap), skip_lab=False)
         assert not ok
         assert results[-1].stage == "lab"
-        # the refusal must name the policy either way: endpoint down OR
-        # the managed lab failed to start (docker missing / pool clash)
-        assert ("behavioural proof impossible" in results[-1].detail
-                or "lab unreachable" in results[-1].detail)
+        assert "behavioural proof impossible" in results[-1].detail
         assert "no auto-load and no PR" in results[-1].detail
+
+    def test_lab_reports_a_capability_missing_from_the_registry(
+            self, tmp_path, monkeypatch):
+        """When a lab IS up but the capability was never installed, the lab
+        stage must say so instead of reporting a broken adapter: the dry-run
+        runs the INSTALLED capability, and `reg.get()` returning None used to
+        surface as an AttributeError on None."""
+        from phantom.automation.evolution import lab as lab_mod
+        monkeypatch.setattr(gate_mod, "_existing_lab_port", lambda: 8081)
+
+        class _Noop:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return None
+
+        monkeypatch.setattr(lab_mod, "lab_session", lambda: _Noop())
+        cap = tmp_path / "learned_absent.py"
+        cap.write_text(
+            GOOD_CAP.split("# FILE:", 1)[1].split("\n", 1)[1],
+            encoding="utf-8")
+        with patch.object(gate_mod, "check_registry",
+                          return_value=gate_mod.GateResult("registry", True, "ok")), \
+                patch.object(gate_mod, "check_units",
+                             return_value=gate_mod.GateResult("units", True, "ok")):
+            ok, results = gate_mod.run_gate(str(cap), skip_lab=False)
+        assert not ok
+        assert results[-1].stage == "lab"
+        assert "not in the registry" in results[-1].detail
+        assert "adapter/interpreter raised" not in results[-1].detail
 
 
 def _w(tmp_path: Path, body: str) -> Path:

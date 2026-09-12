@@ -315,6 +315,10 @@ def check_lab(cap_relpath: str, cap_id: str) -> GateResult:
             "from phantom.core.knowledge import reset_wm\n"
             "reg = make_registry()\n"
             "cap = reg.get(r'%s')\n"
+            "if cap is None:\n"
+            "    print(json.dumps({'error': 'capability not in the registry'}),\n"
+            "          file=sys.stderr)\n"
+            "    sys.exit(3)\n"
             "wm = reset_wm('127.0.0.1')\n"
             "wm.add_finding(kind='service', key='tcp/%s',\n"
             "               value={'port': %s, 'product': 'flask',\n"
@@ -338,6 +342,18 @@ def check_lab(cap_relpath: str, cap_id: str) -> GateResult:
         except subprocess.TimeoutExpired:
             return GateResult("lab", False,
                               f"lab dry-run exceeded {LAB_TIMEOUT}s")
+        if proc.returncode == 3:
+            # the dry-run runs make_registry() in a fresh interpreter, so a
+            # capability that is not installed under the learned dir is
+            # simply absent. Say that: the generic "adapter/interpreter
+            # raised" plus an AttributeError on None reads like a broken
+            # capability when the real cause is a missing file.
+            return GateResult(
+                "lab", False,
+                f"capability '{cap_id}' is not in the registry: the lab stage "
+                "runs the installed capability, so it must exist under "
+                f"{LEARNED_DIR.as_posix()} before the gate reaches it",
+                logs=(proc.stderr or "").strip().splitlines()[-4:])
         if proc.returncode != 0:
             tail = (proc.stderr or "").strip().splitlines()[-8:]
             return GateResult("lab", False, "adapter/interpreter raised",
