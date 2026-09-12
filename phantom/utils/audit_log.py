@@ -49,24 +49,86 @@ class AuditLog:
         self.path = path
         self._lock = threading.Lock()
 
+    def _locked_fd(self):
+        """Cross-process exclusive lock on a sidecar .lock file.
+
+        The C2 listener, the shell and agent workers share the log inside
+        one process (threading.Lock covers that) but a second Phantom
+        process (second operator shell, Electron backend + CLI at once)
+        must not interleave records — the chain-of-custody log has to stay
+        line-atomic. Returns (fd, unlock_callable)."""
+        lock_path = self.path + ".lock"
+        os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            def _unlock():
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                finally:
+                    os.close(fd)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            def _unlock():
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+        return _unlock
+
+    def _write_line(self, line: str) -> None:
+        """Append one full line (O_APPEND + fsync). Caller holds the
+        cross-process lock, so the write is line-atomic and durable."""
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                     0o600)
+        try:
+            os.write(fd, line.encode("utf-8") + b"\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
     # ------------------------------------------------------------------ append
 
     def append(self, event: str, **fields: Any) -> Dict[str, Any]:
-        """Append one event; returns the record as written."""
+        """Append one event; returns the record as written.
+
+        Every field is REDACTED before hashing/writing: the audit log is the
+        chain-of-custody record that can be shown to the client, so raw
+        passwords/OTPs/tokens must never land in it (a `command` field like
+        "sshpass -p secret ssh ..." would otherwise leak the credential).
+        The hash covers the redacted record, so the chain stays verifiable.
+        """
+        from phantom.utils.redact import redact as _redact_obj
+        from phantom.utils.redact import redact_text as _redact_text
         with self._lock:
-            prev = self._last_hash()
-            record: Dict[str, Any] = {
-                "seq": self._count() + 1,
-                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "event": event,
-            }
-            record.update(fields)
-            record["prev"] = prev
-            record["hash"] = hashlib.sha256(
-                _canonical(record).encode("utf-8")).hexdigest()
-            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(_canonical(record) + "\n")
+            # The WHOLE read-compute-write is one critical section across
+            # BOTH the thread lock and the cross-process file lock: two
+            # processes must not both read the same tail (same prev/seq)
+            # before either writes, or the hash chain forks.
+            unlock = self._locked_fd()
+            try:
+                prev = self._last_hash()
+                record: Dict[str, Any] = {
+                    "seq": self._count() + 1,
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "event": event,
+                }
+                record.update(fields)
+                # KEY-based redaction first (a field literally named
+                # `password`/`otp` is masked whatever its value), then
+                # TEXT-based masking for string values (a `command` field
+                # carrying "sshpass -p secret ..." is masked in place).
+                record = _redact_obj(record)
+                record = {k: (_redact_text(v) if isinstance(v, str) else v)
+                          for k, v in record.items()}
+                record["prev"] = prev
+                record["hash"] = hashlib.sha256(
+                    _canonical(record).encode("utf-8")).hexdigest()
+                self._write_line(_canonical(record))
+            finally:
+                unlock()
             return record
 
     # ------------------------------------------------------------------ reads

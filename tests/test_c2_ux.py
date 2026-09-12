@@ -82,7 +82,7 @@ class TestC2Help(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("config", out)
         self.assertIn("listeners", out)
-        self.assertIn("v1.0.0", out)  # version footer
+        self.assertIn("v3.0.0", out)  # version footer
 
     def test_help_specific_command(self):
         sh = C2Shell()

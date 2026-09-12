@@ -67,14 +67,28 @@ def get_c2_endpoint() -> tuple:
     operator sets PHANTOM_C2_HOST).
     """
     from phantom.core.session import session
+    from phantom.utils import config as cfg
 
-    host = os.getenv("PHANTOM_C2_HOST", "").strip()
+    # An EXPLICIT env override always wins (even loopback: a local lab run
+    # may genuinely want it). A loopback value coming from the config FILE
+    # is treated as unset: older installs stored 127.0.0.1 as the default
+    # and a beacon carrying it dials its own loopback — a dead beacon and
+    # a dead dropper link nobody notices until the engagement fails.
+    host = str(os.getenv("PHANTOM_C2_HOST", "")).strip()
+    if not host:
+        stored = str(cfg.get("c2.host", "") or "").strip()
+        if stored and stored not in ("127.0.0.1", "localhost", "::1",
+                                     "0.0.0.0"):
+            host = stored
     if not host:
         host = session.lhost or get_lhost()
 
-    port = os.getenv("PHANTOM_C2_PORT", "").strip()
+    port = str(cfg.get("c2.port", "", env="PHANTOM_C2_PORT")).strip()
     if port:
-        port = int(port)
+        try:
+            port = int(port)
+        except ValueError:
+            port = 8080
     else:
         port = session.lport or 8080
     return host, port

