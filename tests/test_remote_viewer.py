@@ -1,4 +1,9 @@
-"""Tests for the browser-based remote session viewer (CLI → real GUI)."""
+"""Tests for the browser-based remote session viewer (CLI → real GUI).
+
+Since P0-5 every data route (/frames, /frame, /send) requires the
+per-session bearer token issued by launch_viewer; only the HTML shell
+is public (it carries the token to the page via the URL fragment).
+"""
 import json
 import threading
 import time
@@ -17,22 +22,33 @@ def fake_beacon():
     c2_state.beacons.pop("R-VIEWTEST1", None)
 
 
-def _get(url):
-    return urllib.request.urlopen(url, timeout=5).read()
+@pytest.fixture
+def viewer(fake_beacon):
+    from phantom.core import remote_viewer
+    port, _t, token = remote_viewer.launch_viewer(
+        "R-VIEWTEST", open_browser=False)
+    time.sleep(0.4)
+    yield port, token
 
 
-def _post(url, body):
+def _get(url, token=""):
     req = urllib.request.Request(
-        url, data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"})
+        url, headers=({"Authorization": "Bearer " + token} if token else {}))
     return urllib.request.urlopen(req, timeout=5).read()
 
 
-def test_viewer_binds_loopback_random_port(fake_beacon):
-    from phantom.core import remote_viewer
-    port, _t = remote_viewer.launch_viewer("R-VIEWTEST", open_browser=False)
+def _post(url, body, token=""):
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode(), headers=headers)
+    return urllib.request.urlopen(req, timeout=5).read()
+
+
+def test_viewer_binds_loopback_random_port(viewer, fake_beacon):
+    port, _token = viewer
     assert port > 0
-    time.sleep(0.4)
     html = _get(f"http://127.0.0.1:{port}/").decode()
     assert "PHANTOM" in html and fake_beacon in html
     # the page wires the full control surface
@@ -50,15 +66,25 @@ def test_viewer_rejects_network_bind():
     assert '"127.0.0.1", 0' in src
 
 
-def test_viewer_frames_and_send_endpoints(fake_beacon):
-    from phantom.core import remote_viewer
-    from phantom.core.c2_server import c2_state
-    port, _t = remote_viewer.launch_viewer("R-VIEWTEST", open_browser=False)
-    time.sleep(0.4)
-    frames = json.loads(_get(f"http://127.0.0.1:{port}/frames"))
+def test_viewer_data_routes_require_token(viewer, fake_beacon):
+    port, token = viewer
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"http://127.0.0.1:{port}/frames")
+    assert exc.value.code == 401
+    # with the token everything works
+    frames = json.loads(_get(f"http://127.0.0.1:{port}/frames", token))
     assert frames["beacon"] == fake_beacon and "frames" in frames
+
+
+def test_viewer_send_queues_task(viewer, fake_beacon):
+    from phantom.core.c2_server import c2_state
+    port, token = viewer
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _post(f"http://127.0.0.1:{port}/send",
+              {"cmd": "remote input move 5 6"})
+    assert exc.value.code == 401
     resp = json.loads(_post(f"http://127.0.0.1:{port}/send",
-                            {"cmd": "remote input move 5 6"}))
+                            {"cmd": "remote input move 5 6"}, token))
     assert resp["ok"] is True
     assert c2_state.tasks[fake_beacon][-1]["command"] == "remote input move 5 6"
 

@@ -55,6 +55,10 @@ export interface SessionState {
 
 export interface AutoModeState {
   running: boolean
+  /** P1-14: explicit terminal-state machine — `running` alone cannot
+   *  distinguish a stalled poll from an active run, a stop request in
+   *  flight, or a finished/failed run. */
+  run_state?: 'idle' | 'starting' | 'active' | 'stopping' | 'done' | 'failed'
   startedAt?: number
   plan: string[]
   current_step: number

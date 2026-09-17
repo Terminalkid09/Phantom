@@ -20,6 +20,7 @@ the planner may still proceed at its own risk).
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -297,10 +298,19 @@ class VmBackend(SandboxBackend):
         try:
             remote = f"C:\\phantom_sample_{int(time.time())}.exe"
             if self.copy_cmd:
-                subprocess.run(f"{self.copy_cmd.format(local=sample_path, remote=remote)}",
-                               shell=True, capture_output=True, timeout=60)
-            r = subprocess.run(f"{self.vm_exec} {remote}", shell=True,
-                               capture_output=True, text=True, timeout=int(self.timeout or 60))
+                # A-7: no shell — a template that formats a sample path must
+                # never be able to inject shell syntax into the copy step.
+                subprocess.run(
+                    shlex.split(self.copy_cmd.format(local=sample_path,
+                                                     remote=remote)),
+                    capture_output=True, timeout=60)
+            # `vm_exec` is an operator-configured launcher (e.g. "vmrun -T ws
+            # start"), split into argv + the remote path appended as one arg:
+            # the sample path is data, never syntax.
+            argv = shlex.split(self.vm_exec) + [remote]
+            r = subprocess.run(argv, shell=False,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, timeout=int(self.timeout or 60))
             return SandboxResult(backend=self.name, ok=r.returncode == 0,
                                  output=r.stdout.strip()[:300],
                                  error=r.stderr.strip()[:200])

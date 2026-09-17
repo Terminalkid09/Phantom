@@ -369,9 +369,15 @@ def write_beacon_auth_config(beacon_dir: str, beacon_id: Optional[str] = None) -
     mtls = issue_client_certificate(identity["beacon_id"]) if mtls_enabled else None
     extra = ""
     if mtls:
+        # `c2_config.h` may already carry the pin (it resolves the C2's own
+        # certificate). Guard instead of redefining: a redefinition is a
+        # warning today and a hard error under -Werror, and two different
+        # pins would be a silent trust decision.
         extra = f"""
 #define BEACON_MTLS_ENABLED 1
+#ifndef BEACON_SERVER_FINGERPRINT
 #define BEACON_SERVER_FINGERPRINT \"{mtls['server_fingerprint']}\"
+#endif
 static const char BEACON_CLIENT_CERT_PEM[] = { _pem_literal(mtls['client_cert_pem']) };
 static const char BEACON_CLIENT_KEY_PEM[] = { _pem_literal(mtls['client_key_pem']) };
 static const char BEACON_CLIENT_CA_PEM[] = { _pem_literal(mtls['client_ca_pem']) };

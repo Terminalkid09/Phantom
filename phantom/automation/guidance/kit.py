@@ -265,11 +265,72 @@ def _effective_target(wm: WorldModel) -> str:
     For identity targets (username/email/phone) the harvested victim IP
     becomes the real machine target; for network targets it is the target
     itself. This is how the identity chain converges on beacon injection.
+
+    EDGE-AWARE: when the address in scope is a provider's reverse proxy, the
+    machine to aim at is the ORIGIN discovered behind it. Every network
+    adapter in this kit goes through this one function, so "do not scan the
+    CDN, scan the box behind it" is one rule in one place instead of a rule
+    every adapter has to remember.
     """
     ips = wm.find("victim_ip")
     if ips:
         return str(ips[0].value.get("ip", wm.target))
+    origin = best_origin(wm)
+    if origin:
+        return origin
     return wm.target
+
+
+def best_origin(wm: WorldModel):
+    """The most credible origin behind an edge, or None.
+
+    Only candidates above `ORIGIN_MIN_CONFIDENCE` count: below that we have
+    a naming guess, and aiming an engagement at a guess is worse than
+    waiting for the next discovery pass.
+    """
+    from phantom.automation.brain.edge import (ORIGIN_FACT,
+                                               ORIGIN_MIN_CONFIDENCE)
+    best, best_conf = "", 0.0
+    try:
+        findings = wm.find(ORIGIN_FACT)
+    except Exception:
+        return None
+    for f in findings:
+        v = f.value if isinstance(f.value, dict) else {}
+        try:
+            conf = float(v.get("confidence", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if conf < ORIGIN_MIN_CONFIDENCE:
+            continue
+        host = str(v.get("host", "") or v.get("ip", "") or "")
+        if host and conf > best_conf:
+            best, best_conf = host, conf
+    return best or None
+
+
+def edge_of(wm: WorldModel):
+    """The EDGE finding that applies to the address in scope, or None."""
+    from phantom.automation.brain.edge import EDGE_FACT, EDGE_THRESHOLD
+    try:
+        findings = wm.find(EDGE_FACT)
+    except Exception:
+        return None
+    target = str(getattr(wm, "target", "") or "")
+    for f in findings:
+        v = f.value if isinstance(f.value, dict) else {}
+        if not v.get("is_edge"):
+            continue
+        try:
+            if float(v.get("confidence", 0) or 0) < EDGE_THRESHOLD:
+                continue
+        except (TypeError, ValueError):
+            continue
+        addr = str(v.get("address", "") or "")
+        if addr and target and addr != target:
+            continue
+        return v
+    return None
 
 
 def _beacon_payload(wm: WorldModel) -> str:
@@ -311,6 +372,58 @@ def _ad_dc(wm: WorldModel) -> str:
     return wm.target
 
 
+def _origin_interp(output: str, wm: WorldModel,
+                   slots: Dict[str, Any]) -> List[Finding]:
+    """Interpreter for the origin-discovery engine: `EDGE:` and `ORIGIN:`
+    marker lines become typed facts the rest of the chain reasons about.
+
+    `edge` is the GATE fact ("this address is a provider's proxy"), `origin`
+    is the RESOLUTION fact ("the machine behind it is here"). Keeping them
+    separate is what lets the guard say "blocked: edge, no origin yet"
+    instead of having to guess from one overloaded flag.
+    """
+    from phantom.automation.brain.edge import EDGE_FACT, ORIGIN_FACT
+
+    def _num(raw: Any, default: float = 0.0) -> float:
+        try:
+            return float(str(raw).strip())
+        except (TypeError, ValueError):
+            return default
+
+    findings: List[Finding] = []
+    for line in (output or "").splitlines():
+        kv = _parse_marker_line(line, "EDGE:")
+        if kv.get("address"):
+            address = kv.get("address", "")
+            if address == "-":
+                address = wm.target
+            conf = _num(kv.get("confidence"))
+            findings.append(Finding(
+                kind=EDGE_FACT, key=f"edge:{address}",
+                value={"address": address,
+                       "provider": kv.get("provider", ""),
+                       "confidence": conf,
+                       "is_edge": str(kv.get("is_edge", "")).lower() == "true",
+                       "evidence": [e for e in
+                                    str(kv.get("evidence", "")).split("|") if e]},
+                confidence=max(0.2, conf), source="origin_discovery",
+                target=wm.target))
+            continue
+        kv = _parse_marker_line(line, "ORIGIN:")
+        host = kv.get("host", "")
+        if host and host != "-":
+            conf = _num(kv.get("confidence"))
+            ip = kv.get("ip", "")
+            findings.append(Finding(
+                kind=ORIGIN_FACT, key=f"origin:{host}",
+                value={"host": host, "ip": "" if ip == "-" else ip,
+                       "reason": kv.get("reason", ""),
+                       "confidence": conf},
+                confidence=max(0.2, conf), source="origin_discovery",
+                target=wm.target))
+    return findings
+
+
 def _mk_slot(name: str, typ: str, required: bool = True, desc: str = "") -> InputSlot:
     return InputSlot(name=name, type=typ, required=required, description=desc)
 
@@ -319,14 +432,28 @@ def _mk(cap_id: str, category: str, desc: str, inputs: List[InputSlot],
         effects: List[str], adapter, interpreter=None, opsec_cost: float = 1.0,
         detection_risk: float = 0.1, stealth_level: str = "passive",
         forceful: bool = False, timeout: int = 30, preconditions: List = None,
-        banner: str = "", tools: List[str] = None) -> Capability:
+        banner: str = "", tools: List[str] = None,
+        exec_class: str = "shell_command", requires: List[str] = None) -> Capability:
+    # P2-1: marker adapters are AUTO-classified — the honest stubs can
+    # never masquerade as shell capabilities because the classification
+    # is derived from the adapter's own return marker, not from a hand-set
+    # tag someone might forget to update.
+    if exec_class == "shell_command":
+        import inspect as _inspect
+        try:
+            src = _inspect.getsource(adapter)
+            if "://" in src and "return f\"" in src and "marker" in src.lower():
+                exec_class = "marker_only"
+        except (OSError, TypeError):
+            pass
     return Capability(
         id=cap_id, category=category, description=desc, inputs=inputs,
         effects=effects, adapter=adapter, interpreter=interpreter,
         opsec_cost=opsec_cost, detection_risk=detection_risk,
         stealth_level=stealth_level, forceful=forceful, timeout=timeout,
         preconditions=preconditions or [], banner=banner or desc,
-        tools=tools or [])
+        tools=tools or [], exec_class=exec_class,
+        requires=list(requires or []))
 
 
 def _interp_nmap_ports(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
@@ -337,11 +464,49 @@ def _interp_nmap_os(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[
     return [Finding(**f, target=wm.target) for f in parse_nmap_os(output)]
 
 
+def _header_map(raw: str) -> Dict[str, str]:
+    """Every `Name: value` pair of a raw HTTP response, lower-cased keys.
+
+    Used for EDGE detection: a CDN does not announce itself in `Server`
+    alone — `cf-ray`, `x-amz-cf-id`, `x-iinfo`, `x-served-by` are the
+    decisive ones, and they were being thrown away.
+    """
+    out: Dict[str, str] = {}
+    for line in (raw or "").splitlines():
+        if ":" not in line or line.lstrip().startswith("<"):
+            continue
+        name, _, value = line.partition(":")
+        name = name.strip()
+        if not name or len(name) > 40 or " " in name:
+            continue
+        out.setdefault(name.lower(), value.strip())
+    return out
+
+
 def _interp_http(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
     findings = [Finding(**f, target=wm.target) for f in parse_http_banner(output)]
     cms = detect_cms(output)
     if cms:
         findings.append(Finding(**cms, target=wm.target))
+    # EDGE detection rides on the HTTP probe: the headers are already in
+    # hand, and knowing "this is Cloudflare, not the customer" changes what
+    # the rest of the chain is allowed to touch.
+    try:
+        from phantom.automation.brain.edge import EDGE_FACT, detect
+        verdict = detect(address=_effective_target(wm),
+                         headers=_header_map(output))
+        if verdict.is_edge:
+            findings.append(Finding(
+                kind=EDGE_FACT, key=f"edge:{_effective_target(wm)}",
+                value={"address": _effective_target(wm),
+                       "provider": verdict.provider,
+                       "confidence": verdict.confidence,
+                       "is_edge": True,
+                       "evidence": list(verdict.evidence)},
+                confidence=verdict.confidence, source="http_probe",
+                target=wm.target))
+    except Exception:
+        pass
     return findings
 
 
@@ -2656,6 +2821,14 @@ def _idor_adapter(wm, slots):
     return "idor://web (differential engine, in-process)"
 
 
+def _origin_adapter(wm, slots):
+    """Marker stub: origin discovery executes in-process (CT logs, DNS
+    resolution, header evidence) and NEVER sends a packet at the edge —
+    the adapter exists only to keep the 'adapter is the command source'
+    invariant, like the IDOR and web-credentials engines."""
+    return "edge://origin-discovery (in-process)"
+
+
 def _idor_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
     """Parse IDOR: markers into idor findings (authorization flaws)."""
     from phantom.automation.belief import Finding
@@ -2852,6 +3025,26 @@ CAPABILITIES = [
         preconditions=[_has_network_host()], banner="port scan",
         tools=["nmap", "masscan", "nc"]),
 
+    # Origin discovery: the gate that keeps the chain off a provider's CDN.
+    # IP/domain targets increasingly resolve to a reverse proxy, and
+    # scanning that address footprints Cloudflare instead of the customer
+    # (and touches a third party's infrastructure). This capability answers
+    # "where is the machine BEHIND the edge" from public evidence only —
+    # CT-log hostnames, DNS resolution outside the provider ranges, response
+    # headers — and produces the EDGE gate fact plus the ORIGIN facts every
+    # network adapter then aims at through `_effective_target`.
+    _mk("origin_discovery", "recon",
+        "Origin discovery behind a CDN/edge: reads the HTTP header evidence "
+        "(cf-ray, x-amz-cf-id, x-iinfo, x-served-by …), mines CT-log "
+        "hostnames and DNS resolution for a host that is NOT in the "
+        "provider's ranges, and ranks the candidates. Public data only: it "
+        "never sends a scan packet at the edge",
+        [], ["edge", "origin"], _origin_adapter, _origin_interp,
+        exec_class="in_process_engine",   # P2-1: in-process engine
+        opsec_cost=0.2, detection_risk=0.05, stealth_level="passive",
+        timeout=120, preconditions=[_has_network_host()],
+        banner="origin discovery", tools=[]),
+
     _mk("version_detect", "recon", "Service version fingerprinting",
         [_mk_slot("port", "port", False, "target port")],
         ["service", "version"], _version_adapter, _interp_nmap_ports,
@@ -2886,6 +3079,7 @@ CAPABILITIES = [
         "no LLM, deterministic and bounded",
         [_mk_slot("port", "port", False, "web port (default: all web services)")],
         ["hunt_anomaly"], _hunt_web_adapter, _hunt_web_interp,
+        exec_class="in_process_engine",   # P2-1: anomaly engine, in-process
         opsec_cost=1.0, detection_risk=0.25, stealth_level="active",
         forceful=True, timeout=120,
         preconditions=[_has_network_host(), _has_finding("service")],
@@ -2901,6 +3095,7 @@ CAPABILITIES = [
         "body when the advisor is enabled",
         [_mk_slot("port", "port", False, "web port (default: all web services)")],
         ["idor"], _idor_adapter, _idor_interp,
+        exec_class="in_process_engine",   # P2-1: IDOR engine, in-process
         opsec_cost=1.2, detection_risk=0.3, stealth_level="active",
         timeout=120, preconditions=[_has_network_host(), _has_finding("service")],
         banner="IDOR reference walk", tools=[]),
@@ -2912,6 +3107,7 @@ CAPABILITIES = [
         "score against baseline (status/size/timing/body markers), "
         "validate top anomalies, report confirmed findings",
         [], ["differential_anomaly"], _differential_adapter, _differential_interp,
+        exec_class="in_process_engine",   # P2-1: differential engine, in-process
         opsec_cost=1.5, detection_risk=0.3, stealth_level="active",
         forceful=True, timeout=120,
         preconditions=[_has_network_host(), _has_finding("service")],
@@ -3021,6 +3217,7 @@ CAPABILITIES = [
         "move when the app leaks the database instead of brute-forcing "
         "SSH (deterministic, bounded, zero external tools)",
         [], ["creds"], _web_creds_adapter, _web_creds_interp,
+        exec_class="in_process_engine",   # P2-1: SSRF/SQLi engine, in-process
         opsec_cost=1.4, detection_risk=0.25, stealth_level="active",
         timeout=120, preconditions=[_has_web_service()],
         banner="web credential extraction", tools=["curl"]),

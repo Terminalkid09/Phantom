@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -67,6 +68,44 @@ def _in_scope(target: str, scope_list: List[str]) -> bool:
         return True
     from phantom.core.scope import is_in_scope
     return is_in_scope(target, scope_list)
+
+
+# ── the EDGE gate's vocabulary ─────────────────────────────────────────────
+#
+# Packet-level work, refused while the address in scope is a provider's
+# reverse proxy. The list is explicit rather than "everything that is not
+# web": a capability added later must be classified on purpose.
+_EDGE_GUARDED_CATEGORIES = ("scan", "service", "brute", "exploit", "hunt")
+_EDGE_GUARDED_IDS = ("scan_tcp", "version_detect", "os_detect",
+                     "fingerprint_services", "mobile_probe")
+_EDGE_EXEMPT_IDS = ("origin_discovery", "surface_map")
+
+
+def _is_ip(value: str) -> bool:
+    return bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", (value or "").strip()))
+
+
+def _headers_from_raw(raw: str) -> Dict[str, str]:
+    """`Name: value` pairs of a raw HTTP response, lower-cased keys."""
+    out: Dict[str, str] = {}
+    for line in (raw or "").splitlines():
+        if ":" not in line or line.lstrip().startswith("<"):
+            continue
+        name, _, value = line.partition(":")
+        name = name.strip()
+        if not name or len(name) > 40 or " " in name:
+            continue
+        out.setdefault(name.lower(), value.strip())
+    return out
+
+
+def _best_origin(wm):
+    """The credible origin behind an edge, or None (see kit.best_origin)."""
+    try:
+        from phantom.automation.guidance.kit import best_origin
+        return best_origin(wm)
+    except Exception:
+        return None
 
 
 class ShareContext:
@@ -196,9 +235,19 @@ class _BeaconSession:
         self.beacon_id = beacon_id
 
     def task(self, command: str) -> Optional[str]:
-        from phantom.core.c2_server import c2_state
+        from phantom.core.c2_server import c2_state, TaskPolicyError
         try:
             return c2_state.queue_task(self.beacon_id, command)
+        except TaskPolicyError:
+            # P1-1 legacy adapter: OS command lines (persistence cron/unit,
+            # recon one-liners) are not beacon verbs — the beacon executes
+            # them through its OS-shell verb, exactly like the C2 shell's
+            # interact mode does for free-form input.
+            try:
+                return c2_state.queue_task(self.beacon_id,
+                                           f"shell {command}")
+            except Exception:
+                return None
         except Exception:
             return None
 
@@ -241,12 +290,17 @@ class AutonomousAgent:
                  hunt_runner: Optional[Callable[[str, str, str, float], Any]] = None,
                  hunt_delay: Optional[float] = None,
                  fuzz_sender: Optional[Callable[[str, str], Any]] = None,
+                 edge_runner: Optional[Callable[..., Any]] = None,
                  threat_intel=None,
                  persist_learning: bool = False,
                  experience: bool = False,
                  evolution: bool = False,
                  llm: bool = False,
-                 stop_event=None) -> None:
+                 stop_event=None,
+                 reason_profile: str = "",
+                 cell_loop: bool = False,
+                 cell_stages: Optional[List[str]] = None,
+                 evolution_mode: str = "code") -> None:
         self.target = target
         if target_type in ("", "auto"):
             from phantom.automation.guidance.targets import classify_target
@@ -257,6 +311,7 @@ class AutonomousAgent:
         self.stealth = stealth
         self.paranoid = paranoid
         self.speed = speed
+        self.reason_profile = reason_profile
         self.scope_list = scope_list or []
         # target ledger: the single source of truth for the ACTIVE target
         # set (initial + mid-run pivots), their classification, and the
@@ -289,11 +344,36 @@ class AutonomousAgent:
         self.planner = Planner(self.registry, self.stealth_engine)
         self.reasoning = ReasoningEngine(self.registry, paranoid=paranoid)
         self.enterprise = EnterpriseBrain(profile, threat_intel=threat_intel)
+        # R1/R2/R3 reasoning core: a named objective (the profile) plus the
+        # arbiter that reads a move through five lenses whose weights follow
+        # the ENGAGEMENT STATE (events, never a clock). `base` remains the
+        # legacy expected value, so the arbitration is a bounded modulation:
+        # it reorders near-ties and never silently inverts the kill-chain
+        # ordering or makes a forbidden move affordable.
+        from phantom.automation.brain.lenses import Arbitrator, choose_profile
+        self.reasoning_profile = choose_profile(
+            profile, paranoid=paranoid, aggressive=aggressive, speed=speed,
+            explicit=reason_profile)
+        self.arbiter = Arbitrator(self.reasoning_profile)
+        self._decisions: Dict[str, Any] = {}
+        self._last_stall: str = ""
+        self._current_stage: str = ""
+        self._last_failed_cap: Any = None
+        # C2/C4: the run's cell team (roster + egress permit + bus +
+        # tribunal). `cell_loop` turns the roster from an ADDITION into the
+        # AUTHORITY for the stages listed in `cell_stages` (C4 migration:
+        # empty means the old planning path keeps serving every stage).
+        self.cell_loop = bool(cell_loop)
+        self.cell_stages: tuple = tuple(cell_stages or ())
+        self.cells: Any = None
         self.persist_learning = persist_learning
         # self-improvement loop flag: when True, stable uncovered failure
         # patterns are closed by an authoring sub-agent (background, never
         # blocking) that opens a reviewable PR. Off by default.
         self.evolution = evolution
+        # C3: how a learning gap is closed — `code` (author + gate + lab) or
+        # `proposal` (`--oM`: a reviewed markdown dossier, no LLM, no lab).
+        self.evolution_mode = str(evolution_mode or "code")
         self._evolution_spawned = False
         # case-based EXPERIENCE memory (brain/experience): remembers the
         # situation, the technique's OUTCOME, WHY it failed and which move
@@ -347,6 +427,10 @@ class AutonomousAgent:
         # optional in-process fuzz sender (tests / campaigns inject a
         # scripted sender); None means the bounded urllib sender is used
         self.fuzz_sender = fuzz_sender
+        # origin-discovery transport: `runner(cmd, timeout=…)` with
+        # `.ok`/`.stdout`, injectable exactly like hunt_runner/fuzz_sender so
+        # the EDGE gate can be exercised offline with no DNS and no network.
+        self.edge_runner = edge_runner
         self.sink = EventSink()
         self._on_event = on_event
         # optional local-LLM advisor: non-gating, injection-hardened
@@ -450,6 +534,253 @@ class AutonomousAgent:
         except Exception:
             pass
 
+    # ── origin discovery (EDGE gate) ───────────────────────────────────────
+
+    def _origin_run(self, cmd: str, timeout: int = 15) -> str:
+        """One bounded discovery command; stdout only, never raises."""
+        runner = self.edge_runner
+        if runner is not None:
+            try:
+                res = runner(cmd, timeout=timeout)
+                return str(getattr(res, "stdout", "") or "")
+            except Exception:
+                return ""
+        try:
+            from phantom.core.executor import execute_quiet
+            res = execute_quiet(cmd, timeout=timeout + 10)
+            return str(getattr(res, "stdout", "") or "")
+        except Exception:
+            return ""
+
+    def _edge_resolve(self, host: str) -> Tuple[str, List[str]]:
+        """(cname, [ips]) for a host through CNAME + A lookups.
+
+        With `edge_runner` injected this is a pure function of scripted
+        answers, which is how the whole gate is tested offline.
+        """
+        cname = ""
+        out = self._origin_run(f"dig +short CNAME {host}", timeout=10).strip()
+        if out:
+            cname = out.splitlines()[0].strip().strip(".")
+        ips = [ln.strip() for ln in
+               self._origin_run(f"dig +short A {host}", timeout=10).splitlines()
+               if _is_ip(ln.strip())]
+        return cname, ips
+
+    def _edge_headers(self, addresses: Sequence[str]) -> Dict[str, str]:
+        """Response headers of the address in scope (best effort).
+
+        An ordinary HTTP request, not a probe: it is how any client learns
+        that the site in front of the target is Cloudflare.
+        """
+        for addr in addresses:
+            if not addr or addr == "-":
+                continue
+            for scheme in ("http", "https"):
+                raw = self._origin_run(
+                    f"curl -sS -k -I -m 10 {scheme}://{addr}", 12)
+                if raw:
+                    return _headers_from_raw(raw)
+        return {}
+
+    def _edge_verdict(self) -> Optional[dict]:
+        """The EDGE finding that applies to the address this run aims at."""
+        from phantom.automation.brain.edge import EDGE_FACT, EDGE_THRESHOLD
+        try:
+            findings = self.wm.find(EDGE_FACT)
+        except Exception:
+            return None
+        target = str(self.target)
+        for f in findings:
+            v = f.value if isinstance(f.value, dict) else {}
+            if not v.get("is_edge"):
+                continue
+            try:
+                if float(v.get("confidence", 0) or 0) < EDGE_THRESHOLD:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            addr = str(v.get("address", "") or "")
+            if addr and addr != target:
+                continue
+            return v
+        return None
+
+    def _edge_guard(self, cap) -> str:
+        """Refuse a target-touching move while the address in scope is a
+        provider's edge. Returns the refusal reason, or "".
+
+        What is gated and what is not is a deliberate line:
+
+          * GATED — packet-level work (port scan, version/OS detection,
+            per-service enumeration, brute force, exploit and anomaly
+            hunting): it would footprint the provider and touch a third
+            party's infrastructure;
+          * NOT gated — ordinary web requests (http_probe/http_get) and the
+            discovery pass itself. Those are what a normal visitor does, and
+            they are how the provider is identified in the first place.
+
+        The refusal is a DEFERRAL, not a failure: the capability stays
+        plannable and unlocks the moment an origin is discovered, because
+        `_effective_target` then aims it at the origin.
+        """
+        if (cap.category not in _EDGE_GUARDED_CATEGORIES
+                and cap.id not in _EDGE_GUARDED_IDS):
+            return ""
+        if cap.id in _EDGE_EXEMPT_IDS:
+            return ""
+        verdict = self._edge_verdict()
+        if not verdict:
+            return ""
+        if _best_origin(self.wm):
+            return ""
+        self._origin_needed = True
+        provider = verdict.get("provider") or "CDN"
+        return (f"{provider} edge detected on {self.target}: this is the "
+                f"provider's reverse proxy, not the target — discover the "
+                f"origin before touching it")
+
+    def _origin_hosts(self) -> List[str]:
+        """Candidate hostnames the run already knows about.
+
+        CT-log hosts and surface assets come from the public surface map;
+        the target itself is included so a domain target always has a seed.
+        """
+        hosts: List[str] = []
+        for f in self.wm.find("environment"):
+            v = f.value if isinstance(f.value, dict) else {}
+            for key in ("asset", "value", "domain", "hostname"):
+                value = str(v.get(key, "") or "")
+                if value:
+                    hosts.append(value)
+                    break
+        for f in self.wm.find("hostname"):
+            v = f.value if isinstance(f.value, dict) else {}
+            value = str(v.get("hostname", "") or "")
+            if value:
+                hosts.append(value)
+        hosts.append(str(self.target))
+        return hosts
+
+    def _run_origin_discovery(self) -> bool:
+        """One bounded discovery pass, in-process.
+
+        It NEVER scans the edge: it reads the header evidence, mines CT-log
+        hostnames from the public surface map and resolves each candidate,
+        then ranks what is provably outside the provider's ranges.
+        """
+        from phantom.automation.brain import edge as edge_mod
+        target = str(self.target)
+        addresses = [target]
+        victim = self.wm.find("victim_ip")
+        if victim:
+            v = victim[0].value if isinstance(victim[0].value, dict) else {}
+            if v.get("ip"):
+                addresses.insert(0, str(v["ip"]))
+
+        hostname = target
+        f = self.wm.find("hostname")
+        if f:
+            v = f.value if isinstance(f.value, dict) else {}
+            if v.get("hostname"):
+                hostname = str(v["hostname"])
+
+        headers = self._edge_headers(addresses)
+        cname, ips = ("", []) if _is_ip(target) else self._edge_resolve(target)
+        verdict = edge_mod.detect(address=target, ip=ips[0] if ips else "",
+                                  cname=cname, headers=headers)
+
+        hosts: List[str] = list(self._origin_hosts())
+        if _is_ip(target):
+            # an IP target has no namespace to mine: a PTR plus whatever the
+            # surface map already harvested is all there is
+            ptr = self._origin_run(f"dig +short -x {target}", timeout=10).strip()
+            if ptr:
+                hosts.append(ptr.splitlines()[0].strip().strip("."))
+            domain = ""
+        else:
+            domain = hostname
+            # CT-log hostnames are the richest origin lead, and they are a
+            # PUBLIC-data fetch (crt.sh). An injected edge_runner REPLACES
+            # the transport, so the public fetch only happens on the real
+            # path — tests and campaigns script it through ct_logs_fn.
+            ct = getattr(self, "ct_logs_fn", None)
+            if ct is None and self.edge_runner is None:
+                try:
+                    from phantom.automation.surface import _ct_logs as ct
+                except Exception:
+                    ct = None
+            if ct is not None:
+                try:
+                    hosts.extend(a.value for a in ct(domain)
+                                 if getattr(a, "kind", "") == "ct_host")
+                except Exception:
+                    pass
+
+        report = edge_mod.discover(target, hosts=hosts, domain=domain,
+                                   ip=ips[0] if ips else "", cname=cname,
+                                   headers=headers, resolve=self._edge_resolve)
+        # a provider can also be identified from the header evidence alone,
+        # so the gate can arm even when the resolution was inconclusive
+        if not report.verdict.is_edge and verdict.is_edge:
+            report.verdict = verdict
+
+        self._emit("run", capability="origin_discovery",
+                   banner="origin discovery", category="recon", cost=0.2,
+                   command="edge://origin-discovery (in-process)",
+                   reason="EDGE: the address in scope is a reverse proxy")
+        output = "\n".join(report.markers())
+        self._emit("edge", address=target,
+                   provider=report.verdict.provider,
+                   confidence=round(report.verdict.confidence, 2),
+                   is_edge=report.verdict.is_edge,
+                   candidates=[c.to_dict() for c in report.candidates[:5]])
+        cap = self.registry.get("origin_discovery")
+        if cap is None or not output:
+            self.wm.record_failure("origin_discovery", "no information")
+            return False
+        findings = cap.interpret(output, self.wm, {})
+        learned = self._register_findings(cap.id, findings)
+        self.wm.record_action(cap.id, {}, "edge://origin-discovery",
+                              ok=bool(learned),
+                              note=f"edge={report.verdict.is_edge} "
+                                   f"candidates={len(report.candidates)}")
+        if not learned:
+            self.wm.record_failure(cap.id, "no new facts learned")
+            return False
+        self._emit("found", capability=cap.id,
+                   findings=[f"{f.kind}:{f.key}" for f in findings])
+        # the gate unlocks only on a REAL origin; when nothing credible came
+        # out, say so plainly instead of letting the run retry forever
+        best = report.best()
+        if report.verdict.is_edge and (best is None or best.confidence < 0.55):
+            self._emit("note", capability="origin_discovery",
+                       detail=("edge confirmed but no credible origin found: "
+                               "supply one via the operator target, or "
+                               "expect the provider to block direct access"))
+        return True
+
+    def _execute_origin_capability(self, cap, slots: Dict[str, Any]) -> bool:
+        """The `origin_discovery` capability when the planner asks for it:
+        the same pass, reported as the capability's own run."""
+        return self._run_origin_discovery()
+
+    def _maybe_origin_discovery(self) -> None:
+        """One-shot scheduling: the gate fired, or an edge is already known
+        and the origin is still missing. Bounded to one pass per run so a
+        target with no discoverable origin cannot become a discovery loop.
+        """
+        if getattr(self, "_edge_resolved", False):
+            return
+        needs = bool(getattr(self, "_origin_needed", False))
+        if not needs:
+            needs = (self._edge_verdict() is not None
+                     and not _best_origin(self.wm))
+        if not needs:
+            return
+        self._edge_resolved = True
+        self._run_origin_discovery()
+
     def _execute_capability(self, step: PlanStep) -> bool:
         cap = step.capability
         slots = dict(step.slot_values)
@@ -459,6 +790,28 @@ class AutonomousAgent:
             self._emit("blocked", capability=cap.id,
                        reason=f"target {self.target} out of scope")
             self.wm.record_failure(cap.id, f"out of scope: {self.target}")
+            return False
+        # R2 stealth veto: once the engagement has spent its noise budget the
+        # stealth lens refuses LOUD moves outright. It is narrow on purpose
+        # (aggressive/forceful/high-detection only) so it stops the run from
+        # gambling its last quiet on a marginal move without freezing a run
+        # that has no quieter path left.
+        veto = self._stealth_veto(cap)
+        if veto:
+            self._mark_failed(cap.id)
+            self._emit("blocked", capability=cap.id,
+                       reason=f"stealth veto: {veto}")
+            self.wm.record_failure(cap.id, f"stealth veto: {veto}")
+            return False
+        # EDGE gate: an address behind Cloudflare/Akamai/Fastly/… is the
+        # PROVIDER's reverse proxy, not the target. Packet-level work against
+        # it footprints the CDN and touches a third party, so it is refused
+        # (as a DEFERRAL: it unlocks as soon as an origin is discovered and
+        # `_effective_target` aims the move at the origin instead).
+        edge_block = self._edge_guard(cap)
+        if edge_block:
+            self._emit("blocked", capability=cap.id, reason=edge_block)
+            self.wm.record_failure(cap.id, edge_block)
             return False
         # the world is the judge: a capability whose preconditions are not
         # met NOW is deferred, not executed (e.g. network tooling on an
@@ -516,11 +869,21 @@ class AutonomousAgent:
         # (baseline + reference walk + distinct-object oracle, in-process)
         if cap.id == "idor_scan":
             return self._execute_idor_capability(cap, slots)
+        # ORIGIN discovery executes through the edge engine (public data
+        # only: header evidence + CT-log hostnames + DNS resolution)
+        if cap.id == "origin_discovery":
+            return self._execute_origin_capability(cap, slots)
         # web credential extraction is an in-process engine (SSRF/SQLi
         # probes against the discovered web services) — the adapter returns
         # WEBCREDS: markers, never a shell command
         if cap.id == "web_creds":
-            return self._execute_web_creds_capability(cap, slots)
+            return self._execute_web_creds_capability(cap, slots)        # A-2: a LEARNED capability carries NO in-process adapter/interpreter
+        # (the loader reads only an out-of-process descriptor). Its whole
+        # contribution — preconditions, adapter and interpreter — runs in the
+        # task worker, and findings come back as JSON data. This must be
+        # handled BEFORE make_command(), which by design has no adapter here.
+        if cap.id.startswith("learned.") and getattr(cap, "source_module", ""):
+            return self._execute_learned_capability(cap, slots)
         # synthesize the command — the ONLY place commands exist
         try:
             cmd = cap.make_command(self.wm, slots)
@@ -528,7 +891,7 @@ class AutonomousAgent:
             self._mark_failed(cap.id)
             self._emit("error", capability=cap.id, detail=str(e))
             return False
-        # per-run dynamic shaping: never ship a static command, vary the
+        # per-run dynamic shaping: never ship a static command, vary the 
         # ephemeral staging path so consecutive runs differ on the endpoint
         cmd = self._dyn.shape(cmd, self.wm)
         # senior discipline: never deploy a beacon without a foothold.
@@ -589,12 +952,15 @@ class AutonomousAgent:
         # the live stream carries the REAL command plus the planner's WHY,
         # the stealth badge and the detection risk: the operator (and the
         # report) can audit the action, not just its name
+        _dec = getattr(self, "_decisions", {}).get(cap.id)
         self._emit("run", capability=cap.id, banner=cap.banner,
                    category=cap.category, cost=cap.opsec_cost,
                    command=cmd,
                    reason=getattr(step, "reason", "") or "",
                    stealth_level=cap.stealth_level,
-                   detection_risk=cap.detection_risk)
+                   detection_risk=cap.detection_risk,
+                   driver=(_dec.driver if _dec is not None else ""),
+                   search_policy=self.search_policy())
         # noise circuit breaker: account the detection risk of loud moves
         self._account_noise(cap)
         # stealth-aware execution (human timing + opsec spend + egress)
@@ -703,6 +1069,92 @@ class AutonomousAgent:
             return False
         return True
 
+    def _world_snapshot(self) -> Dict[str, Any]:
+        """JSON view of the world model handed to the learned worker.
+
+        The worker has no access to the live WorldModel: it receives data,
+        evaluates the module's own preconditions against it, and returns
+        findings as data. Nothing machine-authored touches this process.
+        """
+        findings = []
+        for f in self.wm.all_findings():
+            try:
+                findings.append({"kind": f.kind, "key": f.key,
+                                 "value": f.value if isinstance(
+                                     f.value, (dict, list, str, int, float,
+                                               bool, type(None))) else str(f.value),
+                                 "confidence": f.confidence,
+                                 "source": f.source,
+                                 "evidence": (f.evidence or "")[:400],
+                                 "target": f.target})
+            except Exception:
+                continue
+        return {"target": getattr(self.wm, "target", ""),
+                "target_type": getattr(self.wm, "target_type", "ip"),
+                "findings": findings}
+
+    def _execute_learned_capability(self, cap, slots: Dict[str, Any]) -> bool:
+        """A-2: run a machine-authored capability entirely out of process.
+
+        The worker re-checks the module's own preconditions, runs the
+        adapter, runs the interpreter, and returns findings as JSON. A
+        failed precondition is reported as BLOCKED (not a failure) so the
+        planner keeps the capability available for a later world state.
+        """
+        try:
+            from phantom.automation.guidance.learned.worker import \
+                run_learned_task
+        except Exception as exc:  # noqa: BLE001 — worker import is soft
+            self._emit("error", capability=cap.id,
+                       detail=f"learned worker unavailable: {exc}")
+            return False
+        res = run_learned_task(
+            getattr(cap, "source_module", ""), slots, self._world_snapshot(),
+            timeout=float(getattr(cap, "timeout", 30) or 30))
+        label = getattr(cap, "banner", "") or cap.id
+        if res.get("blocked"):
+            self._emit("blocked", capability=cap.id, reason=res.get("reason", ""),
+                       banner=label)
+            return False
+        ok = bool(res.get("ok"))
+        output = str(res.get("output", ""))
+        self.wm.record_action(cap.id, slots, label, ok=ok,
+                              note=str(res.get("reason", ""))[:200],
+                              opsec=self.runtime.cost_per_action)
+        if not ok:
+            self._mark_failed(cap.id)
+            self._emit("error", capability=cap.id,
+                       detail=str(res.get("reason", "worker failed"))[-200:])
+            return False
+        from phantom.automation.belief import Finding
+        found = []
+        for item in res.get("findings", []) or []:
+            try:
+                found.append(Finding(
+                    kind=str(item.get("kind", "")),
+                    key=str(item.get("key", "")),
+                    value=item.get("value"),
+                    confidence=float(item.get("confidence", 0.5) or 0.5),
+                    source=str(item.get("source", cap.id)),
+                    evidence=str(item.get("evidence", "")),
+                    target=str(item.get("target", "") or self.wm.target),
+                ))
+            except Exception:
+                continue
+        self._register_findings(cap.id, found)
+        if found:
+            self._emit("found", capability=cap.id,
+                       findings=[f"{f.kind}:{f.key}" for f in found])
+        return True
+
+    def _run_learned_isolated(self, cap, slots: Dict[str, Any]) -> tuple:
+        """Backward-compatible (ok, output) helper for callers/tests."""
+        from phantom.automation.guidance.learned.worker import \
+            run_learned_adapter
+        return run_learned_adapter(
+            getattr(cap, "source_module", ""), slots,
+            timeout=float(getattr(cap, "timeout", 30) or 30))
+
     def _register_findings(self, cap_id: str, findings) -> bool:
         """Store interpreted findings; True if any was actually NEW.
 
@@ -788,6 +1240,10 @@ class AutonomousAgent:
 
     def _mark_failed(self, capability_id: str) -> None:
         """A capability is dead from now on — unless the world changes."""
+        try:
+            self._last_failed_cap = self.registry.get(capability_id)
+        except Exception:
+            self._last_failed_cap = None
         self._failed_caps[capability_id] = time.time()
         note = ""
         for f in reversed(self.wm.failures):
@@ -1050,20 +1506,14 @@ class AutonomousAgent:
         try:
             import phantom
             from phantom.utils.builder import compile_beacon
-            from phantom.utils.c2_crypto import write_beacon_c2_config
+            from phantom.utils.c2_crypto import beacon_config_endpoint
             beacon_dir = os.path.join(os.path.dirname(phantom.__file__),
                                       "payloads", "beacon")
             # the binary embeds C2 host/port at build time — force a rebuild
-            # when the requested C2 endpoint changed since the last build
-            import hashlib
-            cfg_path = os.path.join(beacon_dir, "src", "c2_config.h")
-            current = ""
-            if os.path.exists(cfg_path):
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    current = f.read()
-            desired = write_beacon_c2_config(
-                beacon_dir, host=c2_host, port=c2_port, use_ssl=True)
-            force = (desired != current)
+            # when the requested ENDPOINT changed since the last build. Not a
+            # comparison of the whole generated header: that always differed
+            # (the builder adds ladder/proxy/pin) so every build was forced.
+            force = (beacon_config_endpoint(beacon_dir) != (c2_host, c2_port))
             return compile_beacon(
                 platform, os.path.dirname(phantom.__file__),
                 force_rebuild=force, arch="x64",
@@ -2106,6 +2556,33 @@ class AutonomousAgent:
             return False
         self._recoveries += 1
         rearmed = 0
+        # R1: classify WHY we are stuck (brain/stall.py) BEFORE falling back to
+        # the canned escalations. The verdict becomes the stall class the
+        # arbiter adapts to AND the search mode the run follows, and it is
+        # emitted so the operator sees the diagnosis, not just the reaction.
+        try:
+            from phantom.automation.brain.stall import StallClassifier
+            verdict = StallClassifier(
+                noise_breaker_tripped=self.wm.noise_breaker_tripped()
+            ).classify(self.wm, goal)
+            self._last_stall = verdict.stall_class
+            self._emit("stall", stall=verdict.stall_class,
+                       reason=verdict.reason,
+                       strategies=list(verdict.strategies),
+                       policy=self.search_policy())
+        except Exception:
+            self._last_stall = ""
+        # C2: the stalled cell is escalated (an ADVISORY peer when the role
+        # touches the target, so the second opinion costs no noise) and the
+        # peer gets to rate the same candidate set with its own objective.
+        try:
+            if getattr(self, "cells", None) is not None:
+                self.cells.on_stall(self._last_stall,
+                                    getattr(self, "_last_failed_cap", None),
+                                    self._current_stage)
+            self._second_opinion(goal)
+        except Exception:
+            pass
 
         # Beacon-goal coverage gap: the default scan_tcp is top-ports only,
         # so non-standard management/backdoor ports (2222, 22222, 8081-class
@@ -2136,7 +2613,7 @@ class AutonomousAgent:
                                recovery=f"{self._recoveries}/{self._max_recoveries}",
                                detail="no remote-access service found — escalating "
                                       "to full-range port scan")
-                    if self._execute_capability(step):
+                    if self._exec_with_permit(step):
                         rearmed += 1
 
         # credential-path dead end -> code-execution primitives: when a web
@@ -2165,7 +2642,7 @@ class AutonomousAgent:
                                recovery=f"{self._recoveries}/{self._max_recoveries}",
                                detail="no credential path — escalating to "
                                       "web RCE probe")
-                    if self._execute_capability(step):
+                    if self._exec_with_permit(step):
                         rearmed += 1
 
         for cid in list(self._failed_caps):
@@ -2229,9 +2706,18 @@ class AutonomousAgent:
         credentials + lateral movement) and hands the beacon over once.
         """
         self.goal = goal
+        # P1-5: every run is PINNED to the engine/registry versions it was
+        # started with. Learned/beta capabilities authored during THIS run
+        # change the registry on disk but never inject into a run already
+        # in flight — they become visible to the NEXT run after review.
+        self.job_pin = self._compute_job_pin()
         self._emit("start", target=self.target, goal=goal,
                    aggressive=self.aggressive,
                    worker=phase_wait or "lead")
+        try:
+            self._emit("pin", **self.job_pin)
+        except Exception:
+            pass
         if checkpoint_path:
             try:
                 self.save_state(checkpoint_path)
@@ -2350,35 +2836,71 @@ class AutonomousAgent:
         return self.result
 
     def _spawn_evolution(self) -> None:
-        """Close uncovered failure patterns by authoring new capabilities.
+        """Close uncovered failure patterns: author a capability, or (in
+        `proposal` mode, `--oM`) draft a reviewed dossier instead.
 
-        Gated on: the LLM transport being available (the author IS the
-        LLM), the lab being reachable (no proof, no PR), and the daily
-        budgets inside loop.maybe_spawn. One shot per run.
+        Code mode is gated on the LLM transport (the author IS the LLM) and
+        on the lab being reachable (no proof, no PR). PROPOSAL mode needs
+        NEITHER: the dossier is deterministic, and its only requirement is
+        that the triage cell agrees this is a capability-shaped gap.
+        One shot per run.
         """
         if self._evolution_spawned:
             return
         self._evolution_spawned = True
-        if not (self.llm_advisor and self.llm_advisor.available()):
-            return
-        from phantom.automation.evolution import gate as evo_gate
-        if not evo_gate.lab_available():
-            self._emit("note", capability="evolution",
-                       detail="evolution skipped: lab unreachable — "
-                              "no proof, no PR, no auto-load")
-            return
+        proposal = str(getattr(self, "evolution_mode", "code")) == "proposal"
+        if not proposal:
+            if not (self.llm_advisor and self.llm_advisor.available()):
+                return
+            from phantom.automation.evolution import gate as evo_gate
+            if not evo_gate.lab_available():
+                self._emit("note", capability="evolution",
+                           detail="evolution skipped: lab unreachable — "
+                                  "no proof, no PR, no auto-load")
+                return
         from phantom.automation.evolution import loop as evo_loop
         patterns = self.experience.authorable_patterns()
         if not patterns:
             return
         for p in patterns:
             p["sig_hash"] = evo_loop._sig_hash(p)
+        cases: List[Any] = []
+        if proposal:
+            # C3 triage: most failures are NOT capability problems, and the
+            # verdict is what decides whether a proposal is even earned.
+            try:
+                from phantom.automation.brain.triage import Triage
+                triage = Triage(registry=self.registry)
+                cases = triage.package_all(
+                    patterns, roster=getattr(self, "cells", None),
+                    stall_class=self._last_stall)
+                cases = Triage.proposable(cases)
+                self._emit("triage", cases=[c.to_dict() for c in cases],
+                           patterns=len(patterns))
+                if not cases:
+                    self._emit(
+                        "note", capability="evolution",
+                        detail=("no proposal: every pattern was triaged out "
+                                "(environmental / operational / covered / "
+                                "unstable) — nothing for a capability to fix"))
+                    return
+                wanted = {c.sig_hash for c in cases}
+                patterns = [p for p in patterns if p["sig_hash"] in wanted]
+            except Exception as exc:      # noqa: BLE001
+                self._emit("note", capability="evolution",
+                           detail=f"triage unavailable: {exc}")
+                return
         spawned = evo_loop.maybe_spawn(
             patterns, self.llm_advisor, self.wm, emit=self._emit,
-            lab_ok=True)
+            lab_ok=True, mode=("proposal" if proposal else "code"),
+            roster=getattr(self, "cells", None), cases=cases)
         if spawned:
             self._emit("note", capability="evolution",
-                       detail=(f"{len(spawned)} authoring sub-agent(s) "
+                       detail=(f"{len(spawned)} proposal(s) drafted in "
+                               "background — see docs/evolution/ and the "
+                               "PR on auto-evolution/* for review"
+                               if proposal else
+                               f"{len(spawned)} authoring sub-agent(s) "
                                "running in background — PR(s) will appear "
                                "on auto-evolution/* for review"))
 
@@ -2404,6 +2926,16 @@ class AutonomousAgent:
         stage's goal facts exist, False when the stage exhausted its moves
         (bounded recoveries) without reaching them. Shared by single-goal
         runs (goal != deep) and every stage of a deep run."""
+        # the stage IS part of the arbiter's state: the progress lens measures
+        # a move against where the chain actually is, and a post-exploitation
+        # stage weighs blast radius differently from a footprint one.
+        self._current_stage = goal
+        self._ensure_cells(goal)
+        try:
+            if getattr(self, "cells", None) is not None:
+                self.cells.set_stage(goal)
+        except Exception:
+            pass
         for _ in range(max_iterations):
             # operator stop is cooperative and observed at every boundary:
             # an in-flight capability finishes, the loop then exits
@@ -2524,6 +3056,13 @@ class AutonomousAgent:
                     self._run_web_fuzz()
             except Exception:
                 pass
+            # ONE-SHOT origin discovery once an edge is known (or the gate
+            # fired): public data only, bounded, and it unlocks the whole
+            # footprint stage against the machine behind the CDN.
+            try:
+                self._maybe_origin_discovery()
+            except Exception:
+                pass
             if checkpoint_path:
                 try:
                     self.save_state(checkpoint_path)
@@ -2576,6 +3115,209 @@ class AutonomousAgent:
             self._emit("hypothesis", resolved=resolved)
         return resolved
 
+    # ----------------------------------------------------------- reasoning R1/R2/R3
+
+    def _goal_facts(self) -> tuple:
+        """The fact kinds that mean "this stage is done" (planner contract)."""
+        try:
+            from phantom.automation.planner import GOAL_FACTS
+            return tuple(GOAL_FACTS.get(
+                self.goal or "complete_kill_chain", ()) or ())
+        except Exception:
+            return ()
+
+    def _open_hypothesis_caps(self) -> List[str]:
+        """Capabilities named by an OPEN hypothesis. R3 uses these for the
+        info-gain reward: a move that discriminates between live beliefs is
+        worth more than one that merely scores well."""
+        try:
+            return [h.capability_id for h in self.wm.hypotheses
+                    if getattr(h, "status", "") == "pending"
+                    and getattr(h, "capability_id", "")]
+        except Exception:
+            return []
+
+    def _signals(self):
+        """The engagement state the arbiter adapts to (event-derived)."""
+        from phantom.automation.brain.lenses import signals_from
+        return signals_from(self.wm,
+                            stage=self._current_stage or (self.goal or ""),
+                            stall_class=self._last_stall)
+
+    def _decision_for(self, step: PlanStep, base: float) -> float:
+        """R1/R2: arbitrate ONE move and keep its explanation.
+
+        The value stays within a bounded band around the legacy expected
+        value; the DECISION RECORD is the point — the operator (and the
+        report) can see which lens drove a move instead of trusting a
+        number.
+        """
+        try:
+            from phantom.automation.brain.lenses import view_of
+            view = view_of(step, goal_facts=self._goal_facts(),
+                           success_prior=1.0,
+                           open_hypothesis_caps=self._open_hypothesis_caps())
+            decision = self.arbiter.evaluate(view, base, self._signals())
+            self._decisions[view.id] = decision
+            return decision.value
+        except Exception:
+            return base
+
+    def search_policy(self) -> str:
+        """The current search MODE (breadth/depth/identity), promoted from
+        the stall classifier so "what to do about being stuck" is a mode the
+        whole cell follows instead of a canned move list."""
+        try:
+            return self.arbiter.search_policy(self._signals())
+        except Exception:
+            return "adaptive"
+
+    # --------------------------------------------------- cells (C2/C4)
+
+    def _chain_class(self) -> str:
+        """The class driving the chain (the roster is built from it)."""
+        try:
+            return str(self.ledger.chain_class())
+        except Exception:
+            return ""
+
+    def _ensure_cells(self, goal: str) -> None:
+        """Bind the run's cell team once, at the first planning pass.
+
+        Strict (roster as AUTHORITY, refusing what no cell owns) applies
+        only to the stages the migration has moved — `cell_stages`. An
+        empty tuple therefore leaves every stage on the old planning path
+        while still giving the run its roster, permit, bus and tribunal.
+
+        Entries are GOALS, not doctrine chain stages: `_drive_stage` sets
+        `_current_stage` to the goal it was handed, so a chain stage name
+        like "footprint" never matches and would leave the strict path inert
+        while appearing switched on. `cells.MIGRATED_STAGES` is the verified
+        ledger (every entry passed the per-class coverage gate).
+        """
+        if getattr(self, "cells", None) is not None:
+            return
+        try:
+            from phantom.automation.brain.cell_runtime import CellRuntime
+            from phantom.automation.brain.cells import MIGRATED_STAGES
+            # `--cell-loop` with no explicit list migrates the stages the
+            # ledger says are READY (each one passed its scope gate). An
+            # explicit list overrides, which is how a new stage is trialled
+            # before it is added to the ledger.
+            stages = tuple(self.cell_stages) or (MIGRATED_STAGES
+                                                if self.cell_loop else ())
+            self.cell_stages = stages
+            self.cells = CellRuntime(
+                goal=goal, target_type=self.target_type,
+                cls=self._chain_class(), aggressive=self.aggressive,
+                paranoid=self.paranoid, speed=self.speed,
+                explicit_profile=self.reason_profile,
+                strict=bool(self.cell_loop and self.cell_stages),
+                emit=lambda k, d: self._emit(k, **d))
+            self.cells.start()
+            self.cells.set_stage(goal)
+        except Exception as exc:      # a roster must never break a run
+            self.cells = None
+            self._emit("note", capability="cells",
+                       detail=f"roster unavailable: {exc}")
+
+    def _cell_strict_here(self) -> bool:
+        return bool(self.cells is not None and self.cells.strict
+                    and self._current_stage in self.cell_stages)
+
+    def _exec_with_permit(self, step: PlanStep) -> bool:
+        """C2: route an action to its owning cell and take the egress permit.
+
+        Both refusal (the stage is cell-scoped and no cell owns this
+        capability) and deferral (the permit is busy) are NOT failures: the
+        capability is left available so the next planning pass can run it.
+        That mirrors the existing precondition-deferral contract, which is
+        what keeps a serialised engagement from losing work.
+        """
+        cells = getattr(self, "cells", None)
+        if cells is None:
+            return self._execute_capability(step)
+        cap = step.capability
+        stage = self._current_stage
+        strict_here = self._cell_strict_here()
+        cell = cells.cell_for(cap, stage, stage_scoped=strict_here)
+        if cell is None:
+            cells.unrouted += 1
+            if strict_here:
+                cells.refused += 1
+                self._emit("blocked", capability=cap.id,
+                           reason=(f"stage '{stage}' is cell-scoped: no cell "
+                                   f"owns category '{cap.category}'"))
+                return False
+            return self._execute_capability(step)        # lenient: lead runs it
+        cells.routed += 1
+        if cell.advisory:
+            cells.refused += 1
+            self._emit("blocked", capability=cap.id,
+                       reason=f"cell {cell.cell_id} is advisory (no egress "
+                              "permit): it reasons, it does not act")
+            return False
+        if not cells.admit(cell):
+            cells.deferred += 1
+            self._emit("deferred", capability=cap.id,
+                       reason=(f"egress permit busy ({cell.cell_id}): contact "
+                               "with the target is serialised"))
+            return False
+        try:
+            return self._execute_capability(step)
+        finally:
+            cells.release(cell)
+
+    def _second_opinion(self, goal: str) -> Optional[dict]:
+        """C2: when a cell stalls, let the escalated peer rate the SAME
+        candidate set with its own objective and adjudicate.
+
+        Only active with `cell_loop`: the peer's pick is adopted only when
+        the tribunal says the lead's weighting was the artifact (or the
+        lead's pick is vetoed by the stricter profile). Returns the dispute
+        summary, or None when there was nothing to adjudicate.
+        """
+        cells = getattr(self, "cells", None)
+        if cells is None or not self.cell_loop:
+            return None
+        try:
+            from phantom.automation.brain.lenses import view_of
+            plan = self.planner.plan_strategic(self.wm, goal=goal, max_steps=6)
+            steps = list(getattr(plan, "steps", []) or [])
+            if not steps:
+                return None
+            goal_facts = self._goal_facts()
+            open_hyp = self._open_hypothesis_caps()
+            views, base_of = [], {}
+            for st in steps:
+                cid = st.capability.id
+                base = self._priority(st)
+                views.append(view_of(st, goal_facts=goal_facts,
+                                     open_hypothesis_caps=open_hyp))
+                base_of[cid] = base
+            dispute = cells.second_opinion(views, base_of, self._signals())
+            return dispute.to_dict() if dispute is not None else None
+        except Exception:
+            return None
+
+    def _stealth_veto(self, cap) -> str:
+        """R2: the stealth lens' veto, checked at EXECUTION time so no
+        scheduler path can bypass it. Returns the reason, or "".
+
+        Defensive by contract: a half-built agent (tests construct one with
+        __new__) must run, not crash, and the absence of an arbiter means
+        "no opinion" rather than "allow".
+        """
+        arb = getattr(self, "arbiter", None)
+        if arb is None:
+            return ""
+        try:
+            from phantom.automation.brain.lenses import view_of
+            view = view_of(cap, goal_facts=self._goal_facts())
+            return arb.hard_veto(view, self._signals())
+        except Exception:
+            return ""
+
     def _priority(self, step: PlanStep) -> float:
         # expected value heuristic: cheap + low detection wins
         # KILL-CHAIN ORDER: before any service is known, the footprint scan
@@ -2604,7 +3346,8 @@ class AutonomousAgent:
                 pass
         if step.capability.category == "post":
             priority -= 10.0  # post-exploitation ALWAYS runs after the beacon
-        return priority
+        # R1/R2: state-dependent arbitration on top of the expected value
+        return self._decision_for(step, priority)
 
     def _orchestrator_worker(self, action: PrioritizedAction, ctx: dict) -> bool:
         cap = self.registry.get(action.capability_id)
@@ -2612,12 +3355,35 @@ class AutonomousAgent:
             return False
         step = PlanStep(capability=cap, slot_values=action.slot_values)
         before = len(self.wm.actions_taken)
-        ok = self._execute_capability(step)
+        ok = self._exec_with_permit(step)
         # enterprise learning: record only REAL attempts (an action was
         # recorded), never deferrals/blocks; ok == made new progress
         if len(self.wm.actions_taken) > before:
             self.enterprise.record(cap.id, ok)
         return ok
+
+    def _compute_job_pin(self) -> Dict[str, Any]:
+        """P1-5 job pin: the immutable identity of this run's engine —
+        registry digest, knowledge/guidance version, capability count and
+        the learned ids visible at START time. A capability that appears
+        mid-run is NOT in this snapshot and must not be scheduled by it."""
+        import hashlib
+        try:
+            from phantom.automation.guidance.commands import make_registry
+            caps = sorted(c.id for c in make_registry().all())
+        except Exception:
+            caps = []
+        learned = [c for c in caps if c.startswith("learned.")]
+        return {
+            "engine_commit": _engine_commit(),
+            "knowledge_version": time.strftime("%Y%m%d%H%M%S",
+                                               time.gmtime()),
+            "policy_version": 1,
+            "registry_digest": hashlib.sha256(
+                ",".join(caps).encode("utf-8", "replace")).hexdigest()[:16],
+            "capability_count": len(caps),
+            "learned_ids": learned,
+        }
 
     def _finalize(self) -> Dict[str, Any]:
         beacons = self.wm.find("beacon")
@@ -2626,6 +3392,7 @@ class AutonomousAgent:
         return {
             "target": self.target,
             "goal": self.goal,
+            "job_pin": getattr(self, "job_pin", {}),
             "stages": dict(self._stage_outcomes or {}),
             "beacon_id": self._session.beacon_id if self._session else "",
             "beacon_established": bool(beacons),
@@ -2662,7 +3429,27 @@ class AutonomousAgent:
             "actions_taken": len(self.wm.actions_taken),
             "failures": len(self.wm.failures),
             "campaign_trail": [e for e in self.sink.events],
+            "cells": (self.cells.to_dict()
+                      if getattr(self, "cells", None) is not None else {}),
+            "cell_stats": (self.cells.stats()
+                           if getattr(self, "cells", None) is not None else {}),
         }
+
+
+def _engine_commit() -> str:
+    """Best-effort commit of the running engine (P1-5 pin). Empty string
+    when not a git checkout — the pin still carries the registry digest."""
+    try:
+        import subprocess
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], capture_output=True,
+            text=True, timeout=5, cwd=os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))))
+        if proc.returncode == 0:
+            return (proc.stdout or "").strip()
+    except Exception:
+        pass
+    return ""
 
 
 def _make_experience(enabled: bool):
@@ -2695,7 +3482,11 @@ def _run_target_with_workers(target: str, profile: str, aggressive: bool,
                              evolution: bool = False,
                              llm: bool = False,
                              stop_event=None,
-                             seed_findings=None) -> tuple:
+                             seed_findings=None,
+                             reason_profile: str = "",
+                             cell_loop: bool = False,
+                             cell_stages: Optional[List[str]] = None,
+                             evolution_mode: str = "code") -> tuple:
     """Same-target parallel workers sharing ONE WorldModel (stealth design).
 
     The lead runs the full kill chain as usual; extra workers deepen single
@@ -2737,7 +3528,9 @@ def _run_target_with_workers(target: str, profile: str, aggressive: bool,
             shared_wm=wm, hunt_runner=hunt_runner, hunt_delay=hunt_delay,
             threat_intel=threat_intel, persist_learning=persist_learning,
             experience=experience, evolution=evolution, llm=llm,
-            stop_event=stop_event)
+            stop_event=stop_event, reason_profile=reason_profile,
+            cell_loop=cell_loop, cell_stages=cell_stages,
+            evolution_mode=evolution_mode)
         if runner is not None:
             from phantom.automation.runtime.stealth_runtime import TimingGovernor
             agent.runtime = StealthRuntime(
@@ -2816,7 +3609,11 @@ def run_autonomous(target: str, target_type: str = "auto",
                    evolution: bool = False,
                    llm: bool = False,
                    seed_findings: Optional[List[Dict[str, Any]]] = None,
-                   stop_event=None):
+                   stop_event=None,
+                   reason_profile: str = "",
+                   cell_loop: bool = False,
+                   cell_stages: Optional[List[str]] = None,
+                   evolution_mode: str = "code"):
     """Full autonomous kill-chain run against a target.
 
     target_type defaults to "auto": the target is classified at runtime as
@@ -2882,7 +3679,10 @@ def run_autonomous(target: str, target_type: str = "auto",
             hunt_delay=hunt_delay, threat_intel=threat_intel,
             persist_learning=persist_learning, experience=experience,
             llm=llm,
-            stop_event=stop_event, seed_findings=seed_findings)
+            stop_event=stop_event, seed_findings=seed_findings,
+            reason_profile=reason_profile,
+            cell_loop=cell_loop, cell_stages=cell_stages,
+            evolution_mode=evolution_mode)
         if return_agent:
             return result, agent
         return result
@@ -2903,7 +3703,11 @@ def run_autonomous(target: str, target_type: str = "auto",
                             experience=experience,
                             evolution=evolution,
                             llm=llm,
-                            stop_event=stop_event)
+                            stop_event=stop_event,
+                            reason_profile=reason_profile,
+                            cell_loop=cell_loop,
+                            cell_stages=cell_stages,
+                            evolution_mode=evolution_mode)
     if runner is not None:
         from phantom.automation.runtime.stealth_runtime import TimingGovernor
         agent.runtime = StealthRuntime(

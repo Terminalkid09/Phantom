@@ -6,6 +6,31 @@ All notable changes to Phantom.
 
 ## [Unreleased] — current development (v3.0.0 line)
 
+### Fixed — P0 hardening round 1 (docs/ROADMAP.md)
+
+- **`chain execute` reported success for failed commands** — `execute_step()`
+  now returns the real outcome: non-zero exit / timeout / guard refusal →
+  `STEP FAILED` with findings NOT ingested (failed-command output is error
+  text, not evidence); exit 0 → `STEP COMPLETED` or `NO FINDINGS`. Preview
+  and execution share one command builder (`_build_shaped_command`) so the
+  approved command is exactly the executed one.
+- **C2 listener could silently fail to start** — a port conflict used to
+  kill the server thread while the shell printed "Started". The bind now
+  happens on the CONFIGURED host, captures `bind_error`, and `start()`
+  raises `RuntimeError` instead of lying (mirrors the tracker contract).
+- **Auto-persist now audited** — kept as the documented default (owner
+  decision Q-1) but every auto-persist queueing lands in the immutable
+  hash-chained audit log as `auto_persist_queued`.
+
+### Changed
+
+- **Reproducible test bootstrap** — `requirements-dev.txt` pins the dev/test
+  set; CI installs it instead of ad-hoc pip lines.
+- **CI collects the whole suite by glob** — the hand-maintained test list
+  silently skipped every new test file; collection now follows the directory
+  with the two standalone integration scripts explicitly excluded (their
+  module body compiles a real beacon and exits at import).
+
 > Every entry below is work toward the next tagged release; the
 > framework version stays **v3.0.0** until that tag lands. Subheadings
 > keep the original working-version markers only as dates/history.

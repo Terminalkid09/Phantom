@@ -88,6 +88,11 @@ class StealthRun:
 class StealthRuntime:
     """The single point through which the agent executes commands."""
 
+    def build_run(self, command: str, output: str, ok: bool = True) -> "StealthRun":
+        """Wrap an ALREADY-EXECUTED output (e.g. the P1-8 learned worker)
+        into a StealthRun so the agent's normal result handling applies."""
+        return StealthRun(command=command, ok=ok, output=(output or "")[:200_000])
+
     def __init__(self, stealth: StealthEngine, runner: Callable = None,
                  governor: Optional[TimingGovernor] = None,
                  splitter: Optional[ScanSplitter] = None,

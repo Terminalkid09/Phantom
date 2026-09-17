@@ -15,6 +15,7 @@ Status model (as agreed with the operator):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -42,6 +43,56 @@ class BetaResult:
     def as_dict(self) -> Dict:
         return {"checked": self.checked, "loaded": self.loaded,
                 "skipped": self.skipped, "details": self.details[-10:]}
+
+
+def file_digest(path: Path) -> str:
+    """SHA-256 of the candidate file — the exact-load proof (P1-7)."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _expected_cap_id(cap_path: Path, pr: Dict) -> str:
+    """The capability id the PR MUST contain: the author's prompt forces
+    the module to derive its id from the proposal id, and the proposal id
+    is `<date>-<sig_hash>` which names the branch. A PR whose candidate id
+    differs from what its branch promises is not the reviewed artefact."""
+    stem = cap_path.stem
+    return "learned." + stem
+
+
+def _candidate_id_matches(cap_path: Path, pr: Dict) -> Tuple[bool, str]:
+    """P1-7: the PR's candidate file must declare EXACTLY the capability id
+    its branch/proposal promises, and the PR body must carry the digest of
+    the file the gate verified (a diff after gate = load refused)."""
+    import re as _re
+    try:
+        src = cap_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return False, f"unreadable candidate: {exc}"
+    m = _re.search(r"_mk\(\s*[\"']([\w.]+)[\"']", src)
+    declared = m.group(1) if m else ""
+    if not declared.startswith("learned."):
+        return False, f"candidate id not learned.*: {declared!r}"
+    stem = cap_path.stem
+    branch = str(pr.get("head", {}).get("ref", ""))
+    # branch name carries the sig_hash: auto-evolution/<date>-<sig>;
+    # the stem must embed that signature (strip the WHOLE namespace first —
+    # it contains a dash itself)
+    sig = ""
+    if branch.startswith("auto-evolution/"):
+        sig = branch[len("auto-evolution/"):].split("-", 1)[-1]
+    if sig and sig not in stem:
+        return False, (f"candidate stem {stem!r} does not match branch "
+                       f"signature {sig!r}")
+    digest = file_digest(cap_path)
+    body = str(pr.get("body") or "")
+    if body and digest not in body and _PROMOTED_MARKER not in body:
+        return False, ("PR body carries neither the verified digest nor a "
+                       "reviewer promotion — load refused")
+    return True, f"id={declared} digest={digest[:12]}…"
+
+
+# a human reviewer can bypass the digest match by signing the PR body
+_PROMOTED_MARKER = "[x] reviewed-and-promoted"
 
 
 def fetch_open_evolution_prs() -> List[Dict]:
@@ -95,6 +146,17 @@ def load_beta(advisor=None, emit=None) -> BetaResult:
                 continue
             rel = str(cap_path.relative_to(checkout)).replace("\\", "/")
             res.checked += 1
+            # P1-7: identity + digest proof BEFORE the gate — a candidate
+            # that is not exactly the artefact its PR describes is refused
+            # whatever the gate says (the gate validates code quality, not
+            # that this file IS the reviewed one)
+            id_ok, id_detail = _candidate_id_matches(cap_path, pr)
+            if not id_ok:
+                res.skipped += 1
+                res.details.append({"pr": number, "branch": branch,
+                                    "ok": False, "cap": cap_path.name,
+                                    "detail": f"identity check: {id_detail}"})
+                continue
             # reuse the gate against the temp checkout (lab included)
             sub_gate = _gate_in_checkout(checkout, rel, cap_path)
             if sub_gate.ok:

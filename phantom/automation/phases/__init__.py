@@ -34,6 +34,7 @@ PHASE_ORDER = (
 # capabilities.py — this is the planner-facing index.
 _CAPABILITY_PHASE: Dict[str, str] = {
     # recon
+    "origin_discovery": "recon",
     "scan_tcp": "recon",
     "version_detect": "recon",
     "os_detect": "recon",

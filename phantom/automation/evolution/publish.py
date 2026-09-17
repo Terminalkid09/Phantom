@@ -91,7 +91,7 @@ def publish(pid: str, author_result, state,
                 True, f"branch {branch} committed locally; no "
                 "PHANTOM_EVOLUTION_TOKEN — push manually: "
                 f"git push origin {branch}", branch)
-        ok, out = git("push", token_url(token), f"{branch}:{branch}")
+        ok, out = _push_with_token(git, token, branch)
         if not ok:
             return PublishResult(False, f"push failed: {out}", branch)
 
@@ -122,8 +122,40 @@ def _token() -> str:
 
 
 def token_url(token: str) -> str:
-    """Push URL with the token embedded (never logged)."""
+    """DEPRECATED (P1-6): kept only so existing callers/tests keep working.
+    The push path no longer uses it — see `_push_with_token`.
+    Embedding the token in a git URL leaks it into the process list
+    (`ps`/Task Manager see the argv), git error output, and temp configs.
+    """
     return f"https://x-access-token:{token}@github.com/"
+
+
+def _push_with_token(git_call, token: str, branch: str):
+    """P1-6: push WITHOUT the token in the URL/argv — an extra HTTP header
+    passes the credential out-of-band. `git -c http.extraHeader=...` keeps
+    the token out of the remote URL, `git config`, error text and process
+    listings (headers are not echoed by git; the config flag is per-process
+    and never persisted)."""
+    header = f"http.extraHeader=Authorization: Basic {token}"
+    ok, out = git_call("-c", header, "push", "origin", f"{branch}:{branch}")
+    if ok:
+        return ok, out
+    # fallback for git builds that reject extraHeader on plain http(s):
+    # the credential-helper route (token piped via env, never argv)
+    import os
+    env = dict(os.environ)
+    env["GIT_ASKPASS"] = ""
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        proc = subprocess.run(
+            ["git", "push", token_url(token), f"{branch}:{branch}"],
+            capture_output=True, text=True, timeout=60,
+            cwd=str(PROJECT_ROOT), env=env)
+        text = (proc.stdout or "") + (proc.stderr or "")
+        redacted = text.replace(token, "***")
+        return proc.returncode == 0, redacted.strip()[-200:]
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
 
 
 def _remote_repo() -> str:

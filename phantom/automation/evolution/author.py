@@ -38,7 +38,7 @@ exactly one module-level object:
 
     CAPABILITY = _mk(id, category, desc, inputs, effects, adapter,
                      interpreter=None, opsec_cost=..., detection_risk=...,
-                     stealth_level=..., timeout=..., preconditions=[...])
+                     stealth_level=..., timeout=..., requires=[...])
 
   id             : MUST start with "learned." (e.g. "learned.ssti_waf_bypass")
   category       : one of "recon" | "brute" | "web" | "post" | "cloud" | "mobile"
@@ -53,8 +53,16 @@ exactly one module-level object:
   interpreter    : def _interp(output, wm, slots) -> list[Finding]  — parse the
                    output into findings: Finding(kind=..., key=..., value=...,
                    target=wm.target, evidence=output[:400])
-  preconditions  : callables over the WorldModel, e.g.
-                   lambda wm: bool(wm.find("web_header"))
+  requires       : MANDATORY declarative preconditions. The planner reads
+                   them WITHOUT importing your module, so they must be data,
+                   not lambdas. Grammar:
+                     "web_header"              any finding of that kind
+                     "service:tcp/445"         an exact (kind, key)
+                     "service:port=445"        a value-attribute match
+                   Example: requires=["web_header", "service:port=445"]
+                   If a runtime-only condition cannot be expressed this way,
+                   still implement `preconditions=[...]` — they are evaluated
+                   in the isolated worker before the adapter runs.
 
 HARD RULES
   * self-contained: stdlib + phantom imports ONLY; no imports from other
@@ -100,7 +108,7 @@ CAPABILITY = _mk(
     [_mk_slot("base_url", "url", False, "base URL (default target web)")],
     ["web_app"], _adapter, _interp,
     opsec_cost=0.6, detection_risk=0.15, stealth_level="active",
-    timeout=30, preconditions=[lambda wm: bool(wm.find("web_header"))],
+    timeout=30, requires=["web_header"],
     banner="learned: /exports enumeration")
 '''
 

@@ -42,15 +42,49 @@ from typing import Any, Dict, List, Optional
 
 # capabilities the advisor may propose (built-in registry subset). Kept
 # here so the prompt's whitelist is stable and the model cannot invent ids.
-_ADVISABLE = [
+#
+# P1-2 (profile-scoped whitelists): the SENSITIVE set (destructive AD
+# attacks, full foothold, social campaign triggers) is excluded from the
+# default profiles — an advisor is non-gating but still shapes the ranking,
+# so a prompt-injected or confused model must not push high-impact moves.
+# They become advisable only on the explicit "redteam" profile.
+_ADVISABLE_CORE = [
     "ssh_login", "smb_enum", "redis_info", "http_probe", "hunt_web",
-    "service_exploit", "rce_foothold", "env_probe", "ad_enum",
-    "kerberoast", "as_rep_roast", "dc_sync", "lateral_pivot", "winrm_pivot",
-    "smb_pivot", "privesc_sudo", "privesc_service_perms", "version_detect",
-    "osint_identity", "breach_check", "campaign_launch", "harvest_campaign",
-    "dm_launch", "dm_stage2", "persona_profile", "dossier_analyze",
+    "env_probe", "ad_enum", "winrm_pivot", "smb_pivot",
+    "privesc_sudo", "privesc_service_perms", "version_detect",
+    "osint_identity", "breach_check", "persona_profile", "dossier_analyze",
     "profile_recon",
 ]
+_ADVISABLE_ENGAGEMENT = _ADVISABLE_CORE + [
+    # authorized-engagement profile: adds exploitation + social delivery
+    "service_exploit", "rce_foothold", "lateral_pivot",
+    "campaign_launch", "harvest_campaign", "dm_launch", "dm_stage2",
+]
+_ADVISABLE_REDTEAM = _ADVISABLE_ENGAGEMENT + [
+    # full redteam/lab profile: credential-attack and AD takeover moves
+    "kerberoast", "as_rep_roast", "dc_sync",
+]
+
+PROFILES = {
+    "default": frozenset(_ADVISABLE_CORE),
+    "engagement": frozenset(_ADVISABLE_ENGAGEMENT),
+    "redteam": frozenset(_ADVISABLE_REDTEAM),
+}
+_DEFAULT_PROFILE = "engagement"
+
+
+def _env_profile() -> str:
+    import os
+    return os.environ.get("PHANTOM_ADVISOR_PROFILE", _DEFAULT_PROFILE).strip()
+
+
+def advisable(profile: str = "") -> frozenset:
+    """The whitelist for one engagement profile (unknown -> default)."""
+    return PROFILES.get(profile or _env_profile(), PROFILES[_DEFAULT_PROFILE])
+
+
+# backwards-compatible module-level whitelist: the engagement default
+_ADVISABLE = list(_ADVISABLE_ENGAGEMENT)
 
 _SYSTEM_PROMPT = (
     "You are an offensive-security reasoning assistant inside a penetration "
@@ -287,6 +321,7 @@ class LLMAdvisor:
     """Non-gating hypothesis advisor over a local GGUF model."""
 
     def __init__(self, enabled: bool = False, paranoid: bool = False,
+                 profile: str = "",
                  model_path: Optional[str] = None,
                  max_suggestions: int = 5,
                  temperature: float = 0.3,
@@ -297,6 +332,10 @@ class LLMAdvisor:
                  remote_model: Optional[str] = None) -> None:
         self.enabled = enabled
         self.paranoid = paranoid
+        # P1-2: profile-scoped whitelist (default=engagement; env
+        # PHANTOM_ADVISOR_PROFILE or explicit `profile=` overrides)
+        self.profile = profile or _env_profile()
+        self.whitelist = advisable(self.profile)
         from phantom.utils import config as cfg
         self.model_path = (model_path
                            or str(cfg.get("llm.model_path", "",
@@ -389,7 +428,7 @@ class LLMAdvisor:
             cid = str(item.get("capability_id", "")).strip()
             if not cid or cid in out:
                 continue
-            if cid not in _ADVISABLE:
+            if cid not in self.whitelist:
                 continue  # not on the whitelist -> dropped
             if registry is not None:
                 cap = registry.get(cid)

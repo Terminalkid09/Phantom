@@ -57,7 +57,9 @@ _DOCTRINES: Dict[str, Doctrine] = {
             ("beacon", "delivery + persistence"),
         ),
         forbidden=("identity",),
-        notes="no breach lookup for a bare machine",
+        notes=("no breach lookup for a bare machine; an address behind a "
+               "CDN/edge is the PROVIDER's proxy, not the target — origin "
+               "discovery runs before any packet-level move"),
     ),
     # ── web: surface map before touching ports ─────────────────────────
     CLASS_WEB: Doctrine(
@@ -69,7 +71,9 @@ _DOCTRINES: Dict[str, Doctrine] = {
             ("beacon", "delivery"),
         ),
         forbidden=("identity",),
-        notes="asset enumeration precedes packet-level scanning",
+        notes=("asset enumeration precedes packet-level scanning; when the "
+               "apex is edge-fronted the surface map is also the origin "
+               "lead, and the scan waits for the origin"),
     ),
     # ── cloud: identity plane first, never a port scan of the tenant ───
     CLASS_CLOUD: Doctrine(

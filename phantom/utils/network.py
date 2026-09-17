@@ -51,6 +51,71 @@ def own_ips() -> set:
     return addrs
 
 
+def get_c2_fallbacks() -> list:
+    """Fallback endpoints to embed behind the primary C2 host.
+
+    A single compiled-in endpoint is a single point of failure: one filtered
+    address, one retired redirector or one provider outage ends the
+    engagement. Priority: PHANTOM_C2_FALLBACK (comma-separated) then the
+    `c2.fallback` config key. The primary is never duplicated here — the
+    beacon's own ladder removes duplicates.
+    """
+    from phantom.utils import config as cfg
+
+    raw = str(os.getenv("PHANTOM_C2_FALLBACK", "")).strip()
+    if not raw:
+        raw = str(cfg.get("c2.fallback", "") or "").strip()
+    out = []
+    for item in raw.split(","):
+        host = item.strip()
+        if host and host not in out:
+            out.append(host)
+    return out
+
+
+def get_c2_proxy() -> str:
+    """Explicit proxy URL to embed ("" = let the beacon use the system one).
+
+    Empty is the right default: the beacon then follows the endpoint's own
+    proxy configuration (PAC/WPAD on Windows, http(s)_proxy on POSIX), which
+    is the only thing that works unconfigured. An explicit value overrides it
+    for engagements where the operator knows the egress.
+    """
+    from phantom.utils import config as cfg
+
+    proxy = str(os.getenv("PHANTOM_C2_PROXY", "")).strip()
+    if not proxy:
+        proxy = str(cfg.get("c2.proxy", "") or "").strip()
+    return proxy
+
+
+def beacon_pin() -> str:
+    """Pinned C2 certificate fingerprint to embed in the beacon, or "".
+
+    TLS without a pin completes a handshake with ANY server, so the pin is
+    what authenticates the peer. It is resolved from the C2's own certificate
+    (the same file the listener loads), which makes the default HTTPS build
+    pinned without requiring mTLS — previously `BEACON_SERVER_FINGERPRINT`
+    was emitted only on the mTLS path, so the runtime verifier was dead code
+    in every ordinary build.
+
+    Opt-out: `PHANTOM_BEACON_PIN=0` / `c2.pin=0`. That is the honest escape
+    hatch for the one real cost of pinning — regenerating the C2 certificate
+    (deleting data/certs) invalidates every already-deployed beacon, which is
+    the correct behaviour but needs to be a deliberate choice, not a
+    surprise mid-engagement.
+    """
+    from phantom.utils import config as cfg
+
+    raw = str(os.getenv("PHANTOM_BEACON_PIN", "")).strip()
+    if not raw:
+        raw = str(cfg.get("c2.pin", "") or "").strip()
+    if raw.lower() in ("0", "false", "no", "off"):
+        return ""
+    from phantom.utils.c2_crypto import server_cert_fingerprint
+    return server_cert_fingerprint()
+
+
 def get_c2_endpoint() -> tuple:
     """Best C2 (host, port) to embed in a beacon so the TARGET can reach us.
 

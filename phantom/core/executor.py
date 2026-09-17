@@ -580,6 +580,33 @@ class QuietResult:
         return self.returncode == 0 and not self.timed_out and not self.error
 
 
+def _kill_process_tree(process: "subprocess.Popen") -> None:
+    """Kill the child AND its descendants (P0 negative-test item). The
+    timeout path previously killed only the direct child (the shell),
+    leaving grandchildren — nmap helpers, wsl children — running.
+    POSIX: SIGKILL the whole process group (execute_quiet starts the
+    child in its own session). Windows: taskkill /T walks the tree."""
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                capture_output=True, timeout=10)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            import signal
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
 def execute_quiet(
     cmd: str,
     target_ip: str = "",
@@ -619,14 +646,30 @@ def execute_quiet(
     session.add_history(cmd)
 
     try:
-        process = subprocess.Popen(
-            cmd,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            text=True,
-        )
+        # P0-negative "timeout kills the process group": start_new_session
+        # (POSIX) / CREATE_NEW_PROCESS_GROUP (Windows) detaches the child
+        # into its own group so the timeout kill takes the WHOLE tree with
+        # it — nmap's helper processes, wsl bash children, etc. included.
+        if os.name == "nt":
+            process = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+        else:
+            process = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                start_new_session=True,
+            )
     except OSError as e:
         return QuietResult(cmd=cmd, error=f"spawn failed: {e}", returncode=-1)
 
@@ -640,7 +683,7 @@ def execute_quiet(
         # interpret the partial output.
         stdout = ""
         try:
-            process.kill()
+            _kill_process_tree(process)
         except OSError:
             pass
         try:

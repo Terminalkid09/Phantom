@@ -1120,8 +1120,11 @@ class PhantomShell(cmd.Cmd):
         for o in opens:
             console.print(f"  [yellow]◉ OPEN[/] {o['ip']}  {o['ua'][:40]}")
         for c in creds:
+            # live operator surface: explicitly unwrap the Secret type
+            # (every persisted copy of this dict keeps the mask)
+            from phantom.utils.redact import unwrap
             console.print(f"  [magenta]◈ CREDS[/] {c['ip']}  "
-                          f"{c['username']}:{c['password']}")
+                          f"{c['username']}:{unwrap(c['password'])}")
         for s in sessions:
             # an AiTM session outlives the credentials: the cookies ARE the
             # logged-in browser, MFA already satisfied
@@ -1300,6 +1303,31 @@ class PhantomShell(cmd.Cmd):
                             help="paranoid OPSEC (mutually exclusive with --aggressive)")
         parser.add_argument("--aggressive", action="store_true", default=False)
         parser.add_argument("--speed", action="store_true", default=False)
+        parser.add_argument("--reason", default="", metavar="PROFILE",
+                            choices=["", "balanced", "stealth_first",
+                                     "evidence_first", "force_first"],
+                            help="REASONING objective: balanced (default), "
+                                 "stealth_first (buy quiet), evidence_first "
+                                 "(buy information), force_first (only sane "
+                                 "with --aggressive)")
+        parser.add_argument("--cell-loop", dest="cell_loop",
+                            action="store_true", default=False,
+                            help="CELL LOOP: the cell roster becomes the "
+                                 "AUTHORITY for the migrated goals (the "
+                                 "migration ledger; e.g. deliver, identity, "
+                                 "post_exploit). Goals that have not been "
+                                 "migrated stay on the old planner.")
+        parser.add_argument("--cell-stages", dest="cell_stages", default="",
+                            metavar="G1,G2",
+                            help="which GOALS the cell loop owns "
+                                 "(comma-separated, e.g. "
+                                 "deliver,post_exploit; requires "
+                                 "--cell-loop)")
+        parser.add_argument("--oM", "--only-markdown", dest="only_markdown",
+                            action="store_true", default=False,
+                            help="LEARNING MODE: draft markdown proposals in "
+                                 "docs/evolution/ instead of authoring code "
+                                 "(no LLM, no lab; separate daily budget)")
         parser.add_argument("--plan", action="store_true", default=False,
                             help="dry-run: show the planned chain, execute nothing")
         parser.add_argument("--verbose", action="store_true", default=False,
@@ -1370,6 +1398,11 @@ class PhantomShell(cmd.Cmd):
             profile=args.profile,
             llm=args.llm,
             resume=args.resume,
+            reason_profile=args.reason,
+            cell_loop=args.cell_loop,
+            cell_stages=[s.strip() for s in args.cell_stages.split(",")
+                         if s.strip()],
+            only_markdown=args.only_markdown,
         )
 
     def do_agent(self, arg: str):

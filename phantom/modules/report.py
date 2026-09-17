@@ -638,7 +638,10 @@ class ReportModule(BaseModule):
         summary = _executive_summary().replace("**", "<strong>").replace(
             "**", "</strong>")
 
-        html = template.replace("{{ target }}", target)
+        # P1-12: the target string is operator/target-controlled input →
+        # escaped before it lands in the client-facing page
+        from html import escape as _e
+        html = template.replace("{{ target }}", _e(str(target)))
         html = html.replace("{{ date_str }}", date_str)
         html = html.replace("{{ summary }}", summary)
         html = html.replace("{{ vuln_content }}", self._build_vuln_html())
@@ -654,6 +657,7 @@ class ReportModule(BaseModule):
         notifier.success(f"Client HTML report saved to {filename}")
 
     def _build_vuln_html(self) -> str:
+        from html import escape as _e
         ranked = _ranked()
         if not ranked:
             return "<p>No vulnerabilities identified through automated analysis.</p>"
@@ -672,11 +676,13 @@ class ReportModule(BaseModule):
             if entry.get("has_poc"):
                 badges += "<span class='badge bg-med'>Public PoC Found</span>"
 
+            # P1-12: every target-derived field is escaped at serialization —
+            # a service banner like `<script>x</script>` must render as text
             html += f"""
         <div class="card vuln-card vuln-{level}">
             <div>
-                <strong>{cve.get('id', 'Unknown CVE')}</strong> - {svc_name}/{svc_port}<br>
-                <small style="color: #666;">{cve.get('description', 'No description available')[:200]}...</small>
+                <strong>{_e(str(cve.get('id', 'Unknown CVE')))}</strong> - {_e(str(svc_name))}/{_e(str(svc_port))}<br>
+                <small style="color: #666;">{_e(str(cve.get('description', 'No description available'))[:200])}...</small>
                 <div style="margin-top: 10px;">{badges}</div>
             </div>
             <div class="score" style="color: var(--{level});">{score}/100</div>
@@ -684,12 +690,16 @@ class ReportModule(BaseModule):
         return html
 
     def _build_service_section(self) -> str:
+        from html import escape as _e
         services = _services()
         if not services:
             return ""
         rows = ""
         for s in services:
-            rows += f"<tr><td>{s.get('port', '?')}</td><td>{s.get('service', '?')}</td><td>{s.get('version') or '—'}</td></tr>"
+            # P1-12: banner/version strings are target-derived → escaped
+            rows += (f"<tr><td>{s.get('port', '?')}</td>"
+                     f"<td>{_e(str(s.get('service', '?')))}</td>"
+                     f"<td>{_e(str(s.get('version') or '—'))}</td></tr>")
         return f"""
     <section>
         <h2>Network Reconnaissance</h2>
@@ -700,13 +710,15 @@ class ReportModule(BaseModule):
     </section>"""
 
     def _build_analyzer_section(self) -> str:
+        from html import escape as _e
         findings = _analyzer_findings()
         if not findings:
             return ""
         items = ""
         for sev, typ, detail in findings:
             color = "high" if sev == "CRITICAL" else ("med" if sev == "HIGH" else "low")
-            items += f"<li><span class='badge bg-{color}'>{sev}</span> <strong>{typ}:</strong> {detail}</li>"
+            items += (f"<li><span class='badge bg-{color}'>{sev}</span> "
+                      f"<strong>{_e(str(typ))}:</strong> {_e(str(detail))}</li>")
         return f"""
     <section>
         <h2>Captured Information & Anomalies</h2>
@@ -714,11 +726,13 @@ class ReportModule(BaseModule):
     </section>"""
 
     def _build_notes_section(self) -> str:
+        from html import escape as _e
         if not session.notes:
             return ""
         items = ""
         for note in session.notes:
-            items += f"<li><strong>[{note.get('timestamp', '')}]</strong> {note.get('text', '')}</li>"
+            items += (f"<li><strong>[{_e(str(note.get('timestamp', '')))}]</strong> "
+                      f"{_e(str(note.get('text', '')))}</li>")
         return f"<section><h2>Field Notes</h2><ul>{items}</ul></section>"
 
     def _export_pdf(self, filename: str):

@@ -28,6 +28,11 @@
 #ifndef closesocket
 #define closesocket(s) ::close(s)
 #endif
+#ifndef Sleep
+// Win32 Sleep was used directly further down, so this TU did not compile at
+// all outside Windows — the POSIX shim block stopped one macro short.
+#define Sleep(ms) ::usleep((ms) * 1000)
+#endif
 #endif
 #include <string>
 #include <vector>
@@ -39,6 +44,39 @@
 #include <cstdlib>
 
 namespace cdp_pivot {
+
+// ── dialing ────────────────────────────────────────────────────────────────
+//
+// Resolve + connect in one place, with getaddrinfo(AF_UNSPEC) and the whole
+// address list tried in turn. The previous `gethostbyname` here was IPv4-only
+// and used only h_addr_list[0]: a pivot to an IPv6-only or dual-stack host
+// never landed, and a host whose first A record was dead never got a second
+// chance. Both call sites below create a socket and connect — exactly what
+// this replaces.
+inline SOCKET cdp_connect(const std::string& host, int port) {
+    struct addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    struct addrinfo* resolved = nullptr;
+    std::string port_str = std::to_string(port);
+    if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &resolved) != 0 ||
+        resolved == nullptr) {
+        return INVALID_SOCKET;
+    }
+    SOCKET sock = INVALID_SOCKET;
+    for (struct addrinfo* ai = resolved; ai != nullptr; ai = ai->ai_next) {
+        SOCKET candidate = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (candidate == INVALID_SOCKET) continue;
+        if (connect(candidate, ai->ai_addr, (int)ai->ai_addrlen) == 0) {
+            sock = candidate;
+            break;
+        }
+        closesocket(candidate);
+    }
+    freeaddrinfo(resolved);
+    return sock;
+}
 
 inline std::string json_get_string(const std::string& json, const std::string& key) {
     std::string search = "\"" + key + "\":\"";
@@ -74,20 +112,8 @@ struct WsConnection {
     char key_buf[32];
 
     bool connect_http(const std::string& host, int port, const std::string& path) {
-        sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sock = cdp_connect(host, port);
         if (sock == INVALID_SOCKET) return false;
-
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons((u_short)port);
-
-        struct hostent* he = gethostbyname(host.c_str());
-        if (!he) { closesocket(sock); sock = INVALID_SOCKET; return false; }
-        memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
-
-        if (connect(sock, (sockaddr*)&addr, sizeof(addr)) != 0) {
-            closesocket(sock); sock = INVALID_SOCKET; return false;
-        }
 
         for (int i = 0; i < 16; i++) key_buf[i] = (char)(rand() % 256);
         std::string wsKey;
@@ -289,17 +315,8 @@ inline bool launch_chrome_with_debug(int port) {
 #endif
 
 inline std::string http_get(const std::string& host, int port, const std::string& path) {
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    SOCKET s = cdp_connect(host, port);
     if (s == INVALID_SOCKET) return "";
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((u_short)port);
-    struct hostent* he = gethostbyname(host.c_str());
-    if (!he) { closesocket(s); return ""; }
-    memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
-
-    if (connect(s, (sockaddr*)&addr, sizeof(addr)) != 0) { closesocket(s); return ""; }
 
     std::string req = "GET " + path + " HTTP/1.1\r\n"
                       "Host: " + host + ":" + std::to_string(port) + "\r\n"

@@ -8,6 +8,14 @@ lateral movement**, plus a **real Active Directory domain controller** for the
 AD chain. Never expose the `lab_net` subnet or these ports to any network you
 do not control.
 
+## Cloud / Kubernetes
+
+A second, independent lab covers the cloud half of the chain without any
+cloud account: [`cloud/`](cloud/README.md) runs LocalStack (IAM/STS/S3), an
+EC2 instance-metadata mock (the SSRF target), Azurite and MinIO, seeded with
+an over-privileged role, a leaked key and readable buckets. Kubernetes/RBAC
+practice uses `kind`/`k3d` plus `cloud/k8s/scenario.yaml`.
+
 ## Topology
 
 - **`dmz`** (`172.28.0.10`, ports 2222/2121/8081 published) — internet-facing.

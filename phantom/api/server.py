@@ -19,7 +19,7 @@ import time
 import threading
 import traceback
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 # Ensure the project root is on sys.path so Phantom imports work
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -198,6 +198,8 @@ async def c2_artifacts(_request: web.Request) -> web.Response:
     """List beacon binary artifacts (screenshots / camera frames / downloads)
     as JSON — the Electron C2 dashboard renders images from these."""
     from phantom.utils.paths import data_dir
+    from phantom.core.artifact_policy import classify as artifact_class, \
+        ttl_days_left as ttl_days_for
     out = []
     for subdir in ("screenshots", "downloads", "remote", "recordings",
                    "recordings/live"):
@@ -223,6 +225,10 @@ async def c2_artifacts(_request: web.Request) -> web.Response:
                     "size": st.st_size,
                     "mtime": datetime.fromtimestamp(st.st_mtime)
                         .strftime("%Y-%m-%d %H:%M:%S"),
+                    # P1-11: governance metadata — what class of data this
+                    # is and when the TTL policy will remove it
+                    "class": (artifact_class(subdir, name)),
+                    "expires_days": ttl_days_for(subdir, st.st_mtime),
                 })
         except OSError:
             continue
@@ -333,7 +339,13 @@ async def c2_beacon_task(request: web.Request) -> web.Response:
     command = (body or {}).get("command", "")
     if not command:
         return _error("Missing 'command' field")
-    task_id = c2_state.queue_task(beacon_id, command)
+    try:
+        task_id = c2_state.queue_task(beacon_id, command)
+    except Exception as exc:
+        from phantom.core.c2_server import TaskPolicyError
+        if isinstance(exc, TaskPolicyError):
+            return _error(str(exc), status=403)
+        raise
     return _json({"task_id": task_id, "beacon_id": beacon_id})
 
 
@@ -1192,26 +1204,21 @@ def _build_allowlists() -> None:
 _build_allowlists()
 
 
-def _validate_backend_command(module: Optional[str],
-                              command: str) -> Optional[str]:
-    """Return an error string when the command must NOT execute, else None.
-    module=None applies the GLOBAL allowlist only (generic /api/backend/run)."""
-    cmd = (command or "").strip()
-    if not cmd:
-        return "empty command"
-    # `curl ... | sh` / `... | python -` is arbitrary code execution even
-    # when the leading binary is allowlisted — reject pipes into
-    # interpreters outright (modules never generate those).
-    if re.search(r"\|\s*(?:sh|bash|zsh|dash|python|python3|perl|ruby|node|php)\b",
-                 cmd):
-        return ("command pipes into an interpreter (arbitrary execution) "
-                "— not allowed")
-    tok = _leading_token(cmd)
-    if not tok:
-        return "unparseable command (check quotes)"
+def _split_shell_segments(cmd: str) -> List[str]:
+    """Split on control operators that appear OUTSIDE quotes (`;`, `&&`,
+    `||`, `|`, newline). Thin wrapper over the SHARED parser in
+    `phantom.core.safe_exec` so validation and execution can never
+    disagree about what the command means."""
+    from phantom.core.safe_exec import split_operators
+    segs, _seps = split_operators(cmd)
+    return [s for s in segs if s.strip()]
+
+
+def _check_segment_token(module: Optional[str], tok: str) -> Optional[str]:
+    """Allowlist check for ONE command segment's leading binary."""
     if module is not None:
-        # 1) real shell binaries win (a do_* method may share its name with
-        #    a tool the module also invokes as a command, e.g. whatweb)
+        # real shell binaries win (a do_* method may share its name with a
+        # tool the module also invokes as a command, e.g. whatweb)
         if tok in _MODULE_TOOLS.get(module, set()) or tok in _ALLOWED_TOOLS:
             return None
         internal = _MODULE_INTERNAL.get(module, set())
@@ -1223,6 +1230,42 @@ def _validate_backend_command(module: Optional[str],
     if tok in _ALLOWED_TOOLS:
         return None
     return f"command '{tok}' is not in the API allowlist"
+
+
+def _validate_backend_command(module: Optional[str],
+                              command: str) -> Optional[str]:
+    """Return an error string when the command must NOT execute, else None.
+    module=None applies the GLOBAL allowlist only (generic /api/backend/run).
+
+    EVERY shell segment is validated, not just the first: `nmap x; rm -rf ~`
+    and `nmap x && curl evil` previously passed because only the leading
+    binary was checked, while the string ran under `shell=True`."""
+    cmd = (command or "").strip()
+    if not cmd:
+        return "empty command"
+    # `curl ... | sh` / `... | python -` is arbitrary code execution even
+    # when the leading binary is allowlisted — reject pipes into
+    # interpreters outright (modules never generate those).
+    if re.search(r"\|\s*(?:sh|bash|zsh|dash|python|python3|perl|ruby|node|php)\b",
+                 cmd):
+        return ("command pipes into an interpreter (arbitrary execution) "
+                "— not allowed")
+    # Nested execution the allowlist would never see. Modules generano
+    # quoted `;` arguments (msfconsole -x "...; exit") but never `$()`,
+    # `${}` or backticks.
+    if "`" in cmd or "$(" in cmd or "${" in cmd:
+        return "command substitution is not allowed"
+    segments = _split_shell_segments(cmd)
+    if not segments:
+        return "unparseable command (check quotes)"
+    for seg in segments:
+        tok = _leading_token(seg)
+        if not tok:
+            return "unparseable command (check quotes)"
+        err = _check_segment_token(module, tok)
+        if err:
+            return err
+    return None
 
 
 @routes.get("/api/modules")
@@ -1262,8 +1305,10 @@ async def module_run(request: web.Request) -> web.Response:
     gate = _validate_backend_command(name, command)
     if gate:
         return _error(gate, 403)
-    result = backend_dispatcher.run(command, str(body.get("target", session.target or "")),
-                                    max(1.0, min(float(body.get("timeout", 120)), 3600.0)))
+    # argv-only execution: the raw string never reaches a shell
+    result = backend_dispatcher.run_pipeline(
+        command, str(body.get("target", session.target or "")),
+        max(1.0, min(float(body.get("timeout", 120)), 3600.0)))
     return _json({"module": name, "command": result.cmd, "stdout": result.stdout,
                   "stderr": result.stderr, "combined": result.combined,
                   "returncode": result.returncode, "timed_out": result.timed_out,
@@ -1299,7 +1344,7 @@ async def module_run_group(request: web.Request) -> web.Response:
     total_started = time.time()
     for i, cmd in enumerate(commands):
         step_start = time.time()
-        result = backend_dispatcher.run(cmd, target, timeout)
+        result = backend_dispatcher.run_pipeline(cmd, target, timeout)
         results.append({
             "index": i,
             "command": result.cmd,
@@ -1498,7 +1543,7 @@ async def backend_run(request: web.Request) -> web.Response:
     gate = _validate_backend_command(None, command)
     if gate:
         return _error(gate, 403)
-    result = backend_dispatcher.run(command, target, timeout)
+    result = backend_dispatcher.run_pipeline(command, target, timeout)
     return _json({"command": result.cmd, "stdout": result.stdout,
                   "stderr": result.stderr, "combined": result.combined,
                   "returncode": result.returncode, "timed_out": result.timed_out,
@@ -1710,7 +1755,6 @@ async def c2_generate(request: web.Request) -> web.Response:
     try:
         import phantom
         from phantom.utils.builder import compile_beacon
-        from phantom.utils.c2_crypto import write_beacon_c2_config
         # C2 endpoint: the generated beacon must check in to THIS c2 — use
         # the session's LHOST/LPORT when set, else the C2 listener endpoint.
         from phantom.utils.network import get_c2_endpoint
@@ -1718,15 +1762,14 @@ async def c2_generate(request: web.Request) -> web.Response:
         lport = int(body.get("lport") or session.lport or get_c2_endpoint()[1])
         pkg_root = os.path.dirname(phantom.__file__)
         beacon_dir = os.path.join(pkg_root, "payloads", "beacon")
-        cfg_path = os.path.join(beacon_dir, "src", "c2_config.h")
-        current = ""
-        if os.path.exists(cfg_path):
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                current = f.read()
-        desired = write_beacon_c2_config(beacon_dir, host=lhost, port=lport,
-                                         use_ssl=True)
+        # Rebuild only when the ENDPOINT burned into the binary changed (see
+        # c2_crypto.beacon_config_endpoint: comparing the whole header always
+        # differed and forced a full recompile on every single build).
+        from phantom.utils.c2_crypto import beacon_config_endpoint
         path = compile_beacon(platform, pkg_root,
-                              force_rebuild=(desired != current), arch="x64",
+                              force_rebuild=(beacon_config_endpoint(beacon_dir)
+                                             != (lhost, lport)),
+                              arch="x64",
                               host=lhost, port=lport, use_ssl=True)
         if not path:
             return _error(
@@ -2935,13 +2978,31 @@ async def export_campaign(_request: web.Request) -> web.Response:
 
 # ── CORS middleware ────────────────────────────────────────────────────────
 
+# A-3: the local renderer only. Vite dev server origins + the packaged
+# app, whose `file://` document sends `Origin: null`.
+_LOCAL_ORIGINS = {
+    "http://localhost:5173", "http://127.0.0.1:5173",
+    "http://localhost:4173", "http://127.0.0.1:4173",
+}
+
+
 @web.middleware
 async def cors_middleware(request: web.Request, handler) -> web.Response:
-    """Allow the Electron renderer (localhost:5173) to call the API."""
+    """CORS for the local renderer ONLY.
+
+    The previous wildcard `*` let any website in the operator's browser
+    read responses from the local API. The renderer is served from the Vite
+    dev server (5173) or from `file://` in the packaged app (`Origin:
+    null`); those are the only origins that receive the headers. Non-browser
+    callers (the Electron main process) send no Origin and need no CORS.
+    """
     response = await handler(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    origin = request.headers.get("Origin", "")
+    if origin and (origin in _LOCAL_ORIGINS or origin == "null"):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
 
 
@@ -2958,9 +3019,11 @@ async def auth_middleware(request: web.Request, handler) -> web.Response:
     if request.method == "OPTIONS":
         return await handler(request)
     from phantom.utils.c2_crypto import get_api_token
+    import hmac as _hmac
     expected = get_api_token()
     provided = request.headers.get("Authorization", "")
-    if provided != f"Bearer {expected}":
+    # timing-safe: a string == leaks the token prefix byte-by-byte
+    if not _hmac.compare_digest(provided.encode(), f"Bearer {expected}".encode()):
         return web.json_response({"error": "unauthorized"}, status=401)
     return await handler(request)
 

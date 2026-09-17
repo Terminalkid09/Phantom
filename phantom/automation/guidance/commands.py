@@ -50,8 +50,22 @@ class Capability:
     id: str
     category: str  # recon | osint | service | creds | exploit | lateral | persistence | beacon | exfil | social
     description: str
+    # P2-1: how this capability actually executes — drives both the
+    # validation matrix and the honest classification of stubs.
+    #   shell_command    : produces a real command line for execute_quiet
+    #   in_process_engine: runs inside this process (hunt/idor/webcreds…)
+    #   marker_only      : adapter returns a marker; the agent owns the run
+    #   beacon_task      : queued as a task to an established beacon
+    #   lab_only         : only meaningful against the compose lab
+    #   not_validated    : no runtime proof yet — treat as untrusted
+    exec_class: str = "shell_command"
     inputs: List[InputSlot] = field(default_factory=list)
     preconditions: List[Callable[[WorldModel], bool]] = field(default_factory=list)
+    # A-2: DECLARATIVE preconditions for machine-authored capabilities, so a
+    # learned module never has to be imported in-process to be planned.
+    # Grammar: "<kind>" (any finding of that kind), "<kind>:<key>" (exact),
+    # "<kind>:<attr>=<value>" (value attribute match).
+    requires: List[str] = field(default_factory=list)
     effects: List[str] = field(default_factory=list)  # fact kinds produced, e.g. ["service"]
     adapter: Optional[Callable[[WorldModel, Dict[str, Any]], str]] = None
     interpreter: Optional[Callable[[str, WorldModel, Dict[str, Any]], List[Finding]]] = None

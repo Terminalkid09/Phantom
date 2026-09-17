@@ -888,7 +888,11 @@ def _run_agent_single(target, goal, profile, aggressive, paranoid, speed,
                       llm: bool = False, state_path: str = "",
                       experience: bool = False,
                       evolution: bool = False,
-                      stop_event: Optional[threading.Event] = None):
+                      stop_event: Optional[threading.Event] = None,
+                      reason_profile: str = "",
+                      cell_loop: bool = False,
+                      cell_stages: Optional[List[str]] = None,
+                      evolution_mode: str = "code"):
     from phantom.automation.agent import run_autonomous
     workers = agents if agents > 0 else _auto_workers(
         target, goal, profile, aggressive, paranoid, speed)
@@ -910,9 +914,11 @@ def _run_agent_single(target, goal, profile, aggressive, paranoid, speed,
         on_event=_make_agent_stream(verbose, on_event), scope_list=scope_list,
         workers_per_target=workers, return_agent=True,
         state_path=state_path or None,
-        threat_intel=_threat_intel_feed(), persist_learning=True, llm=llm,
+        threat_intel=_threat_intel_feed(),        persist_learning=True, llm=llm,
         experience=experience, evolution=evolution, stop_event=stop_event,
-        seed_findings=seed)
+        seed_findings=seed, reason_profile=reason_profile,
+        cell_loop=cell_loop, cell_stages=cell_stages,
+        evolution_mode=evolution_mode)
 
 
 def _run_agent_campaign(targets, goal, profile, aggressive, paranoid, speed,
@@ -1016,7 +1022,11 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                   evolution: bool = False,
                   beta: bool = False,
                   resume: str = "",
-                  stop_event: Optional[threading.Event] = None) -> None:
+                  stop_event: Optional[threading.Event] = None,
+                  reason_profile: str = "",
+                  cell_loop: bool = False,
+                  cell_stages: Optional[List[str]] = None,
+                  only_markdown: bool = False) -> None:
     """Autonomous kill chain (planner agent) — the `auto` entry point.
 
     Classifies each target (ip/domain/url/email/username/phone) and drives
@@ -1185,7 +1195,10 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
             resolved[0], goal, profile, aggressive, stealth, speed,
             scope_list, agents, verbose, on_event, llm,
             state_path=state_path, experience=experience,
-            evolution=evolution, stop_event=stop_event)
+            evolution=evolution, stop_event=stop_event,
+            reason_profile=reason_profile, cell_loop=cell_loop,
+            cell_stages=cell_stages,
+            evolution_mode=("proposal" if only_markdown else "code"))
         tdir, paths = _write_agent_reports(agent, profile, out_root, resolved[0])
         # auto-mode -> manual core: everything the agent learned is merged
         # into the session + manual WorldModel, so `map`, `suggest`,

@@ -19,6 +19,27 @@ def main():
     parser.add_argument("--stealth", action="store_true", help="paranoid OPSEC (auto-mode)")
     parser.add_argument("--aggressive", action="store_true", help="loud, fast exploitation (auto-mode)")
     parser.add_argument("--speed", action="store_true", help="exploit first viable opening (auto-mode)")
+    parser.add_argument("--reason", default="", metavar="PROFILE",
+                        choices=["", "balanced", "stealth_first",
+                                 "evidence_first", "force_first"],
+                        help="auto-mode REASONING objective: balanced "
+                             "(default), stealth_first (buy quiet), "
+                             "evidence_first (buy information), force_first "
+                             "(only sane with --aggressive)")
+    parser.add_argument("--cell-loop", dest="cell_loop", action="store_true",
+                        help="auto-mode CELL LOOP: the cell roster becomes "
+                             "the AUTHORITY for the migrated goals (default: "
+                             "the migration ledger)")
+    parser.add_argument("--cell-stages", dest="cell_stages", default="",
+                        metavar="G1,G2",
+                        help="auto-mode: which GOALS the cell loop owns "
+                             "(comma-separated, e.g. deliver,post_exploit; "
+                             "requires --cell-loop)")
+    parser.add_argument("--oM", "--only-markdown", dest="only_markdown",
+                        action="store_true",
+                        help="auto-mode LEARNING MODE: draft markdown proposals "
+                             "in docs/evolution/ instead of authoring code "
+                             "(no LLM, no lab; separate daily budget)")
     parser.add_argument("--plan", action="store_true", help="dry-run: show plan, execute nothing (auto-mode)")
     parser.add_argument("--verbose", action="store_true", help="stream live reasoning trace (auto-mode)")
     parser.add_argument("-a", "--agents", nargs="?", const=0, type=int, default=0,
@@ -101,6 +122,11 @@ def main():
             evolution=args.evolution,
             beta=args.beta,
             resume=args.resume,
+            reason_profile=args.reason,
+            cell_loop=args.cell_loop,
+            cell_stages=[s.strip() for s in args.cell_stages.split(",")
+                         if s.strip()],
+            only_markdown=args.only_markdown,
         )
         return
 

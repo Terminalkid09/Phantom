@@ -25,6 +25,7 @@ semantics on a curated edge set), not a black box:
 from __future__ import annotations
 
 import json
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,8 @@ STATE_PATH = Path("data/ad_graph.json")
 
 NODE_TYPES = ("domain", "user", "group", "computer", "dc")
 
+NODE_TYPES = ("domain", "user", "group", "computer", "dc")
+
 EDGE_TYPES = (
     "member_of",     # user -> group
     "admin_to",      # user -> computer/DC
@@ -45,6 +48,18 @@ EDGE_TYPES = (
     "as_rep_roastable",
     "cracked",       # user -> creds known
     "owns",          # generic full control
+    # ── P1-15: ACL / delegation edges (BloodHound-grade attack primitives)
+    "generic_all",   # user -> object: read+write everything on the object
+    "write_dacl",    # user -> object: grant yourself any right on it
+    "write_owner",   # user -> object: take ownership -> then WriteDACL
+    "add_member",    # user -> group: add yourself (or others) to the group
+    "all_extended",  # user -> object: AllExtendedRights (reset pwd, msDS-...)
+    "force_change_password",  # user -> user: set a known password
+    "dcsync",        # user -> domain: replicate ALL hashes (DS-Replication)
+    "allowed_to_delegate",     # user -> service: constrained delegation
+    "addspn",        # user -> service: set SPN -> kerberoast the target
+    "shadow_credentials",      # user -> object: add msDS-KeyCredentialLink
+    "has_session",   # computer -> user: reverse session edge (BWHO)
 )
 
 
@@ -61,6 +76,27 @@ class ADEdge:
     dst: str
     type: str                    # EDGE_TYPES
     note: str = ""
+    # P1-15 provenance: WHERE the edge came from and how fresh it is —
+    # a graph without provenance cannot distinguish "verified by logon"
+    # from "guessed by naming convention", and stale ACL data produces
+    # attack paths that no longer exist.
+    source: str = ""             # enum | logon | op | operator | sharp_hound
+    collected_at: float = 0.0    # epoch seconds
+    confidence: float = 0.6      # 0..1 (logon-verified > enum > operator)
+
+    def __post_init__(self) -> None:
+        if not self.collected_at:
+            self.collected_at = time.time()
+
+
+SOURCE_CONFIDENCE = {
+    "logon": 0.95,        # proven by an actual successful authentication
+    "op": 0.85,           # proven by a successful operation (e.g. DCSync ran)
+    "enum": 0.7,          # read from directory enumeration (ACL flags)
+    "sharp_hound": 0.9,   # imported from a real collector dump
+    "operator": 0.5,      # manually asserted by the operator
+    "inference": 0.3,     # deduced (naming, group policy convention)
+}
 
 
 class ADGraph:
@@ -86,16 +122,27 @@ class ADGraph:
         self._save()
         return n
 
-    def add_edge(self, src: str, dst: str, type: str, note: str = "") -> None:
+    def add_edge(self, src: str, dst: str, type: str, note: str = "",
+                 source: str = "", confidence: Optional[float] = None) -> None:
         if src not in self.nodes or dst not in self.nodes:
             return
         for e in self.edges:
             if (e.src, e.dst, e.type) == (src, dst, type):
                 if note and note not in e.note:
                     e.note = f"{e.note}; {note}" if e.note else note
+                # provenance upgrade: a stronger source refreshes the edge
+                if source and source != e.source:
+                    new_conf = SOURCE_CONFIDENCE.get(source, e.confidence)
+                    if new_conf > e.confidence:
+                        e.source = source
+                        e.confidence = new_conf
+                        e.collected_at = time.time()
                 self._save()
                 return
-        self.edges.append(ADEdge(src=src, dst=dst, type=type, note=note))
+        conf = confidence if confidence is not None \
+            else SOURCE_CONFIDENCE.get(source, 0.6)
+        self.edges.append(ADEdge(src=src, dst=dst, type=type, note=note,
+                                 source=source, confidence=conf))
         self._save()
 
     # ── queries ──────────────────────────────────────────────────────
@@ -280,7 +327,11 @@ class ADGraph:
             "nodes": [{"id": n.id, "type": n.type, **(n.props or {})}
                       for n in self.nodes.values()],
             "edges": [{"src": e.src, "dst": e.dst, "type": e.type,
-                       "note": e.note} for e in self.edges],
+                       "note": e.note,
+                       "source": e.source,
+                       "collected_at": e.collected_at,
+                       "confidence": round(e.confidence, 2)}
+                      for e in self.edges],
             "paths": [[{"src": s, "edge": t, "dst": d} for s, t, d in p]
                       for p in self.paths_to("DA")],
         }
@@ -381,5 +432,46 @@ def ingest_from_wm(wm) -> ADGraph:
                 g.add_node(src, "user")
             if dst not in g.nodes:
                 g.add_node(dst, "computer")
-            g.add_edge(src, dst, et, str(v.get("note", "")))
+            g.add_edge(src, dst, et, str(v.get("note", "")),
+                       source=str(v.get("source", "enum")))
+    # ── P1-15: ACL / delegation facts (ad_acl kind) ─────────────────────
+    # value: {principal, target, rights: ["GenericAll"|"WriteDacl"|
+    #   "WriteOwner"|"AddMember"|"AllExtendedRights"|
+    #   "ForceChangePassword"|"DS-Replication-Get-Changes..."|
+    #   "AllowedToDelegate"|"AddSPN"|"KeyCredentialLink"],
+    #   target_type, source, note}
+    _ACL_RIGHT_MAP = {
+        "genericall": "generic_all", "writedacl": "write_dacl",
+        "writeowner": "write_owner", "addmember": "add_member",
+        "allextendedrights": "all_extended",
+        "forcechangepassword": "force_change_password",
+        "ds-replication-get-changes": "dcsync",
+        "ds-replication-get-changes-all": "dcsync",
+        "allowedtodelegate": "allowed_to_delegate",
+        "addspn": "addspn",
+        "keycredentiallink": "shadow_credentials",
+    }
+    for f in wm.find("ad_acl"):
+        v = f.value if isinstance(f.value, dict) else {}
+        principal = str(v.get("principal", "")).strip()
+        target = str(v.get("target", "")).strip()
+        rights = v.get("rights") or []
+        if isinstance(rights, str):
+            rights = [rights]
+        if not principal or not target:
+            continue
+        if principal not in g.nodes:
+            g.add_node(principal, "user", label=principal)
+        ttype = str(v.get("target_type", "computer"))
+        if target not in g.nodes:
+            if ttype in NODE_TYPES:
+                g.add_node(target, ttype, label=target)
+            else:
+                g.add_node(target, "computer", label=target)
+        src_name = str(v.get("source", "enum"))
+        for r in rights:
+            et = _ACL_RIGHT_MAP.get(str(r).lower().strip(), "")
+            if et:
+                g.add_edge(principal, target, et,
+                           str(v.get("note", "")), source=src_name)
     return g

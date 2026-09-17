@@ -15,7 +15,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from phantom.core.executor import QuietResult, _is_safe_target, execute_quiet
+from phantom.core.executor import QuietResult, _is_safe_target
 from phantom.core.scope import is_in_scope, scope_status
 from phantom.core.session import session
 
@@ -98,17 +98,12 @@ class BackendDispatcher:
             "tools": [],
         }
 
-    def run(self, command: str, target: str = "", timeout: float = 120.0) -> QuietResult:
-        """Execute one command after scope and target validation.
-
-        Scope policy is FAIL CLOSED for targeted commands:
+    def _gate_target(self, command: str, target: str) -> Optional[QuietResult]:
+        """Scope + target validation, FAIL CLOSED for targeted commands:
           * scope declared + target out of scope -> refused
           * NO scope declared + remote target      -> refused unless the
             operator explicitly opted out (PHANTOM_ALLOW_UNSCOPED=1)
-        An empty scope list must never mean "everything is allowed" — the
-        whole point of an engagement scope is that the absence of one is a
-        decision the operator makes deliberately.
-        """
+        An empty scope list must never mean \"everything is allowed\"."""
         if target and not _is_identity_target(target):
             status = scope_status(target, session.scope)
             if status == "out_of_scope":
@@ -125,36 +120,62 @@ class BackendDispatcher:
             return QuietResult(command, error=f"unsafe target: {target}", returncode=-1)
         if not command.strip():
             return QuietResult(command, error="empty command", returncode=-1)
+        return None
+
+    def run_pipeline(self, command: str, target: str = "",
+                     timeout: float = 120.0) -> QuietResult:
+        """Execute a command WITHOUT ever handing the raw string to a shell.
+
+        The command is parsed into argv segments (quote-aware) and executed
+        with `shell=False`; pipes/`;`/`&&`/`||` are wired natively for the
+        native backend, and re-serialised with per-token quoting for the
+        WSL2/ssh backends. A command the parser cannot represent as plain
+        argv is refused — filtering shell strings was never a boundary.
+        """
+        gated = self._gate_target(command, target)
+        if gated is not None:
+            return gated
+        from phantom.core.safe_exec import UnsafeCommand, parse, run_local
+        try:
+            parsed = parse(command)
+        except UnsafeCommand as exc:
+            return QuietResult(command, error=f"refused: {exc}", returncode=-1)
 
         backend = self.detect()
         if not backend["available"]:
             return QuietResult(command, error=backend["details"], returncode=-1)
         kind = backend["kind"]
         if kind == "native":
-            return execute_quiet(command, target, timeout=timeout)
-
+            return run_local(parsed, timeout=timeout)
         if kind == "wsl2":
-            # Run as ROOT inside the distro: `sudo nmap ...` (and every other
-            # sudo-prefixed module command) hangs forever waiting for a
-            # password prompt when the WSL default user is not root and the
-            # subprocess stdin is DEVNULL — producing a 2-minute "scan with
-            # no output" for the operator. The default Kali WSL user is
-            # `kali`, not root. `-u root` keeps `sudo` a no-op while still
-            # honouring the operator's requested command verbatim.
+            from phantom.core.safe_exec import to_shell_string
             return self._run_argv(
                 ["wsl.exe", "-d", self.config.distro, "-u", "root", "--",
-                 "bash", "-lc", command],
+                 "bash", "-lc", to_shell_string(parsed)],
                 command, timeout,
             )
-
         if kind == "ssh":
-            destination = f"{self.config.user}@{self.config.host}" if self.config.user else self.config.host
+            from phantom.core.safe_exec import to_shell_string
+            destination = (f"{self.config.user}@{self.config.host}"
+                           if self.config.user else self.config.host)
             return self._run_argv(
-                ["ssh", "-p", str(self.config.port), "-o", "BatchMode=yes", destination, command],
+                ["ssh", "-p", str(self.config.port), "-o", "BatchMode=yes",
+                 destination, to_shell_string(parsed)],
                 command, timeout,
             )
+        return QuietResult(command, error=f"unsupported backend: {kind}",
+                           returncode=-1)
 
-        return QuietResult(command, error=f"unsupported backend: {kind}", returncode=-1)
+    def run(self, command: str, target: str = "", timeout: float = 120.0) -> QuietResult:
+        """Backward-compatible entry point. Delegates to `run_pipeline` so
+        every caller inherits the argv-only execution path."""
+        return self.run_pipeline(command, target, timeout)
+
+    # NOTE (A-1): there is deliberately NO shell-string execution path left on
+    # this dispatcher. `run()` and `run_pipeline()` are the only entry points
+    # and both go through `safe_exec` / per-token re-serialisation. The CLI
+    # shell keeps its own shell semantics (it is the operator's own command
+    # line) — that is a different, documented boundary.
 
     @staticmethod
     def _run_argv(argv: list[str], original: str, timeout: float) -> QuietResult:

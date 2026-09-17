@@ -97,16 +97,23 @@ class WifiModule(BaseModule):
         write_path = f"data/sessions/handshake_{bssid.replace(':', '')}"
         dump_cmd = f"sudo airodump-ng --bssid {bssid} --channel {channel} --write {write_path} {self.interface}"
         
-        # Auto-deauth in background thread
+        # Auto-deauth in background thread. argv (no shell): the BSSID above
+        # is validated, but a monitor interface name is not something a shell
+        # should ever reinterpret.
         notifier.info("Sending 10 deauth frames in parallel to force handshake...")
-        deauth_cmd = f"sudo aireplay-ng --deauth 10 -a {bssid} {self.interface}"
-        try:
-            subprocess.Popen(
-                deauth_cmd, shell=True,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except Exception as e:
-            notifier.warn(f"Auto-deauth failed: {e}. You can run it manually in another tab.")
+        if not re.fullmatch(r"[A-Za-z0-9_.:\-]{1,32}", str(self.interface or "")):
+            notifier.warn(f"Refusing auto-deauth: unsafe interface name "
+                          f"{self.interface!r} — run it manually.")
+        else:
+            deauth_argv = ["sudo", "aireplay-ng", "--deauth", "10",
+                           "-a", bssid, self.interface]
+            try:
+                subprocess.Popen(
+                    deauth_argv, shell=False,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            except Exception as e:
+                notifier.warn(f"Auto-deauth failed: {e}. You can run it manually in another tab.")
 
         run_command(dump_cmd)
 

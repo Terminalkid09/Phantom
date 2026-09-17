@@ -87,6 +87,7 @@ export default function AutoModePanel() {
 
     setAutoMode({
       running: true,
+      run_state: 'starting',
       startedAt: Date.now(),
       targets,
       plan: [],
@@ -123,16 +124,24 @@ export default function AutoModePanel() {
 
     if (res.status === 200) {
       // Poll for stream updates
+      setAutoMode({ run_state: 'active' })
       pollStream()
     } else {
-      setAutoMode({ running: false })
+      setAutoMode({ running: false, run_state: 'failed' })
       appendReasoning(new Date().toLocaleTimeString(), 'ERROR: Failed to start auto-mode')
     }
   }
 
   const pollStream = async () => {
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
+    // P1-14: SERIAL polling — an in-flight request is never overlapped by
+    // the next tick (the old async setInterval stacked concurrent fetches
+    // when the backend answered slowly, and served the same log twice).
+    let busy = false
     pollIntervalRef.current = setInterval(async () => {
+      if (busy) return            // previous poll still in flight
+      busy = true
+      try {
       const res = await api('GET', '/api/automode/stream')
       if (res.status === 200 && res.data) {
         const d = res.data as {
@@ -156,27 +165,39 @@ export default function AutoModePanel() {
           setAutoMode({ current_step: d.current_step })
         }
         if (d.log) {
-          d.log.forEach((l) => appendReasoning(l.time, l.text, {
-            command: l.command || undefined,
-            reason: l.reason || undefined,
-            stealth: l.stealth || undefined
-          }))
+          // P1-14: dedup by time+text — a reconnect/duplicate stream
+          // response must not double the reasoning lines
+          const seen = new Set<string>()
+          d.log.forEach((l) => {
+            const key = `${l.time}|${l.text}`
+            if (seen.has(key)) return
+            seen.add(key)
+            appendReasoning(l.time, l.text, {
+              command: l.command || undefined,
+              reason: l.reason || undefined,
+              stealth: l.stealth || undefined
+            })
+          })
         }
 
         if (d.done) {
           clearInterval(pollIntervalRef.current!)
-          setAutoMode({ running: false })
+          setAutoMode({ running: false, run_state: 'done' })
           appendReasoning(new Date().toLocaleTimeString(), '[■] Auto-mode complete')
           pollC2()
         }
+      }
+      } finally {
+        busy = false
       }
     }, 800)
   }
 
   const handleStop = async () => {
+    setAutoMode({ run_state: 'stopping' })   // explicit in-flight stop state
     await api('POST', '/api/automode/stop')
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
-    setAutoMode({ running: false })
+    setAutoMode({ running: false, run_state: 'idle' })
   }
 
   const handleDryRun = async () => {

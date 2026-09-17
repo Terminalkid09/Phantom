@@ -113,66 +113,122 @@ def plan(session_wm, max_chains: int = len(GOALS)) -> List[dict]:
     return out
 
 
-def preview_step(step: dict, target: str = "") -> Tuple[bool, str]:
-    """Build the CONCRETE command a chain step would run, WITHOUT
-    executing it — `chain preview <plan.step>` in the manual shell. Lets
-    the operator audit exactly what an approved step ships before
-    approving (the 'show me the command, not just the label' move)."""
-    cap_id = step.get("cap")
-    if not cap_id:
-        return False, "engine-only step — no manual-core command exists"
-    try:
-        from phantom.automation.guidance.commands import make_registry
-        from phantom.core.knowledge import session_wm
-        cap = make_registry().get(cap_id)
-    except Exception as e:
-        return False, f"import failed: {e}"
-    if cap is None:
-        return False, f"unknown capability {cap_id}"
-    wm = session_wm()
-    try:
-        cmd = cap.make_command(wm, {})
-    except Exception as e:
-        return False, f"cannot build command (missing data: {e})"
-    # dynamic shaping is applied at execution time; preview shows the
-    # exact command the executor will run after shaping too
+def _build_shaped_command(cap, wm):
+    """The ONE command builder for the chain path: make_command + dynamic
+    shaping, shared by preview AND execution. Preview must never show a
+    different command than the executor runs (the approved-vs-executed
+    divergence class), so both call THIS — there is no second place
+    where shaping is applied."""
+    cmd = cap.make_command(wm, {})
     try:
         from phantom.automation.guidance.dynamics import DynCommandBuilder
         cmd = DynCommandBuilder(seed=hash(str(wm.target)) % 2**31).shape(cmd, wm)
     except Exception:
         pass
+    return cmd
+
+
+def _resolve_step_cap(step: dict) -> Tuple[object, str]:
+    """Shared cap resolution for preview/execute: (cap, error)."""
+    cap_id = step.get("cap")
+    if not cap_id:
+        return None, "engine-only step — no manual-core command exists"
+    try:
+        from phantom.automation.guidance.commands import make_registry
+        cap = make_registry().get(cap_id)
+    except Exception as e:
+        return None, f"import failed: {e}"
+    if cap is None:
+        return None, f"unknown capability {cap_id}"
+    return cap, ""
+
+
+def preview_step(step: dict, target: str = "") -> Tuple[bool, str]:
+    """Build the CONCRETE command a chain step would run, WITHOUT
+    executing it — `chain preview <plan.step>` in the manual shell. Lets
+    the operator audit exactly what an approved step ships before
+    approving (the 'show me the command, not just the label' move)."""
+    cap, err = _resolve_step_cap(step)
+    if cap is None:
+        return False, err
+    from phantom.core.knowledge import session_wm
+    wm = session_wm()
+    try:
+        cmd = _build_shaped_command(cap, wm)
+    except Exception as e:
+        return False, f"cannot build command (missing data: {e})"
     return True, cmd
 
 
 def execute_step(step: dict, target: str) -> Tuple[bool, str]:
-    """Run ONE approved chain step through its mapped capability:
-    build the concrete command, execute it, interpret findings back
-    into the session WorldModel. Returns (ok, summary)."""
-    cap_id = step.get("cap")
-    if not cap_id:
-        return False, "engine-only step — run it through auto-mode"
-    try:
-        from phantom.automation.guidance.commands import make_registry
-        from phantom.core.knowledge import session_wm
-        from phantom.core.executor import run_command
-    except Exception as e:
-        return False, f"import failed: {e}"
+    """Run ONE approved chain step through its mapped capability.
 
-    cap = make_registry().get(cap_id)
+    Status honesty (the false-success bug is closed): the boolean is the
+    REAL outcome —
+
+        ok=False  engine-only / unknown capability / cannot build command
+        ok=False  step failed: non-zero exit with no usable output,
+                  timeout, scope/tool guard refusal
+        ok=True   exit 0, no findings        -> summary marks NO FINDINGS
+        ok=True   exit 0, findings parsed    -> ingested into session WM
+
+    Findings are ingested ONLY from a command that exited 0: output from
+    a failed command is error text, not evidence. (An adapter whose
+    pipeline legitimately exits non-zero after useful work should end
+    its command with `|| true` — the adapter is the right place to fix
+    the contract, not this interpreter.)
+
+    Returns (ok, summary); the summary's first line carries the status
+    word (STEP FAILED / NO FINDINGS / STEP COMPLETED) so callers and the
+    operator see the outcome before the output tail.
+    """
+    cap, err = _resolve_step_cap(step)
     if cap is None:
-        return False, f"unknown capability {cap_id}"
+        return False, f"{err} — run it through auto-mode" if "engine-only" in err else err
+    cap_id = step["cap"]
+    from phantom.core.knowledge import session_wm
     wm = session_wm()
     try:
-        cmd = cap.make_command(wm, {})
+        cmd = _build_shaped_command(cap, wm)
     except Exception as e:
         return False, f"cannot build command (missing data: {e})"
-    output = run_command(cmd, target)
+
+    from phantom.core.executor import execute_quiet
+    res = execute_quiet(cmd, target, timeout=float(getattr(cap, "timeout", 30) or 30))
+    output = res.combined or ""
+
+    # Guard refusals and spawn failures surface as errors with no output.
+    if res.error and not output:
+        return False, f"STEP FAILED — {res.error}\n$ {cmd}"
+    if res.timed_out:
+        tail = output[-800:]
+        note = " (partial output kept — not interpreted)" if output else ""
+        return False, f"STEP FAILED — timed out after {getattr(cap, 'timeout', 30)}s{note}\n$ {cmd}" + (f"\n{tail}" if tail else "")
+    if res.returncode not in (0, None):
+        tail = output[-800:]
+        msg = (f"STEP FAILED — exit code {res.returncode}; findings NOT "
+               f"ingested (failed-command output is error text, not "
+               f"evidence; if this pipeline exits non-zero by design, fix "
+               f"the adapter with `|| true`)\n$ {cmd}")
+        return False, msg + (f"\n{tail}" if tail else "")
+
+    # Exit 0 (or salvaged-after-timeout with rc=None but real output was
+    # already handled above). Interpret — but keep interpreter exceptions
+    # from turning a completed step into a crash.
+    findings: list = []
     try:
-        findings = cap.interpret(output or "", wm, {})
-        for f in findings:
-            wm.add_finding(kind=f.kind, key=f.key, value=f.value,
-                           confidence=getattr(f, "confidence", 0.6),
-                           source=cap_id, evidence=(output or "")[:200])
+        findings = cap.interpret(output or "", wm, {}) or []
     except Exception:
-        pass
-    return True, f"$ {cmd}\n{(output or '')[-800:]}"
+        findings = []
+    if findings:
+        for f in findings:
+            try:
+                wm.add_finding(kind=f.kind, key=f.key, value=f.value,
+                               confidence=getattr(f, "confidence", 0.6),
+                               source=cap_id, evidence=(output or "")[:200])
+            except Exception:
+                pass
+        return True, (f"STEP COMPLETED — {len(findings)} finding(s) "
+                      f"ingested into the session WorldModel\n$ {cmd}\n{(output or '')[-800:]}")
+    return True, (f"NO FINDINGS (exit 0) — the step ran clean but the "
+                  f"interpreter produced nothing\n$ {cmd}\n{(output or '')[-800:]}")
