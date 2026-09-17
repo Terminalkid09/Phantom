@@ -14,6 +14,7 @@ Covers the fixes for:
 """
 import json
 import os
+import sys
 import textwrap
 import time
 from pathlib import Path
@@ -45,6 +46,8 @@ def test_safe_exec_quoted_separator_is_an_argument():
     assert p.segments[0][-1] == "use a; run; exit"
 
 
+@pytest.mark.skipif(os.name == "nt",
+                     reason="POSIX coreutils (echo/false) required")
 def test_run_local_executes_without_a_shell():
     from phantom.core.safe_exec import parse, run_local
     # `;` really is two commands, and no shell expanded anything
@@ -54,6 +57,8 @@ def test_run_local_executes_without_a_shell():
     assert r.returncode != 0 and "never" not in r.stdout
 
 
+@pytest.mark.skipif(os.name == "nt",
+                     reason="POSIX coreutils (seq/grep/wc) required")
 def test_run_local_pipe_wires_stdout_to_stdin():
     from phantom.core.safe_exec import parse, run_local
     # `seq` (not `printf`) produces the multi-line stream: Git-Bash's
@@ -61,6 +66,18 @@ def test_run_local_pipe_wires_stdout_to_stdin():
     r = run_local(parse("seq 1 3 | grep -c ."), timeout=10)
     assert r.stdout.strip() == "3"
     assert run_local(parse("seq 1 5 | wc -l"), timeout=10).stdout.strip() == "5"
+
+
+@pytest.mark.skipif(os.name != "nt",
+                     reason="Windows-native no-shell execution check")
+def test_run_local_executes_without_a_shell_windows():
+    from phantom.core.safe_exec import parse, run_local
+    # same contract as the POSIX test, with a tool present on Windows:
+    # the interpreter runs directly (argv), no cmd.exe involved.
+    # Forward slashes: posix shlex would eat backslashes as escapes.
+    py = sys.executable.replace("\\", "/")
+    r = run_local(parse(f'"{py}" -c "print(40 + 2)"'), timeout=30)
+    assert r.returncode == 0 and r.stdout.strip() == "42"
 
 
 def test_backend_run_pipeline_refuses_substitution():

@@ -1011,6 +1011,65 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{s}s"
 
 
+def _probe_bind(host: str, port: int) -> bool:
+    """Can this box bind (host, port) right now? A throwaway socket answers
+    without touching the real C2 server instance (no half-dead state)."""
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _ensure_c2_listener(server=None) -> bool:
+    """Auto-mode brings its own C2 listener (HTTPS/mTLS) BEFORE any beacon
+    deploy — unless the operator disabled it via ``c2.listener_auto_start``.
+
+    Binds the derived beacon-facing address from get_c2_endpoint() (a real
+    local address), never 0.0.0.0 by default; when that address is not
+    bindable here (e.g. a public NAT address from PHANTOM_C2_HOST) it falls
+    back to the loopback for local-lab runs and says so loudly. Returns
+    True when a listener is up afterwards, False otherwise (the run then
+    continues listener-less: beacons deploy but cannot check in)."""
+    from phantom.core.c2_server import server_instance
+    from phantom.utils.network import get_c2_endpoint
+    srv = server if server is not None else server_instance
+    if srv.thread and srv.thread.is_alive():
+        return True
+    from phantom.utils import config as cfg
+    if not cfg.get("c2.listener_auto_start", True):
+        notifier.warn("c2.listener_auto_start is off and no C2 listener is "
+                      "up: deployed beacons cannot check in — start one "
+                      "with `c2` -> listener start")
+        return False
+    host, port = get_c2_endpoint()
+    if not _probe_bind(host, port):
+        if host != "127.0.0.1" and _probe_bind("127.0.0.1", port):
+            notifier.warn(f"C2 {host}:{port} non bindabile qui (NAT/IP non "
+                          f"locale?) — fallback loopback 127.0.0.1:{port} "
+                          f"(solo lab locale: i beacon remoti non rientrano)")
+            host = "127.0.0.1"
+        else:
+            notifier.warn(f"C2 listener non avviabile su {host}:{port} "
+                          f"(porta occupata o indirizzo non locale) — "
+                          f"proseguo senza listener")
+            return False
+    notifier.status(f"Avvio listener C2 su {host}:{port} (HTTPS/mTLS auto)...")
+    try:
+        srv.start(host=host, port=port, use_ssl=True)
+        return True
+    except Exception as exc:
+        notifier.warn(f"Auto-start listener C2 fallito: {exc}")
+        return False
+
+
 def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                   speed: bool = False, plan: bool = False, agents: int = 0,
                   goal: str = "deliver", profile: str = "enterprise",
@@ -1143,17 +1202,11 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
 
     # Fully automatic kill chain: the C2 listener must be up BEFORE any
     # beacon deploy so a deployed beacon has somewhere to check in. The
-    # operator never has to start it manually — run_auto_mode brings its
-    # own listener (HTTPS + auto-generated mTLS material, bound 0.0.0.0).
-    from phantom.core.c2_server import server_instance
-    from phantom.utils.network import get_c2_endpoint
-    if not (server_instance.thread and server_instance.thread.is_alive()):
-        _c2h, _c2p = get_c2_endpoint()
-        notifier.status(f"Avvio listener C2 su 0.0.0.0:{_c2p} (HTTPS/mTLS auto)...")
-        try:
-            server_instance.start(host="0.0.0.0", port=_c2p, use_ssl=True)
-        except Exception as exc:
-            notifier.warn(f"Auto-start listener C2 fallito: {exc}")
+    # operator never has to start it manually — _ensure_c2_listener brings
+    # its own listener (HTTPS + auto-generated mTLS material) unless
+    # c2.listener_auto_start is off, binding the derived beacon-facing
+    # address instead of 0.0.0.0.
+    _ensure_c2_listener()
 
     started_wall = time.time()
     out_root = resume or _report_out_dir()

@@ -43,7 +43,11 @@ DEFAULTS: Dict[str, Any] = {
         "host": "",
         "port": 8080,
         "mtls": True,
-        "listener_auto_start": False,
+        # True: auto-mode brings its own listener (bound to the derived
+        # beacon-facing address, never 0.0.0.0) when none is up. False:
+        # never auto-start — the operator starts the listener explicitly
+        # (`c2` -> listener start); without one, beacons cannot check in.
+        "listener_auto_start": True,
     },
     "tracker": {
         "host": "0.0.0.0",
