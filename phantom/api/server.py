@@ -194,6 +194,19 @@ def _c2_tasks_dump() -> dict[str, list[dict]]:
 routes = web.RouteTableDef()
 
 
+# ── Capabilities (feature-gating seam) ─────────────────────────────────────
+# The single Electron shell asks which components this build exposes and
+# enables ONLY those sections; a distribution shipping one component does
+# not have to fork the UI. See phantom/core/capabilities.py.
+
+@routes.get("/api/capabilities")
+async def capabilities_get(_request: web.Request) -> web.Response:
+    """Announce which components are available (core / c2 / automode)."""
+    from phantom.core.capabilities import available, COMPONENTS
+    return _json({"capabilities": available(),
+                  "components": list(COMPONENTS)})
+
+
 @routes.get("/api/c2/artifacts")
 async def c2_artifacts(_request: web.Request) -> web.Response:
     """List beacon binary artifacts (screenshots / camera frames / downloads)

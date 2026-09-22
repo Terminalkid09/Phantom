@@ -23,6 +23,7 @@ interface Rule {
 
 const RULES: readonly Rule[] = [
   // ── reads (safe to repeat, no side effects) ────────────────────────────
+  { pattern: '/api/capabilities', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/session', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/session/history', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/session/history', methods: ['POST'], group: 'mutating' },
