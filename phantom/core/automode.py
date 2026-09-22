@@ -392,15 +392,10 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{s}s"
 
 
-# goal -> swarm chain template. Goals without a swarm chain (cleanup…)
+# goal -> swarm chain template, from the single goal registry
+# (phantom/automation/goals.py). Goals without a swarm chain (cleanup…)
 # fall back to the single-agent path with a notice (honest, not silent).
-_GOAL_CHAIN = {
-    "footprint": "footprint", "identity": "identity", "creds": "creds",
-    "web": "web",
-    "beacon": "full", "deliver": "full", "complete_kill_chain": "full",
-    "deep": "deep", "post_exploit": "deep", "ad": "deep",
-    "crack": "deep", "lateral": "deep",
-}
+from phantom.automation.goals import SWARM_CHAIN as _GOAL_CHAIN  # noqa: E402
 
 
 def _stream_swarm_event(kind: str, data: dict, verbose: bool = False,

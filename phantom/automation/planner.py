@@ -20,54 +20,11 @@ from phantom.automation.guidance.commands import Capability, Registry
 from phantom.automation.guidance.stealth import StealthEngine
 from phantom.automation.guidance.tailoring import TailoringEngine
 
-# Goal -> fact kinds that mean "goal reached" (any one satisfies)
-GOAL_FACTS = {
-    "beacon": ["beacon"],
-    "creds": ["creds"],
-    "footprint": ["service", "os", "web_app", "banner"],
-    # NOTE: "persona" was listed here but no interpreter ever emits a
-    # finding of kind "persona" (the persona marker yields kind
-    # "identity"). The cover itself ("persona_profile") is deliberately
-    # NOT terminal: it is a MEANS to phish (see the enrich goal), and
-    # listing it here pulled cover-building ahead of OSINT, breaking
-    # the identity doctrine (dossier before cover). Terminal identity =
-    # know who they are + where they are.
-    "identity": ["identity", "victim_ip"],
-    # enrich: the DEEPEN sub-agent's goal — passive OSINT/breach/profile
-    # deepening + grabber polling. Deliberately excludes the phish/dm_sent
-    # facts so this worker NEVER launches new lures while the lead waits.
-    "enrich": ["identity", "persona_profile", "dossier", "profile",
-               "account_link", "breach_exposure", "victim_ip"],
-    "complete_kill_chain": ["beacon"],  # beacon injection is the terminal goal
-    "deliver": ["beacon", "persistence"],  # deliver mode: beacon + persistence,
-    # web: the URL/app chain terminal is the RCE foothold, not a beacon —
-    # demanding a beacon on a pure web target is unreachable by
-    # construction (no creds path), which read as "spinning forever".
-    "web": ["web_app", "hunt_anomaly", "rce_foothold"],
-    "post_exploit": ["beacon", "persistence", "system_privilege", "injection"],
-    "harvest": ["stolen_cookies", "bt_device", "cdp_cookies", "socks_proxy"],
-    "ad": ["ad_domain", "ad_creds"],
-    "crack": ["ad_domain", "ad_creds", "cracked"],
-    "lateral": ["pivot"],
-    # expand: post-beacon INTERNAL expansion. The beacon snapshots the
-    # internal network (interfaces/routes/ARP) and bounds-probes the
-    # neighbors for pivot services — without this stage the internal recon
-    # capabilities would never be planned and lateral movement would have
-    # no host to aim at outside a multi-target campaign.
-    "expand": ["internal_host", "internal_service"],
-    # evasion: neutralize the defensive stack before the loud stages. Its
-    # only source (edr_disable) is aggressive-only + SYSTEM-gated.
-    "evasion": ["defensive_gap"],
-    "cleanup": ["cleanup"],
-    "impact": ["ransom_sim"],
-    "trojan": ["trojan_bundle"],
-    "exploit": ["exploit_plan", "hunt_anomaly", "rce_foothold"],
-    "environment": ["environment"],
-    "cloud_creds": ["cloud_creds"],
-    "cloud": ["cloud_creds", "cloud_access", "cloud_lateral"],
-    "cloud_lateral": ["cloud_lateral", "cloud_access"],
-    "mobile": ["mobile", "mdm_vendor"],
-}
+# Goal -> fact kinds that mean "goal reached". The goal vocabulary lives in
+# phantom/automation/goals.py so the agent planner and the swarm engine read
+# ONE source; re-exported here for the many callers that import it from the
+# planner.
+from phantom.automation.goals import GOAL_FACTS  # noqa: E402,F401
 
 # Fact kind -> capabilities that can produce it (reverse index, category priority)
 _FACT_SOURCES = {
