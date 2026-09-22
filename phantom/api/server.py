@@ -64,8 +64,7 @@ def _error(msg: str, status: int = 400) -> web.Response:
 # The live session is now mirrored to data/sessions/_auto.json on every
 # mutation and restored at server boot — the app reopens where it left off.
 
-_AUTO_SESSION_FIELDS = ("target", "scope", "lhost", "lport",
-                        "active_wordlist", "notes", "history")
+from phantom.core.engagement import SNAPSHOT_FIELDS as _AUTO_SESSION_FIELDS
 
 
 def _auto_session_file() -> str:
@@ -74,33 +73,24 @@ def _auto_session_file() -> str:
 
 
 def _persist_session() -> None:
-    """Atomically mirror the live session to _auto.json (best effort)."""
+    """Atomically mirror the live session to _auto.json (versioned contract)."""
     try:
-        path = _auto_session_file()
-        data = {k: getattr(session, k, None) for k in _AUTO_SESSION_FIELDS}
-        data["saved_at"] = datetime.now().isoformat(timespec="seconds")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, default=str)
-        os.replace(tmp, path)
+        from phantom.core import engagement
+        engagement.save(_auto_session_file())
     except Exception:
         pass
 
 
 def _restore_session() -> None:
-    """Apply the last auto-saved session at server boot (best effort)."""
+    """Apply the last auto-saved session at server boot (best effort).
+
+    Uses the versioned engagement contract: a snapshot written by an older
+    build (no version key) still loads instead of being dropped."""
     try:
-        path = _auto_session_file()
-        if not os.path.exists(path):
-            return
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        for k in _AUTO_SESSION_FIELDS:
-            if k in data and data[k] not in (None, "", [], 0):
-                setattr(session, k, data[k])
-        if data.get("target"):
-            print(f"[api] Session restored: {data['target']} "
+        from phantom.core import engagement
+        report = engagement.load(_auto_session_file())
+        if "target" in report.get("applied", []):
+            print(f"[api] Session restored: {session.target} "
                   f"(notes={len(session.notes or [])}, "
                   f"history={len(session.history or [])})", flush=True)
     except Exception:

@@ -26,15 +26,20 @@ from typing import Any, Dict, List, Optional
 
 # WorldModel kinds the auto-mode produces that the manual core must be able
 # to consume (suggest / exploit / report). Kept explicit so a new kind is
-# never silently dropped.
-_BRIDGED_KINDS = (
+# never silently dropped — tests/test_engagement_contract.py asserts that
+# every terminal fact of the network/enterprise goals is covered here.
+BRIDGED_KINDS = (
     "service", "os", "creds", "beacon", "persistence", "system_privilege",
     "injection", "rce_foothold", "ad_domain", "ad_creds", "cracked",
     "pivot", "internal_host", "internal_service", "defensive_gap",
     "cloud_creds", "cloud_access", "cloud_lateral", "k8s_escape",
     "environment", "mobile", "mdm_vendor", "mobile_platform",
     "hunt_anomaly", "rce_vector", "web_header", "web_app", "victim_ip",
+    "banner",
 )
+
+# Backwards-compatible private alias (callers/tests may import either name).
+_BRIDGED_KINDS = BRIDGED_KINDS
 
 
 def _val(f) -> Dict[str, Any]:
