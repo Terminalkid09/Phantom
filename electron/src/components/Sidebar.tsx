@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useStore } from '@/store'
+import { useStore, componentForTab } from '@/store'
 import {
   Radio, Target, Bot, FileText, Settings, Terminal,
   Globe, Wifi, Search, Shield, AlertTriangle,
@@ -55,8 +55,15 @@ const SECTIONS = [
 ]
 
 export default function Sidebar() {
-  const { activeTab, setActiveTab, beacons, autoMode } = useStore()
+  const { activeTab, setActiveTab, beacons, autoMode, capabilities } = useStore()
   const nLive = beacons.filter((b) => b.status === 'LIVE').length
+  // Feature-gating: hide the nav entries whose component is not exposed
+  const sections = SECTIONS
+    .map((s) => ({
+      ...s,
+      items: s.items.filter((i) => capabilities[componentForTab(i.id)])
+    }))
+    .filter((s) => s.items.length > 0)
 
   return (
     <div className="w-[218px] flex-shrink-0 bg-surface-card border-r border-surface-border flex flex-col h-full">
@@ -72,7 +79,7 @@ export default function Sidebar() {
 
       {/* Navigation sections */}
       <div className="flex-1 overflow-auto py-2">
-        {SECTIONS.map((section) => (
+        {sections.map((section) => (
           <div key={section.label}>
             <div className="px-4 py-1.5 text-[9px] font-semibold text-text-dim uppercase tracking-[0.15em]">
               {section.label}

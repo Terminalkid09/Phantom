@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useStore } from '@/store'
+import { useStore, componentForTab } from '@/store'
 import { useApi } from '@/hooks/useApi'
 import Sidebar from '@/components/Sidebar'
 import StatusBar from '@/components/StatusBar'
@@ -21,7 +21,7 @@ import AdGraphPanel from '@/components/AdGraphPanel'
 import { ToastContainer } from '@/components/Toast'
 
 export default function App() {
-  const { activeTab, elapsed, setElapsed, setSettings } = useStore()
+  const { activeTab, elapsed, setElapsed, setSettings, capabilities, setCapabilities } = useStore()
   const [backendError, setBackendError] = useState<string | null>(null)
   useApi(true)
 
@@ -53,6 +53,21 @@ export default function App() {
     })()
     return () => { cancelled = true }
   }, [setSettings])
+
+  // Capability discovery: the backend announces which components it exposes;
+  // the shell enables only those sections (a core-only build hides C2/auto-mode
+  // without a forked UI). Default is all-on, so this only ever narrows.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      const res = await window.phantom?.request('GET', '/api/capabilities')
+      if (!cancelled && res?.status === 200 && res.data) {
+        const d = res.data as { capabilities?: Partial<typeof capabilities> }
+        if (d.capabilities) setCapabilities(d.capabilities)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [setCapabilities])
 
   // Session timer
   useEffect(() => {
@@ -94,7 +109,9 @@ export default function App() {
     { id: 'adgraph', node: <AdGraphPanel /> },
   ]
   for (const m of MODULE_TABS) panels.push({ id: m, node: <ModulePanel moduleId={m} /> })
-  const active = panels.find((p) => p.id === activeTab) ?? panels[0]
+  // Feature-gating: drop the panels whose component this build does not expose
+  const visible = panels.filter((p) => capabilities[componentForTab(p.id)])
+  const active = visible.find((p) => p.id === activeTab) ?? visible[0]
 
   if (backendError) {
     return (
@@ -132,7 +149,7 @@ export default function App() {
 
         {/* Panel content — all panels mounted, only the active one visible */}
         <div className="flex-1 overflow-auto min-h-0">
-          {panels.map((p) => (
+          {visible.map((p) => (
             <div key={p.id} className={p.id === active.id ? 'h-full' : 'hidden'}>
               {p.node}
             </div>

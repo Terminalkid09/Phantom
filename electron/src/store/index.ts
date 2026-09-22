@@ -2,6 +2,25 @@ import { create } from 'zustand'
 
 // ── Types ──────────────────────────────────────────────
 
+export interface Capabilities {
+  core: boolean
+  c2: boolean
+  automode: boolean
+}
+
+/** Which component owns each tab. The single Electron shell enables only
+ *  the sections the backend announces via GET /api/capabilities, so a build
+ *  shipping a subset (e.g. the manual core alone) simply hides the rest. */
+const TAB_COMPONENT: Record<string, keyof Capabilities> = {
+  c2: 'c2',
+  recordings: 'c2',
+  automode: 'automode'
+}
+
+export function componentForTab(id: string): keyof Capabilities {
+  return TAB_COMPONENT[id] ?? 'core'
+}
+
 export interface Toast {
   id: string
   title: string
@@ -131,6 +150,10 @@ interface PhantomStore {
   settings: SettingsState
   setSettings: (s: Partial<SettingsState>) => void
 
+  // Capabilities (feature-gating): which components this build exposes
+  capabilities: Capabilities
+  setCapabilities: (c: Partial<Capabilities>) => void
+
   // App
   elapsed: string
   setElapsed: (e: string) => void
@@ -241,6 +264,12 @@ export const useStore = create<PhantomStore>((set, get) => ({
         : false
   },
   setSettings: (s) => set((st) => ({ settings: { ...st.settings, ...s } })),
+
+  // Capabilities: optimistic default (all on) so a failed/absent probe never
+  // hides a section; GET /api/capabilities narrows it once the backend answers
+  capabilities: { core: true, c2: true, automode: true },
+  setCapabilities: (c) =>
+    set((st) => ({ capabilities: { ...st.capabilities, ...c } })),
 
   // App
   elapsed: '0s',
