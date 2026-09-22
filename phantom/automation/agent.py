@@ -70,6 +70,29 @@ def _in_scope(target: str, scope_list: List[str]) -> bool:
     return is_in_scope(target, scope_list)
 
 
+# finding kinds whose VALUES must never leave the box: the `found`
+# stream (UI + persisted session mirror) carries summaries, never jars.
+_COOKIE_VALUE_KINDS = ("stolen_cookies", "cdp_cookies")
+
+
+def _safe_stream_value(f) -> str:
+    """Operator-visible value summary for `found` events.
+
+    Cookie jars stay local (WorldModel + gitignored session files):
+    the stream only ever says HOW MANY. Everything else renders as
+    before (first values joined). One function so all six emit sites
+    cannot drift apart on this again.
+    """
+    if getattr(f, "kind", "") in _COOKIE_VALUE_KINDS:
+        v = getattr(f, "value", None)
+        n = v.get("count", "?") if isinstance(v, dict) else "?"
+        return f"{n} cookie(s) — values stay local"
+    v = getattr(f, "value", "")
+    if isinstance(v, dict):
+        return ", ".join(str(x) for x in list(v.values())[:3])
+    return str(v)
+
+
 # ── the EDGE gate's vocabulary ─────────────────────────────────────────────
 #
 # Packet-level work, refused while the address in scope is a provider's
@@ -335,13 +358,18 @@ class AutonomousAgent:
         elif paranoid:
             self.wm.scan_style = "full_stealth"  # full range, slow timing
         else:
-            self.wm.scan_style = "full"          # full range, standard
+            self.wm.scan_style = "balanced"      # top-1000, standard rate
         self.blue_team = BlueTeamModel.for_profile(profile)
         config = StealthConfig(aggressive=aggressive, paranoid=paranoid,
                                speed=speed, profile=profile)
         self.stealth_engine = StealthEngine(self.wm, config, self.blue_team)
         self.registry = registry or make_registry()
-        self.planner = Planner(self.registry, self.stealth_engine)
+        # evidence_first buys INFORMATION, not quiet: the planner ranks
+        # ready moves by unlocked facts (value_weight=1.0). Every other
+        # profile keeps the historical cost-first ordering (0.0).
+        self.planner = Planner(
+            self.registry, self.stealth_engine,
+            value_weight=1.0 if reason_profile == "evidence_first" else 0.0)
         self.reasoning = ReasoningEngine(self.registry, paranoid=paranoid)
         self.enterprise = EnterpriseBrain(profile, threat_intel=threat_intel)
         # R1/R2/R3 reasoning core: a named objective (the profile) plus the
@@ -390,6 +418,11 @@ class AutonomousAgent:
         self.share = share if share is not None else ShareContext(peers=[])
         self._cred_discoverer = cred_discoverer or self._default_cred_discovery
         self._failed_caps: Dict[str, float] = {}  # capability -> failure ts
+        # novelty set (swarm): capability ids a SIBLING worker already
+        # tried. Unlike failures these never re-arm via _retry_eligible —
+        # the whole point is forcing this worker down a different path
+        # for the entire run. Consulted by _dead_cap_ids.
+        self._novelty_dead: set = set()
         self._last_fail_reason: Dict[str, str] = {}  # capability -> last failure reason
         # consecutive-identical-failure poisoning: a move that fails the same
         # way three times is a deterministic dead end for THIS target. It is
@@ -1002,10 +1035,8 @@ class AutonomousAgent:
                 learned = self._register_findings(cap.id, salvaged)
                 self._emit("found", capability=cap.id,
                            findings=[f"{f.kind}:{f.key}" for f in salvaged],
-                           values={f"{f.kind}:{f.key}": (
-                               ", ".join(str(x) for x in list(f.value.values())[:3])
-                               if isinstance(f.value, dict) else str(f.value))
-                               for f in salvaged},
+                            values={f"{f.kind}:{f.key}": _safe_stream_value(f)
+                                for f in salvaged},
                            partial=True)
                 self.wm.record_action(cap.id, slots, cmd, ok=True,
                                       opsec=self.runtime.cost_per_action)
@@ -1046,10 +1077,8 @@ class AutonomousAgent:
         if findings:
             self._emit("found", capability=cap.id,
                        findings=[f"{f.kind}:{f.key}" for f in findings],
-                       values={f"{f.kind}:{f.key}": (
-                           ", ".join(str(x) for x in list(f.value.values())[:3])
-                           if isinstance(f.value, dict) else str(f.value))
-                           for f in findings})
+                    values={f"{f.kind}:{f.key}": _safe_stream_value(f)
+                            for f in findings})
         # v3.0: record success for fallback/learning engine
         self._fallback.record(
             cap.category, cap.id, self.target, ok=True,
@@ -2171,6 +2200,26 @@ class AutonomousAgent:
                        reason="transport not configured: " + ", ".join(missing))
             self.wm.record_failure(cap.id, "transport not configured")
             return False
+        # branch-aware toolchain: social capabilities shell out per target
+        # TYPE (username -> sherlock, email -> theHarvester), which no
+        # static tools list can express. Refuse with a tool_missing event
+        # (install hints downstream) instead of failing opaquely inside
+        # the engine two minutes later. Only the REAL engine is gated:
+        # an injected engine (tests / custom sender) owns its tooling.
+        if isinstance(self.social_engine, SocialEngine):
+            try:
+                from phantom.automation.guidance.kit import social_tools_for
+                needed = social_tools_for(cap.id, self.wm.target_type)
+            except Exception:
+                needed = []
+            if needed and self.toolchain.resolve(needed) is None:
+                missing_tools = self.toolchain.missing(needed)
+                self._mark_failed(cap.id)
+                self._emit("tool_missing", capability=cap.id,
+                           tools=missing_tools)
+                self.wm.record_failure(
+                    cap.id, "tool unavailable: " + ", ".join(missing_tools))
+                return False
         self._emit("run", capability=cap.id, banner=cap.banner,
                    category=cap.category, cost=cap.opsec_cost)
         run = self.runtime.run("social:" + cap.id, category=cap.category,
@@ -2197,10 +2246,8 @@ class AutonomousAgent:
         if findings:
             self._emit("found", capability=cap.id,
                        findings=[f"{f.kind}:{f.key}" for f in findings],
-                       values={f"{f.kind}:{f.key}": (
-                           ", ".join(str(x) for x in list(f.value.values())[:3])
-                           if isinstance(f.value, dict) else str(f.value))
-                           for f in findings})
+                    values={f"{f.kind}:{f.key}": _safe_stream_value(f)
+                            for f in findings})
         if not learned:
             self._mark_failed(cap.id)
             self.wm.record_failure(cap.id, "no new facts learned")
@@ -2326,6 +2373,50 @@ class AutonomousAgent:
             time.sleep(1.0)
         return "\n".join(collected + follow_lines)
 
+    def _ensure_local_session(self, jar: dict) -> str:
+        """Local stealer fallback (no beacon, no config): when the World
+        Model jar has nothing usable and this box can read its own
+        browsers, collect locally ONCE and merge as a stolen_cookies
+        finding (source=local, same shape/protections as the beacon
+        path). Returns a SESSION_LOCAL warning marker (or "") so the
+        operator sees exactly when their own session was read.
+
+        Read-only views only, downstream — the marker carries platforms
+        and counts, never values.
+        """
+        if jar:
+            return ""
+        try:
+            from phantom.automation.social.local_cookies import (
+                collect_local_session)
+            from phantom.automation.post.harvest import cookies_interpreter
+        except Exception:
+            return ""
+        try:
+            ok, lines = collect_local_session()
+        except Exception:
+            return ""
+        if not ok:
+            return ""
+        try:
+            findings = cookies_interpreter("\n".join(lines), self.wm, {})
+            for f in findings:
+                self.wm.add_finding(f.kind, f.key, f.value,
+                                    confidence=getattr(f, "confidence", 0.9),
+                                    source="local")
+            hosts: set = set()
+            for f in findings:
+                v = getattr(f, "value", {}) or {}
+                if isinstance(v, dict):
+                    for h in v.get("hosts", []) or []:
+                        hosts.add(str(h).lower().lstrip("."))
+            plats = sorted({h.split(".")[-2] for h in hosts
+                            if "." in h} - {"", "com", "net", "org"})
+            return ("SESSION_LOCAL: platforms=%s source=local_reader "
+                    "readonly=1" % ",".join(plats[:6]))
+        except Exception:
+            return ""
+
     def _reverse_handle(self) -> str:
         """Resolve the social handle the reverse-engineering pass should
         map. Username target -> the handle itself; email target -> the
@@ -2358,6 +2449,41 @@ class AutonomousAgent:
                 pass
         if capability_id == "osint_identity":
             ok, lines = engine.osint(self.target, self.target_type)
+        elif capability_id == "deep_recon":
+            # the reverse-engineering pass was registered but never
+            # dispatched (planner could not reach it AND execution did
+            # not know it): handle like profile_recon with the handle
+            # slot, platform slot, operator session cookies and the
+            # run's ask hook for ambiguity.
+            from phantom.automation.social.recon import session_jar
+            handle = slots.get("username", "") or self._reverse_handle()
+            try:
+                jar = session_jar(self.wm)
+            except Exception:
+                jar = {}
+            try:
+                local_note = self._ensure_local_session(jar)
+            except Exception:
+                local_note = ""
+            if local_note:
+                try:
+                    jar = session_jar(self.wm)  # re-read incl. local
+                except Exception:
+                    pass
+            if hasattr(engine, "deep_recon"):
+                try:
+                    ok, lines = engine.deep_recon(
+                        handle or self.target,
+                        platform=slots.get("platform", ""),
+                        cookies=jar or None)
+                except TypeError:
+                    ok, lines = engine.deep_recon(
+                        handle or self.target,
+                        platform=slots.get("platform", ""))
+            else:
+                raise ValueError("social engine has no deep_recon")
+            if local_note:
+                lines = [local_note] + list(lines or [])
         elif capability_id == "breach_check":
             ok, lines = engine.breach(self.target, self.target_type)
         elif capability_id == "persona_create":
@@ -2538,12 +2664,16 @@ class AutonomousAgent:
 
     def _dead_cap_ids(self) -> frozenset:
         """Capabilities that failed AND have no new facts making them viable
-        again — the planner must fall back to alternative sources."""
-        return frozenset(
+        again - the planner must fall back to alternative sources."""
+        base = frozenset(
             cid for cid, _ in self._failed_caps.items()
             if self.registry.get(cid) is not None
             and (cid in self._poisoned
                  or not self._retry_eligible(self.registry.get(cid))))
+        novelty = frozenset(
+            cid for cid in (getattr(self, "_novelty_dead", None) or ())
+            if self.registry.get(cid) is not None)
+        return base | novelty
 
     def _recover_stall(self, goal: str) -> bool:
         """Bounded stall recovery: the planner found no path/move and the goal

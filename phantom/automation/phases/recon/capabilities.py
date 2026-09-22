@@ -17,6 +17,7 @@ RECON_CAPABILITY_IDS = (
     "origin_discovery",
     "scan_tcp",
     "version_detect",
+    "curl_probe",
     "os_detect",
     "ssh_banner",
     "http_probe",

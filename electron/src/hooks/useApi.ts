@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef } from 'react'
+import { useCallback } from 'react'
 import { useStore, type Beacon, type C2Task } from '@/store'
+import { useSerialPoll } from '@/hooks/useSerialPoll'
 
 export async function requestApi(method: string, endpoint: string, body?: unknown) {
   if (!window.phantom) return { status: 0, data: { error: 'IPC not available' } }
@@ -37,19 +38,12 @@ export function useApi(enablePolling = false) {
     if (res.status === 200 && res.data) setSession(res.data as Parameters<typeof setSession>[0])
   }, [setSession])
 
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  useEffect(() => {
-    if (!enablePolling) return
-    void pollC2()
-    void pollSession()
-    intervalRef.current = setInterval(() => {
-      void pollC2()
-      void pollSession()
-    }, 2000)
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current)
-    }
-  }, [enablePolling, pollC2, pollSession])
+  const intervalFn = useCallback(async () => {
+    await pollC2()
+    await pollSession()
+  }, [pollC2, pollSession])
+  // serial: an in-flight poll is never overlapped by the next tick
+  useSerialPoll(intervalFn, 2000, enablePolling, [enablePolling])
 
   return { api, pollC2, pollSession }
 }

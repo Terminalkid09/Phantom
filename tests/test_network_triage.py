@@ -33,7 +33,7 @@ class TestTriageIntegration(unittest.TestCase):
     def _patched(self):
         return ExitStack()
 
-    def _run(self, targets, **extra):
+    def _run(self, targets, force_network=False, **extra):
         with self._patched() as stack:
             camp = stack.enter_context(
                 patch.object(automode, "_run_agent_campaign"))
@@ -52,7 +52,8 @@ class TestTriageIntegration(unittest.TestCase):
                 stack.enter_context(patch.object(automode, target, value))
             session.scope = []
             session.target = None
-            automode.run_auto_mode(targets, goal="deliver")
+            automode.run_auto_mode(targets, goal="deliver",
+                                   force_network=force_network)
             return camp, single, session
 
     def _tri(self, ranked_ips, alive_ips=None):
@@ -68,9 +69,23 @@ class TestTriageIntegration(unittest.TestCase):
                                      {"ip": "10.0.0.9"}],
                          "method": "nmap -sn", "elapsed": 1.0})
     def test_cidr_uses_discovered_ranked_hosts(self, _t):
-        camp, _single, _s = self._run(["10.0.0.0/24"])
+        # a range is NOT intent: engaging it needs the explicit force flag
+        camp, _single, _s = self._run(["10.0.0.0/24"], force_network=True)
         self.assertEqual(camp.call_args[0][0],
                          ["10.0.0.50", "10.0.0.9"])
+
+    @patch("phantom.core.netmap.triage_networks",
+           return_value={"hosts": [{"ip": "10.0.0.9", "alive": True},
+                                   {"ip": "10.0.0.50", "alive": True}],
+                         "ranked": [{"ip": "10.0.0.50"},
+                                     {"ip": "10.0.0.9"}],
+                         "method": "nmap -sn", "elapsed": 1.0})
+    def test_cidr_default_is_discovery_only(self, _t):
+        # without --force-network a CIDR must NEVER reach the campaign:
+        # discovery + ranking only, no engagement
+        camp, single, _s = self._run(["10.0.0.0/24"])
+        self.assertIsNone(camp.call_args)
+        self.assertIsNone(single.call_args)
 
     @patch("phantom.core.netmap.triage_networks",
            return_value={"hosts": [], "ranked": [],
@@ -89,7 +104,8 @@ class TestTriageIntegration(unittest.TestCase):
                                      {"ip": "10.0.0.9"}],
                          "method": "nmap -sn", "elapsed": 1.0})
     def test_explicit_host_precedes_discovered(self, _t):
-        camp, _single, _s = self._run(["10.0.0.5", "10.0.0.0/30"])
+        camp, _single, _s = self._run(["10.0.0.5", "10.0.0.0/30"],
+                                      force_network=True)
         targets = camp.call_args[0][0]
         # explicit host first (operator intent), then discovered+ranked
         self.assertEqual(targets[0], "10.0.0.5")

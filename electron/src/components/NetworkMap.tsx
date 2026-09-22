@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useStore } from '@/store'
 import { useApi } from '@/hooks/useApi'
+import { useSerialPoll } from '@/hooks/useSerialPoll'
 import { Network, RefreshCw, Globe, Monitor, Server, Radio, Route, Bug, KeyRound, ShieldAlert, Wifi, Target, Copy, Check, Smartphone, Router, HardDrive, HelpCircle, Maximize2, Move } from 'lucide-react'
 
 interface NodeMeta {
@@ -254,13 +255,9 @@ export default function NetworkMap({ standalone }: { standalone?: boolean }) {
     }
   }
 
-  useEffect(() => {
-    load()
-    const t = setInterval(load, 8000)
-    // refresh liveness every 30s while the map is open (devices go offline)
-    const l = setInterval(probeLiveness, 30000)
-    return () => { clearInterval(t); clearInterval(l) }
-  }, [])
+  useSerialPoll(load, 8000)
+  // refresh liveness every 30s while the map is open (devices go offline)
+  useSerialPoll(probeLiveness, 30000)
 
   const copy = (text: string) => {
     navigator.clipboard?.writeText(text)

@@ -95,7 +95,7 @@ class Session:
         from phantom.utils.paths import sessions_dir
         sdir = sessions_dir()
         os.makedirs(sdir, exist_ok=True)
-        path = os.path.join(sdir, f"{name}.json")
+        path = os.path.join(sdir, f"{_check_session_name(name)}.json")
         data = json.loads(json.dumps(self.__dict__, indent=2, default=str))
         try:
             from phantom.core.knowledge import session_wm
@@ -113,7 +113,7 @@ class Session:
         from phantom.utils.paths import sessions_dir
         sdir = sessions_dir()
         os.makedirs(sdir, exist_ok=True)
-        path = os.path.join(sdir, filename)
+        path = os.path.join(sdir, _check_session_name(filename))
         with open(path, "w", encoding="utf-8") as f:
 
             def w(line: str = ""):
@@ -273,7 +273,7 @@ class Session:
 
     def load(self, name: str) -> None:
         from phantom.utils.paths import sessions_dir
-        path = os.path.join(sessions_dir(), f"{name}.json")
+        path = os.path.join(sessions_dir(), f"{_check_session_name(name)}.json")
         if os.path.exists(path):
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -305,7 +305,7 @@ class Session:
     def load_raw(name: str) -> dict:
         """Load a session file as a raw dictionary without affecting the current session."""
         from phantom.utils.paths import sessions_dir
-        path = os.path.join(sessions_dir(), f"{name}.json")
+        path = os.path.join(sessions_dir(), f"{_check_session_name(name)}.json")
         if os.path.exists(path):
             try:
                 with open(path, 'r', encoding='utf-8') as f:
@@ -315,3 +315,23 @@ class Session:
         return {}
 
 session = Session()
+
+
+_SESSION_NAME_RE = None
+
+
+def _check_session_name(name: str) -> str:
+    """Validate a session/report file stem: refuse path traversal instead
+    of sanitizing it silently (a silently rewritten name writes somewhere
+    the operator did not ask for). Spaces are allowed (UX: "my run"),
+    separators/.. /leading dots/absolute paths are not."""
+    global _SESSION_NAME_RE
+    if _SESSION_NAME_RE is None:
+        import re as _re
+        _SESSION_NAME_RE = _re.compile(r"^[A-Za-z0-9._\- ]+$")
+    clean = (name or "").strip()
+    if not clean or not _SESSION_NAME_RE.match(clean):
+        raise ValueError(f"invalid session name: {name!r}")
+    if clean.startswith(".") or ".." in clean:
+        raise ValueError(f"invalid session name: {name!r}")
+    return clean

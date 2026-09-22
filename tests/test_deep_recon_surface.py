@@ -236,5 +236,63 @@ class TestHtmlVariation(unittest.TestCase):
         self.assertIn("<!--", html)  # noise comment present
 
 
+class TestAmbiguity(unittest.TestCase):
+    """Two close candidates below CONFIRMED pause for one operator
+    decision instead of guessing (and never contact on a guess)."""
+
+    def _scored(self, s1=0.70, s2=0.62):
+        r = ReconResult(username="u", platform="tiktok")
+        return [("u", "tiktok", "probable", s1, "e1", r),
+                ("u2", "instagram", "probable", s2, "e2", r)]
+
+    def test_clear_winner_no_question(self):
+        from phantom.automation.social.recon import _resolve_ambiguity
+        r = ReconResult(username="u", platform="tiktok")
+        scored = [("u", "tiktok", "confirmed", 0.90, "e", r),
+                  ("u2", "instagram", "probable", 0.60, "e", r)]
+        self.assertEqual(_resolve_ambiguity(scored, ask=None), [])
+        scored = [("u", "tiktok", "probable", 0.90, "e", r),
+                  ("u2", "instagram", "probable", 0.60, "e", r)]
+        self.assertEqual(_resolve_ambiguity(scored, ask=None), [])
+
+    def test_tie_without_hook_records_widen(self):
+        from phantom.automation.social.recon import _resolve_ambiguity
+        lines = _resolve_ambiguity(self._scored(), ask=None)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("IDENTITY_AMBIGUOUS:"))
+        self.assertIn("decision=widen_once_then_halt", lines[0])
+
+    def test_ask_same_resolves(self):
+        from phantom.automation.social.recon import _resolve_ambiguity
+        seen = {}
+
+        def ask(desc, cands):
+            seen["n"] = len(cands)
+            return "same:u@tiktok"
+
+        lines = _resolve_ambiguity(self._scored(), ask=ask)
+        self.assertEqual(seen["n"], 2)
+        self.assertTrue(lines[0].startswith("IDENTITY_RESOLVED:"))
+        self.assertIn("winner=u", lines[0])
+
+    def test_ask_stop_halts(self):
+        from phantom.automation.social.recon import _resolve_ambiguity
+        lines = _resolve_ambiguity(self._scored(),
+                                   ask=lambda d, c: "stop")
+        self.assertIn("by=operator_stop", lines[0])
+
+    def test_present_candidate_renders(self):
+        from phantom.automation.social.recon import present_candidate
+        r = ReconResult(username="u", platform="instagram",
+                        state="private", bio="hello world",
+                        followers="120", following="80",
+                        avatar_url="https://x/y.jpg")
+        text = present_candidate(r)
+        self.assertIn("@u (instagram)", text)
+        self.assertIn("private", text)
+        self.assertIn("https://x/y.jpg", text)
+        self.assertIn("120", text)
+
+
 if __name__ == "__main__":
     unittest.main()

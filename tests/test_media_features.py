@@ -1,15 +1,21 @@
 """Tests for the modular beacon media capture feature integration."""
 import unittest
 
-from phantom.core.automode import _STEP_MAP
 
+class TestDeployOwnership(unittest.TestCase):
+    """Beacon deploy lives on the agent path now: the legacy sequence
+    map (_STEP_MAP / run_sequence_mode) is gone, the planner agent owns
+    the deploy capability."""
 
-class TestMediaCommandCoverage(unittest.TestCase):
-    """Verify that the beacon deploy executor is integrated into automode."""
+    def test_legacy_sequence_removed(self):
+        import phantom.core.automode as am
+        self.assertFalse(hasattr(am, "run_sequence_mode"))
+        self.assertFalse(hasattr(am, "_STEP_MAP"))
 
-    def test_deploy_beacon_has_executor(self):
-        self.assertIn("deploy_beacon", _STEP_MAP)
-        self.assertTrue(callable(_STEP_MAP["deploy_beacon"]))
+    def test_agent_path_owns_deploy(self):
+        from phantom.automation.guidance.commands import make_registry
+        reg = make_registry()
+        self.assertIsNotNone(reg.get("beacon_deploy"))
 
 
 class TestModularMediaHeaders(unittest.TestCase):

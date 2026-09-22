@@ -170,6 +170,12 @@ class SocialEngine:
         self._grabber = None
         self._mailer = None
         self._last_link = None
+        # operator disambiguation hook: ask(description, candidates) ->
+        # "same:<handle>" | "stop" | "widen" | "". None = safe default
+        # (widen once, then halt without contact). Set by interactive
+        # frontends (CLI shell, API answer endpoint); auto-mode without
+        # an operator never blocks on it.
+        self.ask_identity = None
         self._campaigns: List[Campaign] = []
         self._followup_round = 0  # cycles pretexts for cadence follow-ups
         # identity knowledge accumulated across capabilities so a later
@@ -655,7 +661,8 @@ class SocialEngine:
         except Exception as e:
             return False, [f"ERROR: profile recon failed: {e}"]
 
-    def deep_recon(self, username: str, platform: str = "") -> Tuple[bool, List[str]]:
+    def deep_recon(self, username: str, platform: str = "",
+                   cookies=None) -> Tuple[bool, List[str]]:
         """DEEP reverse-engineering pass (the reliable upgrade to
         profile_recon): multi-marker private-state voting across two
         fetches, tagged/commenter/follower mining from embedded JSON,
@@ -667,7 +674,9 @@ class SocialEngine:
             from phantom.automation.social.recon import deep_recon as _deep
             platform = (platform or self._discovered.get("platform")
                         or "instagram").lower()
-            ok, lines = _deep(username, platform)
+            ask = getattr(self, "ask_identity", None)
+            ok, lines = _deep(username, platform, ask=ask,
+                              jar=dict(cookies or {}))
             if ok:
                 self._remember("platform", platform)
                 # parse back our own markers to update the discovered map
@@ -705,6 +714,44 @@ class SocialEngine:
                         h = (kv.get("handle") or "").strip().lstrip("@").lower()
                         if h and kv.get("tier"):
                             self._identity_tiers[h] = kv["tier"]
+                    elif line.startswith("AVATAR:"):
+                        kv = dict(
+                            c.split("=", 1) for c in
+                            line[len("AVATAR:"):].split() if "=" in c)
+                        if kv.get("url"):
+                            self._remember("avatar_urls",
+                                           kv["url"][:300])
+            # "widen" verdict from the operator (or the safe default):
+            # run the bounded deep pass ON each ambiguous handle itself
+            # (no variants: the ambiguity is already scoped). One level
+            # only — widening never recurses.
+            widened = [l for l in lines
+                       if l.startswith("IDENTITY_AMBIGUOUS:")
+                       and "decision=widen" in l]
+            if ok and widened:
+                seen_handles: set = set()
+                for wl in widened[:2]:
+                    kv = dict(c.split("=", 1) for c in wl.split()
+                              if "=" in c)
+                    for h in str(kv.get("candidates", "")).split(","):
+                        handle = h.strip().split("@")[0].lstrip("@")
+                        plat = h.strip().split("@")[1] if "@" in h else platform
+                        if not handle or handle.lower() in seen_handles:
+                            continue
+                        seen_handles.add(handle.lower())
+                        try:
+                            from phantom.automation.social.recon import (
+                                deep_recon as _deep2)
+                            ok2, more = _deep2(
+                                handle, plat, variants=False, wayback=True,
+                                search=True)
+                            if ok2:
+                                lines.append(
+                                    f"IDENTITY_WIDENED: handle={handle} "
+                                    f"platform={plat}")
+                                lines.extend(more)
+                        except Exception:
+                            continue
             return ok, lines
         except Exception as e:
             return False, [f"ERROR: deep recon failed: {e}"]

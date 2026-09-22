@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Film, Download, RefreshCw, Radio, Play } from 'lucide-react'
 import { requestApi } from '@/hooks/useApi'
+import { useSerialPoll } from '@/hooks/useSerialPoll'
 import { useStore } from '@/store'
 
 /**
@@ -66,35 +67,28 @@ export default function RecordingsPanel() {
     }
   }, [])
 
-  // artifact list poll
-  useEffect(() => {
-    void refresh()
-    const h = setInterval(() => void refresh(), 4000)
-    return () => clearInterval(h)
-  }, [refresh])
+  // artifact list poll (serial: never overlap a slow refresh)
+  useSerialPoll(refresh, 4000, true, [refresh])
 
   // live-view poll: /api/c2/recordings/live tells how many segments landed
-  useEffect(() => {
+  // (serial via the shared hook; `cancelled` is obsolete — the hook stops
+  // ticks on unmount and never overlaps an in-flight poll)
+  const poll = useCallback(async () => {
     if (!activeBeacon) return
-    let cancelled = false
-    const poll = async () => {
-      const res = await requestApi('GET', `/api/c2/recordings/live?beacon_id=${encodeURIComponent(activeBeacon)}`)
-      if (res.status !== 200 || cancelled) return
-      const d = res.data as { count: number; segments: Array<{ segment: string; time: string }> }
-      if (d.count === lastSegCount) return
-      setLastSegCount(d.count)
-      await refresh()
-      // auto-open the newest segment so live view "moves"
-      const res2 = await requestApi('GET', '/api/c2/artifacts')
-      if (res2.status !== 200) return
-      const all = ((res2.data as { artifacts?: Artifact[] }).artifacts) || []
-      const segs = all.filter((a) => a.dir === 'recordings/live')
-      if (segs.length > 0) setSelected(segs[0])
-    }
-    void poll()
-    const h = setInterval(() => void poll(), 2500)
-    return () => { cancelled = true; clearInterval(h) }
+    const res = await requestApi('GET', `/api/c2/recordings/live?beacon_id=${encodeURIComponent(activeBeacon)}`)
+    if (res.status !== 200) return
+    const d = res.data as { count: number; segments: Array<{ segment: string; time: string }> }
+    if (d.count === lastSegCount) return
+    setLastSegCount(d.count)
+    await refresh()
+    // auto-open the newest segment so live view "moves"
+    const res2 = await requestApi('GET', '/api/c2/artifacts')
+    if (res2.status !== 200) return
+    const all = ((res2.data as { artifacts?: Artifact[] }).artifacts) || []
+    const segs = all.filter((a) => a.dir === 'recordings/live')
+    if (segs.length > 0) setSelected(segs[0])
   }, [activeBeacon, lastSegCount, refresh])
+  useSerialPoll(poll, 2500, !!activeBeacon, [poll, activeBeacon])
 
   const saveToDisk = async (a: Artifact) => {
     const src = await loadArtifactMedia(a)

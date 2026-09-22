@@ -35,6 +35,7 @@ PHASE_ORDER = (
 _CAPABILITY_PHASE: Dict[str, str] = {
     # recon
     "origin_discovery": "recon",
+    "curl_probe": "recon",
     "scan_tcp": "recon",
     "version_detect": "recon",
     "os_detect": "recon",

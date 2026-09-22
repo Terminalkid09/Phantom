@@ -47,18 +47,28 @@ def merge_agent_into_session(agent, target: str = "") -> Dict[str, int]:
 
     Populates `session.knowledge_base`, `session.results["auto_mode"]` and
     the manual WorldModel (`phantom.core.knowledge.session_wm`) so the
-    manual core — map, suggest, exploit, payload, report — sees the same
+    manual core - map, suggest, exploit, payload, report - sees the same
     truth as the auto-mode. Returns per-section counts for logging/tests.
     """
-    from phantom.core.session import session
-
     if agent is None:
         return {}
     wm = getattr(agent, "wm", None)
     if wm is None:
         return {}
+    return merge_worldmodel_into_session(
+        wm, target or getattr(agent, "target", ""),
+        agent_name=getattr(agent, "target", ""))
 
-    target = target or getattr(agent, "target", "") or session.target
+
+def merge_worldmodel_into_session(wm, target: str = "",
+                                  agent_name: str = "") -> Dict[str, int]:
+    """Same merge for any WorldModel (agent runs, swarm boards...)."""
+    from phantom.core.session import session
+
+    if wm is None:
+        return {}
+
+    target = target or session.target
     if target and not session.target:
         session.target = target
 
@@ -201,7 +211,7 @@ def merge_agent_into_session(agent, target: str = "") -> Dict[str, int]:
     # ── results slot: the operator-facing auto-mode summary ────────────
     session.add_result("auto_mode", {
         "target": target,
-        "agent": getattr(agent, "target", ""),
+        "agent": agent_name,
         "services": counts.get("services", 0),
         "creds": counts.get("creds", 0),
         "beacon": bool(wm.find("beacon")),
@@ -219,6 +229,19 @@ def merge_agent_into_session(agent, target: str = "") -> Dict[str, int]:
         pass
 
     return counts
+
+
+def merge_board_into_session(board) -> Dict[str, Dict[str, int]]:
+    """Merge every committed board WorldModel (swarm) into the session.
+    Returns {target: counts}."""
+    merged: Dict[str, Dict[str, int]] = {}
+    for target in board.targets():
+        try:
+            merged[target] = merge_worldmodel_into_session(
+                board.worldmodel(target), target, agent_name="swarm")
+        except Exception:
+            merged[target] = {}
+    return merged
 
 
 def _copy_findings(src_wm, dst_wm) -> int:

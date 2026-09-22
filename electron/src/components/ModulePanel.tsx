@@ -6,11 +6,18 @@ import {
 import { useStore } from '@/store'
 import { useApi } from '@/hooks/useApi'
 
+interface SuggestionItem {
+  command: string
+  runnable: boolean
+  reason: string
+}
+
 interface ModuleData {
   id: string
   label: string
-  suggestions: Record<string, string[]>
-  commands: Record<string, string[]>
+  target: string
+  suggestions: Record<string, SuggestionItem[]>
+  commands: Record<string, SuggestionItem[]>
 }
 
 interface GroupResult {
@@ -47,21 +54,31 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
   const [preflight, setPreflight] = useState<{ missing: Array<{ tool: string; module: string; hint: string }>; ok: boolean; message: string } | null>(null)
   const [installing, setInstalling] = useState<Record<string, { busy: boolean; output: string; ok?: boolean }>>({})
 
+  // Explicit execution target (defaults to the session target): panels
+  // must not silently run against whatever the global target happens
+  // to be — auto-mode rewrites it mid-run.
+  const [targetOverride, setTargetOverride] = useState('')
+  const effTarget = targetOverride.trim() || session.target
+
   const load = async () => {
     setError('')
     setBatchResults([])
     setBatchRunning(false)
     setPreflight(null)
-    const response = await api('GET', `/api/modules/${moduleId}`)
+    // explicit target: suggestions are generated for THIS panel's target,
+    // not whatever the global session target happens to be right now
+    const qs = targetOverride.trim()
+      ? `?target=${encodeURIComponent(targetOverride.trim())}` : ''
+    const response = await api('GET', `/api/modules/${moduleId}${qs}`)
     if (response.status !== 200) {
       setError(String((response.data as { error?: string })?.error || 'Module unavailable'))
       return
     }
     const data = response.data as ModuleData
     setModule(data)
-    const first = Object.values(data.suggestions || {}).flat()[0]
+    const firstItem = Object.values(data.suggestions || {}).flat()[0]
       || Object.values(data.commands || {}).flat()[0]
-      || ''
+    const first = typeof firstItem === 'string' ? firstItem : (firstItem?.command || '')
     setSelected((current) => current || first)
   }
 
@@ -72,18 +89,34 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
 
   const groups = useMemo(() => {
     if (!module) return []
+    const norm = (items: unknown): SuggestionItem[] =>
+      ((items as (SuggestionItem | string)[]) || []).map((it) =>
+        typeof it === 'string'
+          ? { command: it, runnable: true, reason: '' }
+          : it)
     return [
-      ...Object.entries(module.suggestions || {}).map(([name, commands]) => ({ name: `SUGGESTED · ${name}`, commands, suggested: true })),
-      ...Object.entries(module.commands || {}).map(([name, commands]) => ({ name, commands, suggested: false }))
+      ...Object.entries(module.suggestions || {}).map(([name, commands]) => ({ name: `SUGGESTED · ${name}`, commands: norm(commands), suggested: true })),
+      ...Object.entries(module.commands || {}).map(([name, commands]) => ({ name, commands: norm(commands), suggested: false }))
     ]
   }, [module])
 
+  const selectedItem = groups.flatMap((g) => g.commands).find((c) => c.command === selected) || null
+  const selectedRunnable = selectedItem ? selectedItem.runnable : true
+
   const run = async () => {
     if (!selected) return
+    if (!effTarget) {
+      setError('Set a target in Session (or override it next to Run) before running module commands.')
+      return
+    }
+    if (selectedItem && !selectedItem.runnable) {
+      setError(`Not runnable here: ${selectedItem.reason || 'CLI-only command'}`)
+      return
+    }
     setRunning(true); setError('')
     setOutput(`$ ${selected}\n\n`)
     const response = await api('POST', `/api/modules/${moduleId}/run`, {
-      command: selected, target: session.target, timeout: 120
+      command: selected, target: effTarget, timeout: 120
     })
     setRunning(false)
     const data = response.data as { combined?: string; error?: string; returncode?: number }
@@ -95,11 +128,22 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
     setOutput((current) => `${current}${data.combined || '(no output)'}`)
   }
 
-  const runGroup = async (groupName: string, commands: string[]) => {
-    setBatchRunning(true); setBatchGroup(groupName); setBatchTotal(commands.length)
+  const runnableOnly = (commands: SuggestionItem[]) => {
+    const ok = commands.filter((c) => c.runnable).map((c) => c.command)
+    const skipped = commands.length - ok.length
+    return { ok, skipped }
+  }
+
+  const runGroup = async (groupName: string, commands: SuggestionItem[]) => {
+    const { ok, skipped } = runnableOnly(commands)
+    if (ok.length === 0) {
+      setError(`Nothing runnable in ${groupName} (${skipped} CLI-only — run them in the Phantom shell)`)
+      return
+    }
+    setBatchRunning(true); setBatchGroup(groupName); setBatchTotal(ok.length)
     setBatchCompleted(0); setBatchResults([]); setError('')
     const response = await api('POST', `/api/modules/${moduleId}/run-group`, {
-      commands, target: session.target, timeout: 300,
+      commands: ok, target: effTarget, timeout: 300,
     })
     setBatchRunning(false)
     const data = response.data as {
@@ -125,14 +169,18 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
     setBatchResults(results)
   }
 
-  /** Run ALL groups sequentially — same as CLI `run-all`. */
+  /** Run ALL groups sequentially — same as CLI `run-all` (runnable only). */
   const runAll = async () => {
-    const allCommands = groups.flatMap(g => g.commands)
+    const items = groups.flatMap(g => g.commands)
+    const { ok: allCommands, skipped } = runnableOnly(items)
     if (allCommands.length === 0) return
     setBatchRunning(true); setBatchGroup('ALL GROUPS'); setBatchTotal(allCommands.length)
     setBatchCompleted(0); setBatchResults([]); setError('')
+    if (skipped > 0) {
+      setOutput(`(skipping ${skipped} CLI-only command(s) — run them in the Phantom shell)\n\n`)
+    }
     const response = await api('POST', `/api/modules/${moduleId}/run-group`, {
-      commands: allCommands, target: session.target, timeout: 600,
+      commands: allCommands, target: effTarget, timeout: 600,
     })
     setBatchRunning(false)
     const data = response.data as {
@@ -164,18 +212,23 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
   const startEdit = () => { setEditing(true); setEditValue(selected) }
   const confirmEdit = () => {
     setSelected(editValue)
-    // Also update the module's commands in-place for groups
+    // Also update the module's commands in-place for groups. An edited
+    // command is the operator's responsibility: mark it runnable (the
+    // backend gate still enforces on execution).
     if (module) {
       for (const g of groups) {
-        const idx = g.commands.indexOf(selected)
-        if (idx !== -1) { g.commands[idx] = editValue; break }
+        const idx = g.commands.findIndex((c) => c.command === selected)
+        if (idx !== -1) {
+          g.commands[idx] = { command: editValue, runnable: true, reason: 'edited by operator' }
+          break
+        }
       }
     }
     setEditing(false)
   }
 
   const handlePreflight = async () => {
-    const res = await api('POST', '/api/session/preflight', { module: moduleId })
+    const res = await api('POST', '/api/session/preflight', { module: moduleId, target: effTarget })
     setPreflight(res.data as { missing: []; ok: boolean; message: string })
   }
 
@@ -194,8 +247,8 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
     if (d?.ok) handlePreflight()
   }
 
-  const allCommands = groups.flatMap(g => g.commands)
-  const canRunAll = allCommands.length > 1 && !anyRunning && !!session.target
+  const runnableCommands = groups.flatMap(g => g.commands).filter((c) => c.runnable)
+  const canRunAll = runnableCommands.length > 1 && !anyRunning && !!effTarget
 
   return (
     <div className="p-4 flex flex-col gap-4 h-full">
@@ -216,9 +269,9 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
         </div>
       </div>
 
-      {!session.target && (
+      {!effTarget && (
         <div className="flex items-center gap-2 rounded border border-phantom-yellow/30 bg-phantom-yellow/10 px-3 py-2 text-xs text-phantom-yellow">
-          <AlertTriangle size={14} /> Set a target in Session before running module commands.
+          <AlertTriangle size={14} /> Set a target in Session (or override it next to Run) before running module commands.
         </div>
       )}
 
@@ -279,7 +332,7 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
             {canRunAll && (
               <button onClick={runAll}
                 className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-phantom-magenta/20 text-phantom-magenta hover:bg-phantom-magenta/30 transition-colors">
-                <Play size={10} /> Run All ({allCommands.length})
+                <Play size={10} /> Run All ({runnableCommands.length})
               </button>
             )}
           </div>
@@ -295,28 +348,33 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
                 </span>
                 {group.commands.length > 1 && (
                   <button onClick={() => runGroup(group.name, group.commands)}
-                    disabled={anyRunning || !session.target}
+                    disabled={anyRunning || !effTarget}
                     className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-phantom-green/20 text-phantom-green hover:bg-phantom-green/30 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
                     <Layers size={10} /> Run Group
                   </button>
                 )}
               </div>
-              {group.commands.map((command) => {
+              {group.commands.map((item) => {
+                const command = item.command
                 const batchResult = batchResults.find((r) => r.command === command)
                 const batchOk = batchResult && !batchResult.error && batchResult.returncode === 0
                 const batchFail = batchResult && (batchResult.error || batchResult.returncode !== 0)
+                const batchSkip = batchResult?.error?.startsWith('skipped:')
                 return (
                   <button key={command} onClick={() => setSelected(command)}
+                    title={item.runnable ? command : `CLI-only: ${item.reason || 'run in the Phantom shell'}`}
                     className={`w-full text-left px-3 py-2 text-[11px] font-mono border-l-2 transition-colors break-words ${
                       selected === command
                         ? 'bg-phantom-cyan/10 border-l-phantom-cyan text-phantom-cyan'
                         : batchOk ? 'border-l-phantom-green bg-phantom-green/5 text-text-primary'
-                        : batchFail ? 'border-l-phantom-error bg-phantom-error/5 text-text-primary'
+                        : batchFail && !batchSkip ? 'border-l-phantom-error bg-phantom-error/5 text-text-primary'
+                        : !item.runnable ? 'border-l-transparent text-text-dim opacity-60 hover:bg-surface-hover'
                         : 'border-l-transparent text-text-secondary hover:bg-surface-hover hover:text-text-primary'
                     }`}>
+                    {!item.runnable && <span className="mr-1.5 text-[9px] px-1 rounded bg-surface-border text-text-dim align-middle">CLI</span>}
                     {command}
                     {batchOk && <CheckCircle2 size={10} className="inline ml-1.5 text-phantom-green" />}
-                    {batchFail && <AlertTriangle size={10} className="inline ml-1.5 text-phantom-error" />}
+                    {batchFail && !batchSkip && <AlertTriangle size={10} className="inline ml-1.5 text-phantom-error" />}
                   </button>
                 )
               })}
@@ -353,11 +411,20 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
               </div>
             )}
             <div className="flex gap-2 mt-3">
-              <button onClick={run} disabled={!selected || !session.target || anyRunning}
+              <button onClick={run} disabled={!selected || !effTarget || anyRunning || !selectedRunnable}
+                title={selectedItem && !selectedItem.runnable ? `CLI-only: ${selectedItem.reason || 'run in the Phantom shell'}` : 'Run via backend'}
                 className="flex-1 px-3 py-2 rounded bg-phantom-cyan/20 text-phantom-cyan text-xs font-semibold hover:bg-phantom-cyan/30 disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-2">
                 {running ? <Loader2 size={13} className="animate-spin" /> : <CirclePlay size={13} />}
                 {running ? 'Running...' : 'Run Selected'}
               </button>
+              <input
+                type="text"
+                value={targetOverride}
+                onChange={(e) => setTargetOverride(e.target.value)}
+                placeholder={session.target || 'target override'}
+                title="Explicit execution target for this panel (defaults to the session target — auto-mode rewrites it mid-run)"
+                className="w-36 bg-surface border border-surface-border rounded px-2 py-2 text-[11px] font-mono text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-cyan"
+              />
               {batchRunning && (
                 <button onClick={() => setBatchRunning(false)}
                   className="px-3 py-2 rounded bg-phantom-error/20 text-phantom-error text-xs font-semibold hover:bg-phantom-error/30 flex items-center gap-2">
@@ -365,6 +432,11 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
                 </button>
               )}
             </div>
+            {selectedItem && !selectedItem.runnable && (
+              <p className="text-[10px] text-text-dim mt-2">
+                CLI-only command — {selectedItem.reason || 'run it in the Phantom shell with `use ' + moduleId + '`'}.
+              </p>
+            )}
           </div>
 
           {/* Output */}

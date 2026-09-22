@@ -76,6 +76,8 @@ export interface AutoModeState {
   }>
   agents: number
   mode: 'default' | 'stealth' | 'aggressive' | 'speed'
+  engine: 'agent' | 'swarm'
+  forceNetwork: boolean
   targets: string[]
   profile: string
   goal: string
@@ -123,6 +125,7 @@ interface PhantomStore {
     extra?: { command?: string; reason?: string; stealth?: string }
   ) => void
   updateStep: (index: number, status: string, detail?: string) => void
+  ensureStep: (index: number, name: string) => void
 
   // Settings
   settings: SettingsState
@@ -185,6 +188,8 @@ export const useStore = create<PhantomStore>((set, get) => ({
     reasoning: [],
     agents: 0,
     mode: 'default',
+    engine: 'agent',
+    forceNetwork: false,
     targets: [],
     profile: 'enterprise',
     goal: 'deliver',
@@ -209,6 +214,16 @@ export const useStore = create<PhantomStore>((set, get) => ({
       if (steps[index]) {
         steps[index] = { ...steps[index], status: status as 'done' | 'running' | 'waiting' | 'failed', detail }
       }
+      return { autoMode: { ...s.autoMode, steps } }
+    }),
+  // dynamic steps (deep goals: LATERAL/AD/CRACK/HUNT...): the backend
+  // allocates indices from 8 up — append once, then updateStep works
+  ensureStep: (index, name) =>
+    set((s) => {
+      if (s.autoMode.steps[index]) return s
+      const steps = [...s.autoMode.steps]
+      while (steps.length < index) steps.push({ name: '···', status: 'waiting' as const })
+      steps[index] = { name, status: 'waiting' as const }
       return { autoMode: { ...s.autoMode, steps } }
     }),
 

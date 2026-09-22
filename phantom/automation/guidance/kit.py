@@ -243,6 +243,30 @@ def _not_private_profile():
     return _requires_public
 
 
+# Branch-aware tool needs for the social channel. These capabilities
+# shell out per target TYPE (username -> sherlock, email -> theHarvester,
+# phone -> offline phonenumbers lib), so a static `tools` list would lie:
+# it would block the email path for a missing sherlock nobody calls.
+# The agent resolves these at execution for the CURRENT target type and
+# emits an honest tool_missing (with install hints downstream) instead
+# of running into an opaque runtime failure.
+_SOCIAL_TOOLS = {
+    "osint_identity": {"username": ["sherlock"],
+                       "email": ["theHarvester"],
+                       "phone": []},
+    "profile_recon": {"username": ["sherlock"],
+                      "email": ["sherlock"],
+                      "phone": []},
+    "breach_check": {"username": [], "email": [], "phone": []},
+}
+
+
+def social_tools_for(capability_id: str, target_type: str) -> List[str]:
+    """Binaries the social channel needs for this capability on this
+    target type (empty = nothing external: offline libs / curl)."""
+    return list(_SOCIAL_TOOLS.get(capability_id, {}).get(target_type, []))
+
+
 def _has_network_host():
     """Precondition: a real machine to aim network tooling at.
 
@@ -259,8 +283,49 @@ def _has_network_host():
     return _requires_network_host
 
 
+def _resolve_target_address(wm: WorldModel) -> str:
+    """The raw address to aim at (victim IP > edge origin > target).
+
+    Extracted so host/URL normalization share one resolution instead of
+    drifting apart across 30+ adapters.
+    """
+    ips = wm.find("victim_ip")
+    if ips:
+        return str(ips[0].value.get("ip", wm.target))
+    origin = best_origin(wm)
+    if origin:
+        return origin
+    return wm.target
+
+
+def _bare_host(raw: str) -> str:
+    """Bare machine name from anything the operator may type: full URLs
+    (scheme/userinfo/port/path/query), bare hosts, trailing dots/slashes.
+    Unparseable input comes back stripped but untouched (never invent)."""
+    s = (raw or "").strip().rstrip("/")
+    if not s:
+        return ""
+    if "://" in s:
+        try:
+            from urllib.parse import urlsplit
+            parts = urlsplit(s)
+            host = parts.hostname or ""
+            if host:
+                return host.lower()
+        except ValueError:
+            pass
+    # bare host, maybe with a stray path
+    host = s.split("/")[0].split("?")[0].split("#")[0]
+    if "@" in host:
+        host = host.rsplit("@", 1)[1]
+    host = host.strip().rstrip(".").lower()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    return host
+
+
 def _effective_target(wm: WorldModel) -> str:
-    """The machine to aim network tooling at.
+    """The machine to aim network tooling at: ALWAYS a bare host.
 
     For identity targets (username/email/phone) the harvested victim IP
     becomes the real machine target; for network targets it is the target
@@ -271,14 +336,39 @@ def _effective_target(wm: WorldModel) -> str:
     adapter in this kit goes through this one function, so "do not scan the
     CDN, scan the box behind it" is one rule in one place instead of a rule
     every adapter has to remember.
+
+    URL targets (http://host/app) resolve to the host: 31 adapters from
+    nmap to ssh pass this straight to the tool, and a scheme/path in a
+    tool argument is a broken command, never an intention.
     """
-    ips = wm.find("victim_ip")
-    if ips:
-        return str(ips[0].value.get("ip", wm.target))
-    origin = best_origin(wm)
-    if origin:
-        return origin
-    return wm.target
+    return _bare_host(_resolve_target_address(wm))
+
+
+def _effective_url(wm: WorldModel) -> str:
+    """Full normalized URL for HTTP tooling (scheme://host[:port][/path]).
+
+    URL targets keep their scheme/port/path; bare hosts default to plain
+    http://host. The one place URL construction lives, so adapters stop
+    concatenating "http://" in front of whatever the target string is.
+    """
+    raw = (_resolve_target_address(wm) or "").strip()
+    if "://" not in raw:
+        host = _bare_host(raw)
+        return f"http://{host}" if host else ""
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(raw)
+        if not parts.hostname:
+            return ""
+        netloc = parts.hostname.lower()
+        if parts.port:
+            netloc += f":{parts.port}"
+        path = parts.path or ""
+        return urlunsplit((parts.scheme.lower() or "http", netloc, path,
+                           parts.query, ""))
+    except ValueError:
+        host = _bare_host(raw)
+        return f"http://{host}" if host else ""
 
 
 def best_origin(wm: WorldModel):
@@ -488,6 +578,27 @@ def _interp_http(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Fin
     cms = detect_cms(output)
     if cms:
         findings.append(Finding(**cms, target=wm.target))
+    if findings and not wm.find("service"):
+        # URL bootstrap: a host that answers HTTP *has* a web service.
+        # Without this derived fact the whole web chain (web_rce, hunt,
+        # exploit) waits for an nmap scan that may never run (no nmap on
+        # the box) — the observed "URL spins forever finding nothing".
+        # Confidence stays below a real scan; nmap findings (same key)
+        # overwrite this the moment they exist.
+        from urllib.parse import urlsplit
+        raw_url = str(slots.get("url") or "")
+        try:
+            parts = urlsplit(raw_url or "http://%s" % _effective_target(wm))
+            scheme = (parts.scheme or "http").lower()
+            port = parts.port or (443 if scheme == "https" else 80)
+        except ValueError:
+            scheme, port = "http", 80
+        label = "https" if port == 443 or scheme == "https" else "http"
+        findings.append(Finding(
+            kind="service", key="tcp/%d" % port,
+            value={"port": str(port), "service": label,
+                   "derived": "http_probe"},
+            confidence=0.6, source="http_probe", target=wm.target))
     # EDGE detection rides on the HTTP probe: the headers are already in
     # hand, and knowing "this is Cloudflare, not the customer" changes what
     # the rest of the chain is allowed to touch.
@@ -594,6 +705,10 @@ _SOCIAL_MARKERS = {
     "follow_sent": "FOLLOW_SENT:",
     "follow_accepted": "FOLLOW_ACCEPTED:",
     "identity_conf": "IDENTITY_CONF:",
+    "identity_ambiguous": "IDENTITY_AMBIGUOUS:",
+    "identity_resolved": "IDENTITY_RESOLVED:",
+    "identity_widened": "IDENTITY_WIDENED:",
+    "avatar": "AVATAR:",
 }
 
 
@@ -734,6 +849,57 @@ def _social_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[F
                        "why": kv.get("why", "").replace("_", " ")},
                 confidence=score if score else 0.3,
                 source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["identity_ambiguous"])
+        if kv.get("candidates"):
+            findings.append(Finding(
+                kind="identity_ambiguous",
+                key=f"identity_ambiguous:{kv['candidates'][:80]}",
+                value={"candidates": kv.get("candidates", ""),
+                       "decision": kv.get("decision", ""),
+                       "evidence": kv.get("evidence", "").replace("_", " ")},
+                confidence=0.7, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["identity_resolved"])
+        if kv.get("winner") is not None:
+            findings.append(Finding(
+                kind="identity_resolved",
+                key=f"identity_resolved:{kv.get('winner', 'none')}",
+                value={"winner": kv.get("winner", ""),
+                       "by": kv.get("by", ""),
+                       "evidence": kv.get("evidence", "").replace("_", " ")},
+                confidence=0.9 if kv.get("winner", "none") != "none"
+                else 0.5,
+                source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["identity_widened"])
+        if kv.get("handle"):
+            findings.append(Finding(
+                kind="identity_widened",
+                key=f"identity_widened:{kv['handle']}",
+                value={"handle": kv.get("handle"),
+                       "platform": kv.get("platform", "")},
+                confidence=0.5, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["avatar"])
+        if kv.get("username") and kv.get("url"):
+            findings.append(Finding(
+                kind="avatar",
+                key=f"avatar:{kv['username']}:{kv.get('platform', '')}",
+                value={"username": kv.get("username"),
+                       "platform": kv.get("platform", ""),
+                       "url": kv.get("url", "")[:300]},
+                confidence=0.8, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, "SESSION_USED:")
+        if not kv.get("platforms"):
+            # same receipt from the local reader (no beacon involved)
+            kv = _parse_marker_line(line, "SESSION_LOCAL:")
+        if kv.get("platforms"):
+            # operator-session receipt: WHICH platform views went out
+            # authed (counts/platforms only — values never enter markers)
+            findings.append(Finding(
+                kind="session_used",
+                key=f"session_used:{kv['platforms'][:60]}",
+                value={"platforms": kv.get("platforms", ""),
+                       "source": kv.get("source", "operator_session"),
+                       "readonly": kv.get("readonly", "1")},
+                confidence=0.9, source="deep_recon", target=wm.target))
         kv = _parse_marker_line(line, _SOCIAL_MARKERS["surface_domain"])
         if kv.get("domain"):
             findings.append(Finding(
@@ -949,7 +1115,7 @@ def _port_scan_adapter(wm, slots):
     if tool == "masscan":
         # fastest full-range sweep: rate-capped to stay survivable,
         # nmap -sV still runs afterwards via version_detect for banners
-        rate = "2000" if getattr(wm, "scan_style", "full") != "full_stealth" else "500"
+        rate = "2000" if getattr(wm, "scan_style", "balanced") != "full_stealth" else "500"
         if ports:
             return f"masscan {target} -p {ports} --rate {rate}"
         return f"masscan {target} -p 1-65535 --rate {rate}"
@@ -970,7 +1136,7 @@ def _nc_port_spec(wm) -> str:
     down: a connect() per port is ~100x slower than nmap, so the floor
     sweep covers the top ports + the web/remote range where footholds
     actually live."""
-    style = getattr(wm, "scan_style", "full")
+    style = getattr(wm, "scan_style", "balanced")
     if style in ("top_fast", "top_loud"):
         return "21 22 23 25 53 80 110 111 135 139 143 443 445 993 995 1723 3306 3389 5432 5900 6379 8080 8443"
     return "21 22 23 25 53 80 110 111 135 139 143 443 445 993 995 1433 1723 2375 2376 3306 3389 5432 5900 5985 6379 6443 8000 8080 8081 8443 8888 9090 27017 49152"
@@ -994,24 +1160,26 @@ def _known_open_ports(wm) -> list:
 def _scan_port_spec(wm) -> str:
     """Port coverage per run profile (stamped on the WorldModel by the
     agent from the CLI flags):
-      default    -> full 1-65535 sweep
+      default    -> top-1000, standard rate (nmap's own balanced default:
+                    the ports footholds actually live on, without sweeping
+                    65k ports on every host by default)
       --stealth  -> full sweep, slow -T2 timing (quiet)
       --speed    -> top-100 fast (--min-rate 3000)
       --aggressive-> top-100 fastest (--min-rate 5000)
     -sV is always on: plain scans label non-standard ports with wrong
     table guesses (2222 -> "EtherNetIP-1"), which breaks every service
     precondition downstream (ssh_login needs service == "ssh").
-    An explicit port slot always wins (deep-scan escalation, targeted
-    version detection).
+    An explicit port slot always wins (deep-scan escalation passes
+    1-65535, targeted version detection).
     """
-    style = getattr(wm, "scan_style", "full")
+    style = getattr(wm, "scan_style", "balanced")
     if style == "top_loud":
         return "--top-ports 100 --min-rate 5000"
     if style == "top_fast":
         return "--top-ports 100 --min-rate 3000"
     if style == "full_stealth":
         return "-p 1-65535 -T2"
-    return "-p 1-65535 --min-rate 1000"
+    return "--top-ports 1000 --min-rate 300"
 
 
 def _service_port(wm, service: str, default: int = 22) -> int:
@@ -1034,14 +1202,14 @@ def _version_adapter(wm, slots):
     # nmap -sV restricted to exactly those ports (the toolbelt stamping
     # masscan for scan_tcp does not change the version tool)
     if port:
-        return f"nmap -Pn -sT -sV -p {port} {_effective_target(wm)}"
+        return f"nmap -Pn -sT -sV --version-intensity 2 -p {port} {_effective_target(wm)}"
     known = _known_open_ports(wm)
     if known:
         # only the ports the scan actually found open: fast and precise,
         # never a second full-range sweep (the old default re-scanned
         # 1-65535 with -sV and timed out every time)
         spec = ",".join(str(p) for p in known)
-        return f"nmap -Pn -sT -sV -p {spec} {_effective_target(wm)}"
+        return f"nmap -Pn -sT -sV --version-intensity 2 -p {spec} {_effective_target(wm)}"
     # kill-chain discipline: no known services -> nothing to deepen. A
     # blind -sV --top-ports here re-scans the host identically to scan_tcp
     # and produced the operator-visible "version detect -> fail -> version
@@ -1055,7 +1223,7 @@ def _os_adapter(wm, slots):
 
 
 def _http_probe_adapter(wm, slots):
-    url = slots.get("url", f"http://{_effective_target(wm)}")
+    url = slots.get("url") or _effective_url(wm)
     tool = _chosen_tool(wm, "http_probe", "curl")
     if tool == "httpx":
         # httpx is preferred when installed (concurrent prober); the
@@ -1065,11 +1233,117 @@ def _http_probe_adapter(wm, slots):
 
 
 def _http_get_adapter(wm, slots):
-    url = slots.get("url", f"http://{_effective_target(wm)}")
+    url = slots.get("url") or _effective_url(wm)
     tool = _chosen_tool(wm, "http_get", "curl")
     if tool == "wget":
         return f"wget -q -T 15 -O - {url}"
     return f"curl -s -m 15 {url}"
+
+
+_CURL_PROBE_PORTS = (21, 22, 25, 80, 110, 143, 443, 587, 8080, 8443)
+_CURL_PROBE_SERVICE = {
+    21: "ftp", 22: "ssh", 25: "smtp", 80: "http", 110: "pop3",
+    143: "imap", 443: "https", 587: "smtp", 8080: "http-alt",
+    8443: "https-alt",
+}
+
+
+def _curl_probe_adapter(wm, slots):
+    """curl-only port/banner sweep (the nmap-less footprint engine).
+
+    `curl telnet://host:port` proves TCP openness on ANY box with curl
+    (Windows/macOS/Linux ship it); `-v` also grabs the banner. Ports
+    come from the slot (default: the banner-grabbing shortlist), one
+    `;`-separated segment each so the no-shell executor and the API
+    gate see plain `curl` invocations. Bounded: 10 ports x 3s worst
+    case, always under the capability timeout.
+    """
+    host = _effective_target(wm)
+    raw = str(slots.get("ports", "") or "")
+    ports = []
+    for chunk in raw.replace(",", " ").split():
+        try:
+            port = int(chunk)
+        except ValueError:
+            continue
+        if 1 <= port <= 65535 and port not in ports:
+            ports.append(port)
+    for port in _CURL_PROBE_PORTS:
+        if port not in ports:
+            ports.append(port)
+    segments = []
+    for port in ports[:10]:
+        segments.append(f"echo ==CURLPROBE {port}==")
+        segments.append(
+            f"curl -s -v --max-time 3 telnet://{host}:{port} 2>&1 "
+            f"| head -12")
+    return " ; ".join(segments)
+
+
+def _curl_probe_interp(output: str, wm: WorldModel,
+                       slots: Dict[str, Any]) -> List[Finding]:
+    """Parse curl telnet sections: 'Connected to' proves the port open
+    (curl exit 52/empty-reply still means OPEN — the verdict comes from
+    the connect marker, never from response bytes); `< ...` lines are
+    the banner. SSH/FTP banners additionally disclose the OS family."""
+    from phantom.automation.belief import Finding
+    findings: List[Finding] = []
+    current: Optional[int] = None
+    connected = False
+    banner_lines: List[str] = []
+    have_service = bool(wm.find("service"))
+
+    def _flush():
+        if current is None or not connected:
+            return
+        label = _CURL_PROBE_SERVICE.get(current)
+        if label and not have_service:
+            # curl-grade service fact (confidence below nmap; same key
+            # so a real scan overwrites it the moment one runs)
+            findings.append(Finding(
+                kind="service", key="tcp/%d" % current,
+                value={"port": str(current), "service": label,
+                       "derived": "curl_probe"},
+                confidence=0.55, source="curl_probe", target=wm.target))
+        for line in banner_lines[:4]:
+            findings.append(Finding(
+                kind="banner", key="tcp/%d" % current,
+                value={"port": str(current), "banner": line[:200]},
+                confidence=0.6, source="curl_probe", target=wm.target))
+        low = " ".join(banner_lines).lower()
+        os_name = ""
+        if "openssh" in low and ("debian" in low or "ubuntu" in low):
+            os_name = "Linux"
+        elif "openssh" in low:
+            os_name = "Linux/Unix"
+        elif "microsoft" in low:
+            os_name = "Windows"
+        if os_name:
+            findings.append(Finding(
+                kind="os", key="os",
+                value={"name": os_name, "derived": "curl_probe"},
+                confidence=0.5, source="curl_probe", target=wm.target))
+
+    for raw_line in (output or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("==CURLPROBE") and line.endswith("=="):
+            _flush()
+            try:
+                current = int(line.strip("=").split()[1])
+            except (IndexError, ValueError):
+                current = None
+            connected = False
+            banner_lines = []
+            continue
+        if current is None:
+            continue
+        if "Connected to" in line:
+            connected = True
+            continue
+        if line.startswith("<") and len(line) > 2:
+            banner_lines.append(line[1:].strip())
+    _flush()
+    return findings
 
 
 def _smb_enum_adapter(wm, slots):
@@ -3059,6 +3333,19 @@ CAPABILITIES = [
         preconditions=[_has_network_host()],
         banner="version detect", tools=["nmap"]),
 
+    _mk("curl_probe", "recon", "curl-only port/banner sweep: TCP openness "
+        "via telnet:// plus banner grab on the shortlist (21/22/25/80/ "
+        "110/143/443/587/8080/8443). The footprint engine for boxes "
+        "without nmap — every curl ships this, every OS runs it.",
+        [_mk_slot("ports", "port", False, "space/comma ports (default: shortlist)")],
+        ["service", "banner", "os"], _curl_probe_adapter, _curl_probe_interp,
+        opsec_cost=2.0, detection_risk=0.3, stealth_level="active", timeout=120,
+        # fallback position is deliberate: the registry order tries nmap
+        # first (richer: OS, scripts, versions); curl_probe fires when no
+        # scanner exists, so a curl-only box still grows service facts.
+        preconditions=[_has_network_host()],
+        banner="curl port/banner probe", tools=["curl"]),
+
     _mk("service_exploit", "exploit",
         "Version-matched exploit: match the fingerprinted software@version "
         "to the CVE module registry and synthesize the msfconsole command "
@@ -3156,10 +3443,10 @@ CAPABILITIES = [
         [], ["os"], _os_adapter, _interp_nmap_os,
         opsec_cost=3.0, detection_risk=0.4, stealth_level="aggressive", timeout=120,
         preconditions=[_has_network_host()], banner="os detect", tools=["nmap"]),
-
     _mk("http_probe", "recon", "HTTP banner/title/CMS fingerprint",
         [_mk_slot("url", "url", False, "full URL (default: http://target)")],
-        ["web_header", "web_title", "web_app"], _http_probe_adapter, _interp_http,
+        ["web_header", "web_title", "web_app", "service"], _http_probe_adapter,
+        _interp_http,
         opsec_cost=0.5, detection_risk=0.1, stealth_level="passive", timeout=30,
         preconditions=[_has_network_host()], banner="http probe", tools=["curl", "httpx"]),
 

@@ -169,6 +169,48 @@ class OsintModule(BaseModule):
         else:
             notifier.info("No social profiles found with Sherlock.")
 
+    def do_cookies(self, args):
+        """cookies [domain ...] — read THIS box's browser sessions locally
+        (Chrome/Edge DPAPI, no beacon, no config) for OSINT authed views.
+        Values stay in the WorldModel under the standard protections;
+        only domains + counts are shown here and stored in results."""
+        from phantom.automation.social.local_cookies import (
+            read_browser_cookies)
+        domains = [d.strip().lstrip(".") for d in (args or "").split()
+                   if d.strip()]
+        try:
+            entries = read_browser_cookies(
+                domains=domains or None)
+        except Exception as e:
+            notifier.error(f"Local cookie read failed: {e}")
+            return
+        if not entries:
+            notifier.warn("No local browser cookies found "
+                          "(Windows + Chrome/Edge expected).")
+            return
+        by_host = {}
+        for c in entries:
+            by_host.setdefault(c.get("host", "?"), 0)
+            by_host[c.get("host", "?")] += 1
+        notifier.success(f"{len(entries)} session cookie(s) available "
+                         f"for {len(by_host)} host(s) — values stay local.")
+        for host in sorted(by_host)[:15]:
+            console.print(f"  [cyan]{host}[/]  [dim]{by_host[host]}[/]")
+        try:
+            from phantom.core.knowledge import session_wm
+            from phantom.automation.post.harvest import cookies_interpreter
+            import json as _json
+            wm = session_wm()
+            for f in cookies_interpreter(
+                    "COOKIES:" + _json.dumps(entries[:50]), wm, {}):
+                wm.add_finding(f.kind, f.key, f.value,
+                               confidence=getattr(f, "confidence", 0.9),
+                               source="local")
+            notifier.info("Session jar ready in shared knowledge "
+                          "(deep recon picks it up automatically).")
+        except Exception as e:
+            notifier.warn(f"Knowledge store skipped ({e}); values not kept.")
+
     def do_shodan(self, query):
         """shodan <query> - Execute a Shodan search (Key required in session config)."""
         api_key = session.results.get("config", {}).get("shodan_key", "")

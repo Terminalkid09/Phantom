@@ -44,6 +44,12 @@ def _fingerprint_class(wm) -> str:
     return "generic"
 
 
+def fingerprint_class(wm) -> str:
+    """Public accessor for the prior bucket of a WorldModel (used by the
+    swarm profile picker to learn which reasoning profile wins where)."""
+    return _fingerprint_class(wm)
+
+
 class TechniquePriors:
     """Persistent per-(technique, fingerprint-class) success memory."""
 

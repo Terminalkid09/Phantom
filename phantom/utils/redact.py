@@ -56,13 +56,37 @@ def redact(obj: Any) -> Any:
     if isinstance(obj, Secret):
         return _MASK_JSON
     if isinstance(obj, dict):
-        return {k: ("[REDACTED]" if _is_secret_key(k) else redact(v))
-                for k, v in obj.items()}
+        out = {}
+        for k, v in obj.items():
+            if k == "cookies" and isinstance(v, list):
+                # stolen-cookie jar: keep the LIST structure (the
+                # operator must see which sessions exist) while the
+                # per-entry rule below masks each live value. Without
+                # this carve-out the substring rule ("cookie" in
+                # "cookies") would nuke the whole jar into one mask.
+                out[k] = [redact(x) for x in v]
+            elif _is_secret_key(k):
+                out[k] = "[REDACTED]"
+            elif k == "value" and _is_cookie_entry(obj):
+                # stolen-cookie entry {host,name,path,value}: the VALUE
+                # is a live session — mask it, keep host/name for ops
+                out[k] = "[REDACTED]"
+            else:
+                out[k] = redact(v)
+        return out
     if isinstance(obj, list):
         return [redact(x) for x in obj]
     if isinstance(obj, tuple):
         return tuple(redact(x) for x in obj)
     return obj
+
+
+def _is_cookie_entry(d: dict) -> bool:
+    """Cookie-entry shape from the stealer chain ({host,name,path,value}).
+    Precise on purpose: generic {"name":..., "value":...} pairs elsewhere
+    are untouched."""
+    keys = set(d.keys())
+    return "value" in keys and "host" in keys and "name" in keys
 
 
 _TEXT_SECRET_RE = re.compile(

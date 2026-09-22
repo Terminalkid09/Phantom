@@ -190,3 +190,27 @@ def test_round_trip_agent_then_new_agent():
     applied = seed_agent_wm(fresh, "10.0.0.5")
     assert applied >= 1
     assert fresh.wm.find("service")
+
+
+# ── swarm board -> session ──────────────────────────────────────────────
+
+class _FakeBoard:
+    def __init__(self, wms):
+        self._wms = dict(wms)
+
+    def targets(self):
+        return list(self._wms.keys())
+
+    def worldmodel(self, target):
+        return self._wms.get(target)
+
+
+def test_merge_board_into_session():
+    from phantom.core.session_bridge import merge_board_into_session
+    agent = _agent_with_findings()
+    merged = merge_board_into_session(_FakeBoard({"10.0.0.5": agent.wm}))
+    assert merged["10.0.0.5"]["services"] == 1
+    assert merged["10.0.0.5"]["beacon"] == 1
+    from phantom.core.knowledge import session_wm
+    assert session_wm().find("service")
+    assert session_wm().find("beacon")

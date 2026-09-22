@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useStore, type Beacon, type C2Task } from '@/store'
 import { useApi } from '@/hooks/useApi'
+import { useSerialPoll } from '@/hooks/useSerialPoll'
 import RemoteCanvas from '@/components/RemoteCanvas'
 import {
   Radio, Power, Play, Square, Plus, RefreshCw, Download,
@@ -516,13 +517,10 @@ function MediaStrip({ api, beaconId, compact }: {
     setItems(images)
   }
 
-  useEffect(() => { load() }, [beaconId])
-
   // refresh when new results land (poll every 4s while the beacon is active)
-  useEffect(() => {
-    const h = setInterval(load, 4000)
-    return () => clearInterval(h)
-  }, [beaconId])
+  // serial: overlapping artifact fetches stacked when the backend lagged
+  // (the hook ticks immediately, so no separate mount effect needed)
+  useSerialPoll(load, 4000, true, [beaconId])
 
   // fetch thumbnails for the newest few
   useEffect(() => {

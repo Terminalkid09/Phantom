@@ -25,14 +25,25 @@ GOAL_FACTS = {
     "beacon": ["beacon"],
     "creds": ["creds"],
     "footprint": ["service", "os", "web_app", "banner"],
-    "identity": ["identity", "persona", "victim_ip"],
+    # NOTE: "persona" was listed here but no interpreter ever emits a
+    # finding of kind "persona" (the persona marker yields kind
+    # "identity"). The cover itself ("persona_profile") is deliberately
+    # NOT terminal: it is a MEANS to phish (see the enrich goal), and
+    # listing it here pulled cover-building ahead of OSINT, breaking
+    # the identity doctrine (dossier before cover). Terminal identity =
+    # know who they are + where they are.
+    "identity": ["identity", "victim_ip"],
     # enrich: the DEEPEN sub-agent's goal — passive OSINT/breach/profile
     # deepening + grabber polling. Deliberately excludes the phish/dm_sent
     # facts so this worker NEVER launches new lures while the lead waits.
     "enrich": ["identity", "persona_profile", "dossier", "profile",
                "account_link", "breach_exposure", "victim_ip"],
     "complete_kill_chain": ["beacon"],  # beacon injection is the terminal goal
-    "deliver": ["beacon", "persistence"],  # deliver mode: beacon + persistence, then STOP
+    "deliver": ["beacon", "persistence"],  # deliver mode: beacon + persistence,
+    # web: the URL/app chain terminal is the RCE foothold, not a beacon —
+    # demanding a beacon on a pure web target is unreachable by
+    # construction (no creds path), which read as "spinning forever".
+    "web": ["web_app", "hunt_anomaly", "rce_foothold"],
     "post_exploit": ["beacon", "persistence", "system_privilege", "injection"],
     "harvest": ["stolen_cookies", "bt_device", "cdp_cookies", "socks_proxy"],
     "ad": ["ad_domain", "ad_creds"],
@@ -60,7 +71,7 @@ GOAL_FACTS = {
 
 # Fact kind -> capabilities that can produce it (reverse index, category priority)
 _FACT_SOURCES = {
-    "service": ["scan_tcp", "version_detect"],
+    "service": ["scan_tcp", "version_detect", "curl_probe"],
     "fingerprint": ["fingerprint_services"],
     "exploit_plan": ["service_exploit"],
     "hunt_anomaly": ["hunt_web"],
@@ -72,20 +83,20 @@ _FACT_SOURCES = {
     "cloud_lateral": ["cloud_assume_role", "cloud_cross_account", "cloud_iam_enum"],
     "mobile": ["mobile_probe", "mobile_mdm_fingerprint"],
     "mdm_vendor": ["mobile_mdm_fingerprint"],
-    "os": ["os_detect"],
-    "banner": ["ssh_banner"],
+    "os": ["os_detect", "curl_probe"],
+    "banner": ["ssh_banner", "curl_probe"],
     "web_header": ["http_probe"],
     "web_app": ["http_probe"],
     "smb_share": ["smb_enum"],
     "redis": ["redis_info"],
     "creds": ["web_creds", "ssh_login", "breach_check", "harvest_campaign",
               "cred_spray", "loot_triage"],
-    "identity": ["osint_identity", "persona_create"],
+    "identity": ["osint_identity", "persona_create", "deep_recon"],
     "breach_exposure": ["breach_check"],
     "persona_profile": ["persona_profile"],
     "dossier": ["dossier_analyze"],
-    "profile": ["profile_recon"],
-    "account_link": ["profile_recon"],
+    "profile": ["profile_recon", "deep_recon"],
+    "account_link": ["profile_recon", "deep_recon"],
     "phish": ["phish_identity", "campaign_launch", "dm_launch"],
     "dm_sent": ["dm_launch", "dm_stage2"],
     "dm_stage": ["dm_launch"],
@@ -183,10 +194,18 @@ class Planner:
     """Goal-directed backward planner over capabilities."""
 
     def __init__(self, registry: Registry, stealth: StealthEngine,
-                 tailoring: Optional["TailoringEngine"] = None) -> None:
+                 tailoring: Optional["TailoringEngine"] = None,
+                 value_weight: float = 0.0) -> None:
         self.registry = registry
         self.stealth = stealth
         self.tailoring = tailoring
+        # INFORMATION VALUE (opt-in): when > 0, ready moves are ranked by
+        # how many not-yet-known facts they unlock, before priors. Default
+        # 0.0 = historical behavior (registry order, then priors) — every
+        # existing plan is byte-identical. The evidence_first reasoning
+        # profile sets 1.0 ("buy information"); cost-greedy planning alone
+        # finds the cheapest path, never the most revealing one.
+        self.value_weight = float(value_weight or 0.0)
         # case-based experience memory (optional; set by the agent). Like
         # the priors it is a pure REORDERING signal over already-allowed
         # moves: it can never add, remove or authorise a move.
@@ -384,7 +403,8 @@ class Planner:
                 # the techniques that historically worked against this
                 # fingerprint class (multiplier 1.0 for unknown = no-op,
                 # stable sort preserves the senior priority order)
-                if self.priors is not None or self.experience is not None:
+                if self.priors is not None or self.experience is not None \
+                        or self.value_weight > 0:
                     # combine the coarse global average (priors) with the
                     # situation-scoped cause/repair signal (experience).
                     # Both are "lower = preferred" multipliers, so they
@@ -408,9 +428,41 @@ class Planner:
                         rank *= float(emap.get(cap.id, 1.0))
                         return rank
 
-                    ready = sorted(ready, key=_rank)
+                    if self.value_weight > 0:
+                        order_idx = {id(c): i for i, c in enumerate(ready)}
+                        ready = sorted(
+                            ready,
+                            key=lambda c: (-self._novel_facts(c, wm),
+                                           _rank(c), order_idx[id(c)]))
+                    else:
+                        ready = sorted(ready, key=_rank)
                 return ready[0]
         return candidates[0]
+
+    @staticmethod
+    def _novel_facts(cap: Capability, wm: "WorldModel") -> int:
+        """How many facts this move would newly unlock: unsatisfied
+        effects plus unsatisfied precondition-chain facts. A move whose
+        every effect is already known scores 0 (re-probing)."""
+        novel = 0
+        for effect in (cap.effects or []):
+            try:
+                if not _fact_satisfied(wm, effect):
+                    novel += 1
+            except Exception:
+                novel += 1
+        for pre in (cap.preconditions or []):
+            try:
+                chained = Planner._precondition_facts(pre, wm)
+            except Exception:
+                continue
+            for fact in chained:
+                try:
+                    if not _fact_satisfied(wm, fact):
+                        novel += 1
+                except Exception:
+                    novel += 1
+        return novel
 
     @staticmethod
     def _precondition_viable(cap: Capability, wm: "WorldModel") -> bool:

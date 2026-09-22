@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useCallback } from 'react'
 import { useApi } from '@/hooks/useApi'
+import { useSerialPoll } from '@/hooks/useSerialPoll'
 import {
   ScrollText, RefreshCw, ShieldCheck, ShieldX, Fingerprint,
   Radio, Send, Inbox, Lock, Unlock, Ban, LogOut, Activity,
@@ -53,11 +54,7 @@ export default function AuditViewer({ standalone }: { standalone?: boolean }) {
     if (res.status === 200 && res.data) setData(res.data as AuditData)
   }, [api, tail])
 
-  useEffect(() => {
-    load()
-    const t = setInterval(load, 5000)
-    return () => clearInterval(t)
-  }, [load])
+  useSerialPoll(load, 5000, true, [load])
 
   if (!data) {
     return (

@@ -48,11 +48,11 @@ class TestDeepLadderConstants(unittest.TestCase):
     def test_goal_exposed_everywhere(self):
         from phantom.core.auto_shell import _GOALS
         self.assertIn("deep", _GOALS)
-        # the two CLI argparsers list deep too
-        from phantom.core import shell as _shell
+        # the two CLI argparsers list deep too (handlers live in the
+        # shell commands package since the shell.py split)
+        from phantom.core.shell.commands.auto import cmd_agent, cmd_auto
         import inspect
-        src = inspect.getsource(_shell.PhantomShell.do_agent) + \
-              inspect.getsource(_shell.PhantomShell.do_auto)
+        src = inspect.getsource(cmd_agent) + inspect.getsource(cmd_auto)
         self.assertIn('"deep"', src)
 
 

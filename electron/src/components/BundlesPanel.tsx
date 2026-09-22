@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Package, Download, Upload, RefreshCw, FileBox } from 'lucide-react'
 import { requestApi } from '@/hooks/useApi'
+import { useSerialPoll } from '@/hooks/useSerialPoll'
 import { useStore } from '@/store'
 
 /**
@@ -39,11 +40,7 @@ export default function BundlesPanel() {
     }
   }, [])
 
-  useEffect(() => {
-    void refresh()
-    const h = setInterval(() => void refresh(), 8000)
-    return () => clearInterval(h)
-  }, [refresh])
+  useSerialPoll(refresh, 8000, true, [refresh])
 
   const exportNow = async () => {
     setBusy(true)

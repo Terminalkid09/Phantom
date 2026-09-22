@@ -51,19 +51,57 @@ def test_same_handle_alone_is_weak():
     assert "UNRELATED" in why
 
 
-def test_avatar_match_confirms():
+def test_avatar_match_alone_never_confirms():
+    """Operator rule: the avatar alone proves nothing (same person,
+    different avatars; different people, same avatar). Even byte-exact
+    it only supports — contact stays gated."""
     lead = score_lead("instagram", PRIMARY,
                       _cand(avatar_hash="sha256:primary-avatar",
                             bio="totally different"))
+    assert "avatar_match" in [s for s, _ in lead.signals]
+    assert lead.tier == PROBABLE  # 0.40 + same-handle 0.20
+    assert lead.tier != CONFIRMED
+    ok, _ = may_act(lead, "dm_launch", aggressive=False)
+    assert not ok
+
+
+def test_cross_link_needs_both_directions_to_confirm():
+    """Unidirectional mention (could be a fan) is PROBABLE; bidirectional
+    (they link each other) is near-certain."""
+    lead = score_lead("instagram", PRIMARY,
+                      _cand(bio="find me -> instagram.com/marco.bianchi"))
+    assert lead.tier == PROBABLE
+    lead = score_lead(
+        "instagram",
+        {**PRIMARY, "outbound": ["marco.bianchi_tiktok"]},
+        _cand(username="marco.bianchi_tiktok", platform="tiktok",
+              bio="main -> instagram.com/marco.bianchi"))
+    assert "cross_link_bidi" in [s for s, _ in lead.signals]
     assert lead.tier == CONFIRMED
     ok, _ = may_act(lead, "dm_launch", aggressive=False)
     assert ok
 
 
-def test_cross_link_confirms():
+def test_name_mismatch_penalizes_friend():
+    """Both sides name DIFFERENT real names: probably a friend with a
+    colliding handle. Penalty, not veto — the math stays visible."""
+    lead = score_lead(
+        "instagram", PRIMARY,
+        _cand(username="marco.bianchi", platform="tiktok",
+              bio="Marco Bianchi fan page",
+              full_name="Luca Verdi",
+              avatar_hash="sha256:primary-avatar"))
+    assert ("name_mismatch", 0.30) in lead.penalties
+    # capped weak sum (0.75) - mismatch (0.30) = 0.45 -> UNRELATED:
+    # the avatar says "same", the names say "friend". Names win.
+    assert lead.tier == UNRELATED
+
+
+def test_self_tag_supports():
     lead = score_lead("instagram", PRIMARY,
-                      _cand(bio="find me -> instagram.com/marco.bianchi"))
-    assert lead.tier == CONFIRMED
+                      _cand(username="marco92", platform="tiktok",
+                            graph=["marco.bianchi", "friend1", "friend2"]))
+    assert "self_tag" in [s for s, _ in lead.signals]
 
 
 def test_email_in_bio_confirms():
@@ -93,10 +131,52 @@ def test_probable_read_only_ok_contact_gated():
     assert ok                      # explicit operator override
 
 
-def test_bio_similarity_strong_only_when_high():
+def test_bio_similarity_strong_never_confirms_alone():
+    """Even near-identical bios cap below CONFIRMED (templates, fan
+    pages): bio is supporting evidence, never proof by itself."""
     lead = score_lead("instagram", PRIMARY, _cand(
         bio="Marco Bianchi - developer based in Milano. Into cycling and photography."))
-    assert lead.tier == CONFIRMED  # >= 0.75 jaccard
+    assert lead.tier == PROBABLE
+    assert lead.tier != CONFIRMED
+
+
+def test_dhash_close_counts_when_md5_differs():
+    """Re-encoded same picture: md5 differs, perceptual hash close."""
+    from phantom.automation.social.identity_confidence import (
+        dhash_distance)
+    assert dhash_distance("ffff0000ffff0000", "ffff0000ffff0001") == 1
+    assert dhash_distance("", "ffff0000ffff0000") is None
+    assert dhash_distance("zzzz", "ffff0000ffff0000") is None
+    lead = score_lead("instagram", PRIMARY,
+                      _cand(avatar_hash="different-bytes",
+                            avatar_dhash="ffff0000ffff0000",
+                            bio="unrelated"))
+    # PRIMARY has no dhash -> signal skipped, still UNRELATED-safe
+    assert lead.tier == UNRELATED
+    lead = score_lead(
+        "instagram", {**PRIMARY, "avatar_dhash": "ffff0000ffff0000"},
+        _cand(avatar_hash="different-bytes",
+              avatar_dhash="ffff0000ffff0001",
+              bio="unrelated"))
+    assert "avatar_similar" in [s for s, _ in lead.signals]
+    assert lead.tier != CONFIRMED  # supporting only, by rule
+
+
+def test_compute_dhash_stable_and_bounded():
+    from phantom.automation.social.identity_confidence import compute_dhash
+    assert compute_dhash(b"") == ""
+    assert compute_dhash(b"not-an-image") == ""
+    try:
+        from PIL import Image
+        import io
+        img = Image.new("L", (32, 32), 128)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        h1 = compute_dhash(buf.getvalue())
+        assert len(h1) == 16
+        assert compute_dhash(buf.getvalue()) == h1
+    except ImportError:
+        pass
 
 
 def test_contact_graph_overlap_weak_alone():
@@ -258,6 +338,55 @@ def _engine_with(**discovered):
     return e
 
 
+def test_widen_runs_bounded_second_pass():
+    """A widen verdict triggers ONE bounded deep pass per ambiguous
+    handle (no variants, no recursion) and records it."""
+    import phantom.automation.social.engine as eng
+    from phantom.automation.social import recon as recon_mod
+    e = _engine_with(platform="instagram")
+    first = ["IDENTITY_AMBIGUOUS: candidates=a@tiktok,b@instagram "
+             "decision=widen evidence=x"]
+    calls = []
+
+    def fake_deep(username, platform="", **kw):
+        calls.append((username, kw.get("variants", True)))
+        if len(calls) == 1:  # first call: the ambiguous pass
+            return True, list(first)
+        return True, [f"RECON_STATE: username={username} platform={platform} "
+                      f"state=public conf=0.60"]
+
+    orig = recon_mod.deep_recon
+    recon_mod.deep_recon = fake_deep
+    try:
+        ok, lines = e.deep_recon("someone", "instagram")
+    finally:
+        recon_mod.deep_recon = orig
+    assert ok
+    widened = [l for l in lines if l.startswith("IDENTITY_WIDENED:")]
+    assert len(widened) == 2  # one per ambiguous handle, then stop
+    assert all(c[1] is False for c in calls[1:])  # variants off
+
+
+def test_ask_hook_flows_through_engine():
+    """ask_identity set on the engine reaches deep_recon."""
+    import phantom.automation.social.engine as eng
+    from phantom.automation.social import recon as recon_mod
+    e = _engine_with(platform="instagram")
+    seen = {}
+    e.ask_identity = lambda desc, cands: seen.setdefault("asked", True) or "stop"
+
+    def fake_deep(username, platform="", **kw):
+        assert "ask" in kw
+        return True, []
+
+    orig = recon_mod.deep_recon
+    recon_mod.deep_recon = fake_deep
+    try:
+        e.deep_recon("someone", "instagram")
+    finally:
+        recon_mod.deep_recon = orig
+
+
 def test_email_variants_from_name():
     e = _engine_with(name="Mario Rossi", platform="instagram",
                      emails=["m.rossi@acme.com"])
@@ -319,7 +448,7 @@ def test_identity_conf_markers_populate_tiers():
         "score=0.85 contact=1 reason=identity_CONFIRMED")
     # drive the marker parse path of deep_recon directly
     orig = recon_mod.deep_recon
-    recon_mod.deep_recon = lambda u, p="": (True, markers.splitlines())
+    recon_mod.deep_recon = lambda u, p="", **kw: (True, markers.splitlines())
     try:
         ok, lines = e.deep_recon("someone", "instagram")
     finally:

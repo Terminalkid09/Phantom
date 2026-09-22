@@ -1,10 +1,11 @@
 import { useState, useRef, useEffect } from 'react'
 import { useStore } from '@/store'
 import { useApi } from '@/hooks/useApi'
+import { useSerialPoll } from '@/hooks/useSerialPoll'
 import {
   Bot, Play, Square, FileText, Plus, X, Zap,
   Shield, Gauge, Swords, CheckCircle2, Circle,
-  Loader2, AlertTriangle, ChevronRight, Brain
+  Loader2, AlertTriangle, ChevronRight, Brain, UserCheck, Copy
 } from 'lucide-react'
 
 const MODE_ICONS = {
@@ -22,7 +23,7 @@ const MODE_LABELS: Record<string, string> = {
 }
 
 const PROFILES = ['enterprise', 'smb', 'cloud', 'financial', 'government', 'mobile']
-const GOALS = ['deep', 'deliver', 'complete_kill_chain', 'footprint', 'beacon', 'creds', 'identity', 'post_exploit', 'ad', 'crack', 'lateral', 'cleanup']
+const GOALS = ['deep', 'deliver', 'complete_kill_chain', 'footprint', 'beacon', 'creds', 'web', 'identity', 'post_exploit', 'ad', 'crack', 'lateral', 'cleanup']
 
 const GOAL_HINTS: Record<string, string> = {
   deep: 'Full ladder: beacon → SYSTEM/root → AD (kerberoast/AS-REP/DCSync) → crack → lateral',
@@ -31,6 +32,7 @@ const GOAL_HINTS: Record<string, string> = {
   footprint: 'External footprint only — no exploitation',
   beacon: 'Beacon as fast as possible',
   creds: 'Focus on credential harvesting',
+  web: 'Web app chain: footprint → hunt → RCE foothold (no beacon needed)',
   identity: 'Identity/OSINT focus',
   post_exploit: 'Beacon + privilege escalation + injection',
   ad: 'Active Directory: enum + kerberoast/AS-REP/DCSync',
@@ -39,12 +41,54 @@ const GOAL_HINTS: Record<string, string> = {
   cleanup: 'Post-engagement cleanup simulation'
 }
 
+interface IdentityCandidate {
+  handle: string
+  platform: string
+  avatar_url?: string
+  bio?: string
+  followers?: string
+  following?: string
+  link?: string
+  tier?: string
+  score?: number
+  evidence?: string
+}
+
+interface IdentityCheck {
+  id: string
+  kind: string
+  target: string
+  candidates: IdentityCandidate[]
+  description: string
+}
+
+interface ProfilePreview {
+  username: string
+  platform: string
+  state: string
+  full_name: string
+  bio: string
+  link: string
+  followers: string
+  following: string
+  posts: string
+  avatar_url: string
+}
+
 export default function AutoModePanel() {
-  const { autoMode, setAutoMode, appendReasoning, updateStep, session } = useStore()
+  const { autoMode, setAutoMode, appendReasoning, updateStep, ensureStep, session } = useStore()
   const { api, pollC2 } = useApi()
   const [newTarget, setNewTarget] = useState('')
   const reasoningRef = useRef<HTMLDivElement>(null)
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null)
+
+  // identity start-gate: precise username + platform -> preview card
+  const [idUser, setIdUser] = useState('')
+  const [idPlatform, setIdPlatform] = useState('instagram')
+  const [idPreview, setIdPreview] = useState<ProfilePreview | null>(null)
+  const [idLoading, setIdLoading] = useState(false)
+  // mid-run ambiguity decisions (operator eyes on close candidates)
+  const [idChecks, setIdChecks] = useState<IdentityCheck[]>([])
 
   // Unmount cleanup
   useEffect(() => {
@@ -54,6 +98,42 @@ export default function AutoModePanel() {
   }, [])
 
   const handleClearLog = () => setAutoMode({ reasoning: [] })
+
+  const handlePreview = async () => {
+    const username = idUser.trim().replace(/^@/, '')
+    if (!username) return
+    setIdLoading(true)
+    setIdPreview(null)
+    const res = await api('POST', '/api/osint/preview', { username, platform: idPlatform })
+    setIdLoading(false)
+    if (res.status === 200 && res.data) setIdPreview(res.data as ProfilePreview)
+  }
+
+  const handlePreviewLaunch = () => {
+    if (!idPreview) return
+    if (!autoMode.targets.includes(idPreview.username)) {
+      setAutoMode({ targets: [...autoMode.targets, idPreview.username] })
+    }
+    setIdPreview(null)
+    setIdUser('')
+  }
+
+  const loadIdChecks = async () => {
+    const res = await api('GET', '/api/identity/checks')
+    if (res.status === 200 && res.data) {
+      setIdChecks(((res.data as { checks?: IdentityCheck[] }).checks) || [])
+    }
+  }
+  useSerialPoll(loadIdChecks, 5000)
+
+  const answerCheck = async (id: string, decision: string) => {
+    await api('POST', '/api/identity/confirm', { id, decision })
+    void loadIdChecks()
+  }
+
+  const copyText = (text: string) => {
+    navigator.clipboard?.writeText(text)
+  }
 
   // Auto-scroll reasoning stream
   useEffect(() => {
@@ -115,6 +195,8 @@ export default function AutoModePanel() {
     const res = await api('POST', '/api/automode/run', {
       targets,
       mode: autoMode.mode,
+      engine: autoMode.engine,
+      force_network: autoMode.forceNetwork,
       profile: autoMode.profile,
       goal: autoMode.goal,
       agents: autoMode.agents,
@@ -146,7 +228,7 @@ export default function AutoModePanel() {
       if (res.status === 200 && res.data) {
         const d = res.data as {
           done: boolean
-          step_updates?: Array<{ step: number; status: string; detail: string }>
+          step_updates?: Array<{ step: number; status: string; detail: string; name?: string }>
           current_step?: number
           log?: Array<{
             time: string
@@ -159,7 +241,12 @@ export default function AutoModePanel() {
         }
 
         if (d.step_updates) {
-          d.step_updates.forEach((u) => updateStep(u.step, u.status, u.detail))
+          d.step_updates.forEach((u) => {
+            // dynamic steps (deep goals): the backend allocates idx 8+
+            // with a name — append before updating, or they vanish
+            if (u.step >= 8 && u.name) ensureStep(u.step, u.name)
+            updateStep(u.step, u.status, u.detail)
+          })
         }
         if (d.current_step !== undefined && d.current_step !== -1) {
           setAutoMode({ current_step: d.current_step })
@@ -191,6 +278,20 @@ export default function AutoModePanel() {
         busy = false
       }
     }, 800)
+  }
+
+  const handleLlmToggle = async (checked: boolean) => {
+    setAutoMode({ llm: checked })
+    // live mid-run approval (Fase 6): when a run is active the checkbox
+    // flips the backend gate immediately, so a pending orchestrator
+    // request fires on the next wave; at launch the flag pre-approves
+    if (autoMode.running) {
+      const res = await api('POST', '/api/automode/llm', { allow: checked })
+      if (res.status !== 200) {
+        appendReasoning(new Date().toLocaleTimeString(),
+          `ERROR: LLM toggle failed (${(res.data as { error?: string })?.error || res.status})`)
+      }
+    }
   }
 
   const handleStop = async () => {
@@ -297,6 +398,88 @@ export default function AutoModePanel() {
             )}
           </div>
 
+          {/* Identity start-gate: precise username + platform -> preview,
+              confirm it is really him before burning OSINT hours */}
+          <div className="bg-surface-card border border-surface-border rounded-lg p-3">
+            <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-2 flex items-center gap-1.5">
+              <UserCheck size={12} /> Identity check
+            </h2>
+            <div className="flex gap-1.5 mb-2">
+              <input
+                type="text"
+                value={idUser}
+                onChange={(e) => setIdUser(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') void handlePreview() }}
+                placeholder="@username"
+                className="flex-1 bg-surface border border-surface-border rounded px-2.5 py-1.5
+                  text-xs font-mono text-text-primary placeholder-text-dim
+                  focus:outline-none focus:border-phantom-magenta"
+              />
+              <select
+                value={idPlatform}
+                onChange={(e) => setIdPlatform(e.target.value)}
+                className="bg-surface border border-surface-border rounded px-2 py-1.5
+                  text-xs text-text-primary focus:outline-none"
+              >
+                {['instagram', 'tiktok', 'x', 'github', 'telegram'].map((p) => (
+                  <option key={p} value={p}>{p}</option>
+                ))}
+              </select>
+              <button
+                onClick={() => void handlePreview()}
+                disabled={idLoading || !idUser.trim()}
+                className="px-2.5 py-1.5 rounded bg-phantom-cyan/20 text-phantom-cyan
+                  text-xs hover:bg-phantom-cyan/30 transition-colors
+                  disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                {idLoading ? <Loader2 size={14} className="animate-spin" /> : 'Preview'}
+              </button>
+            </div>
+            {idPreview && (
+              <div className="rounded border border-surface-border bg-surface p-2.5 flex gap-2.5">
+                {idPreview.avatar_url ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={idPreview.avatar_url} alt="avatar"
+                    className="w-12 h-12 rounded-full object-cover flex-shrink-0" />
+                ) : (
+                  <div className="w-12 h-12 rounded-full bg-surface-border flex-shrink-0" />
+                )}
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-semibold text-text-primary">
+                    @{idPreview.username}
+                    <span className="ml-1.5 text-[10px] font-normal text-text-dim">
+                      {idPreview.platform} · {idPreview.state}
+                    </span>
+                  </p>
+                  {idPreview.bio && <p className="text-[11px] text-text-secondary break-words mt-0.5">{idPreview.bio}</p>}
+                  {(idPreview.followers || idPreview.following) && (
+                    <p className="text-[10px] text-text-dim mt-0.5">
+                      {idPreview.followers && `${idPreview.followers} followers`}
+                      {idPreview.followers && idPreview.following && ' · '}
+                      {idPreview.following && `${idPreview.following} following`}
+                    </p>
+                  )}
+                  <div className="flex gap-1.5 mt-1.5">
+                    <button
+                      onClick={handlePreviewLaunch}
+                      className="px-2 py-1 rounded bg-phantom-green/20 text-phantom-green
+                        text-[11px] font-medium hover:bg-phantom-green/30 transition-colors"
+                    >
+                      It's him — add target
+                    </button>
+                    <button
+                      onClick={() => { setIdPreview(null); setIdUser('') }}
+                      className="px-2 py-1 rounded bg-surface-border text-text-secondary
+                        text-[11px] hover:text-text-primary transition-colors"
+                    >
+                      Not him
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
           {/* Mode selector */}
           <div className="bg-surface-card border border-surface-border rounded-lg p-3">
             <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-2">
@@ -377,16 +560,50 @@ export default function AutoModePanel() {
               </select>
             </div>
             <div>
+              <label className="text-[10px] text-text-dim block mb-1">Engine</label>
+              <select
+                value={autoMode.engine}
+                onChange={(e) => setAutoMode({ engine: e.target.value as 'agent' | 'swarm' })}
+                disabled={autoMode.running}
+                className="w-full bg-surface border border-surface-border rounded px-2.5 py-1.5
+                  text-xs text-text-primary focus:outline-none focus:border-phantom-magenta
+                  disabled:opacity-50"
+              >
+                <option value="agent">agent — single planner chain</option>
+                <option value="swarm">swarm — fact-driven tasks, shared board</option>
+              </select>
+              <p className="text-[9px] text-text-dim mt-0.5">
+                Swarm splits the chain into tasks over a shared blackboard
+                (orchestrator + workers); agent runs the classic single chain.
+              </p>
+            </div>
+            <div>
+              <label className="flex items-center justify-between cursor-pointer">
+                <span className="text-[10px] text-text-dim">Force full range engagement</span>
+                <input type="checkbox" checked={autoMode.forceNetwork}
+                  onChange={(e) => setAutoMode({ forceNetwork: e.target.checked })}
+                  disabled={autoMode.running}
+                  className="accent-phantom-error" />
+              </label>
+              <p className="text-[9px] text-text-dim mt-0.5">
+                CIDR/range inputs only discover hosts by default. This engages
+                the FULL chain on every discovered host — loud, use only on
+                authorized ranges.
+              </p>
+            </div>
+            <div>
               <label className="flex items-center justify-between cursor-pointer">
                 <span className="text-[10px] text-text-dim">Local-LLM advisor</span>
                 <input type="checkbox" checked={autoMode.llm}
-                  onChange={(e) => setAutoMode({ llm: e.target.checked })}
-                  disabled={autoMode.running}
+                  onChange={(e) => void handleLlmToggle(e.target.checked)}
                   className="accent-phantom-magenta" />
               </label>
               <p className="text-[9px] text-text-dim mt-0.5">
                 Optional hypothesis advisor (needs PHANTOM_LLM_MODEL). Local only —
                 never gates or executes, data never leaves the machine.
+                {autoMode.running
+                  ? ' Flippable live: approval applies from the next wave.'
+                  : ' Checked at launch pre-approves the session.'}
               </p>
             </div>
             <div>
@@ -498,6 +715,72 @@ export default function AutoModePanel() {
           </div>
 
           {/* Reasoning stream */}
+          {/* Pending identity decisions: close candidates the engine
+              will not guess on — your eyes, one click, then it moves */}
+          {idChecks.length > 0 && (
+            <div className="bg-phantom-yellow/10 border border-phantom-yellow/30 rounded-lg p-3 space-y-2">
+              <h2 className="text-xs font-semibold text-phantom-yellow uppercase tracking-wider flex items-center gap-1.5">
+                <UserCheck size={13} /> Identity decision needed ({idChecks.length})
+              </h2>
+              {idChecks.map((check) => (
+                <div key={check.id} className="rounded border border-surface-border bg-surface p-2">
+                  <p className="text-[11px] text-text-secondary mb-1.5">{check.description}</p>
+                  <div className="flex gap-2 overflow-auto">
+                    {check.candidates.map((c) => (
+                      <div key={`${c.platform}:${c.handle}`} className="flex-shrink-0 w-44 rounded border border-surface-border bg-surface-card p-2">
+                        {c.avatar_url ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img src={c.avatar_url} alt="avatar"
+                            className="w-10 h-10 rounded-full object-cover mb-1" />
+                        ) : (
+                          <div className="w-10 h-10 rounded-full bg-surface-border mb-1" />
+                        )}
+                        <p className="text-[11px] font-semibold text-text-primary break-words">@{c.handle}</p>
+                        <p className="text-[10px] text-text-dim">{c.platform}{c.tier ? ` · ${c.tier}` : ''}</p>
+                        {c.bio && <p className="text-[10px] text-text-secondary break-words mt-0.5 line-clamp-2">{c.bio}</p>}
+                        {(c.followers || c.following) && (
+                          <p className="text-[10px] text-text-dim">{c.followers || '?'} / {c.following || '?'} fol.</p>
+                        )}
+                        <div className="flex gap-1 mt-1.5">
+                          <button
+                            onClick={() => void answerCheck(check.id, `same:${c.handle}`)}
+                            className="flex-1 px-1.5 py-1 rounded bg-phantom-green/20 text-phantom-green
+                              text-[10px] font-medium hover:bg-phantom-green/30 transition-colors"
+                          >
+                            It's him
+                          </button>
+                          <button
+                            onClick={() => copyText(`https://${c.platform}.com/${c.handle}`)}
+                            title="Copy profile URL"
+                            className="px-1.5 py-1 rounded bg-surface-border text-text-secondary
+                              hover:text-text-primary transition-colors"
+                          >
+                            <Copy size={11} />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="flex gap-1.5 mt-2">
+                    <button
+                      onClick={() => void answerCheck(check.id, 'stop')}
+                      className="px-2 py-1 rounded bg-phantom-error/20 text-phantom-error
+                        text-[11px] font-medium hover:bg-phantom-error/30 transition-colors"
+                    >
+                      Stop — wrong person
+                    </button>
+                    <button
+                      onClick={() => void answerCheck(check.id, 'widen')}
+                      className="px-2 py-1 rounded bg-surface-border text-text-secondary
+                        text-[11px] hover:text-text-primary transition-colors"
+                    >
+                      Keep searching
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
           <div className="bg-surface-card border border-surface-border rounded-lg flex-1 flex flex-col min-h-0 relative">
             {/* Global Progress Bar */}
             {autoMode.running && (

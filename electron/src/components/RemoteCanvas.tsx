@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useSerialPoll } from '@/hooks/useSerialPoll'
 import { Monitor, MousePointer2, Play, Square, Zap, Camera } from 'lucide-react'
 import type { Beacon } from '@/store'
 
@@ -66,43 +67,40 @@ export default function RemoteCanvas({ beacon, api }: Props) {
   }
 
   // ── frame polling: newest artifact from data/remote/ ────────────────────
-  useEffect(() => {
-    let cancelled = false
-    const load = async () => {
-      try {
-        const res = await api('GET', '/api/c2/artifacts')
-        if (res.status !== 200 || cancelled) return
-        const all = ((res.data as { artifacts?: Array<{ name: string; dir: string; kind: string }> }).artifacts) || []
-        const frames = all.filter((a) => a.dir === 'remote' && a.kind === 'image')
-          .slice(0, VISIBLE_FRAMES)
-        if (frames.length === 0) return
-        // fetch any frame we haven't cached yet
-        const fresh: string[] = []
-        for (const f of frames) {
-          const key = f.name
-          if (!thumbs.current.has(key)) {
-            const r = await api('GET', `/api/c2/artifact?dir=remote&name=${encodeURIComponent(f.name)}`)
-            if (r.status === 200) {
-              const d = r.data as { media: string; data: string }
-              thumbs.current.set(key, `data:${d.media};base64,${d.data}`)
-            }
+  // serial: a slow frame fetch never stacks behind the next tick
+  // (the hook also stops ticks on unmount, replacing `cancelled`).
+  const load = async () => {
+    try {
+      const res = await api('GET', '/api/c2/artifacts')
+      if (res.status !== 200) return
+      const all = ((res.data as { artifacts?: Array<{ name: string; dir: string; kind: string }> }).artifacts) || []
+      const frames = all.filter((a) => a.dir === 'remote' && a.kind === 'image')
+        .slice(0, VISIBLE_FRAMES)
+      if (frames.length === 0) return
+      // fetch any frame we haven't cached yet
+      const fresh: string[] = []
+      for (const f of frames) {
+        const key = f.name
+        if (!thumbs.current.has(key)) {
+          const r = await api('GET', `/api/c2/artifact?dir=remote&name=${encodeURIComponent(f.name)}`)
+          if (r.status === 200) {
+            const d = r.data as { media: string; data: string }
+            thumbs.current.set(key, `data:${d.media};base64,${d.data}`)
           }
-          const src = thumbs.current.get(key)
-          if (src) fresh.push(key)
         }
-        if (cancelled || fresh.length === 0) return
-        const newest = fresh[0]
-        setLatest({ name: newest, src: thumbs.current.get(newest)! })
-        setHistory(fresh)
-        setSeq((s) => s + 1)
-      } catch {
-        // transient backend hiccup — next poll retries
+        const src = thumbs.current.get(key)
+        if (src) fresh.push(key)
       }
+      if (fresh.length === 0) return
+      const newest = fresh[0]
+      setLatest({ name: newest, src: thumbs.current.get(newest)! })
+      setHistory(fresh)
+      setSeq((s) => s + 1)
+    } catch {
+      // transient backend hiccup — next poll retries
     }
-    void load()
-    const h = setInterval(load, POLL_MS)
-    return () => { cancelled = true; clearInterval(h) }
-  }, [api, beacon.id])
+  }
+  useSerialPoll(load, POLL_MS, true, [api, beacon.id])
 
   // ── coordinate mapping ──────────────────────────────────────────────────
   const remoteCoords = (e: React.MouseEvent<HTMLImageElement>) => {

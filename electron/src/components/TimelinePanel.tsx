@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useApi } from '@/hooks/useApi'
+import { useSerialPoll } from '@/hooks/useSerialPoll'
 import { Clock, Plus, RefreshCw, Layers } from 'lucide-react'
 
 interface TimelineEvent {
@@ -20,7 +21,7 @@ export default function TimelinePanel({ standalone }: { standalone?: boolean }) 
     if (res.status === 200) setEvents((res.data as { events: TimelineEvent[] }).events || [])
   }
 
-  useEffect(() => { load(); const t = setInterval(load, 5000); return () => clearInterval(t) }, [])
+  useSerialPoll(load, 5000)
 
   useEffect(() => {
     if (ref.current && standalone) ref.current.scrollTop = ref.current.scrollHeight

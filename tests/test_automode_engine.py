@@ -2,9 +2,9 @@
 import unittest
 from unittest.mock import Mock, patch
 
+from phantom.automation.guidance.targets import classify_target
 from phantom.core.automode import (
     _auto_workers,
-    _classify_target,
     _expand_targets,
     _fmt_elapsed,
     _stream_agent_event,
@@ -13,24 +13,31 @@ from phantom.core.automode import (
 
 
 class TestTargetClassification(unittest.TestCase):
+    """Target classification lives in guidance.targets (single source of
+    truth); the legacy automode duplicate is gone."""
 
     def test_ip_target(self):
-        self.assertEqual(_classify_target("192.168.1.1"), "ip")
+        self.assertEqual(classify_target("192.168.1.1"), "ip")
 
     def test_domain_target(self):
-        self.assertEqual(_classify_target("example.com"), "domain")
+        self.assertEqual(classify_target("example.com"), "domain")
 
     def test_url_target(self):
-        self.assertEqual(_classify_target("https://example.com/path"), "url")
+        self.assertEqual(classify_target("https://example.com/path"), "url")
 
     def test_email_target(self):
-        self.assertEqual(_classify_target("user@example.com"), "email")
+        self.assertEqual(classify_target("user@example.com"), "email")
 
     def test_username_with_at(self):
-        self.assertEqual(_classify_target("user@host"), "username")
+        self.assertEqual(classify_target("user@host"), "username")
 
     def test_username_with_underscore(self):
-        self.assertEqual(_classify_target("john_doe"), "username")
+        self.assertEqual(classify_target("john_doe"), "username")
+
+    def test_legacy_duplicate_removed(self):
+        import phantom.core.automode as am
+        self.assertFalse(hasattr(am, "_classify_target"))
+        self.assertFalse(hasattr(am, "run_sequence_mode"))
 
 
 class TestExpandTargets(unittest.TestCase):

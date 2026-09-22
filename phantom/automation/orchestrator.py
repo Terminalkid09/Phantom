@@ -29,6 +29,14 @@ class ActionStatus(Enum):
     SKIPPED = "skipped"
 
 
+def _gate_open(gate) -> bool:
+    """A gate that raises is a closed gate (never break the pool)."""
+    try:
+        return bool(gate())
+    except Exception:
+        return False
+
+
 @dataclass
 class PrioritizedAction:
     priority: float = field(compare=False)  # expected value: probability x cost
@@ -39,6 +47,12 @@ class PrioritizedAction:
     slot_values: Dict[str, str] = field(compare=False, default_factory=dict)
     status: ActionStatus = field(compare=False, default=ActionStatus.QUEUED)
     detail: str = field(compare=False, default="")
+    # swarm scheduling: optional release gate + owning task id. A gated
+    # action whose gate() is False stays QUEUED while others drain — this
+    # is how fact-driven DAGs (exploit waits for service) reuse the pool
+    # without the pool knowing about facts.
+    gate: Optional[Callable[[], bool]] = field(default=None, compare=False)
+    task_id: str = field(default="", compare=False)
 
     def __lt__(self, other):
         return (-self.priority, self.seq) < (-other.priority, other.seq)
@@ -48,17 +62,23 @@ class Orchestrator:
     """Dispatches prioritized actions to an elastic pool of agent threads."""
 
     def __init__(self, wm: WorldModel, stealth: StealthEngine,
-                 worker: Callable, max_agents: int = 10,
-                 min_agents: int = 1) -> None:
+                  worker: Callable, max_agents: int = 10,
+                  min_agents: int = 1,
+                  global_slot=None) -> None:
         """
         worker(action: PrioritizedAction, ctx: dict) -> bool
         ctx carries the shared WorldModel, registry, planner, etc.
+        global_slot: optional threading.BoundedSemaphore shared across
+        pool instances (swarm multi-target: every target owns its
+        orchestrator + pool, the semaphore caps TOTAL concurrent
+        workers operation-wide).
         """
         self.wm = wm
         self.stealth = stealth
         self.worker = worker
         self.max_agents = max_agents
         self.min_agents = min_agents
+        self.global_slot = global_slot
         self._queue: List[PrioritizedAction] = []
         self._seq = 0
         self._locks: Dict[str, threading.Lock] = {}
@@ -77,10 +97,13 @@ class Orchestrator:
     # ------------------------------------------------------------------ queue
 
     def submit(self, capability_id: str, entity: str, priority: float,
-               slot_values: Optional[Dict[str, str]] = None) -> PrioritizedAction:
+                slot_values: Optional[Dict[str, str]] = None,
+                gate: Optional[Callable[[], bool]] = None,
+                task_id: str = "") -> PrioritizedAction:
         action = PrioritizedAction(
             priority=priority, seq=self._seq, capability_id=capability_id,
             entity=entity, slot_values=slot_values or {},
+            gate=gate, task_id=task_id,
         )
         self._seq += 1
         heapq.heappush(self._queue, action)
@@ -94,15 +117,24 @@ class Orchestrator:
         with self._lock_guard:
             if not self._queue:
                 return None
+            # scan for the highest-priority action that is runnable: queued,
+            # gate-open and entity-free. The rest goes back on the heap, so
+            # a gated head never blocks a ready tail.
+            deferred = []
             while self._queue:
                 a = heapq.heappop(self._queue)
-                if a.status == ActionStatus.QUEUED and self._entity_free(a.entity):
-                    action = a
-                    break
                 if a.status != ActionStatus.QUEUED:
                     continue
-                heapq.heappush(self._queue, a)
+                if a.gate is not None and not _gate_open(a.gate):
+                    deferred.append(a)
+                    continue
+                if not self._entity_free(a.entity):
+                    deferred.append(a)
+                    continue
+                action = a
                 break
+            for d in deferred:
+                heapq.heappush(self._queue, d)
             if action is not None:
                 action.status = ActionStatus.RUNNING
         if action is not None:
@@ -195,6 +227,24 @@ class Orchestrator:
         self._pause.set()
 
     def _run_one(self, action: PrioritizedAction) -> None:
+        slot = False
+        if self.global_slot is not None:
+            # cross-pool ceiling: wait for a global worker slot, but
+            # never past a stop request (otherwise a saturated operation
+            # parks threads here while the drains already gave up).
+            while not self._stop.is_set():
+                if self.global_slot.acquire(blocking=False):
+                    slot = True
+                    break
+                time.sleep(0.05)
+            if not slot:
+                action.status = ActionStatus.FAILED
+                action.detail = "stopped waiting for a global worker slot"
+                self._unlock_entity(action.entity)
+                with self._lock_guard:
+                    self._done_count += 1
+                self._record_trail(action, False, action.detail)
+                return
         try:
             ok = bool(self.worker(action, self._ctx()))
             action.status = ActionStatus.DONE if ok else ActionStatus.FAILED
@@ -203,6 +253,11 @@ class Orchestrator:
             action.detail = str(e)[:200]
             ok = False
         finally:
+            if slot:
+                try:
+                    self.global_slot.release()
+                except Exception:
+                    pass
             self._unlock_entity(action.entity)
             with self._lock_guard:
                 self._done_count += 1

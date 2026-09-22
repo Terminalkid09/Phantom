@@ -7,6 +7,7 @@ Talks JSON to Electron, delegates to the existing Phantom modules.
 """
 
 import argparse
+import contextlib
 import html
 import json
 import os
@@ -651,6 +652,16 @@ class AutoJob:
         self.thread: Optional[threading.Thread] = None
         self.started_at = time.time()
         self.error: Optional[str] = None
+        # dynamic extra steps (deep goals): label -> index, allocated
+        # from 8 up in first-appearance order (the UI appends them).
+        self.extra_steps: dict = {}
+        # LLM on-demand approval (Fase 6): denied by default; the operator
+        # pre-approves with the run's llm flag or flips it live via
+        # POST /api/automode/llm (Electron checkbox). The legacy agent
+        # path only honors session pre-approval; mid-run flips take full
+        # effect on the swarm path (Fase 7 migration target).
+        from phantom.automation.swarm.llm import LLMApproval
+        self.llm_approval = LLMApproval()
 
     def callback(self, kind: str, data: dict) -> None:
         with _auto_lock:
@@ -710,6 +721,64 @@ class AutoJobManager:
 auto_jobs = AutoJobManager()
 
 
+# capability substring -> fixed step index (the 8 steps the UI shows).
+_BASE_STEP_MAP = {
+    "scan": 0, "osint": 1, "os_detect": 2,
+    "web_recon": 3, "web_probe": 3, "http_probe": 3,
+    "cve_correlate": 4, "service_exploit": 4, "exploit": 4,
+    "creds": 5, "ssh_login": 5, "web_creds": 5, "breach_check": 5,
+    "beacon_deploy": 6, "beacon_via_rce": 6, "inject_beacon": 6,
+    "persist": 7, "persistence_install": 7,
+}
+
+# capability substring -> dynamic step label (deep goals: lateral, AD,
+# crack, hunt, social...). Allocated from index 8 up in first-appearance
+# order; the UI appends them instead of freezing on PERSIST.
+_EXTRA_STEP_LABELS = {
+    "lateral": "LATERAL", "pivot": "LATERAL",
+    "crack": "CRACK", "hash_crack": "CRACK",
+    "ad_enum": "AD", "kerberoast": "AD", "as_rep": "AD",
+    "dc_sync": "AD", "dcsync": "AD",
+    "hunt": "HUNT", "differential": "HUNT", "idor": "HUNT",
+    "cleanup": "CLEANUP", "ransom_sim": "IMPACT",
+    "social": "SOCIAL", "phish": "SOCIAL", "persona": "SOCIAL",
+    "trojan": "DELIVERY", "cloud": "CLOUD", "mobile": "MOBILE",
+}
+
+
+def _match_step(cap: str, job) -> tuple:
+    """(index, name-or-None) for a capability: fixed map first, then the
+    dynamic labels (allocated per job). (None, None) when unknown."""
+    for key, idx in _BASE_STEP_MAP.items():
+        if key in cap:
+            return idx, None
+    for key, label in _EXTRA_STEP_LABELS.items():
+        if key in cap:
+            extra = getattr(job, "extra_steps", None)
+            if extra is None:
+                extra = job.extra_steps = {}
+            if label not in extra:
+                extra[label] = 8 + len(extra)
+            return extra[label], label
+    return None, None
+
+
+def _step_update(idx: int, status: str, detail: str,
+                 name=None) -> dict:
+    upd = {"step": idx, "status": status, "detail": detail}
+    if name:
+        upd["name"] = name
+    return upd
+
+
+def _preapprove_llm(job, llm: bool) -> None:
+    """Pre-approve LLM use for the session when the run asked for it:
+    same meaning as CLI --llm (the advisor may consult from the start,
+    with committed context instead of hallucinating from zero)."""
+    if llm and getattr(job, "llm_approval", None) is not None:
+        job.llm_approval.approve_session()
+
+
 @routes.post("/api/automode/run")
 async def automode_run(request: web.Request) -> web.Response:
     """Start the auto-mode engine as a managed job."""
@@ -723,13 +792,19 @@ async def automode_run(request: web.Request) -> web.Response:
     llm = bool(body.get("llm", False))
     experience = bool(body.get("experience", False))
     verbose = bool(body.get("verbose", False))
+    engine = str(body.get("engine", "agent") or "agent").strip().lower()
+    if engine not in ("agent", "swarm"):
+        return _error("engine must be 'agent' or 'swarm'")
+    force_network = bool(body.get("force_network", False))
 
     if not targets:
         return _error("No targets specified")
 
     job = auto_jobs.create(targets, mode, profile, goal, verbose=verbose)
-    session.target = targets[0]
-
+    # M3: the job owns its targets — never hijack the operator's global
+    # session.target (manual panels + other runs read it concurrently).
+    # Learned facts flow back through the merge, not the global.
+    _preapprove_llm(job, llm)
     def _run(job: AutoJob) -> None:
         try:
             run_auto_mode(
@@ -748,6 +823,8 @@ async def automode_run(request: web.Request) -> web.Response:
                 experience=experience,
                 resume=resume,
                 stop_event=job.stop_event,
+                engine=engine,
+                force_network=force_network,
             )
         except Exception as exc:
             # Never die silently: surface the crash in the UI stream. A
@@ -766,7 +843,7 @@ async def automode_run(request: web.Request) -> web.Response:
     job.thread = threading.Thread(target=_run, args=(job,), daemon=True)
     job.thread.start()
     return _json({"status": "started", "job_id": job.id,
-                  "targets": targets, "mode": mode})
+                  "targets": targets, "mode": mode, "engine": engine})
 
 
 @routes.get("/api/automode/stream")
@@ -780,14 +857,6 @@ async def automode_stream(_request: web.Request) -> web.Response:
 
     step_updates = []
     logs = []
-    step_map = {
-        "scan": 0, "osint": 1, "os_detect": 2,
-        "web_recon": 3, "web_probe": 3, "http_probe": 3,
-        "cve_correlate": 4, "service_exploit": 4, "exploit": 4,
-        "creds": 5, "ssh_login": 5, "web_creds": 5, "breach_check": 5,
-        "beacon_deploy": 6, "beacon_via_rce": 6, "inject_beacon": 6,
-        "persist": 7, "persistence_install": 7,
-    }
 
     for ev in events:
         kind = ev.get("kind", "")
@@ -795,14 +864,11 @@ async def automode_stream(_request: web.Request) -> web.Response:
         cap = (data.get("capability") or "").lower()
 
         if kind == "run":
-            matched_step = None
-            for key, idx in step_map.items():
-                if key in cap:
-                    matched_step = idx
-                    step_updates.append({"step": idx, "status": "running", "detail": cap[:40]})
-                    break
-            if matched_step is not None:
-                job.current_step = matched_step
+            idx, name = _match_step(cap, job)
+            if idx is not None:
+                step_updates.append(_step_update(
+                    idx, "running", cap[:40], name))
+                job.current_step = idx
             # the log carries the REAL command + the planner's WHY + the
             # stealth badge so the UI renders the action, not just its name
             logs.append({
@@ -815,11 +881,11 @@ async def automode_stream(_request: web.Request) -> web.Response:
             })
         elif kind == "found":
             findings = data.get("findings", [])
-            for key, idx in step_map.items():
-                if key in cap:
-                    step_updates.append({"step": idx, "status": "done", "detail": ", ".join(findings[:3])})
-                    job.current_step = idx
-                    break
+            idx, name = _match_step(cap, job)
+            if idx is not None:
+                step_updates.append(_step_update(
+                    idx, "done", ", ".join(findings[:3]), name))
+                job.current_step = idx
             # human-readable value dump: each finding key carries its value
             # (service:tcp/445 = microsoft-ds, os:detected = Windows ...) so
             # the operator sees WHAT was found, not just fact names.
@@ -842,13 +908,12 @@ async def automode_stream(_request: web.Request) -> web.Response:
                 "level": "success",
             })
         elif kind == "failed":
-            for key, idx in step_map.items():
-                if key in cap:
-                    step_updates.append({"step": idx, "status": "failed",
-                                         "detail": (data.get("reason")
-                                                    or data.get("output")
-                                                    or "execution failed")[:60]})
-                    break
+            idx, name = _match_step(cap, job)
+            if idx is not None:
+                step_updates.append(_step_update(
+                    idx, "failed", (data.get("reason")
+                                    or data.get("output")
+                                    or "execution failed")[:60], name))
             reason = (data.get("reason") or data.get("output") or "").strip()
             logs.append({
                 "time": datetime.now().strftime("%H:%M:%S"),
@@ -900,6 +965,23 @@ async def automode_stream(_request: web.Request) -> web.Response:
                 "time": datetime.now().strftime("%H:%M:%S"),
                 "text": f"[!] Blocked: {data.get('reason', '')[:120]}",
                 "level": "warn",
+            })
+        elif kind == "llm_request":
+            # the orchestrator wants a second opinion but has no approval:
+            # surface it so the operator can flip the checkbox / API.
+            # No transport was touched — approval gates every consult.
+            logs.append({
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "text": f"[?] LLM requested: {data.get('reason', '')[:140]} "
+                        f"(approve: POST /api/automode/llm {{\"allow\": true}})",
+                "level": "warn",
+            })
+        elif kind == "llm_consult":
+            logs.append({
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "text": f"[◈] LLM consult ({data.get('state', '')}): "
+                        f"{data.get('count', 0)} validated suggestion(s)",
+                "level": "info",
             })
         elif kind == "beacon_up":
             step_updates.append({"step": 6, "status": "done", "detail": data.get("beacon_id", "")})
@@ -984,11 +1066,44 @@ async def automode_status(_request: web.Request) -> web.Response:
     job = auto_jobs.active()
     if job is None:
         return _json({"running": False, "current_step": -1, "job_id": None})
+    approval = getattr(job, "llm_approval", None)
     return _json({
         "running": not job.done,
         "current_step": job.current_step,
         "job_id": job.id,
+        "llm": approval.state if approval is not None else "denied",
+        "llm_pending": len(approval.pending_requests())
+        if approval is not None else 0,
     })
+
+
+@routes.post("/api/automode/llm")
+async def automode_llm(request: web.Request) -> web.Response:
+    """Flip LLM approval live, mid-run (Electron checkbox / operator API).
+
+    Body {"allow": true} = approve for the session, {"allow": "once"} =
+    single consult, {"allow": false} = deny. The orchestrator consults
+    only with approval; without it only a stream-visible request is
+    recorded and no transport is ever touched.
+    """
+    body = await request.json() or {}
+    job = auto_jobs.active()
+    if job is None:
+        return _error("no active auto-mode run")
+    approval = getattr(job, "llm_approval", None)
+    if approval is None:
+        return _error("this job predates LLM approval support")
+    allow = body.get("allow")
+    if allow is True or allow == "session":
+        state = approval.approve_session()
+    elif allow == "once":
+        state = approval.approve_once()
+    elif allow is False or allow == "deny":
+        state = approval.deny()
+    else:
+        return _error("allow must be true|false|'once'")
+    return _json({"status": "ok", "llm": state,
+                  "job_id": job.id})
 
 
 @routes.post("/api/automode/stop")
@@ -1000,6 +1115,63 @@ async def automode_stop(_request: web.Request) -> web.Response:
     if job is None:
         return _json({"status": "stopped", "note": "no active run"})
     return _json({"status": "stopped", "job_id": job.id})
+
+
+@routes.post("/api/osint/preview")
+async def osint_preview(request: web.Request) -> web.Response:
+    """Bounded profile preview (2 fetches max): avatar URL, bio,
+    follower/following counts, link, state. Powers the start-gate
+    ("is this him?") in Electron/CLI BEFORE a run commits to a target.
+    """
+    body = await request.json() or {}
+    username = str(body.get("username", "") or "").strip().lstrip("@")
+    platform = str(body.get("platform", "") or "instagram").strip().lower()
+    if not username:
+        return _error("username required")
+    if platform not in ("instagram", "tiktok", "x", "github",
+                        "telegram", "reddit"):
+        return _error("unsupported platform")
+    try:
+        from phantom.automation.social.recon import (
+            present_candidate, preview_profile)
+        prof = preview_profile(username, platform)
+        return _json({
+            "username": prof.username, "platform": prof.platform,
+            "state": prof.state,
+            "state_confidence": prof.state_confidence,
+            "full_name": prof.full_name, "bio": prof.bio,
+            "link": prof.link, "followers": prof.followers,
+            "following": prof.following, "posts": prof.posts,
+            "avatar_url": prof.avatar_url,
+            "rendered": present_candidate(prof),
+        })
+    except Exception as exc:
+        return _error(f"preview failed: {exc}")
+
+
+@routes.get("/api/identity/checks")
+async def identity_checks(_request: web.Request) -> web.Response:
+    """Pending operator identity decisions (start-gate + ambiguity):
+    handle, platform, avatar, bio, counts, direct links."""
+    from phantom.automation.social.confirm import get_checks
+    return _json({"checks": get_checks().pending()})
+
+
+@routes.post("/api/identity/confirm")
+async def identity_confirm(request: web.Request) -> web.Response:
+    """Answer a pending identity check: {"id": ..., "decision":
+    "same:<handle>" | "stop" | "widen"}. Unattended runs never block:
+    unanswered checks fall back to widen-once-halt, never contact."""
+    body = await request.json() or {}
+    check_id = str(body.get("id", "") or "")
+    decision = str(body.get("decision", "") or "")
+    if not check_id or not decision:
+        return _error("id and decision required")
+    from phantom.automation.social.confirm import get_checks
+    if get_checks().answer(check_id, decision):
+        return _json({"status": "ok", "id": check_id,
+                      "decision": decision})
+    return _error("unknown or stale check id", 404)
 
 
 @routes.post("/api/automode/plan")
@@ -1090,6 +1262,66 @@ def _module_groups(instance, method: str) -> dict[str, list[str]]:
         return {}
     return {str(key): [str(command) for command in (commands or [])]
             for key, commands in (value or {}).items()}
+
+
+_suggest_lock = threading.Lock()  # serializes scoped suggest generation
+
+
+_TARGET_RE = re.compile(r"^[@+a-zA-Z0-9._\s\-:/]+$")
+
+
+def _query_target(request) -> str:
+    """Explicit ?target= override, validated like the shell's set target
+    (garbage/Mock noise never reaches the session)."""
+    try:
+        raw = str(request.rel_url.query.get("target", "") or "").strip()
+    except Exception:
+        return ""
+    if not raw or raw == session.target:
+        return ""
+    if not _TARGET_RE.match(raw) or ".." in raw:
+        return ""
+    return raw
+
+
+@contextlib.contextmanager
+def _scoped_suggest_target(target: str):
+    """Generate suggestions for an explicit target without moving the
+    operator's global session.target.
+    INTERIM (documented): modules read the global session; until they
+    take an explicit target parameter, generation runs serialized under
+    a lock with a temporary override. Suggest generation is pure string
+    building (no I/O), so the critical section is microseconds-wide and
+    never blocks execution paths (which already carry explicit targets).
+    """
+    if not target:
+        yield
+        return
+    with _suggest_lock:
+        prev = session.target
+        session.target = target
+        try:
+            yield
+        finally:
+            session.target = prev
+
+
+def _module_group_status(name: str, instance, method: str,
+                         ) -> dict[str, list[dict]]:
+    """Same groups, but every command tagged with the REAL execution
+    verdict (the same gate module_run enforces): the UI disables what
+    cannot run instead of showing a button that 403s. Phantom-internal
+    shell commands (do_* like `run`/`fire`) are flagged CLI-only."""
+    out: dict[str, list[dict]] = {}
+    for group, cmds in _module_groups(instance, method).items():
+        items = []
+        for cmd in cmds:
+            gate = _validate_backend_command(name, cmd)
+            items.append({"command": cmd,
+                          "runnable": gate is None,
+                          "reason": "" if gate is None else gate})
+        out[group] = items
+    return out
 
 
 # ── Command allowlist (API execution gate) ─────────────────────────────────
@@ -1269,18 +1501,26 @@ def _validate_backend_command(module: Optional[str],
 
 
 @routes.get("/api/modules")
-async def modules_list(_request: web.Request) -> web.Response:
-    """Return module metadata and live state-aware commands."""
+async def modules_list(request: web.Request) -> web.Response:
+    """Return module metadata and live state-aware commands.
+
+    suggestions/commands carry per-command runnable flags (same gate as
+    execution): the UI disables what cannot run through the backend.
+    ?target= scopes generation to an explicit target (default: the
+    operator's session target, left untouched).
+    """
+    scope = _query_target(request)
     payload = []
-    for name in _MODULES:
-        instance = _module_instance(name)
-        payload.append({
-            "id": name,
-            "label": name.upper(),
-            "suggestions": _module_groups(instance, "suggest_commands") if instance else {},
-            "commands": _module_groups(instance, "build_commands") if instance else {},
-        })
-    return _json({"modules": payload})
+    with _scoped_suggest_target(scope):
+        for name in _MODULES:
+            instance = _module_instance(name)
+            payload.append({
+                "id": name,
+                "label": name.upper(),
+                "suggestions": _module_group_status(name, instance, "suggest_commands") if instance else {},
+                "commands": _module_group_status(name, instance, "build_commands") if instance else {},
+            })
+    return _json({"modules": payload, "target": scope or session.target or ""})
 
 
 @routes.get("/api/modules/{module_name}")
@@ -1288,9 +1528,14 @@ async def module_detail(request: web.Request) -> web.Response:
     name = request.match_info["module_name"].lower()
     if name not in _MODULES:
         return _error(f"Unknown module: {name}", 404)
-    instance = _module_instance(name)
-    return _json({"id": name, "suggestions": _module_groups(instance, "suggest_commands"),
-                  "commands": _module_groups(instance, "build_commands")})
+    scope = _query_target(request)
+    with _scoped_suggest_target(scope):
+        instance = _module_instance(name)
+        payload = {"id": name,
+                   "target": scope or session.target or "",
+                   "suggestions": _module_group_status(name, instance, "suggest_commands"),
+                   "commands": _module_group_status(name, instance, "build_commands")}
+    return _json(payload)
 
 
 @routes.post("/api/modules/{module_name}/run")
@@ -1333,16 +1578,31 @@ async def module_run_group(request: web.Request) -> web.Response:
     commands = [c for c in commands if c]
     if not commands:
         return _error("Missing 'commands' list")
-    for c in commands:
-        gate = _validate_backend_command(name, c)
-        if gate:
-            return _error(gate, 403)
     target = str(body.get("target", session.target or ""))
     timeout = max(1.0, min(float(body.get("timeout", 300)), 7200.0))
 
     results: list[dict] = []
     total_started = time.time()
+    skipped = 0
     for i, cmd in enumerate(commands):
+        gate = _validate_backend_command(name, cmd)
+        if gate:
+            # per-command skip (reported, counted) instead of aborting
+            # the whole batch: groups mix backend commands with
+            # CLI-only pseudo-commands the UI now flags upfront.
+            skipped += 1
+            results.append({
+                "index": i,
+                "command": cmd,
+                "stdout": "",
+                "stderr": "",
+                "combined": "",
+                "returncode": None,
+                "timed_out": False,
+                "error": f"skipped: {gate}",
+                "duration": 0.0,
+            })
+            continue
         step_start = time.time()
         result = backend_dispatcher.run_pipeline(cmd, target, timeout)
         results.append({
@@ -1365,6 +1625,7 @@ async def module_run_group(request: web.Request) -> web.Response:
         "results": results,
         "total": len(commands),
         "completed": len(results),
+        "skipped": skipped,
         "total_duration": time.time() - total_started,
     })
 
@@ -2052,6 +2313,11 @@ async def session_preflight(request: web.Request) -> web.Response:
         except Exception:
             names = ["scan"]
 
+    scope = str(body.get("target", "") or "").strip()
+    if scope and (scope == session.target or not _TARGET_RE.match(scope)
+                  or ".." in scope):
+        scope = ""
+
     missing: list[dict] = []
     for name in names:
         from phantom.core.executor import tool_install_hint
@@ -2060,12 +2326,14 @@ async def session_preflight(request: web.Request) -> web.Response:
             if instance is None:
                 continue
             tools = set()
-            for source in (instance.build_commands(), instance.suggest_commands()):
-                for group in (source or {}).values():
-                    for cmd in (group or []):
-                        first = cmd.split()[0] if cmd.split() else ""
-                        if first:
-                            tools.add(first)
+            with _scoped_suggest_target(scope):
+                for source in (instance.build_commands(),
+                               instance.suggest_commands()):
+                    for group in (source or {}).values():
+                        for cmd in (group or []):
+                            first = cmd.split()[0] if cmd.split() else ""
+                            if first:
+                                tools.add(first)
             for tool in sorted(tools):
                 # Module action words (deploy-agent, privesc-run, run, …)
                 # are PHANTOM commands, not external tools — the first token
@@ -2081,6 +2349,7 @@ async def session_preflight(request: web.Request) -> web.Response:
             pass
 
     return _json({"missing": missing, "ok": len(missing) == 0,
+                  "target": scope or session.target or "",
                   "message": "All tools installed" if not missing else f"{len(missing)} tool(s) missing"})
 
 
