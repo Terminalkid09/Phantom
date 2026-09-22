@@ -181,6 +181,107 @@ def get(key: str, default: Any = None, env: Optional[str] = None) -> Any:
     return node
 
 
+# ── Declared schema ───────────────────────────────────────────────────────
+# Every setting Phantom reads, with its type and the legacy PHANTOM_* env
+# override that WINS over the file. This is the single place a new setting
+# is declared, so the config plane is auditable instead of scattered across
+# call sites. Call sites read through the typed accessors below; the plain
+# `get` stays for callers that pass their own default inline.
+SCHEMA: Dict[str, Dict[str, Any]] = {
+    # C2 listener / beacon transport
+    "c2.host": {"type": str, "env": "PHANTOM_C2_HOST"},
+    "c2.port": {"type": int, "env": "PHANTOM_C2_PORT"},
+    "c2.ssl": {"type": bool, "env": "PHANTOM_C2_SSL"},
+    "c2.mtls": {"type": bool, "env": None},
+    "c2.listener_auto_start": {"type": bool, "env": None},
+    "c2.auto_persist": {"type": bool, "env": "PHANTOM_AUTO_PERSIST"},
+    "c2.fallback": {"type": str, "env": "PHANTOM_C2_FALLBACK"},
+    "c2.proxy": {"type": str, "env": "PHANTOM_C2_PROXY"},
+    "c2.pin": {"type": str, "env": "PHANTOM_BEACON_PIN"},
+    "c2.api": {"type": str, "env": None},
+    "c2.remote_session_ttl": {"type": int, "env": "PHANTOM_REMOTE_SESSION_TTL"},
+    # Tracking server (lure landing)
+    "tracker.host": {"type": str, "env": "PHANTOM_TRACK_HOST"},
+    "tracker.port": {"type": int, "env": "PHANTOM_TRACK_PORT"},
+    "tracker.skin": {"type": str, "env": "PHANTOM_TRACK_SKIN"},
+    "tracker.redirect": {"type": str, "env": "PHANTOM_TRACK_REDIRECT"},
+    "tracker.brand": {"type": str, "env": "PHANTOM_TRACK_BRAND"},
+    "tracker.otp": {"type": bool, "env": "PHANTOM_TRACK_OTP"},
+    "tracker.js_challenge": {"type": bool,
+                             "env": "PHANTOM_TRACK_JS_CHALLENGE"},
+    "tracker.public_url": {"type": str, "env": None},
+    # Outbound transports / breach feeds
+    "transports.smtp.host": {"type": str, "env": "PHANTOM_SMTP_HOST"},
+    "transports.smtp.port": {"type": int, "env": "PHANTOM_SMTP_PORT"},
+    "transports.smtp.username": {"type": str, "env": "PHANTOM_SMTP_USER"},
+    "transports.smtp.password": {"type": str, "env": "PHANTOM_SMTP_PASSWORD"},
+    "transports.smtp.tls": {"type": bool, "env": "PHANTOM_SMTP_TLS"},
+    "transports.telegram_bot_token": {"type": str,
+                                      "env": "PHANTOM_TELEGRAM_BOT_TOKEN"},
+    "transports.discord_webhook": {"type": str, "env": None},
+    "transports.sms_carrier": {"type": str, "env": None},
+    "breach.hibp_api_key": {"type": str, "env": "PHANTOM_HIBP_API_KEY"},
+    "breach.custom_api": {"type": str, "env": "PHANTOM_BREACH_API"},
+    # LLM advisor + engagement governance
+    "llm.model_path": {"type": str, "env": "PHANTOM_LLM_MODEL"},
+    "llm.enabled": {"type": bool, "env": "PHANTOM_LLM_ENABLED"},
+    "engagement.allow_unscoped": {"type": bool,
+                                  "env": "PHANTOM_ALLOW_UNSCOPED"},
+    "engagement.ransom_sim_allow": {"type": bool,
+                                     "env": "PHANTOM_RANSOM_SIM_ALLOW"},
+    "phishing.aitm": {"type": bool, "env": "PHANTOM_AITM"},
+}
+
+_TRUTHY = ("1", "true", "yes", "on")
+_FALSY = ("0", "false", "no", "off", "")
+
+
+def declared(key: str) -> Optional[Dict[str, Any]]:
+    """The schema entry for ``key`` (None when undeclared)."""
+    return SCHEMA.get(key)
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    token = str(value).strip().lower()
+    if token in _TRUTHY:
+        return True
+    if token in _FALSY:
+        return False
+    return bool(default)
+
+
+def get_bool(key: str, default: bool = False,
+             env: Optional[str] = None) -> bool:
+    """Read ``key`` as a boolean with canonical parsing.
+
+    Accepts 1/true/yes/on (and non-zero numbers) as true, 0/false/no/off/
+    empty as false; anything unrecognized falls back to ``default``. This
+    replaces the ad-hoc `str(...) not in (...)` / `bool(...) in (...)`
+    parsing that treated values inconsistently across call sites."""
+    return _as_bool(get(key, default, env=env), default)
+
+
+def get_int(key: str, default: int = 0,
+            env: Optional[str] = None) -> int:
+    """Read ``key`` as an int, falling back to ``default`` when unset or
+    not parseable (never raises)."""
+    try:
+        return int(str(get(key, default, env=env)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def get_str(key: str, default: str = "",
+            env: Optional[str] = None) -> str:
+    """Read ``key`` as a string (``None`` collapses to ``default``)."""
+    value = get(key, default, env=env)
+    return default if value is None else str(value)
+
+
 def set(key: str, value: Any) -> None:
     """Set a dotted key and persist the file (used by ``phantom setup``)."""
     cfg = load_config()

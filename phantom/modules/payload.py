@@ -307,10 +307,7 @@ class PayloadModule(BaseModule):
         os_string, arch, platform = self._guess_os()
         from phantom.utils import config as cfg
         c2_host = str(cfg.get("c2.host", "127.0.0.1", env="PHANTOM_C2_HOST"))
-        try:
-            c2_port = int(cfg.get("c2.port", "8080", env="PHANTOM_C2_PORT"))
-        except (TypeError, ValueError):
-            c2_port = 8080
+        c2_port = cfg.get_int("c2.port", 8080, env="PHANTOM_C2_PORT")
         notifier.info(f"Target platform: {platform} ({arch}) — {os_string}")
         notifier.info(f"C2 callback: {c2_host}:{c2_port}")
         try:

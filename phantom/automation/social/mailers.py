@@ -37,13 +37,9 @@ def env_mail_config() -> MailConfig:
     """
     from phantom.utils import config as cfg
     host = cfg.get("transports.smtp.host", SMTP2GO_HOST, env="PHANTOM_SMTP_HOST")
-    try:
-        port = int(cfg.get("transports.smtp.port", "2525",
-                           env="PHANTOM_SMTP_PORT"))
-    except (TypeError, ValueError):
-        port = 2525
-    use_tls = str(cfg.get("transports.smtp.tls", "1",
-                          env="PHANTOM_SMTP_TLS")) not in ("0", "false", "no", "")
+    port = cfg.get_int("transports.smtp.port", 2525, env="PHANTOM_SMTP_PORT")
+    use_tls = cfg.get_bool("transports.smtp.tls", True,
+                           env="PHANTOM_SMTP_TLS")
     return MailConfig(
         smtp_host=str(host),
         smtp_port=port,

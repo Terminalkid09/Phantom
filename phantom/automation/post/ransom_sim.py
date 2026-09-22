@@ -91,9 +91,8 @@ def _unsafe_dir_reason(target_dir: str) -> str:
 
 def _ransom_sim_allowed() -> bool:
     from phantom.utils import config as cfg
-    v = str(cfg.get("engagement.ransom_sim_allow", "",
-                    env="PHANTOM_RANSOM_SIM_ALLOW"))
-    return v.strip().lower() in ("1", "true", "yes", "on")
+    return cfg.get_bool("engagement.ransom_sim_allow", False,
+                        env="PHANTOM_RANSOM_SIM_ALLOW")
 
 
 def ransom_sim_command(dir_path: str = ".") -> str:

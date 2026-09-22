@@ -38,9 +38,8 @@ def _unscoped_allowed() -> bool:
     PHANTOM_ALLOW_UNSCOPED=1. Never set by default: an authorization gate
     must fail closed."""
     from phantom.utils import config as cfg
-    v = str(cfg.get("engagement.allow_unscoped", "",
-                    env="PHANTOM_ALLOW_UNSCOPED"))
-    return v.strip().lower() in ("1", "true", "yes", "on")
+    return cfg.get_bool("engagement.allow_unscoped", False,
+                        env="PHANTOM_ALLOW_UNSCOPED")
 
 
 @dataclass

@@ -1369,21 +1369,16 @@ def env_tracker() -> TrackingServer:
     PHANTOM_TRACK_* environment variables taking precedence."""
     from phantom.utils import config as cfg
     host = str(cfg.get("tracker.host", "0.0.0.0", env="PHANTOM_TRACK_HOST"))
-    try:
-        port = int(cfg.get("tracker.port", "8080", env="PHANTOM_TRACK_PORT"))
-    except (TypeError, ValueError):
-        port = 8080
+    port = cfg.get_int("tracker.port", 8080, env="PHANTOM_TRACK_PORT")
     redirect = str(cfg.get("tracker.redirect", "https://example.com",
                            env="PHANTOM_TRACK_REDIRECT"))
     brand = str(cfg.get("tracker.brand", "Account verification",
                         env="PHANTOM_TRACK_BRAND"))
-    otp = str(cfg.get("tracker.otp", "0", env="PHANTOM_TRACK_OTP")) not in \
-        ("0", "false", "no", "")
+    otp = cfg.get_bool("tracker.otp", False, env="PHANTOM_TRACK_OTP")
     skin = str(cfg.get("tracker.skin", "youtube", env="PHANTOM_TRACK_SKIN")) \
         .strip().lower()
-    js_challenge = str(cfg.get("tracker.js_challenge", "0",
-                               env="PHANTOM_TRACK_JS_CHALLENGE")) not in \
-        ("0", "false", "no", "")
+    js_challenge = cfg.get_bool("tracker.js_challenge", False,
+                                env="PHANTOM_TRACK_JS_CHALLENGE")
     return TrackingServer(host=host, port=port, redirect_url=redirect,
                           brand=brand, otp=otp, skin=skin,
                           js_challenge=js_challenge)

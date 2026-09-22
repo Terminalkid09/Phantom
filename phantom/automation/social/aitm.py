@@ -91,12 +91,9 @@ def enabled() -> bool:
     """The AiTM relay is opt-in, always: `phishing.aitm` / `PHANTOM_AITM`."""
     try:
         from phantom.utils import config as cfg
-        v = cfg.get("phishing.aitm", False, env="PHANTOM_AITM")
+        return cfg.get_bool("phishing.aitm", False, env="PHANTOM_AITM")
     except Exception:
         return False
-    if isinstance(v, bool):
-        return v
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _origin(url: str) -> str:

@@ -57,8 +57,8 @@ def _auto_persist_allowed() -> bool:
     """
     try:
         from phantom.utils import config as cfg
-        v = str(cfg.get("c2.auto_persist", "1", env="PHANTOM_AUTO_PERSIST"))
-        return v.strip().lower() not in ("0", "false", "no", "off")
+        return cfg.get_bool("c2.auto_persist", True,
+                            env="PHANTOM_AUTO_PERSIST")
     except Exception:
         return True
 
