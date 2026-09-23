@@ -467,13 +467,24 @@ class ReasoningEngine:
                 return None
             return int(m.group(1)), int(m.group(2))
 
+        def _version_eq(version: str, wanted: str) -> bool:
+            """EXACT version match, never a substring.
+
+            `"2.4.49" in version` also matched `2.4.490`/`2.4.449` and any
+            banner that merely contained those digits, flagging a patched
+            host as vulnerable — and a false vuln hypothesis costs real
+            time, because the planner acts on it.
+            """
+            m = re.search(r"\d+(?:\.\d+)+", version or "")
+            return bool(m) and m.group(0) == wanted
+
         for product, version in software.items():
             if product.startswith("apache"):
-                if "2.4.49" in version:
+                if _version_eq(version, "2.4.49"):
                     _flag("apache", "path-traversal-rce",
                           "Apache 2.4.49 is vulnerable to path traversal/RCE",
                           0.95)
-                elif "2.4.50" in version:
+                elif _version_eq(version, "2.4.50"):
                     _flag("apache", "path-traversal-rce",
                           "Apache 2.4.50 path traversal (incomplete fix)",
                           0.9)
