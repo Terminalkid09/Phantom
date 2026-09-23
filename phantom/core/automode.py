@@ -100,81 +100,38 @@ def _expand_targets(raw_targets: List[str],
     return out
 
 
+def _emit_rendered(rendered) -> None:
+    """Print one rendered event on the CLI (level -> notifier channel).
+
+    The wording belongs to the shared contract; the CLI only picks the
+    colour, so the CLI, the swarm stream and the API/UI cannot drift into
+    three different explanations of the same event again.
+    """
+    for line in rendered.lines:
+        if rendered.level == "success":
+            notifier.success(line)
+        elif rendered.level == "warn":
+            notifier.warn(line)
+        elif rendered.level == "error":
+            notifier.error(line)
+        else:
+            notifier.info(line)
+
+
 def _stream_agent_event(kind: str, data: dict, verbose: bool = False) -> None:
-    tag = f"[bold blue]{data.get('target', '')}[/] " if data.get("target") else ""
-    if kind == "run":
-        # the operator must see WHAT is running, the REAL command and WHY:
-        # capability banner + stealth badge + actual command + planner reason
-        cap_name = data.get("banner") or data.get("capability")
-        stealth = data.get("stealth_level") or ""
-        badge = {"paranoid": "⚡paranoid", "active": "●active",
-                 "aggressive": "🎯aggressive"}.get(stealth, "")
-        line = f"{tag}{cap_name}"
-        if badge:
-            line += f"  [dim]{badge}[/]"
-        line += f"  (cost {data.get('cost', '?')})"
-        notifier.info(line)
-        cmd = data.get("command") or ""
-        reason = data.get("reason") or ""
-        if cmd and reason:
-            # real command + planner reason on the same line: the operator
-            # sees both the action and the thinking behind it
-            notifier.info(f"{tag}    $ {cmd[:200]}")
-            notifier.info(f"{tag}      why: {reason[:180]}")
-        elif cmd:
-            notifier.info(f"{tag}    $ {cmd[:200]}")
-        elif reason and verbose:
-            notifier.info(f"{tag}      why: {reason[:180]}")
-    elif kind == "plan":
-        steps = data.get("steps", [])
-        notifier.info(f"{tag}plan: {' -> '.join(steps)} "
-                      f"(strategy={data.get('strategy') or '-'})")
-    elif kind == "inference":
-        if verbose:
-            for f in data.get("findings", []):
-                notifier.info(f"{tag}[infer] {f.get('kind')}:{f.get('key')} "
-                              f"→ {f.get('value')}")
-    elif kind == "reason":
-        if verbose:
-            for h in data.get("hypotheses", []):
-                notifier.info(f"{tag}[reason] {h.get('capability')} :: "
-                              f"{h.get('reason')} (prio {h.get('priority')})")
-    elif kind == "hypothesis":
-        if verbose:
-            for r in data.get("resolved", []):
-                notifier.info(f"{tag}[hypothesis] {r.get('capability')} "
-                              f"→ {r.get('status')}")
-    elif kind == "found":
-        values = data.get("values") or {}
-        parts = []
-        for fkey in (data.get("findings") or [])[:6]:
-            v = values.get(fkey)
-            if v:
-                parts.append(f"{fkey} = {str(v)[:60]}")
-            else:
-                parts.append(fkey)
-        notifier.success(f"{tag}{data.get('capability')}: {', '.join(parts)}")
-    elif kind == "note":
-        notifier.info(f"{tag}{data.get('capability')}: "
-                      f"{data.get('detail', 'no new findings')}")
-    elif kind == "blocked":
-        notifier.warn(f"{tag}{data.get('capability')} bloccata: "
-                      f"{data.get('reason', '')[:120]}")
-    elif kind == "tool_missing":
-        notifier.warn(f"{tag}{data.get('capability')}: tool mancanti "
-                      f"{', '.join(data.get('tools', []))}")
-    elif kind == "failed":
-        # prefer the human reason; fall back to raw output, then a generic
-        # line so a failed step never prints as a bare "Failed:"
-        out = data.get("reason") or data.get("output") or "execution failed"
-        notifier.error(f"{tag}{data.get('capability')}: {str(out)[:120]}")
-    elif kind == "beacon_up":
-        notifier.success(f"{tag}BEACON UP in C2 ({data.get('beacon_id', '')})")
-    elif kind == "handoff":
-        notifier.success(f"{tag}HANDOFF: beacon {data.get('beacon_id', '')} "
-                         f"sotto controllo operatore — nessun cleanup automatico")
-    elif kind == "halt":
-        notifier.warn(f"{tag}halt: {data.get('reason', '')}")
+    """Render an agent event through the shared contract.
+
+    This function used to BE the renderer and knew 12 of the ~40 kinds the
+    engine emits: the stall diagnosis ("stuck because X, change angle to
+    Y") and every error/recover/gate/llm/shared event were emitted and then
+    dropped here, which made a reasoning engagement look like it had gone
+    quiet. The vocabulary now lives in phantom.core.stream_contract.
+    """
+    from phantom.core.stream_contract import render_event
+    rendered = render_event(kind, data, verbose=verbose)
+    if rendered is None:
+        return
+    _emit_rendered(rendered)
 
 
 def _make_agent_stream(verbose: bool = False,
@@ -400,25 +357,17 @@ from phantom.automation.goals import SWARM_CHAIN as _GOAL_CHAIN  # noqa: E402
 
 def _stream_swarm_event(kind: str, data: dict, verbose: bool = False,
                         on_event=None) -> None:
-    """Swarm events onto the operator stream (mirrors the agent event
-    vocabulary where it overlaps so consoles need no new renderer)."""
-    if kind == "task_target":
-        if data.get("ok"):
-            notifier.success(
-                f"Swarm {data.get('task')} @ {data.get('target')}: "
-                f"+{data.get('staged', 0)} finding(s) committed")
-        else:
-            notifier.warn(
-                f"Swarm {data.get('task')} @ {data.get('target')}: "
-                f"no provides ({data.get('staged', 0)} staged)")
-    elif kind == "failed":
-        notifier.warn(f"Swarm {data.get('task')}: {data.get('output', '')[:120]}")
-    elif kind == "llm_request":
-        notifier.warn(f"Swarm chiede LLM: {data.get('reason', '')[:140]} "
-                      f"(approva: POST /api/automode/llm {{\"allow\": true}})")
-    elif kind == "llm_consult":
-        notifier.info(f"Swarm×LLM ({data.get('state', '')}): "
-                      f"{data.get('count', 0)} suggerimenti validati")
+    """Swarm events onto the operator stream, through the SAME contract as
+    the agent path.
+
+    This renderer knew two kinds, so `--verbose` was a no-op on the swarm
+    path: a swarm run showed task outcomes and nothing about what each task
+    reasoned or executed.
+    """
+    from phantom.core.stream_contract import render_event
+    rendered = render_event(kind, data, verbose=verbose)
+    if rendered is not None:
+        _emit_rendered(rendered)
     if on_event is not None:
         try:
             on_event(kind, data)

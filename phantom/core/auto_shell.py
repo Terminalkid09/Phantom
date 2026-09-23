@@ -225,9 +225,15 @@ class AutoShell(cmd.Cmd):
         ev = {"kind": kind, "at": time.time(), **data}
         self.events.setdefault(str(tgt), []).append(ev)
         if self.flags.get("verbose"):
-            emoji = "⏳" if kind == "waiting" else ("🏁" if kind == "handoff" else "•")
-            console.print(f"  [dim]{emoji}[/] [cyan]{tgt}[/] [dim]{kind}[/]"
-                          f" [white]{data.get('message', '')}[/]")
+            # The event's OWN wording via the shared contract. This used to
+            # print `data.get('message')` — a field no emitter ever set, so
+            # --verbose produced a column of empty lines and the operator
+            # concluded the engine was doing nothing.
+            from phantom.core.stream_contract import render_event
+            rendered = render_event(kind, data, verbose=True)
+            if rendered is not None:
+                for line in rendered.lines:
+                    console.print(f"  [dim]•[/] [cyan]{tgt}[/] {line}")
 
     # ── targets ───────────────────────────────────────────────────────────
 

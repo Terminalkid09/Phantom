@@ -77,8 +77,13 @@ class TestRunEventEnriched(unittest.TestCase):
         step.capability = cap
         with patch.object(ag, "_scope_ok", return_value=True):
             ag._execute_capability(step)
-        first = ag.sink.emit.call_args_list[0]
-        self.assertEqual(first.args[0], "run")
+        # a MagicMock capability breaks the lens layer (view_of reads real
+        # attributes), and that degradation is now REPORTED instead of
+        # swallowed — so find the `run` event rather than assuming index 0.
+        runs = [c for c in ag.sink.emit.call_args_list
+                if c.args and c.args[0] == "run"]
+        self.assertTrue(runs, ag.sink.emit.call_args_list)
+        first = runs[0]
         kw = first.kwargs
         self.assertEqual(kw["command"], "nmap -sV -sC -p- 10.0.0.5")
         self.assertEqual(kw["reason"], "port 80 open -> fingerprint web")

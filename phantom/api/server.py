@@ -774,6 +774,78 @@ def _step_update(idx: int, status: str, detail: str,
     return upd
 
 
+def _automode_log_entries(job, events) -> tuple:
+    """Translate drained auto-mode events into UI entries.
+
+    Pure on purpose (no request, no web types) so the translation — the
+    exact layer that used to drop half the engine's signal — is testable
+    without an HTTP round trip.
+
+    Returns ``(step_updates, logs)``. Wording and level come from the
+    shared contract (phantom.core.stream_contract), the same one the CLI
+    prints, so the two surfaces cannot disagree. Events are REDACTED
+    before rendering: the UI stream must never carry a raw credential.
+    """
+    from phantom.core.stream_contract import render_event
+    from phantom.utils.redact import redact, redact_text
+
+    step_updates = []
+    logs = []
+
+    for ev in events:
+        kind = ev.get("kind", "")
+        # REDACT BEFORE RENDERING: the UI stream, the persisted session
+        # mirror and the audit trail must never carry a raw password/OTP/
+        # token. The WorldModel keeps the real values for the kill chain;
+        # redacting here also covers the free-text reason (a planner reason
+        # can quote the command, and the command can carry `sshpass -p …`).
+        data = redact(ev.get("data") or {})
+        cap = (data.get("capability") or "").lower()
+
+        # the UI checklist is a SEPARATE, kind-specific contract: it maps an
+        # event onto a step, independent of the wording
+        if kind in ("run", "found", "failed"):
+            idx, name = _match_step(cap, job)
+            if idx is not None:
+                if kind == "run":
+                    status, detail = "running", cap[:40]
+                elif kind == "found":
+                    status = "done"
+                    detail = ", ".join((data.get("findings") or [])[:3])
+                else:
+                    status = "failed"
+                    detail = str(data.get("reason") or data.get("output")
+                                 or "execution failed")[:60]
+                step_updates.append(_step_update(idx, status, detail, name))
+                if kind != "failed":
+                    job.current_step = idx
+        elif kind == "beacon_up":
+            step_updates.append({"step": 6, "status": "done",
+                                 "detail": data.get("beacon_id", "")})
+            job.current_step = 6
+
+        # ONE renderer, shared with the CLI: this translation used to know
+        # 17 of the ~40 kinds and silently dropped the rest (stall, error,
+        # success, gate, shared, llm …), which is why the UI showed findings
+        # but no reasoning.
+        rendered = render_event(kind, data, verbose=bool(
+            getattr(job, "verbose", False)))
+        if rendered is None:
+            continue
+        fields = dict(rendered.fields)
+        for key in ("command", "reason"):
+            if fields.get(key):
+                fields[key] = redact_text(fields[key])
+        logs.append({
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "text": rendered.head,
+            "level": rendered.level,
+            **fields,
+        })
+
+    return step_updates, logs
+
+
 def _preapprove_llm(job, llm: bool) -> None:
     """Pre-approve LLM use for the session when the run asked for it:
     same meaning as CLI --llm (the advisor may consult from the start,
@@ -856,204 +928,7 @@ async def automode_stream(_request: web.Request) -> web.Response:
     if job is None:
         return _json({"done": True, "step_updates": [], "current_step": -1,
                       "log": []})
-    events = job.drain()
-
-    step_updates = []
-    logs = []
-
-    for ev in events:
-        kind = ev.get("kind", "")
-        data = ev.get("data", {})
-        cap = (data.get("capability") or "").lower()
-
-        if kind == "run":
-            idx, name = _match_step(cap, job)
-            if idx is not None:
-                step_updates.append(_step_update(
-                    idx, "running", cap[:40], name))
-                job.current_step = idx
-            # the log carries the REAL command + the planner's WHY + the
-            # stealth badge so the UI renders the action, not just its name
-            logs.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "text": f"[▶] Running: {data.get('banner') or data.get('capability')}",
-                "level": "info",
-                "command": data.get("command") or "",
-                "reason": data.get("reason") or "",
-                "stealth": data.get("stealth_level") or "",
-            })
-        elif kind == "found":
-            findings = data.get("findings", [])
-            idx, name = _match_step(cap, job)
-            if idx is not None:
-                step_updates.append(_step_update(
-                    idx, "done", ", ".join(findings[:3]), name))
-                job.current_step = idx
-            # human-readable value dump: each finding key carries its value
-            # (service:tcp/445 = microsoft-ds, os:detected = Windows ...) so
-            # the operator sees WHAT was found, not just fact names.
-            # Credential findings are REDACTED here: the UI stream and the
-            # persisted session mirror must never carry raw passwords/OTPs
-            # (the WorldModel keeps them for the kill chain; the operator's
-            # raw report is the only surface that shows the real values).
-            from phantom.utils.redact import redact as _redact_values
-            values = _redact_values(data.get("values") or {})
-            parts = []
-            for fkey in findings[:6]:
-                v = values.get(fkey)
-                if v:
-                    parts.append(f"{fkey} = {str(v)[:60]}")
-                else:
-                    parts.append(fkey)
-            logs.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "text": f"[+] {data.get('capability')}: {', '.join(parts)}",
-                "level": "success",
-            })
-        elif kind == "failed":
-            idx, name = _match_step(cap, job)
-            if idx is not None:
-                step_updates.append(_step_update(
-                    idx, "failed", (data.get("reason")
-                                    or data.get("output")
-                                    or "execution failed")[:60], name))
-            reason = (data.get("reason") or data.get("output") or "").strip()
-            logs.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "text": f"[ERROR] Failed: {cap} — {reason[:120]}" if reason
-                        else f"[ERROR] Failed: {cap} (no output — see reasoning log)",
-                "level": "error",
-            })
-        elif kind == "note":
-            # clean run that produced no new facts: show WHY instead of an
-            # empty success line (e.g. os_detect on a host nmap cannot
-            # fingerprint: "Too many fingerprints match this host")
-            logs.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "text": f"[i] {cap}: {data.get('detail', 'no new findings')}",
-                "level": "dim",
-            })
-        elif kind == "tool_missing":
-            logs.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "text": f"[!] Tool missing: {cap} needs {', '.join(data.get('tools', []))}",
-                "level": "warn",
-            })
-        elif kind == "deferred":
-            logs.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "text": f"[~] Deferred: {cap} — precondition not met yet",
-                "level": "dim",
-            })
-        elif kind == "recover":
-            logs.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "text": f"[↻] Recovery {data.get('recovery', '')}: "
-                        f"{data.get('detail', 're-arming failed capabilities')}",
-                "level": "warn",
-            })
-        elif kind == "hunt_probe":
-            if not job.verbose:
-                continue
-            # behavioural hunt probe lines: endpoint + signals, trimmed
-            req = data.get("request", {})
-            logs.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "text": f"[hunt] {req.get('probe', '')} {req.get('method', 'GET')} "
-                        f"{req.get('path', '')} → {req.get('signals', '')}".strip(),
-                "level": "dim",
-            })
-        elif kind == "blocked":
-            logs.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "text": f"[!] Blocked: {data.get('reason', '')[:120]}",
-                "level": "warn",
-            })
-        elif kind == "llm_request":
-            # the orchestrator wants a second opinion but has no approval:
-            # surface it so the operator can flip the checkbox / API.
-            # No transport was touched — approval gates every consult.
-            logs.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "text": f"[?] LLM requested: {data.get('reason', '')[:140]} "
-                        f"(approve: POST /api/automode/llm {{\"allow\": true}})",
-                "level": "warn",
-            })
-        elif kind == "llm_consult":
-            logs.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "text": f"[◈] LLM consult ({data.get('state', '')}): "
-                        f"{data.get('count', 0)} validated suggestion(s)",
-                "level": "info",
-            })
-        elif kind == "beacon_up":
-            step_updates.append({"step": 6, "status": "done", "detail": data.get("beacon_id", "")})
-            job.current_step = 6
-            logs.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "text": f"[★] BEACON UP: {data.get('beacon_id', '')}",
-                "level": "success",
-            })
-        elif kind == "waiting":
-            logs.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "text": f"[⏳] {data.get('detail', 'waiting for the human')} "
-                        f"({data.get('remaining', '?')}s left)",
-                "level": "info",
-            })
-        elif kind == "halt":
-            logs.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "text": f"[■] {data.get('reason', 'halt')}",
-                "level": "info",
-            })
-        elif kind == "inference":
-            if not job.verbose:
-                continue
-            # render the DEDUCED findings with their values — the operator
-            # must see WHAT was learned ("os: Windows Server 2019", not just
-            # "inference"); secret values are redacted for the UI stream
-            from phantom.utils.redact import redact as _redact_values
-            fins = _redact_values(data.get("findings") or [])
-            if fins:
-                parts = []
-                for f in fins[:4]:
-                    v = f.get("value")
-                    detail = ""
-                    if isinstance(v, dict):
-                        detail = ", ".join(str(x) for x in list(v.values())[:2] if x)
-                    elif v:
-                        detail = str(v)
-                    parts.append(f"{f.get('kind')}:{f.get('key')} = {detail}".rstrip(" ="))
-                logs.append({
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "text": f"[~] Inference: {'; '.join(parts)}",
-                    "level": "dim",
-                })
-        elif kind == "reason":
-            if not job.verbose:
-                continue
-            hyps = data.get("hypotheses") or []
-            if hyps:
-                shown = "; ".join(
-                    f"{h.get('capability')} ({h.get('reason', '')[:60]})"
-                    for h in hyps[:3])
-                logs.append({
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "text": f"[?] Hypothesis: {shown}",
-                    "level": "dim",
-                })
-        elif kind == "plan":
-            steps = data.get("steps") or []
-            if steps:
-                strategy = data.get("strategy") or ""
-                logs.append({
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "text": f"[≡] Plan ({strategy or 'generic'}): "
-                            f"{' → '.join(steps[:8])}" +
-                            (f" …+{len(steps) - 8}" if len(steps) > 8 else ""),
-                    "level": "info",
-                })
+    step_updates, logs = _automode_log_entries(job, job.drain())
 
     return _json({
         "done": job.done,

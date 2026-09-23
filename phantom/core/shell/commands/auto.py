@@ -229,9 +229,16 @@ def cmd_auto(shell, arg: str):
         approval = LLMApproval()
         if args.llm:
             approval.approve_session()
+        # the swarm path used to drop `--verbose` entirely (it printed only
+        # the closing summary) and to ignore `--reason` (no-op). Both are
+        # wired now, through the SAME renderer as the agent path.
+        from phantom.core.automode import _stream_swarm_event
         summary = run_swarm(
             targets, chain=args.chain, profile=args.profile,
-            aggressive=args.aggressive, llm_approval=approval)
+            aggressive=args.aggressive, llm_approval=approval,
+            reason_profile=args.reason,
+            scope_list=list(session.scope) if session.scope else [],
+            on_event=lambda k, d: _stream_swarm_event(k, d, args.verbose))
         notifier.info(f"Swarm {args.chain}: "
                       f"{sum(1 for t in summary['tasks'] if t['status'] == 'done')}"
                       f"/{len(summary['tasks'])} tasks done, "
@@ -340,27 +347,18 @@ def cmd_agent(shell, arg: str):
                       "Set scope with 'set scope <cidr,...>' for real engagements.")
 
     def _stream(kind: str, data: dict) -> None:
+        # ONE renderer: this used to be a fourth, private copy that joined
+        # `findings` without the values (so `agent <t>` showed bare keys).
+        # The contract marks what is verbose-only; `agent` is not verbose.
+        from phantom.core.stream_contract import render_event
+        rendered = render_event(kind, {**data, "target": data.get("target")},
+                                verbose=False)
+        if rendered is None:
+            return
         tgt = data.get("target")
         tag = f"[bold blue]{tgt}[/] " if tgt else ""
-        if kind == "run":
-            _sh.console.print(f"{tag} [cyan]>[/] {data.get('banner', data.get('capability'))} "
-                          f"(cost {data.get('cost', '?')})")
-        elif kind == "found":
-            _sh.console.print(f"{tag} [green]✓[/] {data.get('capability')}: "
-                          f"{', '.join(data.get('findings', []))}")
-        elif kind == "tool_missing":
-            _sh.console.print(f"{tag} [red]⛏[/] {data.get('capability')}: missing tool "
-                          f"{', '.join(data.get('tools', []))}")
-        elif kind == "failed":
-            _sh.console.print(f"{tag} [red]✗[/] {data.get('capability')}: {data.get('output', '')[:120]}")
-        elif kind == "blocked":
-            _sh.console.print(f"{tag} [yellow]⛔[/] {data.get('capability')} blocked: "
-                          f"{data.get('reason', '')[:120]}")
-        elif kind == "beacon_up":
-            _sh.console.print(f"{tag} [bold magenta]★[/] BEACON UP in C2 "
-                          f"({data.get('beacon_id', '')})")
-        elif kind == "halt":
-            _sh.console.print(f"{tag} [yellow]■[/] halt: {data.get('reason', '')}")
+        for line in rendered.lines:
+            _sh.console.print(f"{tag}{line}")
 
     out_root = os.path.join(sessions_dir(), f"agent_{int(time.time())}")
     writer = ReportWriter(out_root)
