@@ -6,84 +6,95 @@ import phantom.core.shell as _sh  # live console: _sh.console resolves the packa
 from phantom.utils.notifier import notifier
 
 
-def cmd_run(shell, arg: str):
-    """run [module] — adaptive next step, or run a specific module.
+def _run_suggested_move(shell, index: int) -> None:
+    """Execute entry <index> of the last ranking (one step, not three)."""
+    from phantom.core import next_moves as _nm
+    moves = _nm.pending()
+    if not moves:
+        notifier.error("No ranked moves yet — run 'suggest' first.")
+        return
+    if index < 1 or index > len(moves):
+        notifier.error(f"Move {index} out of range (1..{len(moves)}).")
+        return
+    move = moves[index - 1]
+    _sh.console.print(f"[bold cyan]── RUN {index}: {move.title} ──[/]")
+    if move.why:
+        _sh.console.print(f"  [dim]why: {move.why}[/]")
+    _nm.execute_move(shell, move)
 
-    With no argument: the shell reads the LIVE engagement (target type,
-    findings, reasoning hypotheses) and proposes the single best next
-    step with the reason, then asks before executing. With a module
-    name it runs that module directly (e.g. `run scan`).
+
+def cmd_run(shell, arg: str):
+    """run [n | module [args]] — one step, from the ranked moves or a module.
+
+    `suggest` prints a ranked, numbered list; `run <n>` executes entry n
+    here (scope, tools and the aggressive confirmation still apply), so a
+    recommendation is one step instead of `use` + `run` + selection.
+
+    With no argument: executes the top-ranked move. With a module name it
+    runs that module (aliases work); extra words are passed to the module
+    flow, e.g. `run scan --quiet` for the non-interactive path.
     """
     if not session.target:
         notifier.error("No target set. Use: set target <ip|email|username|domain>")
         return
-    module = arg.strip().lower()
-    if module:
-        instance = shell._instantiate_module(module)
-        if instance is None:
-            notifier.error(f"Unknown module: {module} (use: use <module>)")
+    tokens = arg.strip().split()
+    if not tokens:
+        from phantom.core import next_moves as _nm
+        ranked = _nm.rank_next_moves(shell)
+        if not ranked.moves:
+            notifier.info("Nothing actionable right now. Try 'use scan' → 'run', "
+                          "or the full chain: auto <target>")
             return
-        if not shell._warn_identity_target(module):
-            try:
-                instance.do_run("")
-            except NotImplementedError:
-                notifier.warn(f"{module} has no automated run — opening interactive shell.")
-                instance.cmdloop()
+        top = ranked.moves[0]
+        _sh.console.print(f"[bold cyan]── NEXT STEP: {(top.module or top.capability).upper()} ──[/]")
+        _sh.console.print(f"  [dim]reason: {top.why or 'best next step from current findings'}[/]")
+        if not _nm.execute_move(shell, top):
+            # the top move needs an interactive module flow: fall back to it
+            instance = shell._instantiate_module(top.module) if top.module else None
+            if instance is not None and not shell._warn_identity_target(top.module):
+                try:
+                    instance.do_run("")
+                except NotImplementedError:
+                    notifier.warn(f"{top.module} has no automated run — opening interactive shell.")
+                    instance.cmdloop()
         return
 
-    suggestion = shell._next_step()
-    if not suggestion:
-        notifier.info("Nothing actionable right now. Try 'use scan' → 'run', "
-                      "or the full chain: auto <target>")
+    head = tokens[0]
+    if head.isdigit():
+        _run_suggested_move(shell, int(head))
         return
-    module, reason = suggestion
+    module = shell.MODULE_ALIASES.get(head.lower(), head.lower())
+    module_args = " ".join(tokens[1:])
     instance = shell._instantiate_module(module)
     if instance is None:
-        notifier.error(f"Suggested module '{module}' unavailable.")
+        notifier.error(f"Unknown module: {module} (use: use <module>)")
         return
-    _sh.console.print(f"[bold cyan]── NEXT STEP: {module.upper()} ──[/]")
-    _sh.console.print(f"  [dim]reason: {reason}[/]")
-    # No extra confirm here: every module flow ends in its own
-    # interactive selection (PreviewSession), so nothing executes
-    # without an explicit choice — a second prompt was only friction.
-    try:
-        instance.do_run("")
-    except NotImplementedError:
-        notifier.warn(f"{module} has no automated run — opening interactive shell.")
-        instance.cmdloop()
+    if not shell._warn_identity_target(module):
+        try:
+            # module args pass through: `run scan --quiet` runs the module's
+            # top suggestion non-interactively (previously unreachable here)
+            instance.do_run(module_args)
+        except NotImplementedError:
+            notifier.warn(f"{module} has no automated run — opening interactive shell.")
+            instance.cmdloop()
 
 
 def cmd_suggest(shell, arg: str):
-    """suggest — evidence-tagged next steps.
+    """suggest — ranked, directly executable next moves.
 
-    Every suggestion shows WHY (the concrete findings behind it), a
-    TRUST score (evidence strength + historical success rate of the
-    technique class), and preflight state (missing tools, already-ran,
-    out-of-scope). Verify the reasoning in two seconds, then run.
+    One ranked list instead of a flat per-module dump: the planner's next
+    chain step and the evidence-tagged commands are scored together, each
+    row shows WHY (the findings behind it), a TRUST score and its
+    preflight state (missing tools, already-ran, out-of-scope), and the
+    paths the planner REFUSED are listed with their real reason.
+
+    `run <n>` executes row n — no `use` + `run` + selection detour.
     """
-    from phantom.core.suggest_meta import tag_suggestions, render_tagged
+    from phantom.core import next_moves as _nm
     if not session.target:
         notifier.error("No target set. Use: set target <ip|email|username|domain>")
         return
-    groups: dict = {}
-    for mod in ("scan", "web", "exploit", "brute", "osint", "payload",
-                "pivot", "wifi", "wordlist"):
-        inst = shell._instantiate_module(mod)
-        if inst is None:
-            continue
-        try:
-            for g, cmds in (inst.suggest_commands() or {}).items():
-                groups.setdefault(g, []).extend(cmds or [])
-        except Exception:
-            continue
-    # reasoning hypotheses add the WHY from the shared WorldModel
-    try:
-        from phantom.modules.suggest import reasoning_suggestion_group
-        for g, cmds in (reasoning_suggestion_group() or {}).items():
-            groups.setdefault(g, []).extend(cmds or [])
-    except Exception:
-        pass
-    render_tagged(tag_suggestions(groups))
+    _nm.render_moves(_nm.rank_next_moves(shell))
 
 
 def cmd_plan(shell, arg: str):

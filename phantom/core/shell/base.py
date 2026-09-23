@@ -333,77 +333,35 @@ class PhantomShell(cmd.Cmd):
             pass
         return False
 
-    # capability id -> manual module (for the reasoning-driven next step)
-    _CAPABILITY_MODULE = {
-        "osint_identity": "osint", "osint_domain": "osint", "breach_check": "osint",
-        "scan_tcp": "scan", "version_detect": "scan", "os_detect": "scan",
-        "service_exploit": "exploit", "rce_foothold": "exploit",
-        "hunt_web": "web", "http_probe": "web", "web_app": "web",
-        "ssh_banner": "scan", "smb_null": "exploit",
-        "creds_brute": "brute", "default_creds": "brute",
-        "payload_gen": "payload", "pivot": "pivot",
-        # deeper capabilities the reasoning engine may suggest: map to the
-        # manual module that performs the equivalent step
-        "web_rce": "exploit",          # upload-RCE probe / exploit module fire
-        "beacon_via_rce": "exploit",   # deploy-agent injects through the RCE
-        "hunt_anomaly": "web",
-        "environment": "scan",         # env probe is a recon surface check
-        "mobile": "web",               # mobile surface is probed over web
-        "ad_enum": "exploit", "kerberoast": "exploit", "as_rep_roast": "exploit",
-        "dc_sync": "exploit", "hash_crack": "exploit",
-        "lateral_pivot": "pivot", "smb_pivot": "pivot", "winrm_pivot": "pivot",
-        # post-beacon-only capabilities live in the C2 operations center
-        "cloud_creds_harvest": "c2", "cloud_s3_enum": "c2", "k8s_escape": "c2",
-    }
+    # capability id -> manual module. The map is OWNED by next_moves so the
+    # ranked `suggest` list and the adaptive `run` can never disagree on
+    # where a capability lives; aliased here because the shell has always
+    # exposed this name.
+    from phantom.core.next_moves import CAPABILITY_MODULE as _CAPABILITY_MODULE
 
     def _next_step(self):
-        """Pick the single best next module from the LIVE engagement state:
-        target type first (identity -> osint, network -> scan), then the
-        senior reasoning hypotheses, then the module with the most
-        actionable suggestions."""
-        from phantom.automation.guidance.targets import classify_target, is_identity_target
-        from phantom.core.knowledge import knowledge_summary
+        """The single best next module from the LIVE engagement state.
 
-        ttype = classify_target(session.target)
-        if is_identity_target(ttype):
-            done = set(session.results.keys())
-            if "osint" not in done:
-                return ("osint", "identity target: build the dossier (emails, phones, "
-                                  "platforms) before touching any network")
-            return ("scan", "identity chain complete — map the victim's IP/network position")
+        Delegates to the ranked move engine (next_moves): the adaptive
+        `run` proposes exactly what `suggest` ranks first, from ONE decision
+        engine instead of a second, parallel heuristic.
+        """
+        from phantom.core import next_moves as _nm
 
-        # senior reasoning hypotheses carry the WHY (same engine as auto-mode)
+        base = _nm.base_move()
+        if base is not None and base.module:
+            return (base.module, base.why)
         try:
-            from phantom.modules.suggest import reasoning_suggestion_group
-            groups = reasoning_suggestion_group() or {}
-            hyp = (groups.get("SUGGESTED (reasoning)") or [])
-            if hyp:
-                text = str(hyp[0])
-                cap = text[1:text.find("]")] if text.startswith("[") else ""
-                reason = text[text.find("]") + 1:].strip() if "]" in text else text
-                mod = self._CAPABILITY_MODULE.get(cap)
-                if mod:
-                    return (mod, reason)
+            # remember=False: proposing a step must not clobber the numbered
+            # list the operator is about to `run <n>`
+            ranked = _nm.rank_next_moves(self, limit=1, remember=False)
         except Exception:
-            pass
-
-        counts = knowledge_summary()
-        if counts.get("service", 0) == 0:
-            return ("scan", "no services discovered yet — enumerate the target first")
-
-        best, best_n = None, 0
-        for mod in ("web", "exploit", "brute", "osint", "payload", "pivot"):
-            inst = self._instantiate_module(mod)
-            if inst is None:
-                continue
-            try:
-                n = sum(len(v or []) for v in (inst.suggest_commands() or {}).values())
-            except Exception:
-                n = 0
-            if n > best_n:
-                best, best_n = mod, n
-        if best and best_n > 0:
-            return (best, f"{best_n} actionable step(s) ready from current findings")
+            ranked = None
+        if ranked is not None and ranked.moves:
+            top = ranked.moves[0]
+            if top.module:
+                return (top.module,
+                        top.why or "best next step from current findings")
         return ("scan", "re-enumerate the target (no actionable suggestions yet)")
 
     MODULE_ALIASES = {

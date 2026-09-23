@@ -42,27 +42,8 @@ class TaggedSuggestion:
     already_ok: bool = False         # ran successfully before (dedup)
     out_of_scope: bool = False
     metadata: Dict = field(default_factory=dict)
-
-    # ---- display -------------------------------------------------------
-    def badge(self) -> str:
-        marks = []
-        if self.trust >= 0.75:
-            marks.append("[green]●●●[/]")
-        elif self.trust >= 0.5:
-            marks.append("[yellow]●●○[/]")
-        else:
-            marks.append("[red]●○○[/]")
-        if self.already_ok:
-            marks.append("[dim]ran-ok[/]")
-        if self.tool_missing:
-            marks.append(f"[red]missing:{self.tool}[/]")
-        if self.out_of_scope:
-            marks.append("[red]out-of-scope[/]")
-        return " ".join(marks)
-
-    def line(self) -> str:
-        why = f"  [dim]why: {self.why}[/]" if self.why else ""
-        return f"{self.command}{why}  {self.badge()}"
+    # Display is owned by next_moves.Move (badge/line here were a SECOND copy
+    # of the same trust-dots convention, free to drift — see the note there).
 
 
 # ---------------------------------------------------------------------------
@@ -173,14 +154,25 @@ def preflight(command: str) -> Dict:
     return {"tool": bare or tool, "missing": missing}
 
 
-def in_scope(command: str) -> bool:
-    """Crude scope check: an explicit scope list must contain the target."""
+def in_scope(command: str = "") -> bool:
+    """Scope preflight for the TARGET, using the same checker the executor
+    enforces with.
+
+    This used to be a substring test ("10.0.0.0/24" never contains
+    "10.0.0.5"), so every suggestion on a CIDR-scoped engagement was
+    flagged out-of-scope. Delegating to :func:`phantom.core.scope.is_in_scope`
+    keeps the badge and the enforcement from disagreeing — including the
+    fail-closed rule for hostnames that do not resolve. `command` is kept
+    for callers that pass it; scope is a property of the target.
+    """
     scope = list(getattr(session, "scope", None) or [])
     if not scope:
+        return True          # unscoped engagements: the caller decides
+    target = (session.target or "").strip()
+    if not target:
         return True
-    target = (session.target or "").lower()
-    return any(target.endswith(s.lower()) or s.lower() in target
-               for s in scope if s)
+    from phantom.core.scope import is_in_scope
+    return is_in_scope(target, scope)
 
 
 def already_ok(command: str) -> bool:
@@ -271,7 +263,12 @@ def tag_suggestions(groups: Dict[str, List[str]]) -> List[TaggedSuggestion]:
                 already_ok=already, out_of_scope=oos,
                 metadata={"evidence_keys": evidence_keys[:8],
                           "evidence_notes": evidence_notes[:8],
-                          "capability_class": cls}))
+                          "capability_class": cls,
+                          # the UNstripped command: the display form drops
+                          # the AGGRESSIVE marker, but an executor that runs
+                          # the suggestion (next_moves.execute_move) must
+                          # still see it or the OPSEC confirmation is lost
+                          "raw": raw.strip()}))
 
     # highest trust first; missing-tool and ran-ok sink to the bottom
     def sort_key(t: TaggedSuggestion):
@@ -284,17 +281,7 @@ def tag_suggestions(groups: Dict[str, List[str]]) -> List[TaggedSuggestion]:
     return tagged
 
 
-def render_tagged(tagged: List[TaggedSuggestion], limit: int = 12) -> None:
-    """Print the tagged suggestion list (the `suggest` front door)."""
-    from rich.console import Console
-    from phantom.utils.notifier import notifier
-    console = Console()
-    if not tagged:
-        notifier.info("No suggestions yet — set a target and scan first.")
-        return
-    console.print("[bold cyan]── SUGGESTIONS (evidence-tagged, preflighted) ──[/]")
-    for i, t in enumerate(tagged[:limit], 1):
-        console.print(f"  [{i:2}] {t.line()}")
-    console.print(
-        "  [dim]●●● high trust · why = findings behind it · missing:<tool> = "
-        "not installed · ran-ok = already succeeded · run <cmd> to execute[/]")
+# NOTE: the renderer for these tags lives in next_moves.render_moves — the
+# tagged suggestion is now an INPUT to the ranked move list, not a list of
+# its own. A second renderer here would be a second, drifting view of the
+# same decision (that is the drift this layer was built to stop).
