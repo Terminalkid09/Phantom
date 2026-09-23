@@ -41,9 +41,28 @@ _SECRET_KEY_RE = re.compile(r"^(?:[a-z0-9_]*[_-])?(?:%s)$" % "|".join(
     re.escape(k) for k in sorted(_SECRET_KEYS, key=len, reverse=True)), re.I)
 
 
+# Credential-bearing FINDING kinds. A `found` event carries its value
+# summary under "<kind>:<key>" (e.g. "creds:ssh", "ad_creds:administrator"),
+# so the key part is just a service/account name and the KIND is the only
+# signal that the value is a credential. Without this list a harvested
+# password travelled to the UI stream and to the LLM advisor under a key
+# that looked innocent ("ssh", "administrator").
+_CREDENTIAL_FINDING_KINDS = {
+    "creds", "cred", "creds_found", "ad_creds", "cloud_creds",
+    "stolen_cookies", "cdp_cookies", "kerberoast", "dcsync", "cracked",
+    "hash", "password", "shadow", "otp", "token",
+}
+
+
 def _is_secret_key(key: str) -> bool:
     k = str(key).lower().strip()
     if k in _SECRET_KEYS:
+        return True
+    # prefixed/suffixed variants: api_key, client_secret, nt_hash, aws_token …
+    if _SECRET_KEY_RE.match(k):
+        return True
+    # finding-shaped key "<kind>:<key>": the KIND decides, never the key part
+    if k.split(":", 1)[0] in _CREDENTIAL_FINDING_KINDS:
         return True
     # broad shape: password/otp/secret/token anywhere in the key name
     return any(s in k for s in ("password", "passwd", "pwd", "otp",

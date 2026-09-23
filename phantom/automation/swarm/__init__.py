@@ -62,11 +62,23 @@ def run_swarm(targets, chain="full", runner=None, profile="enterprise",
               max_agents=MAX_AGENTS_DEFAULT, budget=10, seed=0,
               aggressive=False, on_event=None, drain_timeout=120.0,
               priors=None, failure_log=None, llm_approval=None,
-              advisor_factory=None, seed_facts=None, scope_list=None):
+              advisor_factory=None, seed_facts=None, scope_list=None,
+              reason_profile=""):
     """Run one swarm operation: tasks by chain template, one
     orchestrator+pool PER TARGET (shared semaphore caps total workers),
     commit to the board. Deterministic given a deterministic runner +
     seed (required by the suite).
+
+    TWO distinct knobs, deliberately named apart:
+
+    * ``profile`` — the ENVIRONMENT class of the target (enterprise,
+      cloud, financial, smb, government, mobile): what the box looks
+      like, which drives the chain's vocabulary.
+    * ``reason_profile`` — the REASONING objective (balanced,
+      evidence_first, stealth_first, force_first). It was previously
+      unreachable from the CLI: `auto --swarm --reason X` was a silent
+      no-op. Tasks with no explicit profile take this one; priors-based
+      learning still overrides it when no explicit choice is given.
 
     ``priors`` (a TechniquePriors, tmp-path in tests) learns which
     reasoning profile delivers each goal: omit it and tasks run with
@@ -100,6 +112,11 @@ def run_swarm(targets, chain="full", runner=None, profile="enterprise",
     board = Board(targets)
     tasks = build_tasks(chain, targets, seed=seed, budget=budget,
                         aggressive=aggressive)
+    if reason_profile:
+        # an explicit --reason on the CLI outranks the priors picker
+        for task in tasks:
+            if not task.profile:
+                task.profile = reason_profile
     if seed_facts:
         # operator-known truth lands before the first gate check, so
         # downstream tasks release immediately (no rediscovery)
@@ -275,8 +292,26 @@ def _dispatch(action, board, runner=None, profile="enterprise",
         _events("task_target", {"task": task.id, "target": target,
                                 "ok": result.ok,
                                 "staged": len(result.staged)})
+        # what the task actually produced: emitted as a verbose-only event so
+        # the default stream stays readable and `--verbose` shows the detail
+        _events("task_found", {"task": task.id, "target": target,
+                               "findings": _staged_lines(result.staged)})
         ok_all = ok_all and result.ok
     return ok_all
+
+
+def _staged_lines(staged) -> List[str]:
+    """`kind:key = value` for a worker's staged facts (secrets stay local)."""
+    from phantom.core.stream_contract import fact_line
+    lines = []
+    for item in (staged or [])[:20]:
+        if not isinstance(item, dict):
+            continue
+        line = fact_line(item.get("kind", ""), item.get("key", ""),
+                         item.get("value", ""))
+        if line:
+            lines.append(line)
+    return lines
 
 
 def _consult(task, target, board, llm_approval, advisor_factory,

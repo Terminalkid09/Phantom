@@ -42,6 +42,7 @@ from phantom.automation.social.engine import SocialEngine
 from phantom.automation.fallback import FallbackEngine, HistoricalLearner
 from phantom.automation.ad_awareness import ADAwareness
 from phantom.core.executor import execute_quiet
+from phantom.core.safe_exec import unsafe_slot_reason
 
 # Deep mode: the goal string that runs the full engagement ladder back-to-
 # back in ONE run instead of stopping at the first terminal goal. Each stage
@@ -62,6 +63,37 @@ DEEP_GOAL = "deep"
 DEEP_STAGES = ("deliver", "post_exploit", "expand", "ad", "crack", "lateral")
 
 
+# Gap class -> the capabilities that serve it. The fallback engine's gap
+# analysis says which STRATEGY class is still worth trying; this maps that
+# back to the concrete moves, so a stall recovery can re-arm the useful ones
+# first instead of iterating a dict in insertion order.
+_GAP_CAP_HINTS = {
+    "network_beacon": ("beacon_deploy", "lateral_pivot", "smb_pivot",
+                       "winrm_pivot"),
+    "network_creds": ("ssh_login", "smb_login", "web_creds", "cred_dump"),
+    "exploit_chain": ("service_exploit", "web_rce", "http_probe"),
+    "network_footprint": ("scan_tcp", "version_detect", "surface_map"),
+    "identity_breach": ("breach_check", "osint_identity"),
+    "identity_phish": ("phish", "dm_stage1"),
+    "identity_osint": ("osint_identity", "profile_recon"),
+}
+
+# Slot values interpolated RAW into a command string, restricted to the
+# ones that come from the TARGET (findings, banners, credential discovery,
+# resolved hosts). Those are the injection surface, so they are validated
+# before execution (see `_execute_capability`).
+#
+# Deliberately excluded: operator-supplied LOCAL paths and labels —
+# `carrier`/`payload`/`staging`/`dir`/`bundle` (file paths the executor
+# rewrites for WSL, e.g. C:\... -> /mnt/c/...) and scalars picked from a
+# fixed list (`os`, `method`, `platform`, `provider`, `dialect`). Those are
+# not attacker-controlled and blocking them would only break real runs.
+_SHELL_SLOT_NAMES = frozenset((
+    "base_url", "callback", "domain", "host", "lhost", "lport",
+    "password", "port", "ports", "role_arn", "target", "url", "username",
+))
+
+
 def _in_scope(target: str, scope_list: List[str]) -> bool:
     """Scope enforcement: empty scope list = everything allowed."""
     if not scope_list:
@@ -70,27 +102,16 @@ def _in_scope(target: str, scope_list: List[str]) -> bool:
     return is_in_scope(target, scope_list)
 
 
-# finding kinds whose VALUES must never leave the box: the `found`
-# stream (UI + persisted session mirror) carries summaries, never jars.
-_COOKIE_VALUE_KINDS = ("stolen_cookies", "cdp_cookies")
-
-
 def _safe_stream_value(f) -> str:
     """Operator-visible value summary for `found` events.
 
-    Cookie jars stay local (WorldModel + gitignored session files):
-    the stream only ever says HOW MANY. Everything else renders as
-    before (first values joined). One function so all six emit sites
-    cannot drift apart on this again.
+    The policy (cookie jars stay local; everything else renders as the
+    first values joined) lives in `stream_contract.safe_value` so the
+    agent and the swarm share it. Called from `_emit_found` so every
+    `found` site shares one policy.
     """
-    if getattr(f, "kind", "") in _COOKIE_VALUE_KINDS:
-        v = getattr(f, "value", None)
-        n = v.get("count", "?") if isinstance(v, dict) else "?"
-        return f"{n} cookie(s) — values stay local"
-    v = getattr(f, "value", "")
-    if isinstance(v, dict):
-        return ", ".join(str(x) for x in list(v.values())[:3])
-    return str(v)
+    from phantom.core.stream_contract import safe_value
+    return safe_value(getattr(f, "kind", ""), getattr(f, "value", ""))
 
 
 # ── the EDGE gate's vocabulary ─────────────────────────────────────────────
@@ -549,6 +570,25 @@ class AutonomousAgent:
             except Exception:
                 pass
 
+    def _emit_found(self, capability: str, findings=None, *, labels=None,
+                    partial: bool = False) -> None:
+        """Emit a `found` event that ALWAYS carries an operator-visible value.
+
+        The renderers can only print `key = value` when the event carries
+        the value map. Three call sites used to inline their own summary
+        (dropping the cookie-jar guard) and four passed no values at all,
+        so the stream showed bare keys like `banner:tcp/22:`. One helper
+        so every site cannot drift apart on this again.
+        """
+        findings = list(findings or [])
+        if labels is None:
+            labels = [f"{f.kind}:{f.key}" for f in findings]
+        else:
+            labels = list(labels)
+        values = {f"{f.kind}:{f.key}": _safe_stream_value(f) for f in findings}
+        self._emit("found", capability=capability, findings=labels,
+                   values=values, partial=partial)
+
     # ------------------------------------------------- noise accounting
 
     def _account_noise(self, cap) -> None:
@@ -781,8 +821,7 @@ class AutonomousAgent:
         if not learned:
             self.wm.record_failure(cap.id, "no new facts learned")
             return False
-        self._emit("found", capability=cap.id,
-                   findings=[f"{f.kind}:{f.key}" for f in findings])
+        self._emit_found(cap.id, findings)
         # the gate unlocks only on a REAL origin; when nothing credible came
         # out, say so plainly instead of letting the run retry forever
         best = report.best()
@@ -880,6 +919,22 @@ class AutonomousAgent:
         except Exception as e:
             self._mark_failed(cap.id)
             self._emit("error", capability=cap.id, detail=f"autofill: {e}")
+            return False
+        # execution robustness: a slot value interpolated RAW into a command
+        # string must be a plain token. One carrying a space becomes extra
+        # argv (argument injection) and one carrying `;`/`&` becomes shell
+        # syntax — the executor runs these with shell=True. Refuse with a
+        # typed reason instead of executing a command we do not understand.
+        offenders = [(name, unsafe_slot_reason(val))
+                     for name, val in slots.items()
+                     if name in _SHELL_SLOT_NAMES]
+        offenders = [(name, why) for name, why in offenders if why]
+        if offenders:
+            detail = "; ".join(f"{name}: {why}" for name, why in offenders[:3])
+            self._mark_failed(cap.id)
+            self._emit("blocked", capability=cap.id,
+                       reason=f"unsafe slot value ({detail})")
+            self.wm.record_failure(cap.id, f"unsafe slot value ({detail})")
             return False
         # post-exploitation capabilities execute through the beacon channel
         if cap.category == "post":
@@ -1013,8 +1068,7 @@ class AutonomousAgent:
                     assess_active_directory(self.wm, self.target, ports)
                     self._ad_checked = True
                     if self.wm.has_any("ad_domain"):
-                        self._emit("found", capability="ad_awareness",
-                                   findings=["ad_domain"])
+                        self._emit_found("ad_awareness", labels=["ad_domain"])
             except Exception:
                 pass
         run = self.runtime.run(cmd, category=cap.category,
@@ -1033,21 +1087,29 @@ class AutonomousAgent:
                 if (run.output and getattr(run, "timed_out", False)) else []
             if salvaged:
                 learned = self._register_findings(cap.id, salvaged)
-                self._emit("found", capability=cap.id,
-                           findings=[f"{f.kind}:{f.key}" for f in salvaged],
-                            values={f"{f.kind}:{f.key}": _safe_stream_value(f)
-                                for f in salvaged},
-                           partial=True)
+                self._emit_found(cap.id, salvaged, partial=True)
                 self.wm.record_action(cap.id, slots, cmd, ok=True,
                                       opsec=self.runtime.cost_per_action)
                 return True
-            self.wm.record_failure(cap.id, run.output or "execution failed")
+            # failure taxonomy: WHY it failed (out of scope, tool missing,
+            # timeout, empty output) is what lets the operator and the
+            # fallback engine pick a different angle next time.
+            if getattr(run, "error", ""):
+                reason = f"refused: {run.error}"
+            elif getattr(run, "timed_out", False):
+                reason = "timeout: no usable output"
+            elif run.output.strip():
+                reason = f"non-zero exit: {run.output.strip()[:200]}"
+            else:
+                reason = "execution failed: no output"
+            self.wm.record_failure(cap.id, reason)
             self._mark_failed(cap.id)
-            self._emit("failed", capability=cap.id, output=run.output[:300])
+            self._emit("failed", capability=cap.id, output=run.output[:300],
+                       reason=reason[:300])
             # v3.0: record fallback for smarter next-strategy decisions
             self._fallback.record(
                 cap.category, cap.id, self.target, ok=False,
-                reason=run.output[:200] if run.output else "execution failed",
+                reason=reason[:200],
                 elapsed=run.elapsed if hasattr(run, "elapsed") else 0.0,
             )
             return False
@@ -1075,10 +1137,7 @@ class AutonomousAgent:
                        output="no beacon check-in received")
             return False
         if findings:
-            self._emit("found", capability=cap.id,
-                       findings=[f"{f.kind}:{f.key}" for f in findings],
-                    values={f"{f.kind}:{f.key}": _safe_stream_value(f)
-                            for f in findings})
+            self._emit_found(cap.id, findings)
         # v3.0: record success for fallback/learning engine
         self._fallback.record(
             cap.category, cap.id, self.target, ok=True,
@@ -1172,8 +1231,7 @@ class AutonomousAgent:
                 continue
         self._register_findings(cap.id, found)
         if found:
-            self._emit("found", capability=cap.id,
-                       findings=[f"{f.kind}:{f.key}" for f in found])
+            self._emit_found(cap.id, found)
         return True
 
     def _run_learned_isolated(self, cap, slots: Dict[str, Any]) -> tuple:
@@ -1813,12 +1871,7 @@ class AutonomousAgent:
         output = "\n".join(lines)
         findings = cap.interpret(output, self.wm, slots)
         learned = self._register_findings(cap.id, findings)
-        self._emit("found", capability=cap.id,
-                   findings=[f"{f.kind}:{f.key}" for f in findings],
-                   values={f"{f.kind}:{f.key}": (
-                       ", ".join(str(x) for x in list(f.value.values())[:3])
-                       if isinstance(f.value, dict) else str(f.value))
-                       for f in findings})
+        self._emit_found(cap.id, findings)
         if not learned:
             self._mark_failed(cap.id)
             self.wm.record_failure(cap.id, "no new facts learned")
@@ -1931,12 +1984,7 @@ class AutonomousAgent:
         output = "\n".join(s.to_marker() for s in signals)
         findings = cap.interpret(output, self.wm, slots)
         learned = self._register_findings(cap.id, findings)
-        self._emit("found", capability=cap.id,
-                   findings=[f"{f.kind}:{f.key}" for f in findings],
-                   values={f"{f.kind}:{f.key}": (
-                       ", ".join(str(x) for x in list(f.value.values())[:3])
-                       if isinstance(f.value, dict) else str(f.value))
-                       for f in findings})
+        self._emit_found(cap.id, findings)
         if not learned:
             self._mark_failed(cap.id)
             self.wm.record_failure(cap.id, "no new facts learned")
@@ -1971,12 +2019,7 @@ class AutonomousAgent:
         output = "\n".join(c.marker() for c in creds)
         findings = cap.interpret(output, self.wm, slots)
         learned = self._register_findings(cap.id, findings)
-        self._emit("found", capability=cap.id,
-                   findings=[f"{f.kind}:{f.key}" for f in findings],
-                   values={f"{f.kind}:{f.key}": (
-                       ", ".join(str(x) for x in list(f.value.values())[:3])
-                       if isinstance(f.value, dict) else str(f.value))
-                       for f in findings})
+        self._emit_found(cap.id, findings)
         if not learned:
             self._mark_failed(cap.id)
             self.wm.record_failure(cap.id, "no new facts learned")
@@ -2073,8 +2116,7 @@ class AutonomousAgent:
             return False
         findings = cap.interpret(output, self.wm, slots)
         learned = self._register_findings(cap.id, findings)
-        self._emit("found", capability=cap.id,
-                   findings=[f"{f.kind}:{f.key}" for f in findings])
+        self._emit_found(cap.id, findings)
         if not learned:
             self._mark_failed(cap.id)
             self.wm.record_failure(cap.id, "no new facts learned")
@@ -2154,8 +2196,7 @@ class AutonomousAgent:
             output = run.output or ""
         findings = cap.interpret(output, self.wm, slots)
         learned = self._register_findings(cap.id, findings)
-        self._emit("found", capability=cap.id,
-                   findings=[f"{f.kind}:{f.key}" for f in findings])
+        self._emit_found(cap.id, findings)
         if not learned:
             self._mark_failed(cap.id)
             self.wm.record_failure(cap.id, "no new facts learned")
@@ -2244,10 +2285,7 @@ class AutonomousAgent:
         findings = cap.interpret(output, self.wm, slots)
         learned = self._register_findings(cap.id, findings)
         if findings:
-            self._emit("found", capability=cap.id,
-                       findings=[f"{f.kind}:{f.key}" for f in findings],
-                    values={f"{f.kind}:{f.key}": _safe_stream_value(f)
-                            for f in findings})
+            self._emit_found(cap.id, findings)
         if not learned:
             self._mark_failed(cap.id)
             self.wm.record_failure(cap.id, "no new facts learned")
@@ -2775,7 +2813,29 @@ class AutonomousAgent:
                     if self._exec_with_permit(step):
                         rearmed += 1
 
-        for cid in list(self._failed_caps):
+        # R1b: the fallback engine's GAP ANALYSIS names which strategy class
+        # is still worth trying (`next_strategy` -> `_gap_analysis`). It was
+        # tested but never consulted: every failure got recorded, learned —
+        # and then ignored, because the learned signal never reached a
+        # decision. Order the re-arm by it, so the recovery spends its
+        # budget on the angle that actually serves the MISSING fact.
+        gap = ""
+        try:
+            gap = self._fallback.next_strategy(
+                getattr(self, "_current_strategy", "") or "", self.wm) or ""
+        except Exception as exc:
+            self._degrade("fallback", exc)
+        hints = tuple(_GAP_CAP_HINTS.get(gap, ()))
+        if gap:
+            self._emit("gap", goal=goal, missing=gap,
+                       hints=list(hints[:4]), failed=len(self._failed_caps),
+                       stall=self._last_stall)
+        candidates = sorted(
+            self._failed_caps,
+            key=lambda cid: ((hints.index(cid) if cid in hints else len(hints)),
+                             cid))
+
+        for cid in candidates:
             cap = self.registry.get(cid)
             if cap is None:
                 continue
@@ -3113,6 +3173,9 @@ class AutonomousAgent:
             plan = self.planner.plan_strategic(
                 self.wm, goal=goal, dead=self._dead_cap_ids(),
                 preference=prefs, ledger=self.ledger)
+            # the strategy the run is CURRENTLY on, so a stall recovery can
+            # ask the fallback engine "and what else you got?" with context
+            self._current_strategy = plan.strategy or ""
             # degradation tracking: when the planner could not reach this
             # goal for the target TYPE and fell back (identity->footprint on
             # an IP, network->OSINT on an email), record the fallback so
@@ -3290,8 +3353,28 @@ class AutonomousAgent:
             decision = self.arbiter.evaluate(view, base, self._signals())
             self._decisions[view.id] = decision
             return decision.value
-        except Exception:
+        except Exception as exc:      # a broken lens must not be silent
+            self._degrade("arbiter", exc)
             return base
+
+    def _degrade(self, layer: str, exc: BaseException) -> None:
+        """Announce ONCE that a reasoning layer failed and the run fell back
+        to the raw heuristic.
+
+        A silent `except: return base` looks exactly like competence: the
+        move still happens, the explanation just quietly disappears. The
+        operator has to be able to tell "the arbiter weighted this" from
+        "the arbiter was dead and we used a constant".
+        """
+        seen = getattr(self, "_degraded_layers", None)
+        if seen is None:
+            seen = self._degraded_layers = set()
+        key = f"{layer}:{type(exc).__name__}"
+        if key in seen:
+            return
+        seen.add(key)
+        self._emit("degraded", layer=layer,
+                   detail=f"{type(exc).__name__}: {str(exc)[:120]}")
 
     def search_policy(self) -> str:
         """The current search MODE (breadth/depth/identity), promoted from
@@ -3299,7 +3382,8 @@ class AutonomousAgent:
         whole cell follows instead of a canned move list."""
         try:
             return self.arbiter.search_policy(self._signals())
-        except Exception:
+        except Exception as exc:
+            self._degrade("search_policy", exc)
             return "adaptive"
 
     # --------------------------------------------------- cells (C2/C4)
@@ -3941,7 +4025,17 @@ def run_campaign(targets: List[str], profile: str = "enterprise",
             import re
             safe = re.sub(r"[^A-Za-z0-9._\-]", "_", target)
             state_path = os.path.join(state_dir, f"{safe}.json")
+        # sub-agent lifecycle is observable: without these the console showed
+        # a target's stream start mid-sentence, with no way to tell a queued
+        # sub-agent from a running one or to see how each one ended.
+        _stream("worker", {"worker": target, "phase": "queued",
+                           "pool": max(1, max_agents)})
         with sem:
+            started = time.time()
+            _stream("worker", {"worker": target, "phase": "start",
+                               "role": ("phase-workers"
+                                        if workers_per_target > 1 else "lead"),
+                               "workers": workers_per_target})
             if workers_per_target > 1:
                 result, agent = _run_target_with_workers(
                     target=target, profile=profile, aggressive=aggressive,
@@ -3972,6 +4066,14 @@ def run_campaign(targets: List[str], profile: str = "enterprise",
                     hunt_delay=hunt_delay, threat_intel=threat_intel,
                     persist_learning=persist_learning, experience=experience,
                     evolution=evolution, llm=llm, stop_event=stop_event)
+        _stream("worker", {
+            "worker": target, "phase": "done",
+            "seconds": round(time.time() - started, 1),
+            "actions": int((result or {}).get("actions_taken", 0) or 0),
+            "goal_met": bool((result or {}).get("beacon_established")
+                             or (result or {}).get("cleanup_done")),
+            "failures": int((result or {}).get("failures", 0) or 0),
+        })
         with lock:
             results[target] = result
             agents[target] = agent
