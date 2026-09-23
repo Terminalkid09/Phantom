@@ -70,3 +70,30 @@ def test_dedup_marks_already_ok():
 def test_empty_groups_safe():
     assert tag_suggestions({}) == []
     assert tag_suggestions({"G": []}) == []
+
+
+def test_in_scope_accepts_a_cidr_scope(monkeypatch):
+    """Regression: the scope preflight used a substring test, so a CIDR
+    scope ("10.0.0.0/24") never matched "10.0.0.5" and EVERY suggestion was
+    flagged out-of-scope. It now uses the checker the executor enforces."""
+    from phantom.core.session import session
+    from phantom.core.suggest_meta import in_scope
+    monkeypatch.setattr(session, "target", "10.0.0.5", raising=False)
+    monkeypatch.setattr(session, "scope", ["10.0.0.0/24"], raising=False)
+    assert in_scope("nmap -sV 10.0.0.5") is True
+
+
+def test_in_scope_flags_a_foreign_target(monkeypatch):
+    from phantom.core.session import session
+    from phantom.core.suggest_meta import in_scope
+    monkeypatch.setattr(session, "target", "192.168.1.7", raising=False)
+    monkeypatch.setattr(session, "scope", ["10.0.0.0/24"], raising=False)
+    assert in_scope("nmap -sV 192.168.1.7") is False
+
+
+def test_in_scope_unscoped_is_allowed(monkeypatch):
+    from phantom.core.session import session
+    from phantom.core.suggest_meta import in_scope
+    monkeypatch.setattr(session, "target", "10.0.0.5", raising=False)
+    monkeypatch.setattr(session, "scope", [], raising=False)
+    assert in_scope("nmap -sV 10.0.0.5") is True
