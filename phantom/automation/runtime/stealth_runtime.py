@@ -83,6 +83,11 @@ class StealthRun:
     egress: Optional[str] = None
     timed_out: bool = False   # runner hit its timeout (output may be partial)
     elapsed: float = 0.0
+    # why the run did not execute / failed. `QuietResult.error` used to be
+    # DROPPED here, so "out of scope", "tool not installed" and "command ran
+    # and printed nothing" all reached the operator as the same empty
+    # "execution failed". The failure taxonomy needs this field.
+    error: str = ""
 
 
 class StealthRuntime:
@@ -121,6 +126,7 @@ class StealthRuntime:
             result = self.runner(command, timeout=timeout)
             return StealthRun(command=command, ok=result.ok,
                               output=(result.stdout or "")[:200_000],
+                              error=str(getattr(result, "error", "") or "")[:300],
                               delay=delay, egress=lease.name,
                               timed_out=bool(getattr(result, "timed_out", False)),
                               elapsed=time.time() - t0)

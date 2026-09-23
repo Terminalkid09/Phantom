@@ -48,6 +48,47 @@ class UnsafeCommand(ValueError):
     """The command cannot be represented as argv (or is outright refused)."""
 
 
+# Slot values are interpolated RAW into command strings, and the executor
+# runs those with shell=True. A value carrying a space arrives as TWO argv
+# entries (nmap reads the second as another flag); one carrying `;`/`&`
+# becomes shell syntax. The safe set below is deliberately the intersection
+# of POSIX sh and cmd.exe: a token built from it is inert on both.
+#
+# `!` and `?` are allowed: neither is a command separator (history expansion
+# is interactive-only, cmd.exe delayed expansion needs setlocal/the flag),
+# and refusing them would block real passwords and query strings.
+_SLOT_SAFE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    "._:/@=+,-?!")
+_SLOT_MAX_LEN = 512
+
+
+def unsafe_slot_reason(value) -> str:
+    """Why ``value`` must not be interpolated into a command string.
+
+    Returns "" when the value is a plain token that stays a single inert
+    argument on every shell Phantom executes through. The agent refuses the
+    capability otherwise, instead of letting the value become argument or
+    shell injection.
+    """
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, (dict, list, tuple, set)):
+        return ""   # structured values are read by interpreters, not shells
+    text = str(value)
+    if not text:
+        return ""
+    if len(text) > _SLOT_MAX_LEN:
+        return f"value longer than {_SLOT_MAX_LEN} chars"
+    bad = sorted({ch for ch in text if ch not in _SLOT_SAFE_CHARS})
+    if bad:
+        shown = "".join(" " if ch.isspace() else ch for ch in bad[:8])
+        return f"unsafe character(s) {shown!r}"
+    return ""
+
+
 @dataclass
 class ParsedPipeline:
     source: str
