@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Brain, RefreshCw, Trash2, TrendingUp, TrendingDown, Database } from 'lucide-react'
-import { useApi } from '@/hooks/useApi'
+import { apiError, useApi } from '@/hooks/useApi'
 
 interface Episode {
   sig: { cls?: string; product?: string; services?: string[]; defenses?: string[] }
@@ -50,13 +50,22 @@ export default function LearningPanel() {
   const [data, setData] = useState<LearningData>(EMPTY)
   const [loading, setLoading] = useState(false)
   const [notice, setNotice] = useState('')
+  // a failed LOAD used to leave the panel showing zeroes as if the memory
+  // were empty — the operator cannot tell "nothing learned" from "the
+  // backend did not answer". One visible reason fixes that.
+  const [loadError, setLoadError] = useState('')
   const [filter, setFilter] = useState<'all' | 'repairs' | 'failures'>('all')
 
   const load = async () => {
     setLoading(true)
     try {
       const res = await api('GET', '/api/learning')
-      if (res.status === 200) setData({ ...EMPTY, ...(res.data as LearningData) })
+      if (res.status === 200) {
+        setData({ ...EMPTY, ...(res.data as LearningData) })
+        setLoadError('')
+      } else {
+        setLoadError(apiError(res))
+      }
     } finally {
       setLoading(false)
     }
@@ -70,7 +79,7 @@ export default function LearningPanel() {
       setNotice('Learning memory cleared.')
       load()
     } else {
-      setNotice('Could not clear the learning memory.')
+      setNotice(`Could not clear the learning memory — ${apiError(res)}`)
     }
     setTimeout(() => setNotice(''), 4000)
   }
@@ -118,6 +127,11 @@ export default function LearningPanel() {
           </button>
         </div>
       </div>
+      {loadError && (
+        <div className="px-3 py-1 text-[11px] text-phantom-error border-b border-phantom-error/30 bg-phantom-error/5">
+          Learning memory unavailable — {loadError}
+        </div>
+      )}
       {notice && (
         <div className="px-3 py-1 text-[11px] text-phantom-magenta border-b border-surface-border">
           {notice}

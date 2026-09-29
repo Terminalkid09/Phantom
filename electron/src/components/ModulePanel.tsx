@@ -4,7 +4,7 @@ import {
   Terminal, Pencil, Wrench, Brain, Play
 } from 'lucide-react'
 import { useStore } from '@/store'
-import { useApi } from '@/hooks/useApi'
+import { apiError, useApi } from '@/hooks/useApi'
 
 interface SuggestionItem {
   command: string
@@ -71,7 +71,7 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
       ? `?target=${encodeURIComponent(targetOverride.trim())}` : ''
     const response = await api('GET', `/api/modules/${moduleId}${qs}`)
     if (response.status !== 200) {
-      setError(String((response.data as { error?: string })?.error || 'Module unavailable'))
+      setError(apiError(response))
       return
     }
     const data = response.data as ModuleData
@@ -121,7 +121,9 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
     setRunning(false)
     const data = response.data as { combined?: string; error?: string; returncode?: number }
     if (response.status !== 200 || data.error) {
-      setError(data.error || `Command failed (${data.returncode ?? response.status})`)
+      setError(data.error || (response.status !== 200
+        ? apiError(response)
+        : `Command failed (exit ${data.returncode ?? '?'})`))
       setOutput((current) => `${current}${data.combined || ''}`)
       return
     }
@@ -151,7 +153,9 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
       total_duration?: number; error?: string
     }
     if (response.status !== 200 || data.error) {
-      setError(data.error || 'Group execution failed')
+      setError(data.error || (response.status !== 200
+        ? apiError(response)
+        : 'Group execution failed'))
       return
     }
     const results = data.results || []

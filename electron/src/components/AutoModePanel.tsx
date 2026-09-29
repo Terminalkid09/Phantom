@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { useStore } from '@/store'
-import { useApi } from '@/hooks/useApi'
+import { apiError, useApi } from '@/hooks/useApi'
 import { useSerialPoll } from '@/hooks/useSerialPoll'
 import {
   Bot, Play, Square, FileText, Plus, X, Zap,
@@ -201,6 +201,7 @@ export default function AutoModePanel() {
       goal: autoMode.goal,
       agents: autoMode.agents,
       llm: autoMode.llm,
+      experience: autoMode.experience,
       verbose: autoMode.verbose
     })
 
@@ -289,7 +290,7 @@ export default function AutoModePanel() {
       const res = await api('POST', '/api/automode/llm', { allow: checked })
       if (res.status !== 200) {
         appendReasoning(new Date().toLocaleTimeString(),
-          `ERROR: LLM toggle failed (${(res.data as { error?: string })?.error || res.status})`)
+          `ERROR: LLM toggle failed — ${apiError(res)}`)
       }
     }
   }
@@ -589,6 +590,19 @@ export default function AutoModePanel() {
                 CIDR/range inputs only discover hosts by default. This engages
                 the FULL chain on every discovered host — loud, use only on
                 authorized ranges.
+              </p>
+            </div>
+            <div>
+              <label className="flex items-center justify-between cursor-pointer">
+                <span className="text-[10px] text-text-dim">Learning memory</span>
+                <input type="checkbox" checked={autoMode.experience}
+                  onChange={(e) => setAutoMode({ experience: e.target.checked })}
+                  className="accent-phantom-green" />
+              </label>
+              <p className="text-[9px] text-text-dim mt-0.5">
+                Cross-engagement memory: runs record what worked, why walls
+                happened and what unblocked them (data/experience_cases.json,
+                local disk only). Unchecked = run-only for the next run.
               </p>
             </div>
             <div>

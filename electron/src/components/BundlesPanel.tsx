@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Package, Download, Upload, RefreshCw, FileBox } from 'lucide-react'
-import { requestApi } from '@/hooks/useApi'
+import { apiError, requestApi } from '@/hooks/useApi'
 import { useSerialPoll } from '@/hooks/useSerialPoll'
 import { useStore } from '@/store'
 
@@ -51,7 +51,7 @@ export default function BundlesPanel() {
         pushToast({ title: 'Bundle exported', description: d.path, type: 'success' })
         await refresh()
       } else {
-        pushToast({ title: 'Export failed', description: String((res.data as { error?: string }).error), type: 'error' })
+        pushToast({ title: 'Export failed', description: apiError(res), type: 'error' })
       }
     } finally {
       setBusy(false)
@@ -67,7 +67,7 @@ export default function BundlesPanel() {
         const d = res.data as { summary: string; target: string }
         pushToast({ title: `Imported ${name}`, description: d.summary, type: 'success' })
       } else {
-        pushToast({ title: 'Import failed', description: String((res.data as { error?: string }).error), type: 'error' })
+        pushToast({ title: 'Import failed', description: apiError(res), type: 'error' })
       }
     } finally {
       setBusy(false)
