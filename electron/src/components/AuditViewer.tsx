@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react'
-import { useApi } from '@/hooks/useApi'
+import { apiError, useApi } from '@/hooks/useApi'
 import { useSerialPoll } from '@/hooks/useSerialPoll'
 import {
   ScrollText, RefreshCw, ShieldCheck, ShieldX, Fingerprint,
@@ -49,9 +49,18 @@ export default function AuditViewer({ standalone }: { standalone?: boolean }) {
   const [data, setData] = useState<AuditData | null>(null)
   const [tail, setTail] = useState(50)
 
+  // `!data` used to render "Loading audit log…" forever when the backend
+  // never answered: an endless spinner is a worse lie than an error.
+  const [error, setError] = useState('')
+
   const load = useCallback(async () => {
     const res = await api('GET', `/api/c2/audit?tail=${tail}`)
-    if (res.status === 200 && res.data) setData(res.data as AuditData)
+    if (res.status === 200 && res.data) {
+      setData(res.data as AuditData)
+      setError('')
+    } else if (res.status !== 200) {
+      setError(apiError(res))
+    }
   }, [api, tail])
 
   useSerialPoll(load, 5000, true, [load])
@@ -60,7 +69,19 @@ export default function AuditViewer({ standalone }: { standalone?: boolean }) {
     return (
       <div className="h-full flex flex-col items-center justify-center text-text-dim">
         <ScrollText size={30} className="mb-2" />
-        <p className="text-xs">Loading audit log…</p>
+        {error ? (
+          <>
+            <p className="text-xs text-phantom-error">Audit log unavailable — {error}</p>
+            <button
+              onClick={load}
+              className="mt-2 text-xs px-2 py-1 rounded border border-surface-border hover:bg-surface-hover"
+            >
+              Retry
+            </button>
+          </>
+        ) : (
+          <p className="text-xs">Loading audit log…</p>
+        )}
       </div>
     )
   }

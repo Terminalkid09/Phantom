@@ -101,6 +101,7 @@ export interface AutoModeState {
   profile: string
   goal: string
   llm: boolean
+  experience: boolean
   verbose: boolean
 }
 
@@ -123,11 +124,17 @@ interface PhantomStore {
   activeBeacon: string | null
   tasks: Record<string, C2Task[]>
   c2Connected: boolean
+  // the LAST IPC/API failure, shown to the operator. `c2Connected:false`
+  // alone cannot distinguish "the listener is down" from "the desktop
+  // bridge never answered" (an IPC timeout), which is the failure the
+  // operator actually needs to see.
+  c2Error: string
   setListener: (l: Partial<ListenerState>) => void
   setBeacons: (b: Beacon[]) => void
   setActiveBeacon: (id: string | null) => void
   setTasks: (beaconId: string, tasks: C2Task[]) => void
   setC2Connected: (v: boolean) => void
+  setC2Error: (e: string) => void
 
   // Session
   session: SessionState
@@ -178,12 +185,14 @@ export const useStore = create<PhantomStore>((set, get) => ({
   activeBeacon: null,
   tasks: {},
   c2Connected: false,
+  c2Error: '',
   setListener: (l) => set((s) => ({ listener: { ...s.listener, ...l } })),
   setBeacons: (b) => set({ beacons: b }),
   setActiveBeacon: (id) => set({ activeBeacon: id }),
   setTasks: (beaconId, tasks) =>
     set((s) => ({ tasks: { ...s.tasks, [beaconId]: tasks } })),
   setC2Connected: (v) => set({ c2Connected: v }),
+  setC2Error: (e) => set({ c2Error: e }),
 
   // Session defaults
   session: {
@@ -217,6 +226,7 @@ export const useStore = create<PhantomStore>((set, get) => ({
     profile: 'enterprise',
     goal: 'deliver',
     llm: false,
+    experience: true,
     verbose: false
   },
   setAutoMode: (a) => set((s) => ({ autoMode: { ...s.autoMode, ...a } })),

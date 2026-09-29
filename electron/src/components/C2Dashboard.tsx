@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useStore, type Beacon, type C2Task } from '@/store'
-import { useApi } from '@/hooks/useApi'
+import { apiError, useApi } from '@/hooks/useApi'
 import { useSerialPoll } from '@/hooks/useSerialPoll'
 import RemoteCanvas from '@/components/RemoteCanvas'
 import {
@@ -13,7 +13,7 @@ import {
 export default function C2Dashboard() {
   const {
     listener, beacons, activeBeacon, tasks,
-    c2Connected, elapsed, setActiveBeacon
+    c2Connected, c2Error, elapsed, setActiveBeacon
   } = useStore()
   const { api, pollC2 } = useApi()
   const [taskInput, setTaskInput] = useState('')
@@ -27,6 +27,16 @@ export default function C2Dashboard() {
     fetchBeaconCommands(api).then(setBeaconCmds)
   }, [api])
   const [healthLoading, setHealthLoading] = useState(false)
+
+  // 9.3 auto-open shell: the moment a beacon is LIVE, open its console.
+  // Waiting for the operator to notice and click is how a live session sits
+  // idle while the beacon's first task goes unread. Only fills an EMPTY
+  // selection: an operator who switched panels keeps what they chose.
+  useEffect(() => {
+    if (activeBeacon) return
+    const live = beacons.find((b) => b.status === 'LIVE')
+    if (live) setActiveBeacon(live.id)
+  }, [beacons, activeBeacon, setActiveBeacon])
 
   const handleStartListener = async () => {
     await api('POST', '/api/c2/listener/start')
@@ -110,6 +120,14 @@ export default function C2Dashboard() {
           <span className="text-xs text-text-secondary">
             {c2Connected ? 'API connected' : 'API disconnected'}
           </span>
+          {!c2Connected && c2Error && (
+            <span
+              className="text-xs text-phantom-error max-w-[360px] truncate"
+              title={c2Error}
+            >
+              {c2Error}
+            </span>
+          )}
         </div>
       </div>
 
@@ -743,7 +761,7 @@ function BeaconAuthPanel({ api }: { api: ReturnType<typeof useApi>['api'] }) {
     const res = await api('POST', '/api/c2/beacon-auth/rotate', { beacon_id: beaconId })
     setLoading(false)
     if (res.status === 200) { setMsg('Key rotated ✓'); load() }
-    else setMsg('Rotation failed')
+    else setMsg(`Rotation failed — ${apiError(res)}`)
   }
 
   const handleRevoke = async (beaconId: string) => {
@@ -752,7 +770,7 @@ function BeaconAuthPanel({ api }: { api: ReturnType<typeof useApi>['api'] }) {
     const res = await api('POST', '/api/c2/beacon-auth/revoke', { beacon_id: beaconId })
     setLoading(false)
     if (res.status === 200) { setMsg('Identity revoked ✓'); load() }
-    else setMsg('Revocation failed')
+    else setMsg(`Revocation failed — ${apiError(res)}`)
   }
 
   return (
@@ -821,7 +839,7 @@ function CertsPanel({ api }: { api: ReturnType<typeof useApi>['api'] }) {
   const handleUninstall = async () => {
     const res = await api('POST', '/api/c2/certs/uninstall')
     if (res.status === 200) { setMsg('Certificates removed ✓') }
-    else setMsg(String((res.data as { error?: string })?.error || 'Failed'))
+    else setMsg(`Removal failed — ${apiError(res)}`)
     load()
   }
 
