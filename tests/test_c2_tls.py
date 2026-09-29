@@ -86,7 +86,38 @@ class TestC2ServerTls(unittest.TestCase):
              patch.dict(os.environ, {"PHANTOM_MTLS_CA": mtls["ca_cert"]}, clear=False):
             mtls_ctx = self.server._get_ssl_context()
             self.assertIsNotNone(mtls_ctx)
+            # SECURE BY DEFAULT: a client without a certificate is refused at
+            # the handshake, so the app-layer HMAC is a second gate, not the
+            # only one (CERT_OPTIONAL would let anyone speak TLS to the C2).
+            self.assertEqual(mtls_ctx.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_mtls_client_cert_optional_when_downgraded(self):
+        """c2.mtls_require_client_cert=false restores the legacy posture."""
+        from unittest.mock import patch
+        from phantom.utils.beacon_auth import ensure_mtls_material
+        mtls = ensure_mtls_material(self.tmp, "127.0.0.1")
+        with patch("phantom.core.c2_server.use_mtls", return_value=True), \
+             patch.dict(os.environ, {
+                 "PHANTOM_MTLS_CA": mtls["ca_cert"],
+                 "PHANTOM_MTLS_REQUIRE_CLIENT_CERT": "0",
+             }, clear=False):
+            mtls_ctx = self.server._get_ssl_context()
+            self.assertIsNotNone(mtls_ctx)
             self.assertEqual(mtls_ctx.verify_mode, ssl.CERT_OPTIONAL)
+
+    def test_ssl_context_enforces_tls_floor_and_strong_ciphers(self):
+        """A modern floor + AEAD-only policy, independent of interpreter
+        defaults (the guarantee must not drift with the Python build)."""
+        from unittest.mock import patch
+        with patch("phantom.core.c2_server.use_mtls", return_value=False):
+            ctx = self.server._get_ssl_context()
+            self.assertIsNotNone(ctx)
+            self.assertGreaterEqual(ctx.minimum_version,
+                                    ssl.TLSVersion.TLSv1_2)
+            names = " ".join(c["name"] for c in ctx.get_ciphers())
+            self.assertTrue("GCM" in names or "CHACHA20" in names)
+            for weak in ("RC4", "3DES", "MD5", "NULL"):
+                self.assertNotIn(weak, names)
 
     def test_mtls_client_certificate_roundtrip(self):
         from unittest.mock import patch
@@ -157,8 +188,12 @@ class TestC2ServerTls(unittest.TestCase):
     def test_https_checkin_roundtrip(self):
         """Start an HTTPS listener on an ephemeral port and drive a beacon
         check-in with an encrypted body over real TLS."""
-        self.server._get_ssl_context()
-        ctx = self.server._get_ssl_context()
+        from unittest.mock import patch
+        # Plain-HTTPS roundtrip: the listener under test is TLS-only, without
+        # the (default) client-certificate requirement, so pin use_mtls off
+        # while the context is built.
+        with patch("phantom.core.c2_server.use_mtls", return_value=False):
+            ctx = self.server._get_ssl_context()
 
         # Enroll the beacon so auth passes (secure-by-default). The patch
         # must stay active during the whole asyncio run so the handler can
@@ -197,14 +232,18 @@ class TestC2ServerTls(unittest.TestCase):
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = ssl.CERT_NONE
 
-                from phantom.utils.c2_crypto import encrypt_data, decrypt_data
+                # Per-beacon envelope keys: the listener seals its response
+                # with the key THIS identity derives, so the probe derives it
+                # the same way a real beacon does.
+                from phantom.utils.c2_crypto import (
+                    encrypt_for_beacon, decrypt_for_beacon)
                 ts = str(int(_time.time()))
                 nonce_val = "test-nonce-checkin"
                 counter_val = "1"
-                telemetry = encrypt_data(_json.dumps({
+                telemetry = encrypt_for_beacon(_json.dumps({
                     "sysinfo": "OS: Linux 5.15\nUser: root\nArch: x64\nHost: test",
                     "netinfo": "IP: 10.0.0.5",
-                }))
+                }), "beacon-tls-1")
                 base_headers = {
                     "X-Beacon-Id": "beacon-tls-1",
                     "X-Beacon-Timestamp": ts,
@@ -221,13 +260,14 @@ class TestC2ServerTls(unittest.TestCase):
                             ssl=ssl_ctx) as resp:
                         self.assertEqual(resp.status, 200)
                         body = await resp.text()
-                        decrypted = decrypt_data(body)
+                        decrypted = decrypt_for_beacon(body, "beacon-tls-1")
                         self.assertIn("tasks", decrypted)
                     result_ts = str(int(_time.time()))
                     result_nonce = "test-nonce-result"
                     result_counter = "2"
-                    result_body = encrypt_data(_json.dumps({
-                        "task_id": "t-1", "output": "PERSISTENCE_OK"}))
+                    result_body = encrypt_for_beacon(_json.dumps({
+                        "task_id": "t-1", "output": "PERSISTENCE_OK"}),
+                        "beacon-tls-1")
                     result_headers = {
                         "X-Beacon-Id": "beacon-tls-1",
                         "X-Beacon-Timestamp": result_ts,
@@ -278,8 +318,12 @@ class TestBeaconTlsConfig(unittest.TestCase):
 
     def test_dropper_https_url_and_flag(self):
         for platform in ("linux", "macos", "android"):
-            plain = generate_dropper(platform, "10.0.0.1", 443, use_ssl=False)
-            tls = generate_dropper(platform, "10.0.0.1", 443, use_ssl=True)
+            # one-shot form: the default is resilient, which base64-wraps the
+            # command and would hide the literal URL under test
+            plain = generate_dropper(platform, "10.0.0.1", 443, use_ssl=False,
+                                     resilient=False)
+            tls = generate_dropper(platform, "10.0.0.1", 443, use_ssl=True,
+                                   resilient=False)
             self.assertIn("http://10.0.0.1:443", plain)
             self.assertIn("https://10.0.0.1:443", tls)
             self.assertIn("443 0", plain)

@@ -59,9 +59,11 @@ class TestEdrKillBeaconSurface(unittest.TestCase):
             src = fh.read()
         self.assertIn("namespace edrkill", src)
         self.assertIn("disable_defender", src)
-        # detect-first design
+        # detect-first design (the keyword list now lives in the shared
+        # `dfns` namespace so edrcheck and edrkill use the same detector)
         self.assertIn("detect_defensive_services", src)
-        self.assertIn("DEFENSIVE_KEYWORDS", src)
+        self.assertIn("kDefensiveKeywords", src)
+        self.assertIn("namespace dfns", src)
         # generic keywords catch products nobody hard-coded
         for kw in ("\"edr\"", "\"endpoint\"", "\"antivirus\"",
                    "\"protection\""):

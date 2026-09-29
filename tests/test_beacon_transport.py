@@ -27,9 +27,17 @@ from phantom.utils.c2_crypto import (
     _c2_literal,
     beacon_config_endpoint,
     server_cert_fingerprint,
+    server_cert_pubkey_pin,
     write_beacon_c2_config,
 )
-from phantom.utils.network import beacon_pin, get_c2_fallbacks, get_c2_proxy
+from phantom.utils.network import (
+    beacon_pin,
+    beacon_pubkey_pin,
+    get_c2_fallbacks,
+    get_c2_host_pins,
+    get_c2_proxy,
+    get_c2_pubkey_pins,
+)
 
 BEACON_SRC = os.path.join("phantom", "payloads", "beacon", "src")
 NETWORK_H = os.path.join(BEACON_SRC, "network.h")
@@ -210,11 +218,138 @@ class TestPinnedPeer(unittest.TestCase):
                 os.environ["PHANTOM_BEACON_PIN"] = saved
 
 
+class TestPerEndpointPins(unittest.TestCase):
+    """A ladder of independent redirectors cannot share one certificate.
+
+    Each rung may carry its own SHA-256 DER pin (C2_HOST_PINS), aligned
+    POSITIONALLY with [C2_HOST] + C2_HOSTS; an empty field means "inherit the
+    fallback pin". The macOS transport gets the same rungs in libcurl's
+    sha256//<base64> SPKI shape (C2_HOST_PUBKEY_PINS), since it cannot pin a
+    DER certificate.
+    """
+
+    def _write(self, **kw):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="c2pins_")
+        return _read(write_beacon_c2_config(tmp, **kw))
+
+    def _self_signed(self, directory):
+        """A real self-signed pair plus its DER fingerprint, stdlib-friendly."""
+        import datetime
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "c2.local")])
+        cert = (x509.CertificateBuilder()
+                .subject_name(name).issuer_name(name)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(datetime.datetime.utcnow())
+                .not_valid_after(datetime.datetime.utcnow() +
+                                 datetime.timedelta(days=1))
+                .sign(key, hashes.SHA256()))
+        path = os.path.join(directory, "server.crt")
+        with open(path, "wb") as handle:
+            handle.write(cert.public_bytes(serialization.Encoding.PEM))
+        return path
+
+    def test_pins_align_positionally_with_the_ladder(self):
+        a, b, c = "a" * 64, "b" * 64, "c" * 64
+        text = self._write(host="front.example.net", port=8443,
+                           hosts=["backup1.example.net", "backup2.example.net"],
+                           pins=[a, b, c])
+        self.assertIn(f'#define C2_HOST_PINS "{a},{b},{c}"', text)
+        self.assertIn("#define BEACON_PER_ENDPOINT_PINS 1", text)
+
+    def test_an_empty_field_inherits_the_fallback_pin(self):
+        a, c = "a" * 64, "c" * 64
+        text = self._write(host="front.example.net", port=8443,
+                           hosts=["backup1.example.net", "backup2.example.net"],
+                           pins=[a, "", c])
+        # The gap is preserved: position 1 means "use BEACON_SERVER_FINGERPRINT".
+        self.assertIn(f'#define C2_HOST_PINS "{a},,{c}"', text)
+
+    def test_a_single_endpoint_build_emits_no_per_endpoint_define(self):
+        a = "a" * 64
+        text = self._write(host="c2.example.com", port=443, pin=a, pins=[a])
+        self.assertNotIn("C2_HOST_PINS", text)
+        self.assertNotIn("BEACON_PER_ENDPOINT_PINS", text)
+
+    def test_malformed_pins_are_dropped_not_embedded(self):
+        good = "b" * 64
+        text = self._write(host="front.example.net", port=8443,
+                           hosts=["backup1.example.net", "backup2.example.net"],
+                           pins=['bad"pin', good, "z" * 64])
+        # position 0 malformed -> empty, 1 kept, 2 malformed -> trimmed
+        self.assertIn(f'#define C2_HOST_PINS ",{good}"', text)
+        self.assertNotIn('bad"pin', text)
+
+    def test_the_pubkey_pin_is_emitted_for_macos(self):
+        spki = "sha256//" + "A" * 43 + "="
+        text = self._write(host="front.example.net", port=8443,
+                           pubkey_pin=spki)
+        self.assertIn(f'#define BEACON_SERVER_PUBKEY_PIN "{spki}"', text)
+
+    def test_a_global_pubkey_pin_needs_no_per_endpoint_marker(self):
+        """BEACON_PIN_ENFORCED keys off the define itself; the per-endpoint
+        marker is only for a LADDER with per-rung pins."""
+        spki = "sha256//" + "A" * 43 + "="
+        text = self._write(host="front.example.net", port=8443, pubkey_pin=spki)
+        self.assertNotIn("BEACON_PER_ENDPOINT_PINS", text)
+
+    def test_pubkey_pins_align_with_the_same_rungs(self):
+        s1 = "sha256//" + "A" * 43 + "="
+        s2 = "sha256//" + "B" * 43 + "="
+        text = self._write(host="front.example.net", port=8443,
+                           hosts=["backup.example.net"],
+                           pubkey_pins=[s1, s2])
+        self.assertIn(f'#define C2_HOST_PUBKEY_PINS "{s1},{s2}"', text)
+
+    def test_pubkey_pin_from_a_real_certificate(self):
+        import tempfile
+        path = self._self_signed(tempfile.mkdtemp(prefix="spki_"))
+        pin = server_cert_pubkey_pin(path)
+        self.assertTrue(pin.startswith("sha256//"), pin)
+        # The DER pin and the SPKI pin cover the SAME certificate: both exist,
+        # both non-empty, and neither is the other.
+        self.assertNotEqual(pin, server_cert_fingerprint(path))
+
+    def test_pubkey_pin_is_empty_without_a_certificate(self):
+        self.assertEqual(server_cert_pubkey_pin("does/not/exist.crt"), "")
+
+    def test_beacon_pubkey_pin_honours_the_kill_switch(self):
+        saved = os.environ.get("PHANTOM_BEACON_PIN")
+        try:
+            os.environ["PHANTOM_BEACON_PIN"] = "0"
+            self.assertEqual(beacon_pubkey_pin(), "")
+        finally:
+            if saved is None:
+                os.environ.pop("PHANTOM_BEACON_PIN", None)
+            else:
+                os.environ["PHANTOM_BEACON_PIN"] = saved
+
+    def test_cpp_resolves_the_pin_of_the_current_rung(self):
+        network = _read(NETWORK_H)
+        self.assertIn("active_pin()", network)
+        self.assertIn("host_pins", network)
+        self.assertIn("host_pubkey_pins", network)
+        self.assertIn("split_pins_keep_empty", network)
+        # The verifier must fail CLOSED on a rung nobody pinned.
+        self.assertIn("!want_pin.empty()", network)
+        main = _read(MAIN_CPP)
+        self.assertIn("cfg.seed_ladder(C2_HOST, C2_HOSTS, C2_HOST_PINS, "
+                      "C2_HOST_PUBKEY_PINS)", main)
+
+
 class TestResolution(unittest.TestCase):
 
     def setUp(self):
         self._saved = {k: os.environ.get(k) for k in
-                       ("PHANTOM_C2_FALLBACK", "PHANTOM_C2_PROXY")}
+                       ("PHANTOM_C2_FALLBACK", "PHANTOM_C2_PROXY",
+                        "PHANTOM_C2_PINS", "PHANTOM_C2_PUBKEY_PINS")}
 
     def tearDown(self):
         for key, value in self._saved.items():
@@ -240,6 +375,18 @@ class TestResolution(unittest.TestCase):
         only posture that works unconfigured (PAC/WPAD, http_proxy)."""
         os.environ.pop("PHANTOM_C2_PROXY", None)
         self.assertEqual(get_c2_proxy(), "")
+
+    def test_per_endpoint_pins_come_from_the_environment(self):
+        os.environ["PHANTOM_C2_PINS"] = "a" * 64 + ",," + "c" * 64
+        self.assertEqual(get_c2_host_pins(), ["a" * 64, "", "c" * 64])
+        os.environ["PHANTOM_C2_PUBKEY_PINS"] = "sha256//AAA="
+        self.assertEqual(get_c2_pubkey_pins(), ["sha256//AAA="])
+
+    def test_no_configured_pins_is_an_empty_list(self):
+        os.environ.pop("PHANTOM_C2_PINS", None)
+        os.environ.pop("PHANTOM_C2_PUBKEY_PINS", None)
+        self.assertEqual(get_c2_host_pins(), [])
+        self.assertEqual(get_c2_pubkey_pins(), [])
 
 
 class TestBuilderPlumbing(unittest.TestCase):
@@ -315,7 +462,8 @@ class TestCppInvariants(unittest.TestCase):
         self.assertIn("depth", callback)
 
     def test_the_beacon_seeds_the_ladder_and_the_proxy(self):
-        self.assertIn("cfg.seed_ladder(C2_HOST, C2_HOSTS)", self.main)
+        self.assertIn("cfg.seed_ladder(C2_HOST, C2_HOSTS, C2_HOST_PINS, "
+                      "C2_HOST_PUBKEY_PINS)", self.main)
         self.assertIn("cfg.proxy = C2_PROXY", self.main)
 
     def test_an_argv_host_does_not_discard_the_ladder(self):

