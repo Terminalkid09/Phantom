@@ -430,7 +430,65 @@ def _mine_graph(username: str, platform: str, html: str,
             break
 
 
-# ── layer 3: cross-account correlation ───────────────────────────────────────
+# ── layer 2b: second-hop graph mining ────────────────────────────────
+
+_SECOND_HOP_MAX = 3      # circle members whose profile we fetch
+_SECOND_HOP_BUDGET = 3   # hard network-call cap for the whole pass
+
+
+def _graph_handles(r: "ReconResult") -> set:
+    """The handles a profile's page exposes (commenters + tagged)."""
+    return {l.value.lstrip("@").lower() for l in r.leads
+            if l.kind in ("commenter", "tagged") and l.value}
+
+
+def _second_hop(primary: "ReconResult", platform: str, jar) -> List["Lead"]:
+    """Fetch a few of the primary's circle and mine THEIR circles.
+
+    A stranger who interacts with BOTH the target and a member of the
+    target's circle is the strongest same-person / close-circle evidence
+    available without following anyone — and it is the path that still
+    works on a PRIVATE target, whose public posts show a commenter/tag
+    surface even when the profile itself does not.
+
+    Bounded: <= _SECOND_HOP_MAX profile fetches and _SECOND_HOP_BUDGET
+    total network calls; never raises.
+    """
+    circle = sorted({l.value.lstrip("@").lower() for l in primary.leads
+                     if l.kind in ("commenter", "tagged") and l.value})
+    circle = [h for h in circle if len(h) >= 3][:_SECOND_HOP_MAX]
+    if not circle:
+        return []
+    primary_graph = _graph_handles(primary)
+    out: List[Lead] = []
+    calls = 0
+    for handle in circle:
+        if calls >= _SECOND_HOP_BUDGET:
+            break
+        try:
+            st, cf, html = _state_vote(handle, platform, jar)
+            calls += 1
+        except Exception:
+            continue
+        if not html:
+            continue
+        second = ReconResult(username=handle, platform=platform,
+                             state=st, state_confidence=cf)
+        try:
+            _mine_graph(handle, platform, html, second, jar)
+        except Exception:
+            continue
+        mutual = sorted(primary_graph & _graph_handles(second))
+        for h in mutual[:5]:
+            out.append(Lead("commenter", h, platform,
+                            f"mutual_graph_2hop_via_{handle}", 0.6))
+        if st == "public" and cf >= 0.5:
+            out.append(Lead("account_link", handle, platform,
+                            "second_hop_public", 0.5))
+    return out
+
+
+# ── layer 3: cross-account correlation ───────────────────────────────
 
 def _username_variants(username: str) -> List[str]:
     """Common same-person handle variants, bounded to 6."""
@@ -648,7 +706,8 @@ def present_candidate(result: "ReconResult") -> str:
 
 def deep_recon(username: str, platform: str = "",
                variants: bool = True, wayback: bool = True,
-               search: bool = True, ask=None, jar=None) -> Tuple[bool, List[str]]:
+               search: bool = True, second_hop: bool = True,
+               ask=None, jar=None) -> Tuple[bool, List[str]]:
     """Full reverse-engineering pass. Returns marker lines for the social
     interpreter. Bounded: <= 20 network calls total, never raises.
 
@@ -720,6 +779,17 @@ def deep_recon(username: str, platform: str = "",
             primary.leads.extend(_wayback_snapshots(username, platform))
         if search:
             primary.leads.extend(_search_dorks(username, primary.full_name))
+
+        # second hop: mine the circles of a few circle members (the path that
+        # still works on a PRIVATE target, whose public posts show a
+        # commenter/tag surface). Bounded and additive.
+        if second_hop:
+            try:
+                for lead in _second_hop(primary, platform, jar):
+                    if lead not in primary.leads:
+                        primary.leads.append(lead)
+            except Exception:
+                pass
 
         # cross-account correlation across everything collected
         lines.extend(primary.markers())
@@ -812,6 +882,32 @@ def deep_recon(username: str, platform: str = "",
                         f"source=operator_session readonly=1")
             except Exception:
                 pass
+        # 2-hop receipt: who the primary's circle and a member's circle
+        # SHARE — the mutual-graph strangers. Emitted as one summary line on
+        # top of the per-handle COMMENTER markers below.
+        mutual = sorted({l.value for l in primary.leads
+                         if "mutual_graph_2hop" in (l.evidence or "")})
+        if mutual:
+            lines.append("SOCIAL_2HOP: platform=%s mutual=%s"
+                         % (platform, ",".join(mutual[:8])))
+        # PRIVATE-account path: on a private target, say WHICH routes are
+        # still viable (a public same-handle elsewhere, the mutual-graph
+        # circle, the operator's own stolen session) instead of leaving the
+        # operator to guess there is nothing left.
+        if primary.state == "private":
+            routes = []
+            public_same = sorted({r.platform for r in results[1:]
+                                  if r.platform != platform
+                                  and r.state == "public" and r.bio})
+            if public_same:
+                routes.append("same_handle_public:" + ",".join(public_same))
+            if mutual:
+                routes.append(f"mutual_graph:{len(mutual)}")
+            if jar:
+                routes.append("operator_session")
+            if routes:
+                lines.append("PRIVATE_PATH: platform=%s routes=%s"
+                             % (platform, " ".join(routes)))
         for lead in primary.leads:
             if lead.kind in ("account_link", "search_hit", "wayback"):
                 lines.append(f"ACCOUNT_LINK: handle={lead.value} "

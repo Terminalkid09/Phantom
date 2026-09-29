@@ -49,6 +49,46 @@ class Hypothesis:
         return asdict(self)
 
 
+# belief-revision actions (WorldModel.add_finding)
+REVISED_SUPERSEDED = "superseded"   # stronger evidence replaced the belief
+REVISED_REJECTED = "rejected"       # weaker evidence could not replace it
+
+
+@dataclass
+class Revision:
+    """One belief revision: what changed (or was refused) and why.
+
+    Revision is PER FACT, never a rebuild of a target model: the key
+    ``(kind, key)`` is the unit, so a contradiction on one port's version
+    cannot invalidate an unrelated credential. Everything that changed is
+    kept here for the report and the checkpoint; the belief itself lives
+    on in ``WorldModel._findings``.
+    """
+
+    kind: str
+    key: str
+    action: str                 # superseded | rejected
+    old_value: Any
+    new_value: Any
+    old_confidence: float
+    new_confidence: float
+    source: str = ""
+    reason: str = ""
+    ts: float = field(default_factory=time.time)
+
+    @property
+    def superseded(self) -> bool:
+        return self.action == REVISED_SUPERSEDED
+
+    @property
+    def stronger(self) -> bool:
+        """The challenger carried strictly more confidence than the belief."""
+        return self.new_confidence > self.old_confidence
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 class WorldModel:
     """Belief store + hypothesis queue + opsec ledger."""
 
@@ -65,16 +105,91 @@ class WorldModel:
         # noise circuit breaker: cumulative detection-risk accounting
         self.noise_score: float = 0.0
         self.noise_events: List[Dict[str, Any]] = []
+        # belief revision: the audit trail of every belief that changed or
+        # refused to change, plus the fingerprint-contradiction signal the
+        # stall classifier reads (a stronger observation that flipped the
+        # OS/fingerprint belief IS "the world contradicts the model").
+        self.revisions: List[Revision] = []
+        self.last_revision: Optional[Revision] = None
+        self.fingerprint_mismatch: bool = False
 
     # ------------------------------------------------------------- findings
 
     def add_finding(self, kind: str, key: str, value: Any,
                     confidence: float = 0.5, source: str = "perception",
                     evidence: str = "", target: str = "") -> Finding:
+        """Store a belief, REVISING the one it contradicts (per fact).
+
+        The unit of revision is the fact key ``(kind, key)``: a new belief
+        that contradicts a stored one either SUPERSEDES it (evidence at
+        least as strong) or is REJECTED (strictly weaker — a weaker
+        restatement never overwrites a stronger belief), and either way
+        the previous value, the challenger and the reason land in
+        ``revisions``. Without that record a re-probe could silently flip a
+        belief with nothing to show it happened — the plan would then act
+        on a world nobody measured.
+
+        Returns the belief that is NOW stored: the new one when it won,
+        the retained one when it lost, so a caller compares ``.value`` with
+        the value it passed to know which happened.
+        """
         f = Finding(kind=kind, key=key, value=value, confidence=confidence,
                     source=source, evidence=evidence, target=target or self.target)
+        prev = self._findings.get((kind, key))
+        if prev is not None and prev.value != f.value:
+            if f.confidence >= prev.confidence:
+                action = REVISED_SUPERSEDED
+                reason = (f"new evidence ({f.confidence:.2f}) >= stored "
+                          f"({prev.confidence:.2f})")
+                self._findings[(kind, key)] = f
+                stored = f
+            else:
+                action = REVISED_REJECTED
+                reason = (f"new evidence ({f.confidence:.2f}) < stored "
+                          f"({prev.confidence:.2f}): the stronger belief "
+                          f"stands")
+                stored = prev
+            self._record_revision(Revision(
+                kind=kind, key=key, action=action, old_value=prev.value,
+                new_value=f.value, old_confidence=prev.confidence,
+                new_confidence=f.confidence, source=source, reason=reason))
+            return stored
+        if prev is not None:
+            # the same value again: CORROBORATION. A weaker restatement
+            # never weakens a belief (the evidence that raised it is still
+            # on record), so the stored confidence is the maximum ever seen.
+            f.confidence = max(prev.confidence, f.confidence)
+            if not f.evidence:
+                f.evidence = prev.evidence
         self._findings[(kind, key)] = f
         return f
+
+    def _record_revision(self, rev: Revision) -> None:
+        self.revisions.append(rev)
+        self.last_revision = rev
+        # bounded history (the beliefs themselves are what the plan reads)
+        if len(self.revisions) > 200:
+            del self.revisions[:-100]
+        # a STRONGER observation on the OS/fingerprint belief is the
+        # "wrong model" signal the stall classifier consumes: keep
+        # re-probing, do not repeat the move.
+        if rev.superseded and rev.stronger and rev.kind in ("os", "fingerprint"):
+            self.fingerprint_mismatch = True
+
+    def contradictions(self, kind: Optional[str] = None) -> List[Revision]:
+        """Revisions where the STORED belief won: a challenger was refused.
+
+        These are the ones with no other operator-visible trace (an
+        accepted revision shows up as a normal ``found``), so they are
+        what a caller surfaces and what the report counts.
+        """
+        return [r for r in self.revisions
+                if r.action == REVISED_REJECTED
+                and (not kind or r.kind == kind)]
+
+    def revisions_of(self, kind: str) -> List[Revision]:
+        """Every recorded change (accepted or refused) on one fact kind."""
+        return [r for r in self.revisions if r.kind == kind]
 
     def get(self, kind: str, key: str) -> Optional[Finding]:
         return self._findings.get((kind, key))
@@ -194,6 +309,8 @@ class WorldModel:
             "identity": self.identity.to_dict(),
             "noise_score": self.noise_score,
             "noise_events": self.noise_events,
+            "revisions": [r.to_dict() for r in self.revisions],
+            "fingerprint_mismatch": self.fingerprint_mismatch,
         }
 
     def to_json(self) -> str:
@@ -233,6 +350,20 @@ class WorldModel:
         # circuit-breaker memory (persisted so resumes keep the discipline)
         wm.noise_score = float(data.get("noise_score", 0.0))
         wm.noise_events = list(data.get("noise_events", []))
+        # belief revision survives a resume: a checkpointed run remembers
+        # which beliefs were contested (and that its model was wrong)
+        for rd in data.get("revisions", []):
+            wm.revisions.append(Revision(
+                kind=rd.get("kind", ""), key=rd.get("key", ""),
+                action=rd.get("action", REVISED_SUPERSEDED),
+                old_value=rd.get("old_value"), new_value=rd.get("new_value"),
+                old_confidence=float(rd.get("old_confidence", 0.0)),
+                new_confidence=float(rd.get("new_confidence", 0.0)),
+                source=rd.get("source", ""), reason=rd.get("reason", ""),
+                ts=rd.get("ts", time.time())))
+        if wm.revisions:
+            wm.last_revision = wm.revisions[-1]
+        wm.fingerprint_mismatch = bool(data.get("fingerprint_mismatch", False))
         return wm
 
 

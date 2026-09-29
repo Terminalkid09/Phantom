@@ -190,8 +190,42 @@ def _has_path_traversal(value: Any) -> bool:
     return False
 
 
+def _has_command_injection(value: Any) -> bool:
+    """A CONFIRMED command-injection anomaly — the strongest web finding,
+    because the box already runs our command (validated by the hunt engine
+    on a re-inject with a marker)."""
+    if isinstance(value, dict):
+        return value.get("cls") == "cmdi" and value.get("confirmed")
+    return False
+
+
+def _has_deserialization(value: Any) -> bool:
+    if isinstance(value, dict):
+        return value.get("cls") == "deser" and value.get("confirmed")
+    return False
+
+
+def _has_xss(value: Any) -> bool:
+    """A CONFIRMED reflected-XSS anomaly (raw payload reflected in an HTML
+    context): its payoff is the victim's session, not code on the box."""
+    if isinstance(value, dict):
+        return value.get("cls") == "xss" and value.get("confirmed")
+    return False
+
+
 def _always_true(_: Any) -> bool:
     return True
+
+
+# Kinds a path can START from: a reachable service, or a foothold the
+# operator already holds (a shell, a web-upload RCE, elevated privilege).
+# A standalone foothold is itself an entry point, so it must not be dropped
+# by the reachability pass.
+_ENTRY_KINDS = frozenset({
+    "service", "fingerprint", "creds", "hunt_anomaly", "rce",
+    "rce_foothold", "shell_foothold", "system_privilege", "injection",
+    "xss_exfil",
+})
 
 
 # ── chain rules ────────────────────────────────────────────────────────
@@ -242,6 +276,14 @@ CHAIN_RULES: List[ChainRule] = [
      "Path traversal → file read confirmed", 0.65, "T1003"),
     ("hunt_anomaly", _is_sql_injection, "data_exfil", _always_true,
      "SQL injection → data exfiltration confirmed", 0.7, "T1565"),
+    ("hunt_anomaly", _has_command_injection, "rce", _always_true,
+     "Command injection → remote code execution", 0.85, "T1059"),
+    ("hunt_anomaly", _has_deserialization, "rce", _always_true,
+     "Insecure deserialization → code execution", 0.7, "T1190"),
+    ("hunt_anomaly", _has_xss, "creds", _always_true,
+     "Reflected XSS → session / credential theft", 0.5, "T1185"),
+    ("xss_exfil", _always_true, "creds", _always_true,
+     "XSS weaponisation → session / credential theft", 0.5, "T1185"),
 
     # Hash → crack → creds
     ("hash", _has_hash, "creds", _always_true,
@@ -250,6 +292,19 @@ CHAIN_RULES: List[ChainRule] = [
     # RCE → beacon
     ("rce", _always_true, "beacon", _always_true,
      "RCE → beacon injection", 0.8, "T1105"),
+
+    # Real kit findings (the kinds the adapters actually write). Without
+    # these, a confirmed shell or a web-upload RCE — the two most direct
+    # ways a box becomes a beacon host — never reached the beacon goal in
+    # the graph, so the planner never saw the path.
+    ("shell_foothold", _always_true, "beacon", _always_true,
+     "Shell foothold → beacon deploy", 0.8, "T1105"),
+    ("rce_foothold", _always_true, "beacon", _always_true,
+     "RCE foothold (upload/cmdi) → beacon deploy", 0.85, "T1105"),
+    ("system_privilege", _always_true, "beacon", _always_true,
+     "Elevated privilege → beacon inject", 0.85, "T1055"),
+    ("injection", _always_true, "beacon", _always_true,
+     "Privileged execution → beacon", 0.9, "T1055"),
     ("cloud_creds", _always_true, "beacon", _always_true,
      "Cloud credentials → lateral beacon deploy", 0.6, "T1105"),
     ("cloud_creds", _always_true, "cloud_lateral", _always_true,
@@ -339,10 +394,15 @@ class AttackGraph:
             "beacon": 100,
             "creds": 50,
             "rce": 80,
+            "rce_foothold": 80,
+            "shell_foothold": 70,
+            "system_privilege": 75,
+            "injection": 85,
             "cloud_creds": 60,
             "service": 20,
             "fingerprint": 15,
             "hunt_anomaly": 40,
+            "xss_exfil": 40,
             "vuln": 50,
             "smb_anon": 30,
             "peer_discovery": 30,
@@ -357,7 +417,7 @@ class AttackGraph:
         # Entry points: any service node
         queue: deque[AttackNode] = deque()
         for node in self.nodes.values():
-            if node.kind in ("service", "fingerprint"):
+            if node.kind in _ENTRY_KINDS:
                 node.reachable = True
                 queue.append(node)
 
@@ -417,7 +477,7 @@ class AttackGraph:
 
         # Start from entry nodes (services/fingerprints)
         for node in self.nodes.values():
-            if node.kind in ("service", "fingerprint", "creds", "hunt_anomaly", "rce") and node.reachable:
+            if node.kind in _ENTRY_KINDS and node.reachable:
                 _dfs(node.id, set(), [], [], 0.0, 1.0)
                 if len(paths) >= max_paths:
                     break

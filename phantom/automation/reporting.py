@@ -55,6 +55,10 @@ class RawReport:
     campaign_trail: List[Dict[str, Any]] = field(default_factory=list)
     opsec_spent: float = 0.0
     c2_evidence: List[Dict[str, Any]] = field(default_factory=list)
+    # the ordered ledger of arbitrated moves (brain/trace.py): which lens
+    # drove each decision and in which stage — the audit of the PLANNING,
+    # where `actions` is the audit of the execution.
+    decision_trace: List[Dict[str, Any]] = field(default_factory=list)
     # chronological narrative: findings + actions + failures + noise + C2
     timeline: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -72,8 +76,21 @@ class RawReport:
             campaign_trail=list(agent.sink.events),
             opsec_spent=wm.opsec_spent,
             c2_evidence=cls._c2_evidence(agent),
+            decision_trace=cls._decision_trace(agent),
             timeline=cls._timeline(agent),
         )
+
+    @staticmethod
+    def _decision_trace(agent) -> List[Dict[str, Any]]:
+        """The run's decision ledger, as plain dicts (empty when the run
+        never arbitrated anything — a stub agent, an offline test)."""
+        trace = getattr(agent, "trace", None)
+        if trace is None:
+            return []
+        try:
+            return list(trace.to_dict().get("entries", []))
+        except Exception:
+            return []
 
     @staticmethod
     def _timeline(agent) -> List[Dict[str, Any]]:
@@ -191,6 +208,7 @@ class RawReport:
             "hypotheses": self.hypotheses,
             "campaign_trail": self.campaign_trail,
             "c2_evidence": self.c2_evidence,
+            "decision_trace": self.decision_trace,
             "timeline": self.timeline,
         }
 
@@ -266,6 +284,19 @@ class RawReport:
                     f"- **[{h.get('status', 'pending').upper()}]** "
                     f"`{h.get('capability_id', '')}`: {h.get('reason', '')} "
                     f"(priority {h.get('priority', '')})")
+            lines.append("")
+        if self.decision_trace:
+            # why the run MOVED the way it did, not just what it ran: the
+            # same wording the live `--verbose` stream uses
+            from phantom.automation.brain.trace import TraceEntry
+            lines += ["## Decision Trace", "",
+                      "> Which lens drove each arbitrated move, in order. "
+                      "One line per CHANGE of decision.", ""]
+            for raw in self.decision_trace:
+                try:
+                    lines.append(f"- {TraceEntry.from_dict(raw).explain()}")
+                except Exception:
+                    continue
             lines.append("")
         # findings grouped by kind, full value + evidence
         by_kind: Dict[str, List[FindingEntry]] = {}

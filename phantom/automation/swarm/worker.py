@@ -15,6 +15,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+# The OFFLINE planning default. Used ONLY when the caller injects no
+# toolchain (tests, bare environments). Operator paths — the CLI
+# `auto --swarm` branch and the auto-mode swarm engine — pass a REAL
+# `ToolRegistry`, so the swarm plans against the tools the box actually
+# has instead of a hardcoded assumption baked into the worker.
+PLANNING_TOOLCHAIN = frozenset({"nmap", "curl", "nc"})
+
 
 @dataclass
 class TaskResult:
@@ -35,7 +42,8 @@ def run_swarm_task(task, target: str, board, runner=None,
                    on_event: Optional[Callable[[str, dict], None]] = None,
                    llm: bool = False, worker_profile: Optional[str] = None,
                    worker_avoid=None, worker_seed: Optional[int] = None,
-                   scope_list=None) -> TaskResult:
+                   scope_list=None, toolchain=None,
+                   resilient_stager: bool = True) -> TaskResult:
     """Run one task on one target; return staged findings (no board writes).
 
     ``llm`` enables the worker's internal non-gating advisor (the
@@ -47,6 +55,9 @@ def run_swarm_task(task, target: str, board, runner=None,
     ``worker_profile`` / ``worker_avoid`` / ``worker_seed`` override the
     task fields for THIS worker only (thread-safe fan-out: siblings
     share the task object but never its overrides).
+
+    ``toolchain`` is the operator's real `ToolRegistry` when injected;
+    otherwise the offline planning default is used (tests, bare boxes).
     """
     from phantom.automation.agent import AutonomousAgent
     from phantom.automation.runtime.stealth_runtime import (
@@ -70,15 +81,20 @@ def run_swarm_task(task, target: str, board, runner=None,
             if cap.category not in banned:
                 registry.register(cap)
 
+    if toolchain is None:
+        # no injected toolchain: the offline planning default. Operator
+        # paths inject a real ToolRegistry (see run_swarm / the CLI).
+        toolchain = ToolRegistry(installed=set(PLANNING_TOOLCHAIN))
     agent = AutonomousAgent(
         target=target, shared_wm=snapshot,
-        toolchain=ToolRegistry(installed={"nmap", "curl", "nc"}),
+        toolchain=toolchain,
         command_seed=task.seed if worker_seed is None else worker_seed,
         on_event=on_event,
         hunt_runner=_quiet_hunt_runner if runner is None else None,
         registry=registry,
         reason_profile=(task.profile if worker_profile is None
                         else worker_profile),
+        resilient_stager=resilient_stager,
         llm=bool(llm),
         scope_list=list(scope_list or []) if scope_list else None,
     )

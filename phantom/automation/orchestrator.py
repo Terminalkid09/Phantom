@@ -174,8 +174,15 @@ class Orchestrator:
         A bounded drain_timeout (default 120s) prevents an agent thread
         that is stuck inside its capability from keeping the orchestrator
         alive forever (which would hang the test session / CLI exit). The
-        timeout only applies when the queue is empty but an agent is still
-        running; actions already queued are always dispatched first.
+        timeout only applies while an agent is still RUNNING (the queue may
+        be empty or hold actions its commit will release).
+
+        When NO agent is running, the loop stops at once: nothing local can
+        open a gate or free an entity, so the only remaining actions are
+        ones a sibling pool could release — the scheduler's wave loop
+        re-submits those after its drains, instead of this loop idling for
+        the full drain_timeout. Actions already runnable are always
+        dispatched first.
         """
         if not self._paused_requested:
             self._pause.set()
@@ -187,14 +194,21 @@ class Orchestrator:
                 self._pause.wait()
                 action = self._pop()
                 if action is None:
-                    if self._agents_active() == 0 and not self._queue:
+                    if self._agents_active() == 0:
+                        # No worker is running, so nothing local can commit
+                        # a fact or release a lock. Either the queue is empty
+                        # (drained) or every remaining action is parked on a
+                        # gate only a SIBLING pool could satisfy — parking
+                        # here for the whole drain_timeout would stall the
+                        # operation for minutes doing nothing. Stop and let
+                        # the caller re-submit (the scheduler runs waves, so
+                        # a fact committed elsewhere is picked up next wave).
                         break
-                    # queue empty but an agent is still running: bounded wait
+                    # an agent is still running: bounded wait for a stuck
+                    # capability (one that never returns).
                     if idle_since is None:
                         idle_since = time.time()
                     elif time.time() - idle_since > drain_timeout:
-                        # an agent is stuck (e.g. a capability that never
-                        # returns). Stop waiting and let the caller proceed.
                         break
                     time.sleep(0.1)
                     continue
