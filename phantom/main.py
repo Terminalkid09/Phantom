@@ -9,8 +9,13 @@ console = Console()
 
 def main():
     parser = argparse.ArgumentParser(description="Phantom offensive Security Framework")
-    parser.add_argument("--profile", help="Load engagement profile at startup")
-    parser.add_argument("--c2", action="store_true", help="Launch Phantom C2 interface instead of pentest shell")
+    parser.add_argument("--profile",
+                        help="Load engagement profile at startup (manual shell)")
+    parser.add_argument("--c2", action="store_true", help="Launch Phantom C2 interface instead of the AUTO-MODE shell")
+    parser.add_argument("--manual", action="store_true",
+                        help="Launch the MANUAL module shell instead of "
+                             "AUTO-MODE (the module workflow is also a "
+                             "`manual` mode inside the AUTO shell)")
     parser.add_argument("--auto", nargs="*", metavar="TARGET", default=None,
                         help="AUTO-MODE: with target(s) run the full kill chain "
                              "directly; with no target open the interactive "
@@ -130,6 +135,24 @@ def main():
         )
         return
 
+    if args.manual:
+        run_pentest_shell(args)
+        return
+
+    # DEFAULT: bare `phantom` opens the AUTO-MODE shell.
+    #
+    # The module/pentest workflow is a MODE of auto-mode now (`manual` inside
+    # the shell, or `phantom --manual`), not a second entry point. Two shells
+    # meant two state paths -- target, scope, accumulated knowledge -- and two
+    # help tables, and that is exactly how they drifted apart: `run` after an
+    # `auto` started from a blank slate. One entry point keeps one source of
+    # truth; the human-in-the-loop path is still there, one command away.
+    from phantom.core.auto_shell import run_auto_shell
+    run_auto_shell()
+
+
+def run_pentest_shell(args) -> None:
+    """The classic MANUAL module shell, on the shared engagement session."""
     shell = PhantomShell()
     shell.auto_run = args.yes
     if args.profile:

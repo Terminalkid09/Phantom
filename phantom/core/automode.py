@@ -20,6 +20,25 @@ from phantom.utils.network import get_lhost
 console = Console()
 
 
+def _experience_enabled(explicit: Optional[bool] = None) -> bool:
+    """Resolve the operator's experience-memory intent.
+
+    Cross-engagement learning is ON by default (config
+    `automation.experience`, default true): every run records (situation,
+    technique, outcome, cause, repair) episodes into
+    data/experience_cases.json on the operator's own disk, and the
+    planner reorders already-allowed moves so a wall hit once is not hit
+    the same way again. Nothing leaves the machine; the operator turns it
+    off with `automation.experience: false` or --no-experience, which
+    keeps the memory run-only.
+    """
+    from phantom.utils import config as cfg
+    default_on = bool(cfg.get_bool("automation.experience", True))
+    if explicit is None:
+        return default_on
+    return bool(explicit) if default_on else False
+
+
 # -----------------------------------------------------------------------------
 # Agent routing (auto -> planner agent -> swarm tasks)
 # -----------------------------------------------------------------------------
@@ -228,6 +247,7 @@ def _run_agent_single(target, goal, profile, aggressive, paranoid, speed,
                       evolution: bool = False,
                       stop_event: Optional[threading.Event] = None,
                       reason_profile: str = "",
+                      resilient_stager: bool = True,
                       cell_loop: bool = False,
                       cell_stages: Optional[List[str]] = None,
                       evolution_mode: str = "code"):
@@ -255,6 +275,7 @@ def _run_agent_single(target, goal, profile, aggressive, paranoid, speed,
         threat_intel=_threat_intel_feed(),        persist_learning=True, llm=llm,
         experience=experience, evolution=evolution, stop_event=stop_event,
         seed_findings=seed, reason_profile=reason_profile,
+        resilient_stager=resilient_stager,
         cell_loop=cell_loop, cell_stages=cell_stages,
         evolution_mode=evolution_mode)
 
@@ -315,6 +336,14 @@ def _safe_target_dir(target: str) -> str:
 def _merge_results_to_session(agent, target: str) -> dict:
     """Bridge an auto-mode agent's findings into the manual session. Never
     raises: a bridge failure must not abort a finished engagement."""
+    # the WHY trail: stash the agent's decision ledger on the session so
+    # `why [capability]` in the manual shell explains the auto-run's moves
+    try:
+        trace = getattr(agent, "trace", None)
+        if trace is not None and len(trace):
+            session._last_decision_trace = trace
+    except Exception:
+        pass
     try:
         return merge_agent_into_session(agent, target) or {}
     except Exception as exc:            # pragma: no cover - defensive
@@ -377,7 +406,8 @@ def _stream_swarm_event(kind: str, data: dict, verbose: bool = False,
 
 def _run_swarm_operation(targets, goal, profile, aggressive, speed,
                          agents, verbose=False, on_event=None,
-                         llm: bool = False, budget: int = 10):
+                         llm: bool = False, budget: int = 10,
+                         resilient_stager: bool = True):
     """Swarm engine for run_auto_mode: fact-driven tasks over a shared
     board, then merge into the manual session. Returns
     (result, summary, merged) where result speaks the legacy keys the
@@ -388,7 +418,10 @@ def _run_swarm_operation(targets, goal, profile, aggressive, speed,
 
     chain = _GOAL_CHAIN.get(goal, "")
     if not chain:
-        return None
+        # this goal has no chain of its own: the ENVIRONMENT profile
+        # decides the starting template (never a hardcoded default).
+        from phantom.automation.swarm import chain_for_profile
+        chain = chain_for_profile(profile)
     approval = LLMApproval()
     if llm:
         approval.approve_session()
@@ -403,10 +436,14 @@ def _run_swarm_operation(targets, goal, profile, aggressive, speed,
                 seed[t] = facts
         except Exception:
             continue
+    # plan against the tools this box ACTUALLY has: the worker no longer
+    # assumes a hardcoded nmap/curl/nc set (see swarm.worker).
+    from phantom.automation.runtime.toolchain import ToolRegistry
     summary = run_swarm(
         targets, chain=chain, profile=profile, aggressive=aggressive,
         max_agents=agents or 10, budget=budget, llm_approval=approval,
         seed_facts=seed or None, scope_list=list(session.scope or []),
+        toolchain=ToolRegistry(), resilient_stager=resilient_stager,
         on_event=lambda k, d: _stream_swarm_event(k, d, verbose, on_event))
     board = summary.get("board_ref")
     merged = merge_board_into_session(board) if board is not None else {}
@@ -520,42 +557,93 @@ def _ensure_c2_listener(server=None) -> bool:
     """Auto-mode brings its own C2 listener (HTTPS/mTLS) BEFORE any beacon
     deploy — unless the operator disabled it via ``c2.listener_auto_start``.
 
-    Binds the derived beacon-facing address from get_c2_endpoint() (a real
-    local address), never 0.0.0.0 by default; when that address is not
-    bindable here (e.g. a public NAT address from PHANTOM_C2_HOST) it falls
-    back to the loopback for local-lab runs and says so loudly. Returns
-    True when a listener is up afterwards, False otherwise (the run then
-    continues listener-less: beacons deploy but cannot check in)."""
-    from phantom.core.c2_server import server_instance
+    BINDS ``c2.bind`` (default 0.0.0.0: every interface, so a multi-homed
+    box or a changed VPN/LAN address never silently makes the C2
+    unreachable) on the derived PORT; the address beacons are TOLD to dial
+    stays get_c2_endpoint()[0]. When the configured bind is not bindable
+    (port taken) it falls back to the loopback for local-lab runs and says
+    so loudly. Returns True when a listener is up afterwards, False
+    otherwise (the run then continues listener-less: beacons deploy but
+    cannot check in)."""
+    from phantom.core.c2_server import server_instance, listener_bind_host
     from phantom.utils.network import get_c2_endpoint
     srv = server if server is not None else server_instance
     if srv.thread and srv.thread.is_alive():
         return True
     from phantom.utils import config as cfg
+    # With the Go data plane selected, the Python listener must stay DOWN: two
+    # servers on one port fight for the bind and the beacons see random
+    # failures. The operator runs `c2d` instead; the protocol is identical.
+    if str(cfg.get("c2.transport_backend", "python") or "python").strip().lower() == "go":
+        notifier.warn("c2.transport_backend=go: il listener Python NON viene "
+                      "avviato — lancia il data plane Go (`c2d`) così i due non "
+                      "si contendono la porta")
+        return False
     if not cfg.get("c2.listener_auto_start", True):
         notifier.warn("c2.listener_auto_start is off and no C2 listener is "
                       "up: deployed beacons cannot check in — start one "
                       "with `c2` -> listener start")
         return False
-    host, port = get_c2_endpoint()
-    if not _probe_bind(host, port):
-        if host != "127.0.0.1" and _probe_bind("127.0.0.1", port):
-            notifier.warn(f"C2 {host}:{port} non bindabile qui (NAT/IP non "
-                          f"locale?) — fallback loopback 127.0.0.1:{port} "
-                          f"(solo lab locale: i beacon remoti non rientrano)")
-            host = "127.0.0.1"
+    dial_host, port = get_c2_endpoint()
+    bind_host = listener_bind_host()
+    if not _probe_bind(bind_host, port):
+        if bind_host != "127.0.0.1" and _probe_bind("127.0.0.1", port):
+            notifier.warn(f"C2 bind {bind_host}:{port} non disponibile qui "
+                          f"— fallback loopback 127.0.0.1:{port} (solo lab "
+                          f"locale: i beacon remoti non rientrano)")
+            bind_host = "127.0.0.1"
         else:
-            notifier.warn(f"C2 listener non avviabile su {host}:{port} "
-                          f"(porta occupata o indirizzo non locale) — "
-                          f"proseguo senza listener")
+            notifier.warn(f"C2 listener non avviabile su {bind_host}:{port} "
+                          f"(porta occupata?) — proseguo senza listener")
             return False
-    notifier.status(f"Avvio listener C2 su {host}:{port} (HTTPS/mTLS auto)...")
+    notifier.status(f"Avvio listener C2 su {bind_host}:{port} "
+                    f"(HTTPS/mTLS auto; dial {dial_host})")
     try:
-        srv.start(host=host, port=port, use_ssl=True)
+        srv.start(host=bind_host, port=port, use_ssl=True)
         return True
     except Exception as exc:
         notifier.warn(f"Auto-start listener C2 fallito: {exc}")
         return False
+
+
+def _callback_preflight(targets, goal: str) -> None:
+    """Say it BEFORE the run when a beacon-bound goal cannot call back.
+
+    The beacon's endpoint is compiled from `c2.host`. When the target
+    cannot dial it (unset host, 0.0.0.0, loopback, or a private endpoint
+    against an external target) the deploy SUCCEEDS and the beacon never
+    checks in — the operator then reads a late "nessun beacon stabilito"
+    with no cause. This is the most common real-deploy failure, so it is
+    named up front (warn when some targets are affected, error when none
+    can work). Never blocks the run: a tunnel may exist that we cannot
+    see from here.
+    """
+    if goal not in ("beacon", "deliver", "complete_kill_chain",
+                    "post_exploit", "deep"):
+        return
+    try:
+        from phantom.utils import config as cfg
+        from phantom.utils.network import callback_plausibility, get_c2_endpoint
+        advertised = cfg.get_str("c2.host", "") or get_c2_endpoint()[0]
+    except Exception:
+        return
+    bad = []
+    for t in targets:
+        try:
+            ok, reason = callback_plausibility(t, advertised)
+        except Exception:
+            continue
+        if not ok:
+            bad.append((t, reason))
+    for t, reason in bad:
+        notifier.warn(f"Callback implausibile per {t}: {reason}")
+    if bad and len(bad) == len(list(targets)):
+        notifier.error(
+            "Nessun target può chiamare il C2: i beacon si deployerebbero "
+            "ma non rientrerebbero MAI.",
+            hint="imposta c2.host all'indirizzo operatore raggiungibile dal "
+                 "target (o fai port-forward) — `doctor --net` verifica il "
+                 "listener")
 
 
 def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
@@ -568,14 +656,15 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                   experience: bool = False,
                   evolution: bool = False,
                   beta: bool = False,
-                  resume: str = "",
-                  stop_event: Optional[threading.Event] = None,
+                  resume: str = "",                   stop_event: Optional[threading.Event] = None,
                    reason_profile: str = "",
+                   resilient_stager: bool = True,
                    cell_loop: bool = False,
                    cell_stages: Optional[List[str]] = None,
                    only_markdown: bool = False,
                    engine: str = "agent",
-                   force_network: bool = False) -> None:
+                   force_network: bool = False,
+                   force_profile: bool = False) -> None:
     """Autonomous kill chain (planner agent) — the `auto` entry point.
 
     Classifies each target (ip/domain/url/email/username/phone) and drives
@@ -612,6 +701,11 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
     + ranking) by default — the range is NEVER sprayed with full chains
     unless the operator passes force_network=True (CLI --force-network
     with an explicit disclaimer + confirm). A range is not intent.
+
+    force_profile: keep `profile` even when it contradicts the target
+    class (e.g. --profile mobile on a PC). By default the coherence
+    check corrects the posture and says so; this flag is the operator's
+    escape hatch for the cases where the contradiction is intentional.
     """
     raw = list(targets or [])
     if isinstance(targets, str):
@@ -690,14 +784,22 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
             f"e brute force gireranno su tutta la rete.")
 
     notifier.success("=" * 25 + " PHANTOM AUTO-MODE (agent) " + "=" * 25)
-    # auto-profile: a phone-number target (or any mobile-classified
-    # target) defaults to the mobile defender model when the operator left
-    # the default profile untouched — explicit --profile choices win.
-    if profile == "enterprise":
-        from phantom.automation.guidance.targets import classify_target
-        if any(classify_target(t) in ("phone", "mobile") for t in resolved):
-            profile = "mobile"
-            notifier.info("Target mobile rilevato -> profilo difensivo: mobile")
+    # profile <-> target coherence: the profile is the ENVIRONMENT, the
+    # target is the ENTITY. When they contradict (`--profile mobile` on a
+    # PC, or a machine profile on a phone number) the posture derived from
+    # the profile is wrong by construction, so the plan is corrected here
+    # and the correction is announced — never silent. `--force-profile`
+    # (force_profile=True) keeps the operator's choice: they may know the
+    # IP *is* the phone. This REPLACES the old, one-way "default
+    # enterprise + phone target -> mobile" rule, which could not see the
+    # opposite (and worse) mistake.
+    from phantom.automation.guidance.targets import classify_target
+    from phantom.automation.swarm.profile_policy import check_profile_target
+    _check = check_profile_target(
+        profile, [classify_target(t) for t in resolved], force=force_profile)
+    if not _check.ok:
+        notifier.warn(_check.reason)
+    profile = _check.effective
 
     notifier.info(f"Target: {', '.join(resolved)}")
     notifier.info(f"Goal: {goal} | profile: {profile} | "
@@ -705,7 +807,10 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                   f"aggressive={aggressive} | speed={speed} | "
                   f"verbose={verbose} | agents={agents or 'auto'} | "
                   f"llm={'on' if llm else 'off'} | "
-                  f"experience={'global' if experience else 'run-only'}")
+                  f"experience={'global' if _experience_enabled(experience) else 'run-only'}")
+    # a beacon-bound goal is only as good as the callback the target can
+    # make: name an implausible endpoint BEFORE burning the engagement
+    _callback_preflight(resolved, goal)
     if not scope_list:
         try:
             from phantom.automation.guidance.targets import (
@@ -741,8 +846,8 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
     # beacon deploy so a deployed beacon has somewhere to check in. The
     # operator never has to start it manually — _ensure_c2_listener brings
     # its own listener (HTTPS + auto-generated mTLS material) unless
-    # c2.listener_auto_start is off, binding the derived beacon-facing
-    # address instead of 0.0.0.0.
+    # c2.listener_auto_start is off, binding c2.bind (every interface by
+    # default) and dialing the derived beacon-facing address.
     _ensure_c2_listener()
 
     started_wall = time.time()
@@ -791,7 +896,7 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
             notifier.success("=" * 25 + " PHANTOM AUTO-MODE (swarm) " + "=" * 25)
             result, summary, _merged = _run_swarm_operation(
                 resolved, goal, profile, aggressive, speed, agents,
-                verbose, on_event, llm)
+                verbose, on_event, llm, resilient_stager=resilient_stager)
             paths = _write_swarm_summary(summary, out_root, resolved[0])
             if _merged:
                 notifier.info(
@@ -807,10 +912,10 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
         result, agent = _run_agent_single(
             resolved[0], goal, profile, aggressive, stealth, speed,
             scope_list, agents, verbose, on_event, llm,
-            state_path=state_path, experience=experience,
+            state_path=state_path, experience=_experience_enabled(experience),
             evolution=evolution, stop_event=stop_event,
             reason_profile=reason_profile, cell_loop=cell_loop,
-            cell_stages=cell_stages,
+            cell_stages=cell_stages, resilient_stager=resilient_stager,
             evolution_mode=("proposal" if only_markdown else "code"))
         tdir, paths = _write_agent_reports(agent, profile, out_root, resolved[0])
         # auto-mode -> manual core: everything the agent learned is merged
@@ -849,6 +954,13 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                 f"azioni={result.get('actions_taken')}")
         notifier.info("Report (raw operatore + client sanificato):")
         _print_report_paths(paths)
+        # end-of-run LEARNING receipt: what this run recorded and what the
+        # next one will do differently (the visible half of the loop)
+        try:
+            from phantom.automation.agent import experience_receipt
+            notifier.info(experience_receipt(agent.experience))
+        except Exception:
+            pass
         notifier.info(f"⏱ Tempo totale engagement: {elapsed}.")
         notifier.info(
             f"Checkpoint: {os.path.join(out_root, 'checkpoint.json')} — "
@@ -876,7 +988,7 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
         notifier.success("=" * 25 + " PHANTOM AUTO-MODE (swarm) " + "=" * 25)
         result, summary, merged = _run_swarm_operation(
             resolved, goal, profile, aggressive, speed, agents,
-            verbose, on_event, llm)
+            verbose, on_event, llm, resilient_stager=resilient_stager)
         _write_swarm_summary(summary, out_root, ",".join(resolved))
         if merged:
             for t, counts in merged.items():
@@ -892,7 +1004,8 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
     campaign = _run_agent_campaign(
         resolved, goal, profile, aggressive, stealth, speed,
         scope_list, agents, verbose, on_event, llm,
-        state_dir=out_root, experience=experience, evolution=evolution,
+        state_dir=out_root, experience=_experience_enabled(experience),
+        evolution=evolution,
         stop_event=stop_event)
     elapsed = _fmt_elapsed(time.time() - started_wall)
     per_target = {}

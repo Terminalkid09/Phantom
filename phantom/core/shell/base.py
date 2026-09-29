@@ -217,6 +217,21 @@ class PhantomShell(cmd.Cmd):
         return plugins
 
     # Profile management
+    @staticmethod
+    def _saved_profile_names():
+        """Names of the profiles saved on disk.
+
+        One place for the directory scan, so 'load-profile x' can offer a
+        closest match instead of a bare "not found", and `list-profiles`
+        cannot drift from it.
+        """
+        profile_dir = os.path.expanduser("~/.phantom/profiles")
+        try:
+            return sorted(f[:-5] for f in os.listdir(profile_dir)
+                          if f.endswith(".json"))
+        except OSError:
+            return []
+
     def save_profile(self, name: str):
         """Save current session settings as a profile."""
         profile_dir = os.path.expanduser("~/.phantom/profiles")
@@ -237,13 +252,16 @@ class PhantomShell(cmd.Cmd):
         """Load a profile and apply settings to current session."""
         profile_path = os.path.expanduser(f"~/.phantom/profiles/{name}.json")
         if not os.path.exists(profile_path):
-            notifier.error(f"Profile '{name}' not found.")
+            notifier.unknown("profile", name, self._saved_profile_names(),
+                             hint="run 'list-profiles' to see saved profiles")
             return
         try:
             with open(profile_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except (json.JSONDecodeError, OSError) as e:
-            notifier.error(f"Cannot load profile: {e}")
+            notifier.error(f"Cannot load profile '{name}'.", exc=e,
+                           hint="the file is unreadable or not valid JSON — "
+                                "re-create it with 'save-profile'")
             return
 
         # Validate and apply with type checking

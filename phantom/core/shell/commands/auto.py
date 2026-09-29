@@ -10,6 +10,42 @@ import phantom.core.shell as _sh  # live console: _sh.console resolves the packa
 from phantom.utils.notifier import notifier
 
 
+def _announce_profile_coverage(profile: str, goal: str = "") -> None:
+    """Warn when the chosen profile cannot reach its own declared phases.
+
+    ``check_profile_target`` already reports a profile that contradicts
+    the TARGET. This is the other half: a profile whose chain or phases
+    no longer resolve (a renamed capability, a fact with no producer)
+    would otherwise just make the plan stop with "no affordable path to
+    goal" and no explanation. The audit is cheap and read-only, so it is
+    announced ONCE, before the run, and never blocks it.
+
+    With ``goal`` it also reports (profile, goal) pairs that cannot
+    succeed as configured — a mobile target cannot beacon, 'impact' needs
+    its config opt-in — so the operator learns it up front.
+    """
+    try:
+        from phantom.automation.swarm.coverage import (
+            coverage_for_profile, feasibility_warnings)
+        row = coverage_for_profile(profile)
+    except Exception:
+        return
+    for warn in feasibility_warnings(profile, goal):
+        notifier.warn(warn)
+    if not row.chain:
+        return
+    problems = []
+    if row.unreachable:
+        problems.append(f"unreachable phases: {', '.join(row.unreachable)}")
+    if row.thin_caps_missing:
+        problems.append("thin-surface capabilities missing: "
+                        f"{', '.join(row.thin_caps_missing)}")
+    if problems:
+        notifier.warn(f"Profile '{profile}' has a capability coverage gap "
+                      f"({' ; '.join(problems)}) — those stages will be "
+                      f"skipped. Run 'coverage {profile}' for the detail.")
+
+
 def cmd_auto(shell, arg: str):
     """auto | auto <target[,target...|CIDR]> [flags] - Autonomous kill chain.
 
@@ -117,6 +153,12 @@ def cmd_auto(shell, arg: str):
     parser.add_argument("--profile", default="enterprise",
                         choices=["smb", "enterprise", "cloud", "financial",
                                  "government", "mobile"])
+    parser.add_argument("--force-profile", dest="force_profile",
+                        action="store_true", default=False,
+                        help="keep --profile even when it contradicts the "
+                             "target class (--profile mobile on a PC, a "
+                             "machine profile on a phone): the coherence "
+                             "check is announced, not enforced")
     parser.add_argument("--resume", default="", metavar="CHECKPOINT",
                         help="resume a run from an auto-mode checkpoint "
                              "(extract it from a .pm with import-session)")
@@ -124,20 +166,47 @@ def cmd_auto(shell, arg: str):
                         help="optional local-LLM advisor (requires "
                              "PHANTOM_LLM_MODEL=<path-to-gguf>): non-gating "
                              "hypothesis suggestions, never executes anything")
+    parser.add_argument("--experience", dest="experience",
+                        action="store_true", default=None,
+                        help="cross-engagement LEARNING memory (default: "
+                             "automation.experience, on): episodes persist in "
+                             "data/experience_cases.json so a wall hit once "
+                             "is not hit the same way again — local disk only")
+    parser.add_argument("--no-experience", dest="experience",
+                        action="store_false", default=None,
+                        help="keep the learning memory run-only for this "
+                             "run (nothing written to disk)")
     parser.add_argument("--force-network", dest="force_network",
                         action="store_true", default=False,
                         help="CIDR/range inputs engage the FULL chain on "
                              "every discovered host (default: discovery "
                              "only). Loud and broad: use only on "
                              "authorized ranges.")
+    parser.add_argument("--allow-install", dest="allow_install",
+                        action="store_true", default=False,
+                        help="CONSENT to install missing tools BEFORE the "
+                             "run (apt/brew/choco/pip in user scope). Off by "
+                             "default: nothing installs silently, and never "
+                             "mid-engagement")
     parser.add_argument("--swarm", action="store_true", default=False,
                         help="swarm orchestration: fact-driven tasks over a "
                              "shared blackboard (orchestrator + worker "
                              "agents) instead of the single-agent chain")
-    parser.add_argument("--chain", default="full",
-                        choices=["footprint", "identity", "full", "deep",
+    parser.add_argument("--chain", default="",
+                        choices=["", "footprint", "identity", "full", "deep",
                                  "web", "creds"],
-                        help="swarm chain template (with --swarm only)")
+                        help="swarm chain template (with --swarm only); "
+                             "empty = derive it from --profile (mobile "
+                             "opens with the scan, cloud is identity-led)")
+    parser.add_argument("--no-resilient", dest="no_resilient",
+                        action="store_true", default=False,
+                        help="ONE-SHOT beacon stager: do NOT schedule a "
+                             "retry when the first C2 download fails. The "
+                             "default is resilient (the stager retries on "
+                             "its own until the C2 answers, which is what "
+                             "makes delivery survive the server being down); "
+                             "opt out only when the retry artefact must not "
+                             "exist (max-OPSEC engagements)")
     parser.add_argument("--platform", default="",
                         metavar="PLATFORM",
                         help="social platform of a username target "
@@ -153,10 +222,15 @@ def cmd_auto(shell, arg: str):
         return
 
     if args.stealth and args.aggressive:
-        notifier.error("--stealth and --aggressive are mutually exclusive.")
+        notifier.error(
+            "--stealth and --aggressive are mutually exclusive.",
+            hint="pick one: --stealth (quiet, minimal footprint) or "
+                 "--aggressive (noisy, faster)")
         return
     if args.agents is not None and args.agents < 0:
-        notifier.error("Agent count must be >= 1 (use -a for auto).")
+        notifier.error("Agent count must be >= 1.",
+                       hint="use -a for auto-decide, or --agents N with "
+                            "N >= 1")
         return
 
     targets = [t.strip() for t in args.targets if t.strip()]
@@ -223,23 +297,66 @@ def cmd_auto(shell, arg: str):
     if targets:
         session.target = targets[0]
 
+    # Consent-gated provisioning: only an explicit --allow-install touches
+    # an installer, and only BEFORE the engagement (never mid-run, where a
+    # download is noise on the client's wire).
+    if args.allow_install and not args.plan:
+        from phantom.automation.runtime.provision import (
+            CORE_TOOLS, provision_missing)
+        from phantom.automation.runtime.toolchain import ToolRegistry
+        _report = provision_missing(ToolRegistry(), consent=True,
+                                    tools=CORE_TOOLS)
+        for _tool in _report["installed"]:
+            notifier.success(f"installed {_tool}")
+        for _tool, _res in _report["results"].items():
+            if not _res.get("ok"):
+                notifier.warn(
+                    f"{_tool}: {str(_res.get('output', ''))[:140]}")
+
     if args.swarm:
-        from phantom.automation.swarm import run_swarm
+        from phantom.automation.swarm import chain_for_profile, run_swarm
         from phantom.automation.swarm.llm import LLMApproval
+        from phantom.automation.swarm.profile_policy import (
+            check_profile_target)
+        from phantom.automation.guidance.targets import classify_target
         approval = LLMApproval()
         if args.llm:
             approval.approve_session()
+        # profile <-> target coherence, before anything derives from the
+        # profile: `--profile mobile` on a host is corrected (and said) so
+        # the chain is not built on a posture that cannot fit the target.
+        _check = check_profile_target(
+            args.profile, [classify_target(t) for t in targets],
+            force=args.force_profile)
+        if not _check.ok:
+            notifier.warn(_check.reason)
+        effective_profile = _check.effective
+        _announce_profile_coverage(effective_profile, args.goal)
+        # the profile decides the chain when no explicit --chain was given
+        effective_chain = args.chain or chain_for_profile(effective_profile)
+        # plan against the tools this box ACTUALLY has (no hardcoded set)
+        from phantom.automation.runtime.provision import (
+            CORE_TOOLS, missing as _missing_tools)
+        from phantom.automation.runtime.toolchain import ToolRegistry
+        real_tools = ToolRegistry()
+        _gaps = _missing_tools(real_tools, CORE_TOOLS)
+        if _gaps:
+            notifier.warn(
+                f"Missing recon tools: {', '.join(_gaps)} — capabilities "
+                f"that need them are skipped (use --allow-install to "
+                f"provision them)")
         # the swarm path used to drop `--verbose` entirely (it printed only
         # the closing summary) and to ignore `--reason` (no-op). Both are
         # wired now, through the SAME renderer as the agent path.
         from phantom.core.automode import _stream_swarm_event
         summary = run_swarm(
-            targets, chain=args.chain, profile=args.profile,
+            targets, chain=effective_chain, profile=effective_profile,
             aggressive=args.aggressive, llm_approval=approval,
-            reason_profile=args.reason,
+            reason_profile=args.reason, toolchain=real_tools,
+            resilient_stager=not args.no_resilient,
             scope_list=list(session.scope) if session.scope else [],
             on_event=lambda k, d: _stream_swarm_event(k, d, args.verbose))
-        notifier.info(f"Swarm {args.chain}: "
+        notifier.info(f"Swarm {effective_chain}: "
                       f"{sum(1 for t in summary['tasks'] if t['status'] == 'done')}"
                       f"/{len(summary['tasks'])} tasks done, "
                       f"+{summary.get('added', 0)} findings committed, "
@@ -260,14 +377,17 @@ def cmd_auto(shell, arg: str):
         agents=args.agents or 0,
         goal=args.goal,
         profile=args.profile,
+        force_profile=args.force_profile,
         llm=args.llm,
         resume=args.resume,
         reason_profile=args.reason,
+        resilient_stager=not args.no_resilient,
         cell_loop=args.cell_loop,
         cell_stages=[s.strip() for s in args.cell_stages.split(",")
                      if s.strip()],
         only_markdown=args.only_markdown,
         force_network=args.force_network,
+        experience=args.experience,
     )
 
 
@@ -305,6 +425,11 @@ def cmd_agent(shell, arg: str):
     parser.add_argument("--profile", default="enterprise",
                         choices=["smb", "enterprise", "cloud", "financial",
                                  "government", "mobile"])
+    parser.add_argument("--force-profile", dest="force_profile",
+                        action="store_true", default=False,
+                        help="keep --profile even when it contradicts the "
+                             "target class (--profile mobile on a PC, a "
+                             "machine profile on a phone)")
     parser.add_argument("--goal", default="complete_kill_chain",
                         choices=["deep", "footprint", "beacon", "creds",
                                  "web",
@@ -325,6 +450,14 @@ def cmd_agent(shell, arg: str):
     parser.add_argument("--state-dir", default=None,
                         help="directory for per-target campaign checkpoints "
                              "(resumes sub-agents that were interrupted)")
+    parser.add_argument("--experience", dest="experience",
+                        action="store_true", default=None,
+                        help="cross-engagement LEARNING memory (default: "
+                             "automation.experience, on) — local disk only")
+    parser.add_argument("--no-experience", dest="experience",
+                        action="store_false", default=None,
+                        help="keep the learning memory run-only for this "
+                             "run (nothing written to disk)")
     try:
         args = parser.parse_args(arg.split())
     except SystemExit:
@@ -340,11 +473,30 @@ def cmd_agent(shell, arg: str):
         notifier.error("Empty target in list.")
         return
 
+    # profile <-> target coherence (same rule as `auto`): the profile is
+    # the environment, the target is the entity. Corrected posture is
+    # announced, never silent; --force-profile keeps the operator's pick.
+    from phantom.automation.guidance.targets import classify_target
+    from phantom.automation.swarm.profile_policy import check_profile_target
+    _check = check_profile_target(
+        args.profile, [classify_target(t) for t in targets],
+        force=args.force_profile)
+    if not _check.ok:
+        notifier.warn(_check.reason)
+    profile = _check.effective
+    _announce_profile_coverage(profile, goal)
+
     # scope enforcement: the session scope is mandatory for the agent
     scope_list = list(session.scope) if session.scope else []
     if not scope_list:
         notifier.warn("No scope defined: the agent will refuse nothing. "
                       "Set scope with 'set scope <cidr,...>' for real engagements.")
+
+    # experience memory: the entry point resolves the operator's intent
+    # (flag wins over config; config default is on). The agent never reads
+    # config itself — same contract as llm/evolution.
+    from phantom.core.automode import _experience_enabled
+    experience_enabled = _experience_enabled(args.experience)
 
     def _stream(kind: str, data: dict) -> None:
         # ONE renderer: this used to be a fourth, private copy that joined
@@ -378,13 +530,18 @@ def cmd_agent(shell, arg: str):
         elif args.state:
             notifier.info(f"Checkpoint target: {args.state}")
         result, agent = run_autonomous(
-            target=targets[0], profile=args.profile,
+            target=targets[0], profile=profile,
             aggressive=args.aggressive, goal=goal,
             scope_list=scope_list,
             on_event=_stream, return_agent=True,
-            state_path=args.state)
+            state_path=args.state,
+            experience=experience_enabled)
         paths = writer.write(
-            RawReport.from_agent(agent), ClientReport.from_agent(agent, args.profile))
+            RawReport.from_agent(agent), ClientReport.from_agent(agent, profile))
+        receipt = getattr(agent, "experience", None)
+        if receipt is not None:
+            from phantom.automation.agent import experience_receipt
+            notifier.info(experience_receipt(receipt))
         notifier.success("Agent run finished. Reports:")
         for k, p in paths.items():
             _sh.console.print(f"  [cyan]{k}[/]: {p}")
@@ -393,9 +550,10 @@ def cmd_agent(shell, arg: str):
     notifier.info(f"Campaign over {len(targets)} targets "
                   f"(pool: {args.max_agents} sub-agents)...")
     campaign = run_campaign(
-        targets=targets, profile=args.profile, aggressive=args.aggressive,
+        targets=targets, profile=profile, aggressive=args.aggressive,
         goal=goal, scope_list=scope_list, max_agents=args.max_agents,
-        on_event=_stream, state_dir=args.state_dir)
+        on_event=_stream, state_dir=args.state_dir,
+        experience=experience_enabled)
     per_target = {}
     for t in targets:
         r = campaign["results"].get(t, {})
@@ -403,10 +561,10 @@ def cmd_agent(shell, arg: str):
         if a is not None:
             tdir = os.path.join(out_root, t.replace("/", "_"))
             paths = ReportWriter(tdir).write(
-                RawReport.from_agent(a), ClientReport.from_agent(a, args.profile))
+                RawReport.from_agent(a), ClientReport.from_agent(a, profile))
             per_target[t] = {"dir": tdir, **paths}
     cpaths = writer.write_campaign(
-        CampaignReport(campaign, args.profile, per_target))
+        CampaignReport(campaign, profile, per_target))
     notifier.success(
         f"Campaign finished: {campaign['beacons']} beacons, "
         f"{campaign['persistent']} persistent, "

@@ -249,7 +249,21 @@ def _r_recover(d: dict) -> List[str]:
 
 
 def _r_halt(d: dict) -> List[str]:
-    return [f"[!] {_tag(d)}{d.get('reason') or 'stopped'}"]
+    lines = [f"[!] {_tag(d)}{d.get('reason') or 'stopped'}"]
+    # WHY the goal was unreachable: the planner's rejected candidates carry
+    # the concrete reason (stealth-gated / tool missing / already failed /
+    # needs a fact that can no longer be produced). Without these the
+    # operator only ever saw "no affordable path to goal".
+    for r in (d.get("rejected") or [])[:4]:
+        if not isinstance(r, dict):
+            continue
+        lines.append(
+            f"    · {r.get('capability') or '?'} for '{r.get('fact') or '?'}'"
+            f": {r.get('reason') or 'not chosen'}")
+    if d.get("rejected_total"):
+        lines.append(f"    ({d['rejected_total']} candidate(s) rejected in "
+                     "total — `plan <goal>` shows the full list)")
+    return lines
 
 
 def _r_waiting(d: dict) -> List[str]:
@@ -397,6 +411,10 @@ def _r_experience(d: dict) -> List[str]:
             f"{', '.join(f'{k}={v}' for k, v in list(d.items())[:4])}"]
 
 
+def _r_learning_receipt(d: dict) -> List[str]:
+    return [f"[brain] {_clip(d.get('detail'), 300)}"]
+
+
 def _r_sandbox(d: dict) -> List[str]:
     return [f"[~] Sandbox {_tag(d)}{d.get('capability')}: "
             f"{d.get('detail') or 'pre-flight'}"
@@ -441,6 +459,24 @@ def _r_swarm_found(d: dict) -> List[str]:
     return [head] + [f"      - {r}" for r in rows[:20]]
 
 
+def _r_decision(d: dict) -> List[str]:
+    """One arbitrated move: the lens that drove it and by how much."""
+    return [f"[~] {_tag(d)}Decision {_clip(d.get('detail'), 200)}"]
+
+
+def _r_contradiction(d: dict) -> List[str]:
+    """A probe measured something the model REFUSED to believe.
+
+    The belief revision kept the stronger stored value, so the move learned
+    nothing new — but the operator has to see that the differential fired,
+    otherwise it is indistinguishable from "the probe found nothing".
+    """
+    return [f"[!] {_tag(d)}Contradiction on {d.get('finding') or '?'}: "
+            f"kept '{_clip(d.get('stored'), 80)}' over "
+            f"'{_clip(d.get('value'), 80)}' "
+            f"(stored confidence {d.get('confidence')})"]
+
+
 def _r_degraded(d: dict) -> List[str]:
     return [f"[!] {_tag(d)}reasoning degraded: "
             f"{d.get('layer') or 'layer'} unavailable "
@@ -466,9 +502,14 @@ def _r_worker(d: dict) -> List[str]:
 
 def _r_gap(d: dict) -> List[str]:
     hints = ", ".join(d.get("hints") or []) or "-"
+    policy = d.get("policy") or ""
+    # on a thin surface the "missing fact" is the surface itself, and the
+    # PROFILE (not the learned gap) chose the families below
+    missing = d.get("missing") or ("a surface" if policy else "?")
     return [f"[~] {_tag(d)}GAP after {d.get('failed', 0)} failure(s)"
-            f"{' [' + str(d.get('stall')) + ']' if d.get('stall') else ''}: "
-            f"what is still worth trying is '{d.get('missing')}' "
+            f"{' [' + str(d.get('stall')) + ']' if d.get('stall') else ''}"
+            f"{' [thin surface: ' + str(policy) + ']' if policy else ''}: "
+            f"what is still worth trying is '{missing}' "
             f"-> re-arming {hints}"]
 
 
@@ -495,6 +536,8 @@ EVENTS: Dict[str, EventSpec] = {
                      fields=("command", "reason", "stealth",
                              "capability", "banner")),
     "plan": EventSpec("info", _r_plan, fields=("strategy",)),
+    "decision": EventSpec("dim", _r_decision, verbose_only=True,
+                         fields=("capability", "driver", "stage")),
     "resumed": EventSpec("info", _r_resumed),
     "waiting": EventSpec("info", _r_waiting),
     "beacon_up": EventSpec("success", _r_beacon_up, fields=("beacon_id",)),
@@ -523,6 +566,8 @@ EVENTS: Dict[str, EventSpec] = {
         "error", lambda d: _r_hypothesis_lifecycle(d, "refuted"),
         verbose_only=True),
     "stall": EventSpec("warn", _r_stall, fields=("stall", "strategies")),
+    "contradiction": EventSpec("warn", _r_contradiction,
+                              fields=("capability", "finding", "stored")),
     "advice": EventSpec("dim", _r_advice, verbose_only=True),
     "escalation": EventSpec("warn", _r_escalation),
     "llm": EventSpec("dim", _r_llm, verbose_only=True),
@@ -536,6 +581,7 @@ EVENTS: Dict[str, EventSpec] = {
     "shared": EventSpec("dim", _r_shared, verbose_only=True),
     "pin": EventSpec("dim", _r_pin, verbose_only=True),
     "experience": EventSpec("dim", _r_experience, verbose_only=True),
+    "learning_receipt": EventSpec("info", _r_learning_receipt),
     "fuzz_complete": EventSpec("dim", _r_fuzz, verbose_only=True),
     "edge": EventSpec("dim", _r_edge, verbose_only=True),
     "triage": EventSpec("dim", _r_triage, verbose_only=True),
@@ -549,11 +595,16 @@ EVENTS: Dict[str, EventSpec] = {
     "tool_missing": EventSpec("warn", _r_tool_missing, fields=("capability",)),
     "deferred": EventSpec("dim", _r_deferred, fields=("capability",)),
     "recover": EventSpec("warn", _r_recover),
-    "halt": EventSpec("warn", _r_halt),
+    # `rejected`/`goal` are part of the payload, not just rendered text: the
+    # UI needs the structured why (which capability, which fact, which
+    # reason) to show a halt that is actionable instead of a dead end.
+    "halt": EventSpec("warn", _r_halt,
+                      fields=("goal", "rejected", "rejected_total",
+                              "stale")),
     "degraded": EventSpec("warn", _r_degraded,
                           fields=("layer", "capability")),
     "gap": EventSpec("info", _r_gap,
-                     fields=("missing", "goal", "hints")),
+                     fields=("missing", "goal", "hints", "policy")),
     "worker": EventSpec("info", _r_worker,
                         fields=("worker", "phase", "role", "goal_met")),
 

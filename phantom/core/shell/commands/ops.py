@@ -60,9 +60,11 @@ def cmd_ad(shell, arg: str):
         return
     if sub == "add-user":
         if len(parts) < 2:
-            notifier.error("Usage: ad add-user <user> [--kerberoastable] "
-                           "[--as-rep] [--cracked] [--admin-to H] "
-                           "[--session-on H] [--group G]")
+            notifier.usage(
+                "ad add-user",
+                "<user> [--kerberoastable] [--as-rep] [--cracked] "
+                "[--admin-to H] [--session-on H] [--group G]",
+                "run 'ad tree' to see the nodes already recorded")
             return
         u = parts[1]
         g.add_node(u, "user", label=u)
@@ -93,7 +95,10 @@ def cmd_ad(shell, arg: str):
         return
     if sub == "add-dc":
         if len(parts) < 2:
-            notifier.error("Usage: ad add-dc <host>")
+            notifier.usage("ad add-dc", "<host>",
+                           "auto-mode records the DC when it enumerates the "
+                           "domain; add it manually if you collected it "
+                           "out-of-band")
             return
         g.add_node(parts[1], "dc", label="Domain Controller")
         if g.domain:
@@ -103,7 +108,9 @@ def cmd_ad(shell, arg: str):
         return
     if sub == "add-edge":
         if len(parts) < 4 or parts[2].lower() not in EDGE_TYPES:
-            notifier.error(f"Usage: ad add-edge <src> <{'|'.join(EDGE_TYPES)}> <dst>")
+            notifier.usage("ad add-edge",
+                           f"<src> <{'|'.join(EDGE_TYPES)}> <dst>",
+                           "edge type is positional, between src and dst")
             return
         s, t, d = parts[1], parts[2].lower(), parts[3]
         for nid, ntype in ((s, "user"), (d, "computer")):
@@ -119,7 +126,10 @@ def cmd_ad(shell, arg: str):
         g2 = _G()
         notifier.success("AD graph cleared")
         return
-    notifier.error(f"Unknown ad subcommand: {sub}")
+    notifier.unknown("ad subcommand", sub,
+                     ["tree", "paths", "add-user", "add-dc", "add-edge",
+                      "reset"],
+                     hint="run 'ad tree' for the current graph")
 
 
 def cmd_wordlists(shell, arg: str):
@@ -133,11 +143,11 @@ def cmd_export(shell, arg: str):
     from phantom.modules.report import ReportModule
     parts = arg.strip().split()
     if not parts:
-        notifier.error("Usage: export <json|pdf|html> [filename]")
+        notifier.usage("export", "<json|pdf|html> [filename]")
         return
     fmt = parts[0].lower()
     if fmt not in ("json", "pdf", "html"):
-        notifier.error("Invalid format. Use json, pdf, or html.")
+        notifier.unknown("export format", fmt, ["json", "pdf", "html"])
         return
     default_name = f"report_{session.target or 'phantom'}.{fmt}"
     filename = parts[1] if len(parts) > 1 else default_name

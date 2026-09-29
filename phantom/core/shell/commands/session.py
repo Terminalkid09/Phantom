@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 
 from phantom.core.notes import show_notes
 from phantom.core.scope import is_in_scope
@@ -14,7 +13,8 @@ from phantom.utils.notifier import notifier
 def cmd_save_profile(shell, name: str):
     """save-profile <name> — save current settings as a profile."""
     if not name.strip():
-        notifier.error("Usage: save-profile <name>")
+        notifier.usage("save-profile", "<name>",
+                       "saves target, scope and wordlist for reuse")
         return
     shell.save_profile(name.strip())
 
@@ -22,20 +22,19 @@ def cmd_save_profile(shell, name: str):
 def cmd_load_profile(shell, name: str):
     """load-profile <name> — load a profile."""
     if not name.strip():
-        notifier.error("Usage: load-profile <name>")
+        notifier.usage("load-profile", "<name>",
+                       "run 'list-profiles' to see them")
         return
     shell.load_profile(name.strip())
 
 
 def cmd_list_profiles(shell, arg: str):
     """List all saved profiles."""
-    profile_dir = os.path.expanduser("~/.phantom/profiles")
-    if not os.path.exists(profile_dir):
-        notifier.warn("No profiles found.")
-        return
-    profiles = [f.replace(".json", "") for f in os.listdir(profile_dir) if f.endswith(".json")]
+    # one directory scan, shared with `load-profile`'s typo suggestion
+    profiles = shell._saved_profile_names()
     if not profiles:
         notifier.warn("No profiles found.")
+        notifier.info("Save one with: save-profile <name>")
         return
     _sh.console.print("[cyan]Available Profiles:[/]")
     for p in profiles:
@@ -46,7 +45,8 @@ def cmd_set(shell, arg: str):
     """set target <ip/domain/email> | set scope <cidr,...> | set lhost <ip> | set lport <port>"""
     parts = arg.strip().split(maxsplit=1)
     if len(parts) < 2:
-        notifier.error("Usage: set <target|mode|scope|lhost|lport> <value>")
+        notifier.usage("set", "<target|mode|scope|lhost|lport> <value>",
+                       "run 'help' for the session settings")
         return
     key, value = parts[0].lower(), parts[1]
 
@@ -148,14 +148,17 @@ def cmd_show(shell, arg: str):
                           "— type 'suggest' inside any module to see them.[/]")
         notifier.info("Findings here feed every module's suggestions and the report.")
     else:
-        notifier.error("Usage: show session | show scope | show mode | show knowledge")
+        notifier.usage("show",
+                       "session | scope | mode | knowledge",
+                       "no argument shows the session")
 
 
 def cmd_note(shell, arg: str):
     """note "<text>" — add an inline note to the session"""
     text = arg.strip().strip('"').strip("'")
     if not text:
-        notifier.error("Usage: note \"your note here\"")
+        notifier.usage("note", "\"your note here\"",
+                       "quote the text; it is timestamped into the report")
         return
     session.add_note(text)
     notifier.success("Note added.")
@@ -170,7 +173,7 @@ def cmd_save_session(shell, name: str):
     """save-session <name> — save current session to disk"""
     name = name.strip()
     if not name:
-        notifier.error("Usage: save-session <name>")
+        notifier.usage("save-session", "<name>")
         return
     session.save(name)
     notifier.success(f"Session saved: {name}.json")
@@ -180,7 +183,8 @@ def cmd_load_session(shell, name: str):
     """load-session <name> — load a previously saved session"""
     name = name.strip()
     if not name:
-        notifier.error("Usage: load-session <name>")
+        notifier.usage("load-session", "<name>",
+                       "run 'list-sessions' to see them")
         return
     try:
         session.load(name)
@@ -234,7 +238,8 @@ def cmd_import_session(shell, arg: str):
     from phantom.utils.session_bundle import import_session, summarize
     path = arg.strip()
     if not path:
-        notifier.error("Usage: import-session <file.pm>")
+        notifier.usage("import-session", "<file.pm>",
+                       ".pm bundles are produced by 'export-session'")
         return
     try:
         data = import_session(path)

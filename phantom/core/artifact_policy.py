@@ -33,7 +33,45 @@ _CLASSES: Dict[str, Dict[str, Any]] = {
     "recordings/live":  {"cls": "live_segment",    "ttl_days": 7,  "quota_mb": 1024},
     "remote":           {"cls": "remote_frame",    "ttl_days": 7,  "quota_mb": 512},
     "downloads":        {"cls": "acquired_file",   "ttl_days": 30, "quota_mb": 2048},
+    # Run state and textual output: TTL 0 by design — NEVER auto-deleted.
+    # A checkpoint may still be the only way to resume an engagement and
+    # the audit log is the engagement's record; the honest treatment is to
+    # MEASURE them (doctor reports usage) instead of pruning them. Note the
+    # cleanup pass only removes FILES directly inside these directories, so
+    # per-run subdirectories (sessions/auto_*/) are untouchable by design.
+    "sessions":         {"cls": "run_state",         "ttl_days": 0, "quota_mb": 0},
+    "reports":          {"cls": "engagement_report", "ttl_days": 0, "quota_mb": 0},
+    "logs":             {"cls": "runtime_log",       "ttl_days": 0, "quota_mb": 0},
 }
+
+
+def usage_report(data_root: str) -> List[Dict[str, Any]]:
+    """Per-class disk usage of the artifact directories (for `doctor`).
+
+    Read-only: never deletes, never writes. Size is best-effort and
+    recursive, so a directory of per-run subdirectories (sessions,
+    reports) reports the total an operator actually pays for.
+    """
+    out: List[Dict[str, Any]] = []
+    for subdir in _CLASSES:
+        d = os.path.join(data_root, subdir)
+        if not os.path.isdir(d):
+            continue
+        total = 0
+        files = 0
+        for root, _dirs, names in os.walk(d):
+            for name in names:
+                p = os.path.join(root, name)
+                try:
+                    total += os.path.getsize(p)
+                    files += 1
+                except OSError:
+                    continue
+        meta = classify(subdir)
+        out.append({"dir": subdir, "class": meta["class"],
+                    "bytes": total, "files": files,
+                    "ttl_days": meta["ttl_days"]})
+    return out
 
 DEFAULT_TTL_DAYS = 30          # owner decision Q-5
 DEFAULT_QUOTA_MB = 1024

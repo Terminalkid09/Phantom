@@ -13,6 +13,18 @@ from phantom.utils.notifier import notifier
 
 console = Console()
 
+# A username is interpolated RAW into a shell command (`sherlock <user> ...`)
+# and the executor only validates the TARGET, not the command string, so the
+# value must be a plain token here: anything with a space, `;`, `|`, `&` or a
+# quote would become extra shell syntax on the operator's own box.
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
+
+
+def _clean_username(value: str) -> str:
+    """A shell-safe username, or "" (fail closed, never "escape and hope")."""
+    candidate = (value or "").strip().lstrip("@")
+    return candidate if _USERNAME_RE.match(candidate) else ""
+
 
 class OsintModule(BaseModule):
     module_name = "osint"
@@ -88,10 +100,10 @@ class OsintModule(BaseModule):
         except ValueError:
             # Se contiene caratteri tipici dei social, l'username è l'intero target (pulito da eventuali @)
             if "_" in target or "@" in target:
-                return target.lstrip("@")
+                return _clean_username(target)
             
             # Se è un dominio classico (es. azienda.com), prendiamo solo la prima parte
-            return target.split('.')[0] if '.' in target else target
+            return _clean_username(target.split('.')[0] if '.' in target else target)
 
     def do_phone(self, _):
         """phone — phone-number OSINT: carrier + region via phonenumbers
@@ -144,9 +156,12 @@ class OsintModule(BaseModule):
 
     def do_sherlock(self, args):
         """sherlock [username] - Search social media for a username."""
-        username = args.strip() or self._get_username(session.target)
+        username = _clean_username(args.strip()) or self._get_username(session.target)
         if not username:
-            notifier.error("No username provided and target is not a valid username candidate.")
+            notifier.error("No safe username provided and target is not a valid "
+                           "username candidate (a username becomes a shell "
+                           "argument, so metacharacters/whitespace are "
+                           "refused).")
             return
         
         notifier.status(f"Running Sherlock for username: {username}...")

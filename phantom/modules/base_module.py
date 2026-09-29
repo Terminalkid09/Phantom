@@ -172,6 +172,36 @@ class BaseModule(cmd.Cmd):
         execute the top suggested command directly (pipe-able)."""
         if "--quiet" in (arg or "").split():
             self.quiet = True
+        # TOOL GATE: the same check `preflight` runs, applied here — a
+        # missing binary used to surface as a confusing mid-flow failure
+        # ('run scan' with python-nmap installed but no nmap binary).
+        # Interactive: warn with the exact install hints and keep going (a
+        # module may only need the tool conditionally). Quiet/scripted:
+        # refuse, because there is nobody to read the warning — but only
+        # for the TOP suggestion, which is the one quiet mode will run.
+        try:
+            from phantom.core.executor import module_missing_tools
+            if getattr(self, "quiet", False):
+                top = []
+                for group in (self.suggest_commands() or {}).values():
+                    top.extend(group or [])
+                missing = module_missing_tools(self, commands=top[:1])
+            else:
+                missing = module_missing_tools(self)
+        except Exception:
+            missing = []
+        if missing:
+            from phantom.utils.notifier import notifier
+            tools = ", ".join(t for t, _ in missing)
+            if getattr(self, "quiet", False):
+                notifier.error(
+                    f"Missing tool(s) for this module: {tools}. Install them "
+                    "or run interactively to see the hints.",
+                    hint="; ".join(h for _, h in missing[:3]))
+                return False
+            notifier.warn(f"Missing tool(s) for this module: {tools} — the "
+                          "run may fail partway; `preflight` lists the "
+                          "install hints.")
         if getattr(self, "quiet", False):
             if self._run_quiet(self.suggest_commands()):
                 return
