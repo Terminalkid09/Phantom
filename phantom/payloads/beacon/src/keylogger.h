@@ -463,8 +463,11 @@ inline void evdev_worker() {
     }
 
     bool shift_pressed = false;
-    bool ctrl_pressed = false;
-    bool alt_pressed = false;
+    // ctrl/alt are tracked so the state is complete, but the ASCII map only
+    // needs shift today: mark them so a strict -Wall build never fails on a
+    // value that is deliberately set-but-unread.
+    [[maybe_unused]] bool ctrl_pressed = false;
+    [[maybe_unused]] bool alt_pressed = false;
 
     while (is_running) {
         fd_set readfds;

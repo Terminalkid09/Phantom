@@ -41,12 +41,70 @@ DEFAULTS: Dict[str, Any] = {
         # get_c2_endpoint() derive the routable operator address; set an
         # explicit host (public IP or your domain) for real engagements.
         "host": "",
+        # PUBLIC, DISPOSABLE front the beacons are built against (a
+        # redirector / CDN). When set it is embedded as the beacon's
+        # endpoint INSTEAD of `host`, so a captured beacon only reveals a
+        # hop you can burn and rotate in minutes while the real listener
+        # never enters the binary. Accepts "host" or "host:port". Empty =
+        # fall back to `host` (the backend is then compiled in) — `doctor`
+        # flags that build as leaking the backend.
+        "front": "",
+        # Certificate the beacon PINS. Empty = the listener's own certificate
+        # (the passthrough case). When the front TERMINATES TLS it presents
+        # its own certificate, so set this to that file (or drop
+        # certs/front.crt, which is picked up automatically) — otherwise the
+        # pin never matches and every check-in fails. See `c2.pins` for a
+        # per-rung pin list when the ladder's redirectors differ.
+        "front_cert": "",
+        # PER-ENDPOINT pins, positionally aligned with [host] + `fallback`.
+        # One SHA-256 DER digest per rung (empty field = inherit the primary
+        # pin); `pubkey_pins` is the same list in libcurl's sha256//SPKI shape
+        # for the macOS transport.
+        "pins": "",
+        "pubkey_pins": "",
+        # LAST-RING dead drop: one neutral URL (a paste, a gist, an S3
+        # object) holding the CURRENT endpoint as an obfuscated record,
+        # consulted after the ladder fails. With `bootstrap_dead_drop` it is
+        # also the FIRST source, so the indirection can be rotated without
+        # rebuilding the beacon. Declared here because it was read at call
+        # sites (dead_drop.configured_url, doctor) but invisible to the
+        # config plane.
+        "dead_drop": "",
+        # Resolve the live endpoint from the dead drop BEFORE the first
+        # check-in: the compiled endpoint then only ever acts as a fallback
+        # rung. A failed bootstrap costs one request and falls through to
+        # the compiled ladder unchanged.
+        "bootstrap_dead_drop": True,
+        # DATA PLANE implementation: "python" (the in-tree listener, default)
+        # or "go" (the `c2d` static binary). With "go", auto-mode does NOT
+        # start the Python listener — run c2d so the two do not fight for the
+        # port. Same wire protocol either way; the beacon cannot tell.
+        "transport_backend": "python",
+        # BIND address of the listener (where it LISTENS), distinct from
+        # `host` above (what beacons are told to DIAL). 0.0.0.0 by default:
+        # the listener accepts on every interface, so a multi-homed
+        # operator or a changed VPN address never silently makes the C2
+        # unreachable. `host` stays the advertised address — 0.0.0.0 there
+        # would make every beacon dial its own loopback.
+        "bind": "0.0.0.0",
         "port": 8080,
         "mtls": True,
-        # True: auto-mode brings its own listener (bound to the derived
-        # beacon-facing address, never 0.0.0.0) when none is up. False:
-        # never auto-start — the operator starts the listener explicitly
-        # (`c2` -> listener start); without one, beacons cannot check in.
+        # mTLS client-certificate REQUIREMENT. True (default): a client
+        # without a certificate cannot complete the handshake at all
+        # (CERT_REQUIRED). False keeps CERT_OPTIONAL, where the app-layer
+        # HMAC is the only gate — accepted for legacy setups, flagged by
+        # `doctor`. Beacons get their certificate at BUILD time, so the
+        # required default never blocks a real deploy.
+        "mtls_require_client_cert": True,
+        # Refuse to run a PLAINTEXT listener on a non-loopback bind: that is
+        # a C2 anyone on the path can read and hijack. Set True to override
+        # (lab only) — the listener then starts with a loud warning.
+        "allow_plaintext": False,
+        # True: auto-mode brings its own listener (HTTPS/mTLS, bound to
+        # `c2.bind` = every interface by default, dialing the derived
+        # beacon-facing address) when none is up. False: never auto-start —
+        # the operator starts the listener explicitly (`c2` -> listener
+        # start); without one, beacons cannot check in.
         "listener_auto_start": True,
     },
     "tracker": {
@@ -80,6 +138,15 @@ DEFAULTS: Dict[str, Any] = {
     "llm": {
         "model_path": "",          # empty -> bundled default (Qwen) when present
         "enabled": False,
+    },
+    "automation": {
+        # Cross-engagement EXPERIENCE memory: when true, every run records
+        # (situation, technique, outcome, cause, repair) episodes into
+        # data/experience_cases.json and the planner reorders already-allowed
+        # moves so a wall hit once is not hit the same way again. Privacy:
+        # everything stays in the local data dir; `automation.experience:
+        # false` (or --no-experience) keeps the memory run-only.
+        "experience": True,
     },
     "engagement": {
         "allow_unscoped": False,   # PHANTOM_ALLOW_UNSCOPED equivalent
@@ -190,6 +257,13 @@ def get(key: str, default: Any = None, env: Optional[str] = None) -> Any:
 SCHEMA: Dict[str, Dict[str, Any]] = {
     # C2 listener / beacon transport
     "c2.host": {"type": str, "env": "PHANTOM_C2_HOST"},
+    "c2.front": {"type": str, "env": "PHANTOM_C2_FRONT"},
+    "c2.front_cert": {"type": str, "env": "PHANTOM_C2_FRONT_CERT"},
+    "c2.pins": {"type": str, "env": "PHANTOM_C2_PINS"},
+    "c2.pubkey_pins": {"type": str, "env": "PHANTOM_C2_PUBKEY_PINS"},
+    "c2.dead_drop": {"type": str, "env": "PHANTOM_C2_DEADDROP"},
+    "c2.bootstrap_dead_drop": {"type": bool,
+                               "env": "PHANTOM_C2_DEADDROP_BOOTSTRAP"},
     "c2.port": {"type": int, "env": "PHANTOM_C2_PORT"},
     "c2.ssl": {"type": bool, "env": "PHANTOM_C2_SSL"},
     "c2.mtls": {"type": bool, "env": None},
@@ -199,6 +273,11 @@ SCHEMA: Dict[str, Dict[str, Any]] = {
     "c2.proxy": {"type": str, "env": "PHANTOM_C2_PROXY"},
     "c2.pin": {"type": str, "env": "PHANTOM_BEACON_PIN"},
     "c2.api": {"type": str, "env": None},
+    "c2.bind": {"type": str, "env": "PHANTOM_C2_BIND"},
+    "c2.transport_backend": {"type": str, "env": "PHANTOM_C2_BACKEND"},
+    "c2.mtls_require_client_cert": {
+        "type": bool, "env": "PHANTOM_MTLS_REQUIRE_CLIENT_CERT"},
+    "c2.allow_plaintext": {"type": bool, "env": "PHANTOM_ALLOW_PLAINTEXT"},
     "c2.remote_session_ttl": {"type": int, "env": "PHANTOM_REMOTE_SESSION_TTL"},
     # Tracking server (lure landing)
     "tracker.host": {"type": str, "env": "PHANTOM_TRACK_HOST"},
@@ -218,6 +297,9 @@ SCHEMA: Dict[str, Dict[str, Any]] = {
     "transports.smtp.tls": {"type": bool, "env": "PHANTOM_SMTP_TLS"},
     "transports.telegram_bot_token": {"type": str,
                                       "env": "PHANTOM_TELEGRAM_BOT_TOKEN"},
+    "transports.telegram_allowed_users": {"type": str, "env": None},
+    "transports.dm_transport": {"type": str, "env": None},
+    "transports.phish_from": {"type": str, "env": None},
     "transports.discord_webhook": {"type": str, "env": None},
     "transports.sms_carrier": {"type": str, "env": None},
     "breach.hibp_api_key": {"type": str, "env": "PHANTOM_HIBP_API_KEY"},
@@ -225,6 +307,7 @@ SCHEMA: Dict[str, Dict[str, Any]] = {
     # LLM advisor + engagement governance
     "llm.model_path": {"type": str, "env": "PHANTOM_LLM_MODEL"},
     "llm.enabled": {"type": bool, "env": "PHANTOM_LLM_ENABLED"},
+    "automation.experience": {"type": bool, "env": None},
     "engagement.allow_unscoped": {"type": bool,
                                   "env": "PHANTOM_ALLOW_UNSCOPED"},
     "engagement.ransom_sim_allow": {"type": bool,

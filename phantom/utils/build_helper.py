@@ -394,6 +394,12 @@ def check_build_env(platform, arch="x64"):
                 missing.append("g++-mingw-w64-i686")
     
     elif platform == "macos":
+        # On a real Mac the system clang++ builds the payload directly: no
+        # cross-toolchain is involved. osxcross exists to cross-compile FROM
+        # Linux, and demanding it on macOS made a native build impossible —
+        # the platform was in practice only buildable from Linux.
+        if sys.platform == "darwin" and shutil.which(os.environ.get("CXX") or "clang++"):
+            return True
         # Check for osxcross
         osxcross_root = os.environ.get("OSXCROSS_ROOT", "/opt/osxcross")
         o32_cc = os.path.join(osxcross_root, "bin", "o32-clang++")

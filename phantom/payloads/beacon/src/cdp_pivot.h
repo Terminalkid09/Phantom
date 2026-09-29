@@ -448,7 +448,9 @@ struct CdpSession {
                     return val;
                 }
                 std::string val;
-                while (valPos < resp.size() && (resp[valPos] >= '0' && resp[valPos] <= '9' || resp[valPos] == '-')) {
+                while (valPos < resp.size() &&
+                       ((resp[valPos] >= '0' && resp[valPos] <= '9') ||
+                        resp[valPos] == '-')) {
                     val += resp[valPos++];
                 }
                 return val;

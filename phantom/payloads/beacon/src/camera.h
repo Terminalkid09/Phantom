@@ -161,7 +161,6 @@ inline bool grab_frame(std::vector<uint8_t>& pixels, int& w, int& h,
         }
     }
 
-    void* source = nullptr;
     bool ok = false;
     for (unsigned long i = 0; i < count && !ok; ++i) {
         void* act = activates[i];
@@ -204,7 +203,6 @@ inline bool grab_frame(std::vector<uint8_t>& pixels, int& w, int& h,
                     unsigned long maxLen = 0, curLen = 0;
                     if (SUCCEEDED(pLock(buf, &data, &maxLen, &curLen)) && data && curLen > 0) {
                         // read dimensions from the current media type
-                        typedef long (__stdcall *FnGetSize)(void*, unsigned long*, unsigned long*);
                         void* curType = nullptr;
                         typedef long (__stdcall *FnGetType)(void*, unsigned long, void**);
                         auto pGetType = slot<FnGetType>(reader, 3 + 0x0C); // GetCurrentMediaType
@@ -231,7 +229,7 @@ inline bool grab_frame(std::vector<uint8_t>& pixels, int& w, int& h,
                             }
                             ok = true;
                         }
-                        pLock; // lock released via Unlock below
+                        // lock released via Unlock below
                         typedef long (__stdcall *FnUnlock)(void*);
                         auto pUnlock = slot<FnUnlock>(buf, 3 + 4);
                         pUnlock(buf);

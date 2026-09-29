@@ -238,7 +238,6 @@ inline BOOL WinHttpQueryOptionDynamic(
     HINTERNET hInternet, DWORD dwOption,
     LPVOID lpBuffer, LPDWORD lpdwBufferLength)
 {
-    auto& t = get_winhttp();
     // Resolve QueryOption lazily (not stored in table — used only for mTLS)
     static PFN_WinHttpQueryOption pfnQueryOption = nullptr;
     if (!pfnQueryOption) {

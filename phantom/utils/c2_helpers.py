@@ -80,7 +80,7 @@ BEACON_COMMAND_LIST: list[tuple[str, str, str]] = [
     ("set-sleep <ms> [jitter%]", "Cadence + jitter, mid-session", ""),
     ("auth-rotate <b64-secret>", "Rotate this beacon's HMAC identity", ""),
     ("health", "Self-report: uptime, check-ins, cadence, errors", ""),
-    ("edrcheck", "Probe loaded AV/EDR drivers", "win"),
+    ("edrcheck", "Probe the defensive stack (EDR drivers; LSM/eBPF/audit; macOS SIP)", ""),
     ("edr-kill", "Disable Defender realtime + stop known AV/EDR services (needs SYSTEM)", ""),
     ("exit | kill", "Shut the beacon down", ""),
 ]

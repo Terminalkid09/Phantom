@@ -228,7 +228,6 @@ inline std::vector<ConnEntry> get_tcp_connections() {
                     ssize_t len = readlink(fdPath.c_str(), link, sizeof(link) - 1);
                     if (len > 0) {
                         link[len] = '\0';
-                        char targetInode[32];
                         // Match "socket:[inode]" format
                         unsigned long sockInode = 0;
                         if (sscanf(link, "socket:[%lu]", &sockInode) == 1 && sockInode == inode) {
@@ -266,8 +265,11 @@ inline std::string format_connections() {
         char local[24], remote[24];
         snprintf(local, sizeof(local), "%s:%d", e.localAddr.c_str(), e.localPort);
         snprintf(remote, sizeof(remote), "%s:%d", e.remoteAddr.c_str(), e.remotePort);
-        snprintf(line, sizeof(line), "%-6s %-22s %-22s %-11s %5d %s\n",
-                 e.protocol.c_str(), local, remote, e.state.c_str(), e.pid, e.processName.c_str());
+        // DWORD pid is an unsigned long: %lu, never %d (a size mismatch here
+        // is undefined behaviour, not a cosmetic warning).
+        snprintf(line, sizeof(line), "%-6s %-22s %-22s %-11s %5lu %s\n",
+                 e.protocol.c_str(), local, remote, e.state.c_str(),
+                 static_cast<unsigned long>(e.pid), e.processName.c_str());
         out << line;
     }
     return out.str();
