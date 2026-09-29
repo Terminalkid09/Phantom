@@ -37,10 +37,30 @@ from .tasks import (
     SwarmTask,
     build_tasks,
 )
+from .profile_policy import (
+    POLICY as PROFILE_POLICY,
+    ProfilePolicy,
+    ProfileTargetCheck,
+    chain_for_profile,
+    check_profile_target,
+    difficulty_for,
+    policy_for,
+    reason_hint_for,
+    thin_surface_for,
+)
 from .worker import TaskResult, run_swarm_task
 
 __all__ = [
     "Board",
+    "PROFILE_POLICY",
+    "ProfilePolicy",
+    "ProfileTargetCheck",
+    "chain_for_profile",
+    "check_profile_target",
+    "difficulty_for",
+    "policy_for",
+    "reason_hint_for",
+    "thin_surface_for",
     "LLMApproval",
     "SwarmTask",
     "TaskResult",
@@ -58,16 +78,20 @@ __all__ = [
 ]
 
 
-def run_swarm(targets, chain="full", runner=None, profile="enterprise",
+def run_swarm(targets, chain="", runner=None, profile="enterprise",
               max_agents=MAX_AGENTS_DEFAULT, budget=10, seed=0,
               aggressive=False, on_event=None, drain_timeout=120.0,
               priors=None, failure_log=None, llm_approval=None,
               advisor_factory=None, seed_facts=None, scope_list=None,
-              reason_profile=""):
+              reason_profile="", toolchain=None,
+              resilient_stager: bool = True):
     """Run one swarm operation: tasks by chain template, one
     orchestrator+pool PER TARGET (shared semaphore caps total workers),
     commit to the board. Deterministic given a deterministic runner +
     seed (required by the suite).
+
+    ``chain`` empty means "derive it from ``profile``" (see
+    ``profile_policy``); pass an explicit template to override.
 
     TWO distinct knobs, deliberately named apart:
 
@@ -93,6 +117,10 @@ def run_swarm(targets, chain="full", runner=None, profile="enterprise",
     path): network targets outside it are REFUSED upfront, before any
     worker thread exists; identity targets are always allowed (they
     are the subject, scope gates machines).
+
+    ``toolchain`` (a `ToolRegistry`) is the operator's REAL tools; the
+    CLI and the auto-mode engine inject one. Omit it (tests, bare
+    environments) and workers plan against the offline default.
     """
     from phantom.automation.belief import WorldModel
     from phantom.automation.guidance.commands import make_registry
@@ -109,6 +137,11 @@ def run_swarm(targets, chain="full", runner=None, profile="enterprise",
                 "reason": "out of scope: %s (scope=%s)" % (
                     ", ".join(refused), ",".join(scope_list or [])),
                 "tasks": []}
+    if not chain:
+        # no explicit --chain: the ENVIRONMENT profile decides the start
+        # (mobile opens with the scan, not a direct web chain; cloud is
+        # identity-led). An explicit --chain always wins.
+        chain = chain_for_profile(profile)
     board = Board(targets)
     tasks = build_tasks(chain, targets, seed=seed, budget=budget,
                         aggressive=aggressive)
@@ -133,7 +166,8 @@ def run_swarm(targets, chain="full", runner=None, profile="enterprise",
             action, board, runner=runner, profile=profile,
             aggressive=aggressive, on_event=on_event, priors=priors,
             registry=registry, sink=sink, llm_approval=approval,
-            advisor_factory=advisor_factory,
+            advisor_factory=advisor_factory, toolchain=toolchain,
+            resilient_stager=resilient_stager,
             scope_list=list(scope_list or []))
 
     def _orch_factory(sem, per_pool):
@@ -184,7 +218,8 @@ def _refuse_out_of_scope(targets, scope_list) -> list:
 def _dispatch(action, board, runner=None, profile="enterprise",
               aggressive=False, on_event=None, priors=None,
               registry=None, sink=None, llm_approval=None,
-              advisor_factory=None, scope_list=None):
+              advisor_factory=None, scope_list=None, toolchain=None,
+              resilient_stager: bool = True):
     """Orchestrator worker: run every target of the action's task, commit
     staged findings, report task-level success. Exceptions never escape
     (the pool marks the action FAILED and keeps draining) — a crashed
@@ -240,7 +275,9 @@ def _dispatch(action, board, runner=None, profile="enterprise",
                 aggressive=aggressive, llm=session_llm,
                 worker_profile=worker_profile,
                 worker_avoid=worker_avoid, worker_seed=worker_seed,
+                toolchain=toolchain,
                 scope_list=list(scope_list or []) if scope_list else None,
+                resilient_stager=resilient_stager,
                 on_event=_capture,
             )
         except Exception as exc:  # noqa: BLE001 — pool contract

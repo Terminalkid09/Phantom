@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from phantom.automation.belief import WorldModel, Finding
 
@@ -68,6 +68,13 @@ class Capability:
     requires: List[str] = field(default_factory=list)
     effects: List[str] = field(default_factory=list)  # fact kinds produced, e.g. ["service"]
     adapter: Optional[Callable[[WorldModel, Dict[str, Any]], str]] = None
+    # An in-process ENGINE: the code that actually does the work when
+    # exec_class is "in_process_engine". It is SEPARATE from the adapter on
+    # purpose — building a command (which the chain preview does for every
+    # candidate) must never touch the network. With an engine set,
+    # make_command returns a placeholder and the agent runs the engine at
+    # execution time, under a timeout, with its result cached.
+    engine: Optional[Callable[[WorldModel, Dict[str, Any]], str]] = None
     interpreter: Optional[Callable[[str, WorldModel, Dict[str, Any]], List[Finding]]] = None
     opsec_cost: float = 1.0
     detection_risk: float = 0.1  # probability of tripping blue team, 0..1
@@ -83,11 +90,17 @@ class Capability:
     tools: List[str] = field(default_factory=list)  # binaries needed on operator box
 
     def make_command(self, wm: WorldModel, slot_values: Dict[str, Any]) -> str:
-        if self.adapter is None:
-            raise ValueError(f"capability {self.id} has no adapter")
         for slot in self.inputs:
             if slot.required and (slot.name not in slot_values or not slot.accepts(slot_values[slot.name])):
                 raise ValueError(f"capability {self.id}: missing/invalid input '{slot.name}' ({slot.type})")
+        if self.engine is not None:
+            # In-process engine: its real work happens at EXECUTION time
+            # (`run_engine`), never here. Building a command must be pure —
+            # the chain preview calls this for every candidate and used to
+            # fire live socket probes through the adapters.
+            return f"# in-process engine ({self.id}): runs at execution time"
+        if self.adapter is None:
+            raise ValueError(f"capability {self.id} has no adapter")
         cmd = self.adapter(wm, slot_values)
         return cmd
 
@@ -95,6 +108,50 @@ class Capability:
         if self.interpreter is None:
             return []
         return self.interpreter(output, wm, slot_values)
+
+
+# ── in-process engine execution (timeout + cache) ─────────────────────
+
+# A probe result is only useful within a run; re-running the same engine
+# against the same target within this window returns the cached markers
+# instead of firing the sockets again (the preview/execute split can
+# otherwise ask twice).
+_ENGINE_CACHE_TTL = 120.0
+_engine_cache: Dict[Any, Tuple[float, str]] = {}
+
+
+def run_engine(cap: "Capability", wm: WorldModel,
+               slot_values: Dict[str, Any]) -> str:
+    """Run an in-process engine under a timeout, with a short TTL cache.
+
+    The engine is the ONE place the I/O happens; it never runs during
+    command synthesis. A timeout returns a comment line the interpreter
+    ignores, so a hung probe cannot stall the run loop.
+    """
+    import time
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TO
+
+    key = (cap.id, str(getattr(wm, "target", "")),
+           tuple(sorted((k, str(v)) for k, v in (slot_values or {}).items())))
+    now = time.time()
+    hit = _engine_cache.get(key)
+    if hit and now - hit[0] < _ENGINE_CACHE_TTL:
+        return hit[1]
+
+    # wait=False: a timed-out engine thread must NOT block the run loop
+    # while the pool joins. The worker is abandoned to finish on its own.
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(cap.engine, wm, slot_values)
+    try:
+        out = future.result(timeout=max(1, int(cap.timeout)))
+    except _TO:
+        out = f"# in-process engine {cap.id}: timed out"
+    except Exception as exc:  # a broken engine is a comment, not a crash
+        out = f"# in-process engine {cap.id}: {exc}"
+    finally:
+        pool.shutdown(wait=False)
+    _engine_cache[key] = (now, out)
+    return out
 
 
 class Registry:

@@ -39,6 +39,23 @@ class ToolOption:
     styles: Tuple[str, ...] = ("default", "stealth", "speed", "aggressive")
     # styles this option is suitable for; the run profile filters the pool
     note: str = ""            # shown in tool_missing / setup panels
+    # services the TARGET must expose for this option to be usable at all:
+    # ranking an SMB tool for a host with no SMB is how a plan ends up
+    # looping a tool against a surface that is not there.
+    requires_service: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TargetSurface:
+    """What the TARGET actually exposes — the input that turns "best tool
+    on MY box" into "tool that fits THIS target". Derived from the
+    WorldModel's service/os findings, never from the operator's machine."""
+    services: frozenset = frozenset()
+    has_web: bool = False
+    os: str = ""
+
+    def has(self, name: str) -> bool:
+        return (name or "").lower() in self.services
 
 
 @dataclass
@@ -85,32 +102,36 @@ _TOOL_CATALOG: Dict[str, List[ToolOption]] = {
         ToolOption("nmap", rank=40),
     ],
     "ssh_banner": [
-        ToolOption("__internal__", rank=10,
+        ToolOption("__internal__", rank=10, requires_service=("ssh",),
                    note="pure-socket fingerprint engine (no binary needed)"),
-        ToolOption("nc", rank=80, note="banner grab fallback"),
+        ToolOption("nc", rank=80, requires_service=("ssh",),
+                   note="banner grab fallback"),
     ],
     "smb_enum": [
-        ToolOption("smbmap", rank=30),
-        ToolOption("enum4linux", rank=60),
-        ToolOption("nmap", rank=90,
+        ToolOption("smbmap", rank=30, requires_service=("smb",)),
+        ToolOption("enum4linux", rank=60, requires_service=("smb",)),
+        ToolOption("nmap", rank=90, requires_service=("smb",),
                    note="nmap --script smb-enum-shares fallback"),
     ],
     "http_probe": [
-        ToolOption("curl", rank=30),
-        ToolOption("httpx", rank=20, note="concurrent prober when installed"),
+        ToolOption("curl", rank=30, requires_service=("http",)),
+        ToolOption("httpx", rank=20, requires_service=("http",),
+                   note="concurrent prober when installed"),
     ],
     "http_get": [
-        ToolOption("curl", rank=30),
-        ToolOption("wget", rank=40, note="fallback fetcher when curl is absent"),
+        ToolOption("curl", rank=30, requires_service=("http",)),
+        ToolOption("wget", rank=40, requires_service=("http",),
+                   note="fallback fetcher when curl is absent"),
     ],
     "redis_info": [
-        ToolOption("redis-cli", rank=30),
+        ToolOption("redis-cli", rank=30, requires_service=("redis",)),
         ToolOption("nc", rank=80, styles=("default",),
+                   requires_service=("redis",),
                    note="RESP INFO over raw TCP (zero extra deps)"),
     ],
     "brute_ssh": [
-        ToolOption("hydra", rank=30),
-        ToolOption("medusa", rank=60),
+        ToolOption("hydra", rank=30, requires_service=("ssh",)),
+        ToolOption("medusa", rank=60, requires_service=("ssh",)),
     ],
 }
 
@@ -123,19 +144,63 @@ class Toolbelt:
 
     def __init__(self, registry: Optional[ToolRegistry] = None) -> None:
         self.registry = registry or ToolRegistry()
-        self._cache: Dict[Tuple[str, str], ToolChoice] = {}
+        self._cache: Dict[Tuple, ToolChoice] = {}
         self._lock = threading.Lock()
 
+    @staticmethod
+    def surface_from_wm(wm) -> TargetSurface:
+        """Derive the target surface from a WorldModel's findings.
+
+        Only the TARGET's own service/os facts are read — this is the
+        difference between "what my box has" and "what the target is",
+        which is what the choice should turn on."""
+        services = set()
+        has_web = False
+        os_name = ""
+        try:
+            for f in wm.find("service"):
+                v = f.value if isinstance(f.value, dict) else {}
+                svc = str(v.get("service") or "").lower()
+                prod = str(v.get("product") or "").lower()
+                if "http" in svc or "http" in prod:
+                    has_web = True
+                    services.add("http")
+                if "smb" in svc or "microsoft-ds" in svc or \
+                        "netbios" in svc or "netbios" in prod:
+                    services.add("smb")
+                if "ssh" in svc or "ssh" in prod:
+                    services.add("ssh")
+                if "redis" in svc or "redis" in prod:
+                    services.add("redis")
+            for f in wm.find("os"):
+                v = f.value if isinstance(f.value, dict) else {}
+                os_name = str(v.get("os") or v.get("name") or "")
+                break
+        except Exception:
+            pass
+        return TargetSurface(services=frozenset(services),
+                             has_web=has_web, os=os_name)
+
     # ── public API ─────────────────────────────────────────────────────
-    def pick(self, capability: str, style: str = "default") -> ToolChoice:
-        """Best installed implementer for a capability, or tool=None."""
-        key = (capability, style if capability in _PROFILE_SENSITIVE
-               else "default")
+    def pick(self, capability: str, style: str = "default",
+             target: Optional[TargetSurface] = None) -> ToolChoice:
+        """Best implementer for a capability ON THIS TARGET, or tool=None.
+
+        ``target`` is the target's surface (services present). When given,
+        an option whose ``requires_service`` is absent is dropped before
+        ranking — a tool aimed at a surface the target does not expose can
+        never be the right answer, however well installed it is.
+        """
+        style_key = style if capability in _PROFILE_SENSITIVE else "default"
+        tkey = None
+        if target is not None:
+            tkey = (tuple(sorted(target.services)), target.has_web)
+        key = (capability, style_key, tkey)
         with self._lock:
             cached = self._cache.get(key)
         if cached is not None:
             return cached
-        choice = self._resolve(capability, style)
+        choice = self._resolve(capability, style, target)
         with self._lock:
             self._cache[key] = choice
         return choice
@@ -154,13 +219,25 @@ class Toolbelt:
         return out
 
     # ── resolution ─────────────────────────────────────────────────────
-    def _resolve(self, capability: str, style: str) -> ToolChoice:
+    def _resolve(self, capability: str, style: str,
+                 target: Optional[TargetSurface] = None) -> ToolChoice:
         options = _TOOL_CATALOG.get(capability, [])
         if not options:
             return ToolChoice(capability, None, reason="no tool options registered")
         pool = [o for o in options if style in o.styles or "default" in o.styles]
         if not pool:
             pool = options
+        if target is not None:
+            wanted = sorted({s for o in pool for s in o.requires_service})
+            viable = [o for o in pool
+                      if not o.requires_service
+                      or any(target.has(s) for s in o.requires_service)]
+            if not viable:
+                return ToolChoice(
+                    capability, None,
+                    reason="target exposes no " + "/".join(wanted) +
+                           " surface — tool not applicable")
+            pool = viable
         ranked = sorted(pool, key=lambda o: o.rank)
         missing: List[str] = []
         for opt in ranked:

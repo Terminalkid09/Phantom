@@ -32,6 +32,7 @@ _FACT_SOURCES = {
     "fingerprint": ["fingerprint_services"],
     "exploit_plan": ["service_exploit"],
     "hunt_anomaly": ["hunt_web"],
+    "xss_exfil": ["xss_weaponize"],
     "differential_anomaly": ["differential_analysis"],
     "rce_foothold": ["web_rce", "rce_foothold"],
     "environment": ["env_probe", "env_probe_internal", "cloud_creds_harvest"],

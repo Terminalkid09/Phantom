@@ -189,6 +189,15 @@ class EvolutionState:
             return True
         return bool(self._locked(_claim))
 
+    def release_gate_slot(self) -> None:
+        """Give back a gate slot claimed by reserve_gate_slot() when the
+        gate NEVER actually ran (authoring failed / lab unreachable). The
+        daily budget must count gate RUNS, not spawns that produced
+        nothing; floored at zero so a double-release cannot underflow."""
+        def _release():
+            self._d["gate_runs"] = max(0, self._d.get("gate_runs", 0) - 1)
+        self._locked(_release)
+
     def can_pr(self) -> bool:
         return self._d.get("prs", 0) < MAX_PRS_PER_DAY
 
@@ -360,12 +369,15 @@ def _worker(pid: str, pat: Dict, advisor, state: EvolutionState,
         result = author_mod.author(pid, case, advisor, sandbox=sb,
                                    case_stats=stats)
     except author_mod.AuthorUnavailable as exc:
+        # the gate never ran: give the daily budget its slot back
+        state.release_gate_slot()
         _emit_note(emit, f"evolution {pid}: author unavailable ({exc})")
         return
 
     state.record_authoring(h, result.ok)
     if not result.ok:
         state.clear_authored(h)   # release: a future run may retry
+        state.release_gate_slot()  # no gate ran -> do not burn the budget
         _emit_note(emit, f"evolution {pid}: authoring failed after "
                          f"{result.attempts} attempt(s) — postmortem in "
                          "docs/evolution/")

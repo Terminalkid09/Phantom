@@ -33,6 +33,7 @@ failure log path is configured.
 from __future__ import annotations
 
 import threading as _threading
+import time as _time
 from typing import Dict, List
 
 _MAX_WAVES = 3  # initial + requeue/helpers + final helpers
@@ -76,6 +77,42 @@ def _drain_all(orchs, drain_timeout) -> None:
         t.start()
     for t in threads:
         t.join()
+    # SHARED ACTIVITY: a pool whose own run returned may have left a worker
+    # in flight (drain timeout). A SIBLING pool's queued task must not be
+    # declared "never released" while that worker is still about to commit
+    # the exact fact that releases it. Wait for cross-pool activity to
+    # reach zero (bounded) before the caller decides a dead end.
+    _wait_for_activity(orchs, grace=_ACTIVITY_GRACE_S)
+
+
+_ACTIVITY_GRACE_S = 5.0
+
+
+def _active_across(orchs) -> int:
+    """Workers in flight across EVERY pool (a shared view, not per-pool)."""
+    total = 0
+    for orch in orchs.values():
+        try:
+            total += int(orch._agents_active())
+        except Exception:
+            continue
+    return total
+
+
+def _wait_for_activity(orchs, grace: float = _ACTIVITY_GRACE_S) -> int:
+    """Block until no pool has a worker in flight, or `grace` elapses.
+
+    Returns the workers still in flight when it gave up (0 = fully quiet).
+    This is the shared-activity notion the scheduler lacked: without it, one
+    pool finishing a wave could freeze a queued task whose producer was
+    running in another pool, and the summary called that "never released".
+    """
+    deadline = _time.time() + max(0.0, grace)
+    while True:
+        active = _active_across(orchs)
+        if active == 0 or _time.time() >= deadline:
+            return active
+        _time.sleep(0.05)
 
 
 def _schedule_grouped(board, tasks, orch_factory, drain_timeout=120.0,
@@ -150,20 +187,31 @@ def _schedule_single(orch, board, tasks, drain_timeout=120.0, priors=None,
         if not submitted:
             break
         orch.run(drain_timeout=drain_timeout)
+        _wait_for_activity({"": orch}, grace=_ACTIVITY_GRACE_S)
         _requeue_failed(tasks)
         helpers = _prepare_helpers(tasks, sink)
     return _summarize(tasks, board, {"": orch}, sink)
 
 
 def _summarize(tasks, board, orchs, sink) -> Dict:
+    # snapshot of cross-pool activity at the decision point: a nonzero value
+    # means a worker was STILL in flight when we gave up waiting, so a
+    # queued task may be pending a producer rather than a true dead end
+    active = _active_across(orchs)
     out = []
     for task in tasks:
         if task.status == "queued":
-            # never released: a need that no committed fact can satisfy
-            # (producer failed or chain mismatch) — say so explicitly
-            # instead of leaving a silent "queued".
             task.status = "failed"
-            task.note = f"never released (needs={sorted(task.needs)})"
+            if active:
+                # not "never released": a sibling pool's worker was still
+                # in flight and may be about to commit the releasing fact
+                task.note = (f"pending producer (needs={sorted(task.needs)}, "
+                             f"active={active})")
+            else:
+                # never released: a need that no committed fact can satisfy
+                # (producer failed or chain mismatch) — say so explicitly
+                # instead of leaving a silent "queued".
+                task.note = f"never released (needs={sorted(task.needs)})"
         out.append({"id": task.id, "goal": task.goal,
                     "status": task.status, "attempts": task.attempts,
                     "profile": task.profile or "balanced",
@@ -176,6 +224,8 @@ def _summarize(tasks, board, orchs, sink) -> Dict:
             "added": board.added, "skipped": board.skipped,
             "actions_taken": int(sink.get("actions", 0)),
             "trail": trail,
+            "shared_activity": {"active_at_summary": active,
+                                "pools": len(orchs)},
             "failures": list(sink["failures"]),
             "evolution_cases": list(sink["cases"])}
 

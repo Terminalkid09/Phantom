@@ -248,6 +248,67 @@ STRATEGIES: List[Strategy] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# thin-surface policy (what to do when enumeration found almost nothing)
+# ---------------------------------------------------------------------------
+#
+# The ENVIRONMENT profile owns a thin-surface policy (see
+# `phantom.automation.swarm.profile_policy`): deepen_one / identity /
+# control_plane. It was declared in 7.1 and consumed by nobody, so a run
+# on a barren surface still reached for the generic escalation list.
+#
+# The policy ORDERS the capability families a recovery re-arms first — it
+# does not exclude the rest (the docstrings say "before", not "instead"):
+# a machine class stops DEFAULTING into active OSINT/phishing, a mobile
+# class does exactly the opposite, a cloud class goes to the control
+# plane rather than to more ports. The ids are capability ids, so a typo
+# would silently disable a policy — the test suite pins them against the
+# registry.
+THIN_SURFACE_CAPS: Dict[str, tuple] = {
+    # go DEEPER on the one service that is open: identify it, then use it
+    "deepen_one": ("version_detect", "surface_map", "os_detect",
+                   "service_exploit", "http_probe"),
+    # identity/MDM/social surface BEFORE anything active (mobile: the OS
+    # sandbox hides the device, so the person and the enrolment are the
+    # surface that actually exists)
+    "identity": ("osint_identity", "profile_recon", "deep_recon",
+                 "mobile_probe", "mobile_mdm_fingerprint", "breach_check"),
+    # cloud identity/config IS the surface (OIDC, IAM, tokens), not ports
+    "control_plane": ("cloud_creds_harvest", "cloud_iam_enum",
+                      "cloud_s3_enum", "env_probe", "env_probe_internal"),
+}
+
+# fact kinds that mean the engagement HAS A LEAD (a surface to work, a
+# credential to use, a foothold). Their absence is what makes a surface
+# THIN — "os"/"banner" alone deliberately do NOT count: a guess about the
+# platform is not something to build a plan on.
+_LEAD_FACTS = ("service", "web_app", "web_header", "creds", "ad_domain",
+               "mobile", "mdm_vendor", "cloud_creds", "identity",
+               "victim_ip", "beacon", "rce_foothold", "internal_host")
+
+
+def surface_is_thin(wm: WorldModel) -> bool:
+    """Enumeration found almost nothing to work with.
+
+    Scarcity, not difficulty: no service, no web/app surface, no
+    credential, no foothold. This is the state the thin-surface policy
+    exists for — here "try the next tool" is a guess, and the profile's
+    doctrine is the only informed answer available. As soon as ONE lead
+    exists the policy stands down (the plan can work the lead instead of
+    following a class prior), so a run with valid creds re-arms
+    `beacon_deploy` rather than "deepen" a service it has not found.
+    """
+    try:
+        return not any(wm.has_any(kind) for kind in _LEAD_FACTS)
+    except Exception:
+        return False
+
+
+def thin_surface_caps(policy: str) -> tuple:
+    """Capability ids to re-arm FIRST under a thin-surface policy."""
+    return tuple(THIN_SURFACE_CAPS.get((policy or "").strip().lower(), ()))
+
+
 def applicable_strategies(model: TargetModel) -> List[Strategy]:
     """The strategies that fit the current target profile, best first."""
     return sorted((s for s in STRATEGIES if s.requires(model)),

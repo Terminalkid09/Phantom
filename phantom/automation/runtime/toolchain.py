@@ -16,7 +16,7 @@ operator action, not new world knowledge.
 from __future__ import annotations
 
 import shutil
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 
 def _wsl_which(name: str) -> Optional[str]:
@@ -88,6 +88,44 @@ def _wsl_distro_list() -> list:
     return out
 
 
+# Logical tool name -> the binaries that can provide it. Modern distros
+# install impacket's Windows-side scripts as `impacket-<name>` (pip entry
+# points, Debian packaging), so a bare which("secretsdump.py") reports a
+# MISSING tool on a fully provisioned box — which silently killed the whole
+# AD chain (kerberoast/dcsync/psexec) with a misleading install hint.
+_TOOL_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "secretsdump.py": ("secretsdump.py", "impacket-secretsdump",
+                       "secretsdump"),
+    "GetUserSPNs.py": ("GetUserSPNs.py", "impacket-GetUserSPNs",
+                       "GetUserSPNs"),
+    "GetNPUsers.py": ("GetNPUsers.py", "impacket-GetNPUsers",
+                      "GetNPUsers"),
+    "psexec.py": ("psexec.py", "impacket-psexec", "psexec"),
+    "wmiexec.py": ("wmiexec.py", "impacket-wmiexec", "wmiexec"),
+    "smbexec.py": ("smbexec.py", "impacket-smbexec", "smbexec"),
+    "atexec.py": ("atexec.py", "impacket-atexec", "atexec"),
+    "ntlmrelayx.py": ("ntlmrelayx.py", "impacket-ntlmrelayx",
+                      "ntlmrelayx"),
+}
+
+
+def tool_candidates(name: str) -> Tuple[str, ...]:
+    """Every binary name that satisfies a logical tool."""
+    return _TOOL_ALIASES.get(name, (name,))
+
+
+def resolve_tool(name: str) -> str:
+    """The FIRST installed binary for a logical tool, else the logical name.
+
+    Used by command builders: detection may find `impacket-secretsdump`, so
+    the command must be built with THAT name, not the legacy `.py` one.
+    """
+    for cand in tool_candidates(name):
+        if shutil.which(cand):
+            return cand
+    return name
+
+
 class ToolRegistry:
     """Detects which offensive tools are installed on the operator box."""
 
@@ -101,9 +139,14 @@ class ToolRegistry:
         if name not in self._cache:
             if self._installed is not None:
                 # injected toolset (tests / offline planning): authoritative
-                found = name in self._installed
+                found = any(cand in self._installed
+                            for cand in tool_candidates(name))
             else:
                 found = self._detect(name)
+                if not found:
+                    # alias-aware: impacket-<name> satisfies the .py names
+                    found = any(cand != name and self._detect(cand)
+                                for cand in tool_candidates(name))
                 if not found and _wsl_which(name):
                     # Windows-native miss -> the tool exists in a WSL distro
                     # (Kali toolbox): usable via the `wsl -d <distro>` wrapper.

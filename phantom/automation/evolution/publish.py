@@ -37,10 +37,6 @@ def publish(pid: str, author_result, state,
     git = run_git or _git
     branch = f"{BRANCH_NS}{pid}"
 
-    if not state.can_pr():
-        return PublishResult(False, "daily PR budget exhausted "
-                             "(2/day) — branch kept local", branch)
-
     # collect the exact files the author produced
     files: List[str] = [p for p in (author_result.cap_relpath,
                                     author_result.test_relpath,
@@ -84,20 +80,26 @@ def publish(pid: str, author_result, state,
         if not ok:
             return PublishResult(False, f"commit failed: {out}", branch)
 
-        # 4. push (token-scoped) — or leave local with instructions
+        # 4. push (token-scoped) — or leave local with instructions.
+        # P1-4: claim the PR slot ATOMICALLY, right before the push. The
+        # old can_pr()+count_pr() pair (~check~...~count~) let concurrent
+        # workers over-admit past the 2/day budget; reserving here also
+        # means a failure BEFORE this point never spends a slot.
+        if not state.reserve_pr_slot():
+            return PublishResult(False, "daily PR budget exhausted "
+                                 "(2/day) — branch kept local", branch)
         token = _token()
         if not token:
             return PublishResult(
                 True, f"branch {branch} committed locally; no "
                 "PHANTOM_EVOLUTION_TOKEN — push manually: "
                 f"git push origin {branch}", branch)
-        ok, out = _push_with_token(git, token, branch)
+        ok, out = _push_with_token(token, branch)
         if not ok:
             return PublishResult(False, f"push failed: {out}", branch)
 
         # 5. open the PR
         pr = _open_pr(token, branch, pid, proposal_md, gate_md)
-        state.count_pr()
         return PublishResult(True, f"PR opened: {pr}", branch, pr)
     finally:
         git("worktree", "remove", "--force", str(_wt_dir(pid)))
@@ -121,39 +123,29 @@ def _token() -> str:
     return os.environ.get("PHANTOM_EVOLUTION_TOKEN", "").strip()
 
 
-def token_url(token: str) -> str:
-    """DEPRECATED (P1-6): kept only so existing callers/tests keep working.
-    The push path no longer uses it — see `_push_with_token`.
-    Embedding the token in a git URL leaks it into the process list
-    (`ps`/Task Manager see the argv), git error output, and temp configs.
-    """
-    return f"https://x-access-token:{token}@github.com/"
+def _push_with_token(token: str, branch: str):
+    """P1-6: push with the token OUT of the URL and OUT of argv.
 
-
-def _push_with_token(git_call, token: str, branch: str):
-    """P1-6: push WITHOUT the token in the URL/argv — an extra HTTP header
-    passes the credential out-of-band. `git -c http.extraHeader=...` keeps
-    the token out of the remote URL, `git config`, error text and process
-    listings (headers are not echoed by git; the config flag is per-process
-    and never persisted)."""
-    header = f"http.extraHeader=Authorization: Basic {token}"
-    ok, out = git_call("-c", header, "push", "origin", f"{branch}:{branch}")
-    if ok:
-        return ok, out
-    # fallback for git builds that reject extraHeader on plain http(s):
-    # the credential-helper route (token piped via env, never argv)
+    Both the old URL form (`https://x-access-token:TOKEN@github.com/...`)
+    and the first header form (`-c http.extraHeader=Authorization: Basic
+    TOKEN`) put the credential in the child's ARGV, where `ps` / Task
+    Manager read it. A git credential helper reads the secret from the
+    environment instead: the helper string in argv is a fixed literal, the
+    token lives only in the subprocess env, and git's own output is redacted
+    before it is returned. There is deliberately NO token-bearing fallback."""
     import os
     env = dict(os.environ)
-    env["GIT_ASKPASS"] = ""
-    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["PHANTOM_PUSH_TOKEN"] = token
+    helper = ("!f() { echo username=x-access-token; "
+              "echo password=$PHANTOM_PUSH_TOKEN; }; f")
     try:
         proc = subprocess.run(
-            ["git", "push", token_url(token), f"{branch}:{branch}"],
+            ["git", "-c", f"credential.helper={helper}",
+             "push", "origin", f"{branch}:{branch}"],
             capture_output=True, text=True, timeout=60,
             cwd=str(PROJECT_ROOT), env=env)
         text = (proc.stdout or "") + (proc.stderr or "")
-        redacted = text.replace(token, "***")
-        return proc.returncode == 0, redacted.strip()[-200:]
+        return proc.returncode == 0, text.replace(token, "***").strip()[-200:]
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
 

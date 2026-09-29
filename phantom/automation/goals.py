@@ -58,7 +58,9 @@ GOAL_FACTS = {
     "cleanup": ["cleanup"],
     "impact": ["ransom_sim"],
     "trojan": ["trojan_bundle"],
-    "exploit": ["exploit_plan", "hunt_anomaly", "rce_foothold"],
+    # xss_exfil is the payoff of a confirmed XSS reflex (session theft),
+    # reachable under the exploit goal alongside the RCE foothold.
+    "exploit": ["exploit_plan", "hunt_anomaly", "rce_foothold", "xss_exfil"],
     "environment": ["environment"],
     "cloud_creds": ["cloud_creds"],
     "cloud": ["cloud_creds", "cloud_access", "cloud_lateral"],
