@@ -191,6 +191,42 @@ class TestAttackGraph(unittest.TestCase):
         summary = build_attack_summary(self.wm)
         self.assertGreater(len(summary["entry_points"]), 0)
 
+    def test_a_shell_foothold_reaches_the_beacon_goal(self):
+        """The kinds kit.py ACTUALLY writes (shell_foothold, rce_foothold)
+        must chain to beacon — the old rules only matched kinds nothing
+        emitted, so a confirmed shell never appeared on a path."""
+        self.wm.add_finding("shell_foothold", "reverse:bash",
+                            {"kind": "reverse", "command": "bash -i"},
+                            confidence=0.9, source="payload_reverse")
+        self.wm.add_finding("beacon", "established", {"session": "sf1"},
+                            confidence=0.9, source="beacon_deploy")
+        graph = AttackGraph(self.wm)
+        graph.build()
+        self.assertTrue(any("Shell foothold" in e.label for e in graph.edges))
+        self.assertGreater(len(graph.find_paths("beacon")), 0)
+
+    def test_a_web_upload_rce_foothold_reaches_the_beacon_goal(self):
+        self.wm.add_finding("rce_foothold", "web_upload",
+                            {"vector": "arbitrary-file-upload"},
+                            confidence=0.9, source="hunt_web")
+        self.wm.add_finding("beacon", "established", {"session": "rf1"},
+                            confidence=0.9, source="beacon_deploy")
+        graph = AttackGraph(self.wm)
+        graph.build()
+        self.assertTrue(any("RCE foothold" in e.label for e in graph.edges))
+        self.assertGreater(len(graph.find_paths("beacon")), 0)
+
+    def test_an_xss_exfil_reaches_creds(self):
+        self.wm.add_finding("xss_exfil", "xss:/search",
+                            {"cls": "xss", "confirmed": True},
+                            confidence=0.8, source="hunt_web")
+        self.wm.add_finding("creds", "web:admin",
+                            {"username": "admin", "password": "pw"},
+                            confidence=0.6, source="xss_exfil")
+        graph = AttackGraph(self.wm)
+        graph.build()
+        self.assertTrue(any("XSS" in e.label for e in graph.edges))
+
     def test_hash_to_creds_edge(self):
         """Hash finding enables creds via cracking edge."""
         self.wm.add_finding("hash", "ntlm:DC01",

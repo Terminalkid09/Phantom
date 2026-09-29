@@ -243,6 +243,65 @@ class TestAutonomousAgent(unittest.TestCase):
         executed = [a["capability"] for a in agent.wm.actions_taken]
         self.assertIn("ssh_login", executed)
 
+    def test_a_failed_move_reports_an_explicit_unblock_condition(self):
+        agent = self._agent()
+        agent.wm.record_failure("ssh_login", "no creds")
+        agent._mark_failed("ssh_login")
+        cond = agent._unblock_conditions.get("ssh_login", "")
+        self.assertTrue(cond, "ssh_login must say what would revive it")
+        self.assertIn("service", cond)
+        rec = [f for f in agent.wm.failures
+               if f.get("capability") == "ssh_login"][-1]
+        self.assertEqual(rec.get("unblock"), cond)
+
+    def test_a_move_with_no_preconditions_reports_no_unblock_condition(self):
+        agent = self._agent()
+        # a self-sufficient move can never be revived by new facts: a dead
+        # end, not a waiting move — and the EMPTY condition is the answer
+        class _Bare:
+            preconditions = []
+            requires = []
+        self.assertEqual(agent._unblock_condition_for(_Bare()), "")
+        self.assertEqual(agent._unblock_condition_for(None), "")
+
+    def test_a_raising_precondition_fails_closed(self):
+        """A precondition that RAISES must not be read as satisfied.
+
+        The old code swallowed the exception and moved on, so a bug (or a
+        hostile fact) that broke a guard silently OPENED the door instead of
+        closing it."""
+        agent = self._agent()
+        cap = next(c for c in make_registry().all()
+                   if c.id == "service_exploit")
+        original = cap.preconditions
+
+        def _boom(_wm):
+            raise RuntimeError("precondition exploded")
+
+        cap.preconditions = [_boom]
+
+        class _Step:
+            capability = cap
+            slot_values = {}
+
+        try:
+            ok = agent._execute_capability(_Step())
+        finally:
+            cap.preconditions = original
+        self.assertFalse(ok, "a raising precondition must BLOCK the move")
+        reasons = [str(d.get("reason", "")) for k, d in self.events
+                   if k == "deferred"]
+        self.assertTrue(any("precondition error" in r for r in reasons),
+                        reasons)
+
+    def test_a_blocked_event_carries_the_unblock_condition(self):
+        agent = self._agent()
+        agent._mark_failed("ssh_login")
+        agent._emit("blocked", capability="ssh_login",
+                    reason="precondition not met")
+        blocked = [d for k, d in self.events if k == "blocked"][-1]
+        self.assertIn("unblock", blocked)
+
     def test_sandbox_denies_beacon_in_quiet_mode(self):
         class _DenySandbox(SandboxEngine):
             def preflight(self, sample_path):

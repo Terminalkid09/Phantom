@@ -203,6 +203,14 @@ class TestBruteSshMultiTool(unittest.TestCase):
         cmd2 = _brute_ssh_adapter(wm, {})
         self.assertTrue(cmd2.startswith("medusa"))
 
+    def test_os_adapter_consumes_chosen_tool(self):
+        """os_detect routes on the stamp too (not a silent nmap default)."""
+        from phantom.automation.guidance.kit import _os_adapter
+        from phantom.automation.belief import WorldModel
+        wm = WorldModel("10.0.0.9")
+        wm.chosen_tool = {"capability": "os_detect", "tool": "nmap"}
+        self.assertTrue(_os_adapter(wm, {}).startswith("nmap -Pn -O"))
+
     def test_interpreter_hydra_and_medusa(self):
         from phantom.automation.guidance.kit import _brute_ssh_interp
         from phantom.automation.belief import WorldModel

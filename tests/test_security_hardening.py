@@ -113,14 +113,24 @@ class TestScopeFailClosed(SecurityHardenBase):
             "no engagement scope", r.error or "")
 
     def test_multi_a_record_hostname_in_scope(self):
-        import socket
-        from phantom.core.scope import is_in_scope
-        try:
-            ip = socket.gethostbyname("google.com")
-        except OSError:
+        """ALL resolved addresses must be authorized: a CDN whose addresses
+        spill outside a narrow scope is refused (the DNS rebinding shape),
+        while an explicitly scoped NAME is a deliberate authorization."""
+        from phantom.core.scope import (clear_scope_cache, is_in_scope,
+                                        resolve_addresses)
+        clear_scope_cache()
+        addrs = resolve_addresses("google.com")
+        if not addrs:
             self.skipTest("no DNS")
-        net = ".".join(ip.split(".")[:3]) + ".0/24"
-        self.assertTrue(is_in_scope("google.com", [net]))
+        net = ".".join(addrs[0].split(".")[:3]) + ".0/24"
+        outside = [a for a in addrs if not a.startswith(net.split(".0/")[0])]
+        if outside:
+            self.assertFalse(is_in_scope("google.com", [net]))
+        else:
+            self.assertTrue(is_in_scope("google.com", [net]))
+        # declaring the NAME scopes it deliberately
+        self.assertTrue(is_in_scope("google.com", ["google.com"]))
+        clear_scope_cache()
 
     def test_unresolvable_hostname_fails_closed(self):
         from phantom.core.scope import is_in_scope
@@ -141,6 +151,17 @@ class TestSecretRedaction(SecurityHardenBase):
         self.assertEqual(out["service"], "ssh")
         self.assertEqual(out["nested"]["token"], "[REDACTED]")
         self.assertEqual(out["nested"]["port"], 22)
+
+    def test_provider_named_api_keys_are_redacted(self):
+        """`shodan_key` (stored on the session by `set-key`) is a credential:
+        a fixed allowlist of exact names let it reach reports unredacted."""
+        from phantom.utils.redact import redact
+        out = redact({"shodan_key": "abc123", "virustotal_key": "vt-secret",
+                      "aws_access_key": "AKIA...", "api_key": "k",
+                      "service": "ssh"})
+        for key in ("shodan_key", "virustotal_key", "aws_access_key", "api_key"):
+            self.assertEqual(out[key], "[REDACTED]", key)
+        self.assertEqual(out["service"], "ssh")
 
     def test_redact_text_masks_keyvalue_and_flag_forms(self):
         from phantom.utils.redact import redact_text

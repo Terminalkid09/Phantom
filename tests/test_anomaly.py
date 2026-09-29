@@ -49,7 +49,7 @@ class TestProbeLibrary(unittest.TestCase):
                          {"traversal", "sqli", "ssti", "xxe", "ssrf",
                           "cmdi", "open_redirect", "crlf", "nosqli",
                           "header_ssti", "jndi", "exposure", "verb",
-                          "deser", "graphql"})
+                          "deser", "graphql", "xss"})
         for cls, probes in lib.items():
             baselines = [p for p in probes if p.baseline]
             payloads = [p for p in probes if not p.baseline]
