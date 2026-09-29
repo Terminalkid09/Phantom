@@ -128,8 +128,10 @@ inline std::vector<AccessPoint> scan_access_points() {
         // Add diagnostic info about this interface
         char guidStr[40];
         snprintf(guidStr, sizeof(guidStr),
-            "%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
-            ifInfo.InterfaceGuid.Data1, ifInfo.InterfaceGuid.Data2,
+            // Data1 is an unsigned long (DWORD): %08lX, not %08X.
+            "%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+            (unsigned long)ifInfo.InterfaceGuid.Data1,
+            (unsigned)ifInfo.InterfaceGuid.Data2,
             ifInfo.InterfaceGuid.Data3,
             ifInfo.InterfaceGuid.Data4[0], ifInfo.InterfaceGuid.Data4[1],
             ifInfo.InterfaceGuid.Data4[2], ifInfo.InterfaceGuid.Data4[3],

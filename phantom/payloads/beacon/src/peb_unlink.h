@@ -153,4 +153,69 @@ inline void hide_module() {
 }
 
 }  // namespace peb_unlink
+#else
+// ============================================================================
+//  peb_unlink.h — POSIX (Linux / macOS) module hiding
+//  ──────────────────────────────────────────────────────────────────
+//  There is no PEB on POSIX; the equivalent bookkeeping is the dynamic
+//  loader's link_map — the doubly-linked list glibc walks for
+//  dl_iterate_phdr(). On Linux we unlink the module that contains
+//  hide_module() from that list, so a tool enumerating loaded objects no
+//  longer sees it. The mapping stays valid: only the list links are severed
+//  (identical intent to the PEB unlink above). macOS's dyld image list is
+//  not writable through any public API, so there hide_module() is a
+//  documented no-op.
+// ============================================================================
+#include <cstdint>
+
+// struct link_map / _r_debug are exposed by glibc and musl's <link.h>; Apple's
+// dyld and Android's bionic do NOT provide them, so the unlink compiles only
+// where it exists and degrades to a documented no-op elsewhere.
+#if !defined(__APPLE__) && !defined(__ANDROID__) && defined(__linux__)
+    #define PHANTOM_HAVE_LINK_MAP 1
+    #include <link.h>
+    #include <dlfcn.h>
+#else
+    #define PHANTOM_HAVE_LINK_MAP 0
+#endif
+
+namespace peb_unlink {
+
+#if PHANTOM_HAVE_LINK_MAP
+// _r_debug.r_map is the head of glibc's link_map list. Match our own object by
+// its load bias (l_addr) and unlink it, then blank l_name so the path no
+// longer appears either.
+inline bool hide_module() {
+    uintptr_t self_base = 0;
+    dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int {
+        uintptr_t fn = reinterpret_cast<uintptr_t>(&hide_module);
+        for (int i = 0; i < info->dlpi_phnum; ++i) {
+            const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+            if (ph.p_type != PT_LOAD) continue;
+            uintptr_t lo = info->dlpi_addr + ph.p_vaddr;
+            if (fn >= lo && fn < lo + ph.p_memsz) {
+                *reinterpret_cast<uintptr_t*>(data) = info->dlpi_addr;
+                return 1;
+            }
+        }
+        return 0;
+    }, &self_base);
+    if (!self_base) return false;
+
+    for (struct link_map* m = _r_debug.r_map; m; m = m->l_next) {
+        if (m->l_addr == self_base) {
+            if (m->l_prev) m->l_prev->l_next = m->l_next;
+            if (m->l_next) m->l_next->l_prev = m->l_prev;
+            m->l_name = const_cast<char*>("");
+            return true;
+        }
+    }
+    return false;
+}
+#else
+// macOS dyld list and Android bionic expose no writable link_map.
+inline bool hide_module() { return false; }
+#endif
+
+}  // namespace peb_unlink
 #endif

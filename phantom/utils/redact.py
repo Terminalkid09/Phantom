@@ -64,6 +64,13 @@ def _is_secret_key(key: str) -> bool:
     # finding-shaped key "<kind>:<key>": the KIND decides, never the key part
     if k.split(":", 1)[0] in _CREDENTIAL_FINDING_KINDS:
         return True
+    # Provider / credential keys named by their provider: `shodan_key`,
+    # `virustotal_key`, `hibp_key`, `aws_access_key`, `google_api_key` … The
+    # fixed list above only caught `api_key`/`apikey`, so an API key stored
+    # under a provider name travelled to reports / UI / the LLM unredacted.
+    # A false positive here only hides a value the report did not need.
+    if k == "key" or k.endswith(("_key", "-key", ".key")):
+        return True
     # broad shape: password/otp/secret/token anywhere in the key name
     return any(s in k for s in ("password", "passwd", "pwd", "otp",
                                 "secret", "token", "api_key", "apikey",

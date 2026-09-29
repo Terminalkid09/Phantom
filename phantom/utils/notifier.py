@@ -1,3 +1,5 @@
+import difflib
+
 from rich.console import Console
 from phantom.core.logger import logger
 
@@ -48,13 +50,71 @@ class PhantomNotifier:
         logger.info(f"SUCCESS: {message}")
 
     @staticmethod
-    def error(message: str, exc: Exception = None):
-        console.print(f"[bold red][✘] ERROR: {message}[/]")
+    def error(message: str, exc: Exception = None, hint: str = ""):
+        """One error shape everywhere: what failed, then what to do.
+
+        The hint line is the point. An error that only names the problem
+        makes the operator go read the source; every refusal in the shell
+        can name its own remedy in the same place, so they all read the
+        same way (and a capability refusal is never a dead end).
+
+        A message that already starts with "Usage:" is RE-RENDERED through
+        `usage()` instead of being printed raw. That keeps the ~30 legacy
+        call sites coherent without editing each one (and without them
+        drifting apart again): the shape is enforced by the renderer, not
+        by every author remembering the convention.
+        """
+        text = str(message if message is not None else "")
+        if text.strip().lower().startswith("usage:"):
+            PhantomNotifier.usage("", text.split(":", 1)[1].strip(),
+                                  hint=hint)
+            return
+        console.print(f"[bold red][✘] ERROR: {text}[/]")
+        if hint:
+            console.print(f"    [dim]↳ {hint}[/]")
         if exc:
             console.print(f"    [dim]{str(exc)}[/]")
-            logger.error(f"ERROR: {message} | EXCEPTION: {exc}")
+            logger.error(f"ERROR: {text} | HINT: {hint} | EXCEPTION: {exc}")
         else:
-            logger.error(f"ERROR: {message}")
+            logger.error(f"ERROR: {text} | HINT: {hint}")
+
+    @staticmethod
+    def usage(command: str, syntax: str, hint: str = ""):
+        """Uniform syntax refusal: `Usage: <command> <syntax>` + remedy.
+
+        Also the funnel for every legacy `notifier.error("Usage: ...")`
+        call site, so the box, the colour and the log tag are the same
+        regardless of who refuses.
+        """
+        from rich.markup import escape
+        line = " ".join(part for part in (command, syntax) if part).strip()
+        console.print("[bold red][✘] ERROR: missing or invalid arguments[/]")
+        console.print(f"    [white]Usage: {escape(line)}[/]")
+        if hint:
+            console.print(f"    [dim]↳ {escape(hint)}[/]")
+        logger.error(f"USAGE: {line} | HINT: {hint}")
+
+    @staticmethod
+    def unknown(kind: str, value: str, options=None, hint: str = ""):
+        """Uniform unknown-entity refusal, with a closest-match suggestion.
+
+        `options` are the valid names; the nearest one is offered when it
+        is close enough to be a likely typo (difflib, cutoff 0.6
+        deliberately conservative — a wrong guess is worse than none).
+        """
+        close = ""
+        try:
+            opts = [str(o) for o in (options or [])]
+            match = difflib.get_close_matches(str(value), opts, n=1,
+                                              cutoff=0.6)
+            close = match[0] if match else ""
+        except Exception:
+            close = ""
+        msg = f"Unknown {kind}: '{value}'."
+        if close:
+            msg += f" Did you mean '{close}'?"
+            hint = hint or f"closest match: {close}"
+        PhantomNotifier.error(msg, hint=hint)
 
     @staticmethod
     def warn(message: str):

@@ -82,6 +82,7 @@ inline std::string drive_type_str(unsigned int type) {
         default:              return "Unknown";
     }
 #else
+    (void)type;      // POSIX does not distinguish drive types this way
     return "Filesystem";
 #endif
 }

