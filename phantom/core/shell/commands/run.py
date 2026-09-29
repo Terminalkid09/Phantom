@@ -11,10 +11,13 @@ def _run_suggested_move(shell, index: int) -> None:
     from phantom.core import next_moves as _nm
     moves = _nm.pending()
     if not moves:
-        notifier.error("No ranked moves yet — run 'suggest' first.")
+        notifier.error("No ranked moves yet.",
+                       hint="run 'suggest' to rank the next steps first")
         return
     if index < 1 or index > len(moves):
-        notifier.error(f"Move {index} out of range (1..{len(moves)}).")
+        notifier.error(f"Move {index} out of range.",
+                       hint=f"valid entries are 1..{len(moves)} "
+                            f"(run 'suggest' to re-rank)")
         return
     move = moves[index - 1]
     _sh.console.print(f"[bold cyan]── RUN {index}: {move.title} ──[/]")
@@ -142,6 +145,15 @@ def cmd_plan(shell, arg: str):
                       "findings — scan/enumerate more and re-plan.[/]")
         if plan.blocked_reason:
             _sh.console.print(f"  [dim]blocked: {plan.blocked_reason}[/]")
+        # WHY nothing was affordable: the planner keeps the rejected
+        # candidates with their concrete reason; showing them turns
+        # "no path" from a mystery into a to-do list.
+        for r in (plan.rejected or [])[:8]:
+            _sh.console.print(
+                f"  [dim]· {r.capability} for '{r.fact}': {r.reason}[/]")
+        if len(plan.rejected or []) > 8:
+            _sh.console.print(f"  [dim](+{len(plan.rejected) - 8} more "
+                              "rejected candidates)[/]")
         return
     for i, s in enumerate(plan.steps, 1):
         cap = s.capability
@@ -159,8 +171,10 @@ def cmd_preflight(shell, arg: str):
     """preflight [module] — check the tools a module needs and show
     install hints for the missing ones. Without arguments checks the
     module you would run next."""
-    import shutil as _shutil
-    from phantom.core.executor import tool_install_hint
+    # ONE gate: the same helper a module's own `run` uses, so `preflight`
+    # and the run can never disagree — and resolution is alias-aware
+    # (impacket-secretsdump satisfies secretsdump.py).
+    from phantom.core.executor import module_missing_tools, module_tools
 
     module_name = arg.strip().lower()
     aliases = shell.MODULE_ALIASES
@@ -176,23 +190,10 @@ def cmd_preflight(shell, arg: str):
         if instance is None:
             notifier.error(f"Unknown module: {name}")
             continue
-        tools = set()
-        try:
-            for source in (instance.build_commands(),
-                           instance.suggest_commands()):
-                for group in (source or {}).values():
-                    for cmd in (group or []):
-                        first = cmd.split()[0] if cmd.split() else ""
-                        if first:
-                            tools.add(first)
-        except Exception:
-            pass
-        for tool in sorted(tools):
-            if _shutil.which(tool) is None:
-                missing.append((tool, tool_install_hint(tool)))
-        if not tools:
+        if not module_tools(instance):
             _sh.console.print(f"  [dim]○ {name}: no commands available yet "
-                          "(set target first to evaluate its tools).[/]")
+                              "(set target first to evaluate its tools).[/]")
+        missing.extend(module_missing_tools(instance))
 
     if not missing:
         notifier.success("All required tools are installed.")
@@ -437,7 +438,8 @@ def cmd_craft(shell, arg: str):
     elif sub == "sessions":
         code = parts[1] if len(parts) > 1 else ""
         if not code:
-            notifier.error("Usage: craft sessions <code>")
+            notifier.usage("craft sessions", "<code>",
+                           "the code is the tracker id from 'craft ipgrab'")
             return
         data = _craft.craft_sessions(code)
         rows = data.get("sessions") or []
@@ -452,14 +454,16 @@ def cmd_craft(shell, arg: str):
     elif sub == "hits":
         code = parts[1] if len(parts) > 1 else ""
         if not code:
-            notifier.error("Usage: craft hits <code>")
+            notifier.usage("craft hits", "<code>",
+                           "the code is the tracker id from 'craft ipgrab'")
             return
         data = _craft.craft_hits(code)
         _print_hits(data)
     elif sub == "wait":
         code = parts[1] if len(parts) > 1 else ""
         if not code:
-            notifier.error("Usage: craft wait <code> [seconds]")
+            notifier.usage("craft wait", "<code> [seconds]",
+                           "returns as soon as a hit lands, or at the timeout")
             return
         timeout = float(parts[2]) if len(parts) > 2 else 300.0
         _craft.craft_wait(code, timeout=timeout)
@@ -542,7 +546,7 @@ def cmd_install(shell, arg: str):
     Windows). Shows the live output."""
     tool = arg.strip().lower()
     if not tool:
-        notifier.error("Usage: install <tool>  (e.g. install hydra)")
+        notifier.usage("install", "<tool>", "e.g. install hydra")
         return
     from phantom.core.executor import install_tool
     notifier.status(f"Installing {tool}... (this can take a while)")

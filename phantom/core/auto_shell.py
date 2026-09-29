@@ -128,8 +128,9 @@ def _context_hint(targets: List[str], has_run: bool) -> str:
         hints.append("status")
         hints.append("export <file>.pm")
     hints.append("help")
+    hints.append("manual")
     hints.append("back")
-    return "[dim]▸ " + "   ".join(hints[:4]) + "[/dim]"
+    return "[dim]▸ " + "   ".join(hints[:5]) + "[/dim]"
 
 
 # ── the shell ──────────────────────────────────────────────────────────────
@@ -556,13 +557,43 @@ class AutoShell(cmd.Cmd):
 
     # ── navigation ────────────────────────────────────────────────────────
 
+    def do_manual(self, arg: str):
+        """manual [<target>] - enter the MANUAL module workflow on the current engagement
+
+        The classic module shell is a MODE of auto-mode, not a separate
+        entry point: it shares the session target, scope and accumulated
+        knowledge, so `suggest` / `run` after an auto run see the findings
+        instead of a blank slate. `exit` from it returns here.
+        """
+        from phantom.core.shell import PhantomShell
+        from phantom.utils.auto_session import auto_export
+        if arg.strip() and not session.target:
+            session.target = arg.strip()
+        manual = PhantomShell()
+        manual.auto_run = True
+        console.print("[dim]Entering the MANUAL module shell — `exit` to "
+                      "return to AUTO-MODE.[/]")
+        try:
+            manual.cmdloop()
+        except KeyboardInterrupt:
+            console.print("\n[dim]Returning to AUTO-MODE.[/]")
+        finally:
+            # Same guarantee as the standalone shell: the engagement is
+            # persisted on EVERY close path, including a double Ctrl+C.
+            try:
+                exported = auto_export()
+                if exported:
+                    console.print(f"[dim]Session auto-saved: {exported}[/]")
+            except Exception:
+                pass
+
     def do_back(self, arg: str):
-        """back - return to the main Phantom shell"""
-        notifier.info("Returning to main shell.")
+        """back - leave AUTO-MODE"""
+        notifier.info("Leaving AUTO-MODE.")
         return True
 
     def do_exit(self, arg: str):
-        """exit - leave AUTO-MODE (back to main shell)"""
+        """exit - leave AUTO-MODE"""
         return self.do_back(arg)
 
     do_quit = do_exit
@@ -584,7 +615,8 @@ class AutoShell(cmd.Cmd):
             ("status", "Per-target event summary of the last run"),
             ("export", "Export the engagement to a portable <file>.pm"),
             ("import", "Restore an engagement from a <file>.pm"),
-            ("back", "Return to the main Phantom shell"),
+            ("manual", "Enter the MANUAL module shell on this engagement"),
+            ("back", "Leave AUTO-MODE"),
         ]
         for c, d in rows:
             table.add_row(c, d)

@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import html
 import json
+import logging
 import os
 import re
 import secrets
@@ -73,12 +74,17 @@ def _auto_session_file() -> str:
 
 
 def _persist_session() -> None:
-    """Atomically mirror the live session to _auto.json (versioned contract)."""
+    """Atomically mirror the live session to _auto.json (versioned contract).
+
+    A failure is LOGGED, not swallowed: a silent drop here makes the
+    desktop UI believe the engagement is persisted when it is not (the
+    classic "I rebooted and lost everything" report)."""
     try:
         from phantom.core import engagement
         engagement.save(_auto_session_file())
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger("phantom.api").warning(
+            "session auto-save failed: %s", exc)
 
 
 def _restore_session() -> None:
@@ -93,8 +99,9 @@ def _restore_session() -> None:
             print(f"[api] Session restored: {session.target} "
                   f"(notes={len(session.notes or [])}, "
                   f"history={len(session.history or [])})", flush=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger("phantom.api").warning(
+            "session auto-restore skipped: %s", exc)
 
 
 def _beacon_status(last_seen_str: str, info: dict | None = None) -> str:
@@ -311,7 +318,23 @@ async def c2_state_get(_request: web.Request) -> web.Response:
         },
         "beacons": _c2_beacons_list(),
         "tasks": _c2_tasks_dump(),
+        # 9.3: whether a NEW beacon is handed a live console (one `health`
+        # task) instead of waiting for the operator to open it by hand
+        "auto_shell": bool(getattr(c2_state, "auto_shell", False)),
     })
+
+
+@routes.post("/api/c2/autoshell")
+async def c2_autoshell(request: web.Request) -> web.Response:
+    """Enable/disable auto-open shell for this run (9.3).
+
+    With it on, the FIRST check-in of a new beacon queues one harmless
+    `health` task, so the operator's console is live with evidence the
+    task channel works. Default off; the toggle is audited.
+    """
+    body = await request.json()
+    enabled = bool((body or {}).get("enabled", False))
+    return _json({"auto_shell": c2_state.set_auto_shell(enabled)})
 
 
 @routes.post("/api/c2/listener/start")
@@ -447,13 +470,15 @@ async def session_set(request: web.Request) -> web.Response:
             try:
                 from phantom.core.knowledge import reset_wm
                 reset_wm(target=target)
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.getLogger("phantom.api").warning(
+                    "world-model reset on target switch failed: %s", exc)
             try:
                 from phantom.core.netmap import reseed_known_hosts
                 reseed_known_hosts()
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.getLogger("phantom.api").warning(
+                    "netmap reseed on target switch failed: %s", exc)
         session.target = target
         _persist_session()
         return _json({"status": "ok", "key": "target", "value": session.target})
@@ -865,7 +890,13 @@ async def automode_run(request: web.Request) -> web.Response:
     agents = body.get("agents", 0)
     resume = body.get("resume", "")
     llm = bool(body.get("llm", False))
-    experience = bool(body.get("experience", False))
+    # experience: None (key absent) follows config `automation.experience`
+    # (default on); an explicit body value wins — same contract as the CLI
+    # --experience/--no-experience flags.
+    _exp_flag = body.get("experience")
+    from phantom.core.automode import _experience_enabled
+    experience = _experience_enabled(
+        None if _exp_flag is None else bool(_exp_flag))
     verbose = bool(body.get("verbose", False))
     engine = str(body.get("engine", "agent") or "agent").strip().lower()
     if engine not in ("agent", "swarm"):
@@ -1920,7 +1951,7 @@ async def c2_generate(request: web.Request) -> web.Response:
         try:
             from phantom.utils.builder import generate_dropper
             dropper = generate_dropper(platform, lhost, lport, arch="x64",
-                                       use_ssl=True)
+                                       use_ssl=True, resilient=True)
         except Exception:
             dropper = ""
         return _json({"status": "compiled", "platform": platform,

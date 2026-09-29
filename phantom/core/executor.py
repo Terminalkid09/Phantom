@@ -304,6 +304,64 @@ def _hide_windows_sudo() -> None:
         pass
 
 
+# Privilege/wrapper prefixes a command may start with: `sudo nmap ...`
+# needs nmap, not sudo — checking the wrapper would report a false positive
+# (or miss the real dependency).
+_WRAPPER_PREFIXES = frozenset({"sudo", "doas", "env", "nohup", "time",
+                               "command", "stdbuf", "nice", "ionice"})
+
+
+def _tools_from_commands(commands) -> set:
+    """Binary names invoked by a flat list of command strings."""
+    tools = set()
+    for cmd in (commands or []):
+        parts = str(cmd).split()
+        idx = 0
+        while idx < len(parts) and parts[idx] in _WRAPPER_PREFIXES:
+            idx += 1
+        first = parts[idx] if idx < len(parts) else ""
+        if first and not first.startswith(("#", "$", "echo")):
+            tools.add(first)
+    return tools
+
+
+def module_tools(instance) -> set:
+    """Binary names a module's own commands invoke (build + suggest)."""
+    tools = set()
+    try:
+        for source in (instance.build_commands(),
+                       instance.suggest_commands()):
+            for group in (source or {}).values():
+                tools |= _tools_from_commands(group or [])
+    except Exception:
+        pass
+    return tools
+
+
+def module_missing_tools(instance, commands=None) -> list:
+    """``[(tool, install_hint)]`` a module instance needs but cannot find.
+
+    ONE gate shared by `preflight` and by a module's own `run`: the tools
+    are derived from the module's own commands (build + suggest), so a
+    module that only calls a tool conditionally does not block. Resolution
+    goes through ToolRegistry, so `impacket-secretsdump` counts as the
+    legacy `secretsdump.py` being installed.
+
+    ``commands`` restricts the check to those command strings — quiet mode
+    executes only the TOP suggestion, so it must not be refused for a tool
+    a different suggestion would need.
+    """
+    try:
+        from phantom.automation.runtime.toolchain import ToolRegistry
+        reg = ToolRegistry()
+    except Exception:
+        return []
+    tools = (_tools_from_commands(commands) if commands is not None
+             else module_tools(instance))
+    return [(t, tool_install_hint(t)) for t in sorted(tools)
+            if not reg.has(t)]
+
+
 def tool_install_hint(tool: str) -> str:
     """Cross-platform install hint for a missing tool (apt/brew/pip/choco)."""
     import sys as _sys_mod

@@ -586,24 +586,28 @@ def _quick_probe_hosts(hosts: List[Dict[str, Any]], timeout: float = 15.0) -> No
         pass
 
 
+# how the terrain view DISPLAYS a family (the decision is shared: see
+# `phantom.utils.target_platform`)
+_OS_DISPLAY = {"windows": "Windows", "linux": "Linux", "macos": "macOS",
+               "android": "Android", "ios": "iOS"}
+
+
 def _guess_os(open_ports: List[int], banner: str = "") -> str:
-    """Coarse OS guess from the open-port fingerprint + banner."""
-    b = (banner or "").lower()
-    if "windows" in b or "microsoft" in b or "iis" in b:
-        return "Windows"
-    if "linux" in b or "ubuntu" in b or "debian" in b or "openssh" in b:
-        return "Linux"
-    if "darwin" in b or "macos" in b:
-        return "macOS"
-    if "android" in b or "adb" in b:
-        return "Android"
-    if "ios" in b or "airplay" in b or "raop" in b:
-        return "iOS"
+    """Coarse OS guess from the open-port fingerprint + banner.
+
+    The banner→family decision belongs to `utils.target_platform` (ONE
+    source, shared with the payload builder and the agent); what stays here
+    is the terrain view's display wording and the router/IoT reading of a
+    small, consumer-looking port set — a netmap-only label that never
+    builds an artefact.
+    """
+    from phantom.utils.target_platform import from_banner
+    answer = from_banner(banner, open_ports, source="banner")
+    if answer.platform:
+        name = _OS_DISPLAY.get(answer.platform, "")
+        # a port-only reading is a likelihood, not a fingerprint
+        return f"{name} (likely)" if answer.source == "ports" else name
     ports = set(open_ports or [])
-    if ports & {3389, 135, 139, 445, 5985}:
-        return "Windows (likely)"
-    if ports & {22, 111, 2049} and not ports & {135, 139, 445}:
-        return "Linux (likely)"
     if ports & {1900, 500, 4500, 53} and len(ports) <= 4:
         return "Router/IoT firmware"
     return ""

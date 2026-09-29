@@ -9,7 +9,9 @@ def cmd_use(shell, arg: str):
     """use <module> — enter a module (built-in or plugin; aliases: s, o, w, e, b, p, h, v, a, r, wl)"""
     module_name = arg.strip().lower()
     if not module_name:
-        notifier.error("Usage: use <module_name>")
+        notifier.usage("use", "<module>",
+                       "built-ins: scan osint web brute exploit payload "
+                       "handler pivot analyzer report wordlist c2")
         return
 
     # short aliases (with collision-safe mapping: sc/ex/pay/ha/pi/an/re)
@@ -53,8 +55,9 @@ def cmd_use(shell, arg: str):
             notifier.error(f"Plugin {module_name} crashed: {e}")
         return
 
-    notifier.error(f"Unknown module: {module_name}")
-    notifier.info(f"Available: {', '.join(sorted(modules) + sorted(plugin_modules.keys()))}")
+    notifier.unknown("module", module_name,
+                     sorted(modules) + sorted(plugin_modules.keys()),
+                     hint="run 'plugins' to list loaded modules")
 
 
 def cmd_plugins(shell, _):

