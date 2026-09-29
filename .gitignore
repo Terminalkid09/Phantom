@@ -223,6 +223,12 @@ data/persistence_rules.json
 # opencode config
 .opencode/
 
+# Local scratch: C++ harnesses compiled during development, editor state,
+# and Code Runner temp files — never part of the product
+.pcheck/
+.vscode/
+tempCodeRunnerFile.*
+
 # Private tooling (dynamic generator, polymorphic encoder, stub factory, CLI)
 private/
 
