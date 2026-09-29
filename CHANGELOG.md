@@ -6,6 +6,429 @@ All notable changes to Phantom.
 
 ## [Unreleased] — current development (v3.0.0 line)
 
+### Security & reliability — per-endpoint pins, real CI, scope hardening, audit
+
+- **Per-endpoint certificate pins.** A fallback ladder whose rungs are
+  different redirectors cannot share one certificate. `C2_HOST_PINS` is
+  aligned positionally with `[C2_HOST] + C2_HOSTS` (empty field = inherit the
+  compiled pin) and enforced on the CURRENT rung in every transport: WinHTTP
+  and OpenSSL compare the SHA-256 DER (`cfg.active_pin()`), macOS pins the
+  public key through libcurl's `CURLOPT_PINNEDPUBLICKEY`
+  (`C2_HOST_PUBKEY_PINS`). A rung with no pin at all now **fails closed**
+  instead of being trusted unauthenticated. Configured from
+  `c2.pins` / `c2.pubkey_pins`.
+- **Pins are derived from the front when it terminates TLS.** Previously
+  manual. Set `c2.front_cert` (or drop `certs/front.crt`) and the build pins
+  the front's certificate; `doctor` reports which certificate will be pinned.
+- **Windows beacons were never exposed to libcurl/OpenSSL.** The macOS
+  transport previously did NOT enforce the pin at all; it now does.
+- **Beacon compiles on Linux again.** `injection.h` included `<linux/elf.h>`,
+  which conflicts with glibc's `<elf.h>` (pulled by `peb_unlink.h`'s
+  `<link.h>`); the include was unused and is gone. Linux/Windows now compile
+  warning-free under `-Wall -Wextra -Werror` (curated WinAPI suppressions).
+- **Android parity.** `anti::is_vm` gained a real emulator check (qemu pipes,
+  `ro.kernel.qemu`, goldfish/ranchu, SDK model) and the platform matrix gained
+  an Android column; the Windows-only list is marked accepted.
+- **DNS-rebinding defense in the scope gate.** `phantom.core.scope` now
+  resolves A **and AAAA** (`getaddrinfo(AF_UNSPEC)`), requires EVERY resolved
+  address of a hostname to be authorized (a mixed in/out resolution is
+  refused), and FREEZES the approved resolution for a TTL so a rebind between
+  the check and the action cannot change the answer. New `scope_reason()`
+  explains a refusal.
+- **Audit fixes.** An agent precondition that RAISED was swallowed and read as
+  satisfied (`agent._execute_capability`) — now fails closed. Provider-named
+  API keys (`shodan_key`, `virustotal_key`, `aws_access_key`, …) were not
+  redacted and could reach reports/UI/LLM — the redaction rule now covers
+  `*_key`. The OSINT `sherlock` path interpolated operator input straight into
+  a `shell=True` command — usernames are now sanitized (fail closed).
+- **Real CI.** The `beacon-syntax` matrix now compiles with `-Werror`; the
+  `beacon-lint` job is a real hygiene linter (`scripts/ci_beacon_lint.py`: no
+  tracked generated headers, no committed artefacts, no debug prints, no
+  secret literals); and the Linux smoke job proves with
+  `scripts/ci_beacon_token_scan.py` that the deployment payload token never
+  reaches the built binary. `c2_config.h` is no longer tracked.
+
+### Security — per-beacon envelope keys, no deployment token in a binary
+
+- **Per-beacon AES-256-GCM envelope key.** An enrolled beacon now derives its
+  own key with HKDF-SHA256 from its own HMAC secret
+  (`phantom.utils.c2_crypto.derive_key`, mirrored byte-for-byte in
+  `c2d/envelope.go` and `beacon/src/crypto.h`). Capturing one beacon no longer
+  reveals the deployment-wide `PHANTOM_C2_KEY`, and it cannot decrypt another
+  beacon's traffic. The deployment key is kept as a LAST fallback, so beacons
+  already in the field keep checking in without a rebuild. Vectors are pinned
+  on all three implementations (`tests/test_c2_crypto_keys.py`,
+  `c2d/c2d_test.go`) and cross-checked by `scripts/c2d_parity_check.py`.
+- **The deployment payload token no longer travels on a target.**
+  `C2_PAYLOAD_TOKEN` moved into the generated `crypto_config.h` (which
+  `crypto.h` includes itself, so the macro is always defined before the code
+  that reads it) and is written EMPTY for an enrolled build. The beacon then
+  derives a per-beacon download token; the server accepts it alongside the
+  legacy deployment token. The tracked `c2_config.h` artefacts no longer carry
+  the token either.
+- **Native macOS build.** A macOS host can build a macOS payload with the
+  system `clang++` (+ Homebrew's keg-only OpenSSL) instead of requiring an
+  osxcross toolchain, which made the platform unbuildable on the platform
+  itself.
+
+### Added — full POSIX stealth parity (Linux / macOS)
+
+- **Anti-analysis is REAL on POSIX, not a stub.** `beacon/src/evasion.h` used to
+  return `false` for `is_debugger_present()` / `is_vm()` and no-op the rest on
+  Linux/macOS, so a POSIX beacon was materially weaker than a Windows one. It
+  now reads `/proc/self/status` `TracerPid` (Linux) and `sysctl` `P_TRACED`
+  (macOS), and detects a VM by DMI vendor strings (Linux) /
+  `kern.hv_vmm_present` + `hw.model` (macOS). AMSI/ETW stay documented no-ops:
+  there is no in-process equivalent to patch on POSIX.
+- **`edrcheck` answers on every OS.** Linux: LSM (`selinux` / AppArmor), eBPF
+  program count, kernel audit, known agents; macOS: SIP and EndpointSecurity
+  system extensions. The defensive-product detection moved into one shared
+  `dfns` namespace used by both `edrcheck` and `edrkill`.
+- **Masked sleep on POSIX** (`ekko_sleep_masked`): RC4 over the sleeping
+  thread's idle stack region (below the live frames) — the safe counterpart of
+  the Windows Ekko path. Code-page encryption is deliberately avoided there
+  (W^X / hardened runtimes / the keylogger thread).
+- **Module hiding on POSIX**: `peb_unlink::hide_module()` unlinks the beacon's
+  object from the dynamic loader's `link_map` (`_r_debug.r_map`) on Linux;
+  macOS has no writable dyld image list, so it is a documented no-op.
+  `masquerade::rename_process()` uses `prctl(PR_SET_NAME)` on Linux.
+- **Platform matrix document** (`docs/beacon_platform_matrix.md`): states, per
+  OS, what is implemented and what is deliberately Windows-only (direct/indirect
+  syscalls, stack spoofing, PPID spoofing, APC injection, SMB, WinHTTP,
+  WASAPI). Pinned by `tests/test_beacon_posix_parity.py`.
+- **Certificate-pin topology documented**: the pin covers the backend leaf, so a
+  front MUST forward the raw TLS (passthrough); a TLS-terminating front needs
+  the pin generated from its own certificate (README +
+  `server_cert_fingerprint` docstring).
+
+### Added — every browser, every platform (cookie collection)
+
+- **The on-box reader (`local_cookies`) is no longer "Windows, Chrome/Edge
+  only".** It now covers the **Chromium family** (Chrome, Edge, Brave,
+  Chromium, Vivaldi, Opera, Opera GX — every profile, `Network/` and legacy
+  layouts) on Windows, macOS and Linux; **Firefox** wherever it is installed
+  (all channels plus snap, flatpak, LibreWolf, Waterfox) — Firefox stores its
+  cookie values in the CLEAR, so they come back whole with no key at all; and
+  **Safari** (`Cookies.binarycookies`, also plaintext). Sealed values
+  (Chrome ≥ 127 App-Bound Encryption, a keystore this process cannot reach)
+  are **counted and named** in the failure reason instead of being reported as
+  a plausible-looking wrong value. Linux Chromium `v10`/`v11` blobs are
+  unsealed with Chrome's own no-keyring fallback (`PBKDF2("peanuts")`) and
+  Windows ones with the DPAPI-wrapped profile key; entries now carry
+  `browser`/`profile` alongside the unchanged `host/name/path/value` contract.
+- **The beacon's `cookies-json` covers the same browsers.** The C++ reader is
+  now schema-aware (column names come from each table's own `CREATE`
+  statement), so one engine reads Chromium's `cookies` and Firefox's
+  `moz_cookies`; Firefox, Safari and the full Chromium browser/profile list are
+  enumerated on every platform, and the emitted JSON carries
+  `browser`/`profile`. A value that cannot be unsealed is reported as
+  `<sealed: reason>`, never guessed. On Linux the `peanuts` OSCrypt path is
+  enabled by `__has_include(<openssl/evp.h>)`, so a build without OpenSSL
+  headers still compiles.
+
+### CI — real cross-platform parity
+
+- `beacon-syntax` now generates its headers with the REAL generators
+  (`scripts/ci_beacon_prepare.py`) instead of a hand-written stub, and also
+  compiles the **remote module**, whose private copy of `crypto.h` is exactly
+  the kind of duplication that drifts silently.
+- New **release-path smoke jobs**: Windows (MinGW/BCrypt), native macOS
+  (clang++/OpenSSL) and Android (NDK + the automatic OpenSSL bootstrap) — each
+  one runs `compile_beacon` and asserts a real binary of that platform's
+  format.
+- New **`c2d-test` job**: `gofmt`, `go vet`, `go test` on the Go data plane
+  plus the Python ↔ Go ↔ beacon key-derivation parity check.
+
+### Added — closed learning loop, `doctor`, `run-diff`, `why`
+
+- **Experience memory ON by default** (`automation.experience`, opt-out
+  with `--no-experience` on `auto`/`agent` or the config key): every run
+  records (situation, technique, outcome, cause, repair) episodes into
+  `data/experience_cases.json` and the planner reorders already-allowed
+  moves so a wall hit once is not hit the same way again. New end-of-run
+  **learning receipt** (CLI + stream + Electron), and the `experience`
+  command to inspect (`list`) and deliberately `forget` episodes.
+- **`doctor [--net]`** — environmental self-check in one command:
+  Python, core deps, beacon toolchain, data dir, config coherence,
+  experience store, LLM model file, transports; `--net` adds the C2/
+  msf/dead-drop probes. FAILs carry the fix in a ↳ hint.
+- **`run-diff <cpA> <cpB>`** — structured comparison of two run
+  checkpoints: findings gained/lost/changed, walls resolved vs new, and
+  a verdict (further / regressed / mixed / sideways).
+- **`why [capability] [--trace <checkpoint>]`** — the decision ledger
+  (`brain/trace`) surfaces in the shell: driver lens, runner-up, top
+  contributions, veto, live or from a finished run's checkpoint.
+
+### Changed
+
+- **The CLI boots into AUTO-MODE.** Bare `phantom` opened the manual module
+  shell and auto-mode was a flag; that meant two entry points, two state
+  paths (target, scope, accumulated knowledge) and two help tables — which is
+  how `run` after an `auto` came to start from a blank slate. `phantom` now
+  opens the AUTO-MODE shell, and the module workflow is a MODE of it (`manual`
+  inside the shell, or `phantom --manual`), on the same engagement session.
+  `phantom --auto <target>` (headless) and `phantom --c2` are unchanged.
+- Session auto-save/auto-restore failures in the API server are logged
+  instead of silently swallowed (silent persistence drops read as lost
+  engagements).
+- `transports.phish_from`, `transports.telegram_allowed_users` and
+  `transports.dm_transport` are now declared in the config SCHEMA (they
+  were read at call sites but invisible to the declared config plane).
+- The legacy **Telegram C2 module is unmaintained**: removed from the
+  shell's module help and documented as dormant in the README (the code
+  stays importable; the Telegram *Bot API* remains supported as a DM
+  transport for the social chain).
+- `coverage <profile>` prints through the shell console instead of raw
+  stdout (consistent capture for tests and tools).
+
+### Added — real-target hardening (simulation across every profile × goal)
+
+A pass that simulated each engagement profile against real targets found
+places where a run could look successful and still be unreachable,
+unresolvable, or silent. Fixed end to end:
+
+- **C2 bind and C2 dial are now separate keys.** The listener binds
+  `c2.bind` (`0.0.0.0` by default — every interface, so a multi-homed box
+  or a changed VPN/LAN address cannot silently make the C2 unreachable),
+  while `c2.host` stays the address beacons are TOLD to dial (empty by
+  default, derived on demand). `listeners`, auto-mode's listener
+  bootstrap and `doctor` all read the new key.
+- **C2 transport hardening.** mTLS `CERT_REQUIRED` by default
+  (`c2.mtls_require_client_cert=false` restores `CERT_OPTIONAL`, and
+  `doctor` flags it), an explicit TLS 1.2 floor with an AEAD-only cipher
+  policy, and a **refusal to start a PLAINTEXT listener on a non-loopback
+  bind** unless `c2.allow_plaintext=true` (lab only) — an on-path observer
+  could otherwise read and hijack the C2. `doctor` reports the posture.
+- **Callback plausibility preflight.** Before a beacon-bound run,
+  `callback_plausibility()` compares the advertised `c2.host` to each
+  target (unroutable / loopback / private-vs-external) and warns per
+  target, erroring when NO target could ever call back — the failure used
+  to surface much later as "no beacon established" with no cause.
+- **impacket aliases.** Modern installs ship `impacket-secretsdump`,
+  `impacket-GetUserSPNs`, … instead of `secretsdump.py`; the tool registry
+  and the AD command builders now resolve either, so a fully provisioned
+  box no longer reports the whole AD chain as missing.
+- **`nmap -O` is gated on raw-socket availability** (root on POSIX, the
+  Npcap driver on Windows); without them the OS-detect adapter degrades to
+  banner-based version detection instead of failing the capability.
+- **Halt explains itself.** A `halt` now carries and renders the planner's
+  rejected candidates (capability, fact, reason) plus `rejected_total`, and
+  `plan` prints the same list — "no affordable path to goal" becomes a
+  to-do list.
+- **Checkpoint schema gate.** A checkpoint whose `schema` differs from the
+  running build is still read, but the resume emits a `note` instead of
+  silently using defaults for fields that moved.
+- **Module tool gate.** `run` and `preflight` share one check derived from
+  the module's own commands (alias-aware); quiet mode refuses only when the
+  TOP suggestion's tool is missing, and `sudo`/`doas`-wrapped commands are
+  checked for the real binary, not the wrapper.
+- **Feasibility warnings for profile × goal.** `auto`/`agent` warn up
+  front when a combination cannot succeed (mobile + beacon/deliver/…,
+  `impact` without `engagement.ransom_sim_allow`, `evasion` without
+  SYSTEM, `smb` + AD goals) instead of halting after the run.
+- **Artifact disk usage.** `sessions`, `reports` and `logs` are declared
+  with no TTL (never auto-deleted) and `doctor` measures their recursive
+  size, so the engagement's own record is measured rather than pruned.
+- **Redirector-first beacon builds.** New `c2.front` (a disposable public
+  hop — a redirector or CDN) is what the beacons are built against instead
+  of the operator's listener. A beacon that is captured therefore points at
+  an address you can burn and rotate in minutes while the backend stays
+  private; `get_c2_endpoint()` prefers the front, and both the build and new
+  `doctor` check `c2-front` flag a beacon that would otherwise embed the
+  backend directly.
+- **Optional Go data plane (`c2d`).** `c2.transport_backend=go` selects a
+  standalone static listener that speaks the SAME wire protocol (HMAC
+  canonical string, AES-256-GCM envelope, routes, malleable catch-all) as the
+  Python one, so an unmodified beacon cannot tell which backend answered. Its
+  dependency set is the Go standard library: no interpreter, no third-party
+  module, no OpenSSL to patch, no `Server:` banner. Python-side parity is
+  pinned by tests against Python-computed key-derivation and signature
+  vectors, plus an end-to-end `httptest` round trip. With `go` selected,
+  auto-mode stops starting the Python listener (the two would fight for the
+  port) and `doctor` reports the backend. The shell, the automation agent and
+  the task/artifact policy stay in Python.
+- **Dead-drop bootstrap.** `c2.bootstrap_dead_drop` (default on) makes the
+  beacon resolve its live endpoint from the dead drop BEFORE the first
+  check-in, so the compiled endpoint is only ever a fallback rung and the
+  indirection can be rotated without a rebuild. `config dead-drop publish`
+  with no arguments publishes the endpoint a beacon would dial right now,
+  and `c2.dead_drop` is now declared in the config SCHEMA (it was read at
+  call sites but invisible to the config plane).
+
+### Added — XSS bug class in the anomaly engine (`exploit/xss.py`)
+
+XSS was the one bug class the hunt engine did not carry at all: the only
+traces were four fuzz tokens and a tool-list entry, so a reflected/stored
+XSS was invisible to both the manual workflow and the auto-mode.
+
+- **New class `xss`** (`phantom/automation/exploit/xss.py`, registered in
+  `_CLASS_PROBES` / `_MUTATIONS`): 8 payloads across the four injection
+  contexts — markup (`<script>` / `<svg onload>` / `<img onerror>`), a
+  double- and single-quoted attribute breakout, a JS-string breakout and an
+  autofocus/onfocus attribute sink — each with a unique `phxssN` canary and
+  the RAW byte (``<`` or a quote) the payload depends on.
+- **The signal is real, not noise.** A marker only counts when the raw
+  canary+markup comes back and was absent from the baseline, so a page that
+  merely echoes the query (or HTML-encodes it) is never a hit. A bare
+  `javascript:alert(1)` probe was deliberately rejected: it survives
+  HTML-encoding, so it would flag a page that prints the value as text.
+- **Execution-context guard** — a reflection inside `application/json` /
+  `text/plain` is data, not script: `_score` reads the response
+  `Content-Type` and refuses the marker outside HTML/SVG.
+- **Bounded endpoint adaptation** — probes the reflection sinks
+  (`q`/`s`/`search`/…) when discovery found no parameter, capped at 3
+  params × 3 endpoints, so the request budget is never blown.
+- Honest limit, stated in the module: this is static reflection analysis.
+  No browser is driven, so DOM XSS and a stored XSS that fires on a
+  different page are out of scope; `confirmed` means the reflection
+  reproduced, not that a victim executed it.
+- Tests: `tests/test_xss_class.py` (15) + the class-set invariant in
+  `tests/test_anomaly.py`. Verify: 198 passed across the anomaly/hunt/
+  exploit/attack-chain suites.
+
+### Added — exploit: XSS weaponization + the closed orphan edges
+
+Two gaps found while auditing exploitation:
+
+- **A confirmed reflected XSS now has a payoff path.** New capability
+  `xss_weaponize` (`exploit/xss.py` builders + `kit.py` wiring) turns the
+  confirmed reflection into the session-theft asset: `xss_exfil_payload()`
+  emits the fire-and-forget `new Image().src` cookie beacon (or a POST of
+  the curl + form fields in `creds` mode) and `xss_poc_url()` builds the
+  ready-to-send PoC URL at the exact injection point. It reports the honest
+  limit in its own description: delivery still needs a victim.
+- **`attack_chain` had no edge for cmdi/deser/xss.** New predicates
+  `_has_command_injection` / `_has_deserialization` / `_has_xss` and edges:
+  confirmed cmdi/deser → `rce`, confirmed XSS → `creds`. (The EXECUTION path
+  for cmdi already existed and works — `_pick_rce_candidate` →
+  `rce_foothold` → `beacon_via_rce` inject the beacon through the confirmed
+  parameter; what was missing was the graph edge, so path analysis ignored
+  it.) `xss_exfil` added to `GOAL_FACTS["exploit"]` so the planner reaches
+  the weaponizer. Tests: `tests/test_xss_weaponize.py` (15).
+
+### Fixed — self-improvement loop: three accounting/leak bugs
+
+- **The PR budget is now claimed atomically, right before the push.**
+  `publish()` used `can_pr()` + `count_pr()` — a check-then-act window in
+  which concurrent workers could over-admit past the 2/day budget, while
+  `EvolutionState.reserve_pr_slot()` (the atomic primitive added in P1-4)
+  sat unused. Reserving at the push also means a failure *before* that
+  point spends no slot.
+- **The push no longer puts the token in argv.** The first `http.extraHeader`
+  form still leaked the token into the child's argv (`ps` / Task Manager
+  read `-c key=value`), and its fallback re-introduced the token-bearing
+  URL that P1-6 exists to remove. The push now uses a git credential helper
+  that reads the secret from the subprocess ENV; git output is redacted and
+  there is no token-bearing fallback.
+- **A failed authoring gives its GATE slot back.** `reserve_gate_slot()` is
+  claimed at spawn, but `clear_authored()` did not release the gate counter
+  — so an authoring failure (or an unavailable author) burned the daily
+  gate budget for a gate run that never happened. New
+  `EvolutionState.release_gate_slot()` (floored at zero).
+  Tests: `tests/test_evolution_accounting.py`.
+
+### Changed — tool choice is now target-aware (and actually wired)
+
+The toolbelt ranked tools by what is installed on the OPERATOR box and,
+because nothing ever stamped `wm.chosen_tool`, its pick never reached the
+adapters — every command silently used the hard-coded default. Now:
+
+- `ToolOption.requires_service` + `TargetSurface` (`surface_from_wm`): an
+  option that needs a service the TARGET does not expose is dropped before
+  ranking, and when nothing survives the choice is `None` with an explicit
+  reason ("target exposes no smb surface — tool not applicable") instead of
+  a tool ground against an absent surface.
+- `AutonomousAgent._stamp_tool_choice()` records the target-aware pick on
+  `wm.chosen_tool` (with its reason) before autofill, so adapters route on
+  it and a bad fit is auditable. Absent the stamp the adapters keep their
+  deterministic default. Tests: `tests/test_toolbelt_target.py`.
+
+### Changed — reasoning: a confirmed bug now promotes its payoff move
+
+New `AutonomousAgent._payoff_bonus()`: a CONFIRMED code-execution / session
+primitive (cmdi/ssti/deser → `rce_foothold`, ssrf → `cloud_creds`,
+traversal → `file_read`, sqli → `creds`, xss → `xss_exfil`) outranks ordinary
+moves while it is UNCONSUMED, so the run weaponizes what it already proved
+instead of wandering off to re-scan. The bonus disappears the moment the
+payoff finding exists, so it cannot become a loop. Tests:
+`tests/test_reasoning_payoff.py`.
+
+### Changed — two compromises from Fase 7/8/9 closed
+
+- **Worker toolchain**: the offline `{nmap,curl,nc}` set stays as the test
+  default only; the operator paths (`AutonomousAgent`, `run_auto_mode`, the
+  `auto` CLI) inject the real `ToolRegistry()`.
+- **Provisioning**: confirmed install runs ONLY pre-engagement
+  (`--allow-install`, never with `--plan`/live runs).
+
+### Added — Fase 7/8/9: reasoning auto-mode, delivery payload, UX operatore
+
+Queste tre fasi non sono un rework architetturale: sono la chiusura di
+cuciture già esistenti ma inerti (tabelle non consumate, copie multiple
+della stessa logica, flag senza effetto). Il dettaglio e i limiti sono nel
+Log di `docs/ROADMAP.md`.
+
+- **7.1 — il profilo decide il piano** (`automation/swarm/profile_policy.py`,
+  nuovo). Prima `--profile` era un'etichetta: finiva nel threat model e
+  nell'OPSEC ma non cambiava la chain. Ora `ProfilePolicy` mappa profilo →
+  `chain` / `difficulty` (prior 0..1 che un passaggio renda) / `thin_surface`
+  / `reason_hint`, ed è l'unico punto di policy; `--chain` esplicito vince
+  sempre. Wired in `swarm/__init__.py`, `core/automode.py`,
+  `core/shell/commands/auto.py`.
+- **Controllo coerenza profilo↔target** (`check_profile_target`). Rileva i
+  soli due casi che si contraddicono davvero (`mobile` su host senza telefono
+  → fallback macchina; profilo macchina su numero di telefono → `mobile`),
+  lo **annuncia** via `notifier.warn` (mai silenzioso) e il piano usa il
+  profilo effettivo. Nuovo flag `--force-profile` su `auto`/`agent` per
+  mantenere la scelta dell'operatore. Test: `tests/test_profile_target_check.py`
+  (20).
+- **7.2 — i tool si scelgono dalla registry** (`swarm/worker.py`). Rimosso
+  l'hardcode `ToolRegistry(installed={"nmap","curl","nc"})`; `toolchain`
+  ora è iniettabile con default offline deterministico per i test, mentre i
+  path reali iniettano `ToolRegistry()`. Test: `tests/test_swarm_toolchain.py`.
+- **7.3 — provisioning dei tool su consenso** (`automation/runtime/provision.py`,
+  nuovo). `provision(...)` senza consenso **non chiama mai** l'installer;
+  gira solo pre-engagement via `--allow-install` e mai con `--plan`. Test:
+  `tests/test_provision.py`.
+- **7.4 — belief revision per-fact + arbiter non silenzioso**
+  (`automation/belief.py`, `agent.py`, `core/stream_contract.py`). Un fatto
+  contraddittorio **revisiona** il precedente e traccia il conflitto; l'arbiter
+  emette invece di tacere; nuovo evento `contradiction` nel contratto.
+  Test: `tests/test_belief_revision.py`.
+- **7.5 — decision trace** (`automation/brain/trace.py`, nuovo).
+  `TraceEntry`/`DecisionTrace` cablati in `agent.py`, evento nel contratto e
+  tracce nel report. Test: `tests/test_decision_trace.py`.
+- **7.6 — la thin-surface policy è consumata** (`guidance/strategy.py`). La
+  tabella di `profile_policy` (prima codice morto) ora guida il recovery di
+  stallo. Test: `tests/test_thin_surface_policy.py`.
+- **7.7 — checkpoint tabelle morte** (`tests/test_gap_tables_checkpoint.py`):
+  ogni chiave di `GOAL_FACTS`/`_GAP_CAP_HINTS` deve avere un consumatore reale;
+  rimossa la chiave morta in `fallback.py`.
+- **8.1 — stager resiliente** (`utils/builder.py`, `automation/agent.py`):
+  prova il download e, se fallisce, schedula un retry persistito con endpoint
+  incorporato. Test: `tests/test_resilient_stager.py`.
+- **8.2 — guardia loop residente beacon** (`tests/test_beacon_loop_residency.py`):
+  pinna che `main.cpp` esca solo su EX/MG, con backoff capped e ladder via
+  `cfg.on_failure()`.
+- **8.3 — unica fonte OS→artefatto** (`utils/target_platform.py`, nuovo).
+  Consolidate 5 copie divergenti (`modules/payload.py`, `core/netmap.py`,
+  `automation/agent.py`, `core/c2_shell.py`); il default silenzioso
+  "Unknown (defaulting to Linux x64)" è eliminato a favore di un fallback
+  **dichiarato** con motivo/warning, e l'arch dichiarata sopravvive
+  (`Unknown i386` → `x86`, non `x64`). Test: `tests/test_target_platform.py`,
+  `tests/test_platform_single_source.py`.
+- **9.1/9.2 — generator HID** (`utils/hid_builder.py`, nuovo). `BOARDS =
+  ("pico","flipper","omg")`, `build_hid_payload(...)` emette DuckyScript o
+  CircuitPython; la board è scelta dall'operatore, mai automatica. Wired in
+  `modules/payload.py`. Test: `tests/test_hid_payload.py`.
+- **9.3/9.4 — auto-open shell C2** (`core/c2_server.py`, `api/server.py`,
+  `electron/src/components/C2Dashboard.tsx`). `auto_shell` **default OFF**,
+  override `c2.auto_shell`/env, e ogni apertura/rifiuto finisce nell'audit
+  hash-chained (`auto_shell_queued`). Test: `tests/test_c2_autoshell.py`.
+
+Verifica: suite completa **3319 passed, 4 skipped, 12 subtests** ·
+`electron && npx tsc --noEmit` exit 0.
+
 ### Fixed — P0 hardening round 1 (docs/ROADMAP.md)
 
 - **`chain execute` reported success for failed commands** — `execute_step()`

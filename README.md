@@ -67,8 +67,12 @@ use <module> → run            # execute the interactive flow (preview ≠ run)
 # set target, `run` routes them to osint first (dossier before any network),
 # and network modules warn when used against an identity target.
 
-# AUTO-MODE has its own shell (like `c2`):
-auto                              # enter the AUTO-MODE shell
+# AUTO-MODE IS THE DEFAULT ENTRY POINT: bare `phantom` opens this shell.
+# The manual module workflow above is a MODE of it now — `manual` here (or
+# `phantom --manual`) — sharing the SAME target/scope/findings, so `run`
+# after an `auto` run sees the accumulated knowledge instead of a blank slate.
+auto                              # enter the AUTO-MODE shell (same as bare `phantom`)
+manual                            # the manual module core, on this engagement
 targets add bob@corp.com,10.0.0.5 # multi-target list (add/rm/list)
 scope add corp.com                # authorized targets
 flags                             # show/change flags (aggressive, stealth, speed, agents, goal, profile, llm, experience)
@@ -320,6 +324,15 @@ The beacon supports **reflective in-memory loading**: a position-independent loa
 | **Encrypted Config** | C2_HOST + C2_PORT XOR-encrypted at compile-time with per-build rotating seed |
 | **Auto-Persist** | RunKey (Win) / Cron/Systemd (Linux) — queued to beacon on first check-in |
 | **Cross-Platform** | Windows (PE, x64), Linux (ELF, x64/x86), Android (ELF, ARM64), macOS |
+
+> **Platform parity.** The Windows-only rows above are deliberate NT mechanisms.
+> Linux and macOS ship real equivalents for everything that has one —
+> debugger/VM detection (`TracerPid` / `kern.hv_vmm_present`), EDR awareness
+> (`edrcheck`: `selinux`/AppArmor LSM, eBPF, audit, known agents), masked sleep
+> (`ekko_sleep_masked`) and module hiding (`link_map` unlink) — and document the
+> rest (direct/indirect syscalls, stack spoofing, PPID spoofing, APC injection,
+> SMB, WinHTTP, WASAPI). Full matrix:
+> [`docs/beacon_platform_matrix.md`](docs/beacon_platform_matrix.md).
 
 ### Beacon Commands (35+)
 
@@ -860,10 +873,18 @@ Five modules feed the adaptive scoring engine:
 
 - `data/phantom_state.json` (gitignored, `0600`) — auto-generated secrets:
   - `PHANTOM_C2_KEY` — 32-byte AES-256 key, embedded in every beacon
-  - `PHANTOM_PAYLOAD_TOKEN` — gates `/api/v1/payload*`, `/x`, `/s/android`
+  - `PHANTOM_PAYLOAD_TOKEN` — gates `/api/v1/payload*`, `/x`, `/s/android`;
+    new builds carry **no** deployment token: each enrolled beacon derives its
+    own and the server accepts either
   - `PHANTOM_API_TOKEN` — gates `/api/v1/beacons`, `/api/v1/queue`, `/api/v1/results`
   - Beacon auth ON by default — every `generate` creates a unique per-beacon HMAC identity
-  - mTLS ON by default — `CERT_OPTIONAL` at TLS layer, enforced via middleware on beacon routes
+  - mTLS ON by default — a **required client certificate** (`CERT_REQUIRED`) plus per-beacon HMAC on beacon routes; beacons get their certificate at build time
+  - TLS 1.2 floor + AEAD-only ciphers; a **plaintext listener is refused** on a non-loopback bind unless `c2.allow_plaintext=true` (lab only)
+  - the listener binds `c2.bind` (`0.0.0.0` by default, every interface) while `c2.host` is the address beacons are told to dial
+  - a **disposable public front** (`c2.front`, a redirector/CDN) is what beacons are built against: a captured beacon reveals a hop you can burn and rotate, never the backend; both the build and `doctor` flag a beacon that would otherwise embed the operator's own address
+  - the pinned fingerprint is the **backend's** leaf certificate (`certs/server.crt`), so a front **must forward the raw TLS (passthrough)** — if the front terminates TLS with its own certificate the pinned leaf will not match and every check-in fails; in that topology the pin must be generated from the front's certificate and rotated with it, and the `C2_HOSTS` ladder shares a single pin
+  - the beacon can resolve its live endpoint from the **dead drop before the first check-in** (`c2.bootstrap_dead_drop`, on by default), so the indirection is rotated without rebuilding
+  - an optional **Go data plane** (`c2d`, `c2.transport_backend=go`): the same wire protocol, HMAC and mTLS as the Python listener, as one static binary with **zero third-party dependencies** — no `venv`, no `pip`, no OpenSSL to keep patched. The beacon cannot tell which backend answered
 - `data/config.json` (gitignored, auto-created with defaults) — settings for the C2, tracker and social transports. Everything local ships pre-configured.
 
 **`setup` command (console):**
@@ -1001,6 +1022,15 @@ External tools (nmap, Metasploit, aircrack-ng) execute through a configurable ba
 | `config` | Show/rotate C2 secrets, toggle mTLS |
 | `telegram` | Start Telegram C2 bot |
 | `results` | View queued task output for active beacon |
+
+> **Telegram C2 (unmaintained).** The legacy Telegram control-plane module
+> (`phantom/modules/telegram.py`, the `telegram` C2 command above) is kept
+> in the codebase but is **not actively maintained** and is therefore not
+> listed in the shell's module help. It still works if you start it
+> manually and configure `PHANTOM_TELEGRAM_BOT_TOKEN`; note that the
+> Telegram *Bot API* remains fully supported as a DM **transport** for the
+> social-engineering chain — only the bot-as-C2-channel is dormant. Don't
+> rely on it for engagements without reviewing the code first.
 | `screen-watch` | Local player for screen recordings: live progressive segments + finished `.mp4` library |
 | `screen-open <file>` | Open one recording artifact from `data/recordings/` |
 
@@ -1044,7 +1074,8 @@ which is what an engagement needs, without shipping collector binaries.
 The beacon/C2 transport has been reviewed for reliability and safety:
 
 - **Task lease & idempotency:** queued tasks use a bounded lease; lost HTTP responses don't lose work; duplicate retries are idempotent
-- **API auth:** `/api/v1/payload*`, `/x`, `/s/android` require `PHANTOM_PAYLOAD_TOKEN`; `/api/v1/beacons`, `/api/v1/queue`, `/api/v1/results` require `PHANTOM_API_TOKEN` on non-localhost
+- **API auth:** `/api/v1/payload*`, `/x`, `/s/android` require `PHANTOM_PAYLOAD_TOKEN` (or the per-beacon token an enrolled beacon derives); `/api/v1/beacons`, `/api/v1/queue`, `/api/v1/results` require `PHANTOM_API_TOKEN` on non-localhost
+- **Envelope keys are per-beacon:** an enrolled beacon derives its AES-256-GCM key from its own HMAC secret (HKDF-SHA256), so one captured beacon exposes neither the deployment key nor another beacon's traffic. The deployment key remains only as a fallback for beacons built before this scheme.
 - **Result caps:** beacon bodies capped at 10 MiB; server caps retained results per beacon
 - **Task watchdog:** every task runs on a worker thread with a per-command budget (30 s default, media captures duration + 15 s, camera 45 s) — a hung camera `ReadSample` or stuck shell pipe can no longer wedge the beacon loop or leave tasks stuck "sent" forever
 - **Evasion ships by default:** sleep mask, stack spoofing, ekko, debugger/VM checks compile into every normal build (`disable_anti=False` default); the `rbp` inline-asm symbol bug that made the anti-evasion build fail at link time is fixed
