@@ -25,6 +25,38 @@ collect_ignore = [
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_fingerprint_probes(monkeypatch):
+    """Keep banner probes off the network unless they target loopback.
+
+    Command adapters can synthesise their output at build time: the
+    ssh_banner and fingerprint adapters run a real socket probe inside
+    ``make_command``. A test that plans those capabilities against a lab IP
+    (10.0.0.x) then blocks for the full connect timeout on a host that is
+    unroutable-but-not-refusing — which is how a single ``run_swarm`` test
+    used to hang the whole suite. The suite is meant to be hermetic, so refuse
+    anything that is not loopback: the probe fails fast and the test renders
+    its degraded path instead of waiting on the network.
+
+    A test that needs real probe behaviour can still ``monkeypatch``
+    ``probes._connect`` itself; that patch is applied after this one.
+    """
+    try:
+        from phantom.automation.fingerprint import probes
+    except Exception:  # pragma: no cover - import guard for isolated runs
+        yield
+        return
+    original = probes._connect
+
+    def _connect(host, port, timeout=5.0):
+        if host in ("127.0.0.1", "localhost", "::1"):
+            return original(host, port, timeout)
+        return None
+
+    monkeypatch.setattr(probes, "_connect", _connect)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _stop_leaked_servers():
     """Tear down any server a test left running (best-effort, never fails)."""
     # snapshot the config module's cached state so a test that repoints

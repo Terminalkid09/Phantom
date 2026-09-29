@@ -1,11 +1,13 @@
 """Tests: auto-mode C2 listener bootstrap.
 
-The contract (Fase 1 C2 fix):
+The contract:
   * ``c2.listener_auto_start = False`` -> never auto-start, warn instead;
-  * otherwise bind the derived beacon-facing address (get_c2_endpoint),
-    never a hardcoded 0.0.0.0;
-  * when that address is not bindable here (NAT/public IP), fall back to
-    the loopback for local-lab runs and say so;
+  * otherwise bind ``c2.bind`` (0.0.0.0 by default: every interface, so a
+    multi-homed box or a changed VPN/LAN address cannot make the C2
+    unreachable). The address beacons are TOLD to dial stays
+    get_c2_endpoint()[0], and is deliberately NOT the bind address;
+  * when the configured bind is not bindable here (a public IP that is not
+    local), fall back to the loopback for local-lab runs and say so;
   * when nothing is bindable, skip the listener and let the run continue.
 """
 import socket
@@ -36,10 +38,14 @@ class _FakeServer:
         self.calls.append((host, port, use_ssl))
 
 
-def _patch_cfg(auto_start):
-    return patch("phantom.utils.config.get",
-                 side_effect=lambda k, d=None, env=None:
-                 auto_start if k == "c2.listener_auto_start" else d)
+def _patch_cfg(auto_start, bind="0.0.0.0"):
+    def _get(k, d=None, env=None):
+        if k == "c2.listener_auto_start":
+            return auto_start
+        if k == "c2.bind":
+            return bind
+        return d
+    return patch("phantom.utils.config.get", side_effect=_get)
 
 
 def test_opt_out_never_starts_listener():
@@ -62,7 +68,10 @@ def test_already_running_listener_is_left_alone():
     ep.assert_not_called()
 
 
-def test_binds_derived_host_not_wildcard():
+def test_binds_configured_bind_not_the_dial_host():
+    """The listener binds c2.bind (0.0.0.0 by default, every interface)
+    while beacons are told to dial the derived address — the two roles are
+    now separate keys."""
     port = _free_port()
     fake = _FakeServer()
     with _patch_cfg(True), \
@@ -70,13 +79,13 @@ def test_binds_derived_host_not_wildcard():
             patch("phantom.utils.network.get_c2_endpoint",
                   return_value=("127.0.0.1", port)):
         assert am._ensure_c2_listener(server=fake) is True
-    assert fake.calls == [("127.0.0.1", port, True)]
+    assert fake.calls == [("0.0.0.0", port, True)]
 
 
-def test_unbindable_derived_host_falls_back_to_loopback():
+def test_unbindable_bind_falls_back_to_loopback():
     port = _free_port()
     fake = _FakeServer()
-    with _patch_cfg(True), \
+    with _patch_cfg(True, bind="203.0.113.9"), \
             patch.object(am, "notifier"), \
             patch("phantom.utils.network.get_c2_endpoint",
                   return_value=("203.0.113.9", port)):  # TEST-NET-3, non-local
@@ -86,14 +95,14 @@ def test_unbindable_derived_host_falls_back_to_loopback():
 
 def test_nothing_bindable_skips_listener_but_returns_false():
     fake = _FakeServer()
-    # hold the loopback port so even the fallback cannot bind: the only
-    # honest answer is "no listener" (deterministic on any privilege level)
+    # the configured bind is non-local AND the loopback fallback port is
+    # held, so the only honest answer is "no listener"
     held = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     held.bind(("127.0.0.1", 0))
     held.listen(1)
     port = held.getsockname()[1]
     try:
-        with _patch_cfg(True), \
+        with _patch_cfg(True, bind="203.0.113.9"), \
                 patch.object(am, "notifier"), \
                 patch("phantom.utils.network.get_c2_endpoint",
                       return_value=("203.0.113.9", port)):  # non-local + taken

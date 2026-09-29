@@ -115,6 +115,47 @@ class TestJsonBlobMining(unittest.TestCase):
         self.assertNotIn("mario.rossi", handles)
 
 
+class TestSecondHop(unittest.TestCase):
+    """Second-hop graph mining: a stranger who interacts with BOTH the
+    target and a circle member is mutual-graph evidence — and it is the
+    path that still works on a PRIVATE target."""
+
+    def _page(self, *handles):
+        blob = json.dumps({"commentList": [{"text": f"@{h} hi"}
+                                           for h in handles]})
+        return f'<script type="application/ld+json">{blob}</script>'
+
+    def test_a_mutual_handle_surfaces(self):
+        primary = ReconResult(username="target", platform="instagram")
+        primary.leads.append(Lead("commenter", "friend1", "instagram", "e", 0.5))
+        primary.leads.append(Lead("commenter", "mutual", "instagram", "e", 0.5))
+        with patch.object(recon, "_state_vote",
+                          return_value=("public", 0.8, self._page("mutual"))):
+            leads = recon._second_hop(primary, "instagram", {})
+        mutual = {l.value: l.evidence for l in leads if l.kind == "commenter"}
+        self.assertEqual(mutual.get("mutual"),
+                         "mutual_graph_2hop_via_friend1")
+        self.assertTrue(any(l.value == "friend1"
+                            and l.evidence == "second_hop_public"
+                            for l in leads))
+
+    def test_no_circle_makes_no_network_calls(self):
+        primary = ReconResult(username="t", platform="instagram")
+        with patch.object(recon, "_state_vote") as sv:
+            self.assertEqual(recon._second_hop(primary, "instagram", {}), [])
+            sv.assert_not_called()
+
+    def test_the_pass_is_bounded(self):
+        primary = ReconResult(username="t", platform="instagram")
+        for i in range(10):
+            primary.leads.append(Lead("commenter", f"friend{i:02d}",
+                                      "instagram", "e", 0.5))
+        with patch.object(recon, "_state_vote",
+                          return_value=("public", 0.8, self._page("x"))) as sv:
+            recon._second_hop(primary, "instagram", {})
+        self.assertLessEqual(sv.call_count, recon._SECOND_HOP_MAX)
+
+
 class TestStateVote(unittest.TestCase):
     """Private-state voting with mocked curl."""
 

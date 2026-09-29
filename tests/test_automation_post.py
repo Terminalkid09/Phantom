@@ -204,6 +204,7 @@ class TestPostInterpreters(unittest.TestCase):
         self.assertEqual(f[0].value["target_process"], "1234")
         self.assertEqual(f[0].kind, "injection")
 
+
     def test_ad_enum_interpreter_discovers_domain(self):
         out = ("dn: DC=corp,DC=local\n"
                "namingContexts: dc=corp,dc=local\n"
@@ -294,6 +295,56 @@ class TestPostInterpreters(unittest.TestCase):
 
     def test_cleanup_interpreter_requires_marker(self):
         self.assertEqual(cleanup_interpreter("Access denied", self.wm, {}), [])
+
+
+class TestInjectCommand(unittest.TestCase):
+    """The payload is a COMMAND, not shellcode: privileged execution is
+    established by something that PERSISTS and survives the C2 being down,
+    never by writing a command line into a remote RWX page."""
+
+    def setUp(self):
+        self.wm = WorldModel(target="10.0.0.5")
+
+    def test_windows_runs_the_payload_as_a_system_task(self):
+        import base64
+        from phantom.automation.post.inject import (
+            _INJECT_TASK_WIN, inject_beacon_command)
+        cmd = inject_beacon_command("windows", "echo PAYLOAD")
+        self.assertTrue(cmd.startswith(
+            "powershell -NoP -NonI -W Hidden -Exec Bypass -Enc "))
+        outer = base64.b64decode(cmd.rsplit("-Enc ", 1)[1]).decode("utf-16-le")
+        self.assertIn(_INJECT_TASK_WIN, outer)
+        self.assertIn("/ru SYSTEM", outer)
+        self.assertIn("INJECT_OK pid=SYSTEM", outer)
+        # the action the task runs is the payload itself, carried encoded
+        action = outer.split("$a='", 1)[1].split("'", 1)[0]
+        self.assertIn("echo PAYLOAD", base64.b64decode(
+            action.rsplit("-Enc ", 1)[1]).decode("utf-16-le"))
+
+    def test_windows_never_writes_a_command_into_an_rwx_page(self):
+        from phantom.automation.post.inject import inject_beacon_command
+        cmd = inject_beacon_command("windows", "echo PAYLOAD")
+        for dead in ("CreateRemoteThread", "VirtualAllocEx",
+                     "WriteProcessMemory"):
+            self.assertNotIn(dead, cmd)
+
+    def test_posix_runs_a_root_systemd_unit(self):
+        import base64
+        from phantom.automation.post.inject import (
+            _INJECT_SCRIPT_NIX, inject_beacon_command)
+        cmd = inject_beacon_command("linux", "echo PAYLOAD")
+        self.assertIn("phantom-inject.service", cmd)
+        unit = base64.b64decode(cmd.split("echo ")[2].split(" | base64 -d")[0]
+                                ).decode()
+        self.assertIn(f"ExecStart=/bin/sh {_INJECT_SCRIPT_NIX}", unit)
+        self.assertIn("WantedBy=multi-user.target", unit)
+        self.assertIn("INJECT_OK pid=systemd", cmd)
+
+    def test_the_interpreter_reports_the_method(self):
+        f = inject_interpreter("INJECT_OK pid=SYSTEM", self.wm, {})
+        self.assertEqual(f[0].value["method"], "scheduled_task")
+        f = inject_interpreter("INJECT_OK pid=systemd", self.wm, {})
+        self.assertEqual(f[0].value["method"], "systemd_unit")
 
 
 class TestPostPlannerSequencing(unittest.TestCase):

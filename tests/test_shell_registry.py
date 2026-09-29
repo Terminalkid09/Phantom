@@ -15,11 +15,13 @@ EXPECTED = {
     "note", "notes", "save_session", "load_session", "list_sessions",
     "export_session", "import_session", "history",
     "run", "suggest", "plan", "preflight", "craft", "map", "install",
-    "scan_diff",
+    "scan_diff", "run_diff",
     "use", "plugins",
     "auto", "agent",
     "c2", "malleable", "ad", "wordlists", "export",
-    "help", "config", "setup", "back", "exit", "quit",
+    "help", "config", "setup", "coverage", "doctor", "experience",
+    "why",
+    "back", "exit", "quit",
 }
 
 

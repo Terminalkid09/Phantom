@@ -116,6 +116,11 @@ class TestRunAndPreflight:
         session.target = "10.0.0.5"
         import shutil
         monkeypatch.setattr(shutil, "which", lambda t: None)
+        # the gate resolves through ToolRegistry, which falls back to WSL on
+        # Windows: pin that off too, or the result depends on the host's
+        # Kali toolbox (nmap present there -> not missing)
+        from phantom.automation.runtime import toolchain as _tc
+        monkeypatch.setattr(_tc, "_wsl_which", lambda t: None)
         buf = io.StringIO()
         with patch("phantom.core.shell.console",
                    SH.Console(file=buf, width=140, force_terminal=False)):
