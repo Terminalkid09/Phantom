@@ -12,5 +12,9 @@ pytest>=8.0
 pytest-asyncio>=0.23
 pytest-timeout>=2.2
 pytest-cov>=5.0
+# D-4: opt-in parallel runs for the ~15-minute suite. Serial is still the
+# default (several tests share process-wide singletons); use `-n auto` when
+# you want it.
+pytest-xdist>=3.5
 pyyaml>=6.0
 bandit>=1.7

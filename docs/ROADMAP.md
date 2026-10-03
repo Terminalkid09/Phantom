@@ -361,11 +361,13 @@ Item residui (da eseguire quando il pezzo corrisponderà): preview digest ≠ ex
 - [x] `--oM` (only-markdown): PR di sola proposta `docs/evolution/<id>.md` (`evolution/proposal.py`), gate profile "proposal" (niente static/registry/units/lab) e **budget separato** dal budget delle capability (contatori `proposal_*` distinti in `EvolutionState`).
 - [x] Test: `tests/test_evolution_proposal.py`.
 
-## C4 — Sostituzione graduale del loop `[x]` (in corso per definizione)
-- [x] Migrazione **per goal** con gate di copertura per classe di target; il vecchio loop resta il riferimento per ogni goal non migrato, poi sparisce pezzo per pezzo.
-- [x] Ledger verificato (`cells.MIGRATED_STAGES`): `complete_kill_chain, deliver, beacon, post_exploit, expand, lateral, identity, social, cloud, mobile, harvest, evasion`. Esclusi `ad`/`crack` perché su target identity-class lo stadio AD pretende `recon` mentre la chain identity vieta `footprint`.
-- [x] Gate di copertura (`tests/test_stage_migration.py`): ogni goal migrato, su ognuna delle 6 classi (ip/domain/cidr/email/username/phone), pianifica verso categorie che i ruoli della copertura possiedono tutte.
-- [x] Contratto behaviour-preserving provato end-to-end (`tests/test_cell_loop_e2e.py`): con il loop stretto acceso la SEQUENZA di capability e l'esito finale sono identici a quelli del loop vecchio, su chain network e identity, con 0 refusal.
+## C4 — Il roster è l'UNICA autorità (vecchio loop rimosso) `[x]`
+- [x] **Migrazione completata**: non esiste più un doppio percorso. `_ensure_cells` costruisce il roster con `strict=True` **sempre**; `_cell_strict_here()` è vero appena il roster esiste; il ramo leniente (`# lenient: lead runs it`) e il fallback `cells is None → vecchio percorso` sono stati **rimossi**. Una capability che nessun ruolo possiede è rifiutata CON MOTIVO, su ogni goal.
+- [x] Ledger (`cells.COVERED_GOALS`, alias legacy `MIGRATED_STAGES`) = l'INTERO vocabolario: `tuple(GOAL_FACTS) + ("deep",)` — 24 goal. `ad`/`crack` inclusi: il blocco "la chain identity vieta `footprint`" è la stessa copertura recon che ogni goal host-bound già porta con sé (misurato, non assunto).
+- [x] **Due goal bucati trovati dal gate esteso**: `web`/`exploit` su target identity offrivano `scan_tcp`/`http_probe` (categoria `recon`) e `hunt_web` (categoria `hunt`) mentre la chain identity non ha né il ruolo recon né il ruolo web. Fix: `_HOST_BOUND` (rinominato da `_BEACON_BOUND`) include `web`/`exploit`; `STAGE_ROLES["web"] = ("web",)`.
+- [x] **Roster non costruibile ≠ ritorno al vecchio loop**: `_cells_failed` + halt esplicito in `_drive_stage` ("refusing to fall back to the removed planning path").
+- [x] Gate di copertura (`tests/test_stage_migration.py`): l'INTERO vocabolario, su ognuna delle 6 classi (ip/domain/cidr/email/username/phone), pianifica verso categorie che i ruoli della copertura possiedono tutte; in più gli invarianti "autorità senza flag", "roster assente ⇒ rifiuto auditabile", "halt su roster assente".
+- [x] End-to-end (`tests/test_cell_loop_e2e.py`): il vecchio switch `cell_loop=False` **non cambia più nulla** (stessa SEQUENZA di capability, stesso esito), perché un secondo percorso non esiste.
 
 ### Tre bug reali trovati dal gate (non dalla review)
 1. **Ledger inerte.** `_current_stage` è il GOAL del run, non uno stadio di chain: un ledger con `("footprint",)` non corrispondeva mai e il loop stretto era codice morto che sembrava acceso. Ora la vocabolario è "goal" ed è pinnato da un test.
@@ -378,10 +380,61 @@ python -m pytest tests/test_reasoning_lenses.py tests/test_cells_egress.py \
                  tests/test_cells_runtime.py tests/test_stage_migration.py \
                  tests/test_cell_loop_e2e.py tests/test_evolution_proposal.py -q   # 136 passed
 python -m pytest tests/test_automation*.py tests/test_automode*.py \
-                 tests/test_agent*.py tests/test_brain*.py tests/test_planner*.py -q   # 615 passed
-# resto della suite (batch, con le 2 esclusioni CI)
+                 tests/test_agent*.py tests/test_brain*.py -q   # 751 passed
+# resto della suite (batch a-c/d-g/h-m/n-r/s-z, escluse test_features_final/test_real_deploy)
+# a-c 1454 + d-g 509 + h-m 420 + n-r 555 + s-z 772 = 3710 passed, 4 skipped, 0 failure
 ```
-Risultato sessione: **2608 test verdi**, 2 skipped, 0 failure.
+Risultato sessione: **3710 test verdi**, 4 skipped, 0 failure.
+
+---
+
+# Fase B — la BASE dell'auto-mode (indipendente dal learning) `[x]`
+
+**Contesto.** Il verdetto dell'operatore: se il punto forte è l'adattivo/learning, la base non è forte — e i 4 buchi architetturali individuati sono tutti debolezze della BASE, non del learning. Ordine concordato: vista per cellula → parallelismo vero → budget conteso → arbitrato sul piano/DAG (il DAG è il **modello mentale del run**; il parallelismo è **vero, a thread**, sui ruoli senza contatto).
+
+## B1 — Vista del world model per cellula `[x]`
+- [x] `CellView` in `brain/cells.py` + `Cell.view(findings)`: la proiezione del mondo consentita dai `sees_kinds` della cellula, PIÙ il conteggio dei fatti che non vede (`hidden`). `has_any`/`findings_of`/`kinds`/`to_dict`.
+- [x] `CellRuntime.views_for/scope_of/report_scope`: ogni cellula ha la SUA vista, e l'isolamento è emesso (`cell_scope`) — uditabile, non dichiarato.
+- [x] Il secondo parere (`_second_opinion`) ragiona sulla vista della peer: candidati fuori dalla sua consapevolezza esclusi, `visibility` derivato dalla SUA vista, e `scope` (visibili/nascosti/candidati ciechi) allegato all'advice.
+- [x] Test: `tests/test_cell_worldview.py`.
+
+## B2 — Parallelismo vero sui ruoli senza contatto `[x]`
+- [x] `CellRuntime.parallel_opinions(...)`: la concorrenza è proprietà dell'AZIONE — solo le cellule `CONTACT_NONE` entrano nel `ThreadPoolExecutor`; un ruolo che tocca il target è serializzato ed escluso. Ogni cellula valuta i candidati di cui è consapevole, col proprio profilo, sulla propria vista; l'ordine dei pareri è quello del roster (deterministico, non l'ordine dei thread).
+- [x] `CellRuntime.consensus(...)`: vince la mossa con più SUPPORTO (N angolazioni che convergono), spareggio sul punteggio aggregato.
+- [x] Wire in `_drive_stage`: `_parallel_reasoning(goal, prefs)` (≥2 cellule quiete) emette `parallel_reasoning` e aggiunge il consenso alle PREFERENZE del planner (una preferenza, mai un'autorità).
+- [x] `Tribunal._arb_for`: un arbitro per profilo (cache), così N profili possono votare in parallelo.
+- [x] Test: `tests/test_cell_parallel.py`.
+
+## B4 — Budget di rumore conteso `[x]`
+- [x] `NoiseBudget` in `brain/cells.py` (lock, `charge` atomico, `refusals` con motivo): una POOL finita per run. Due cellule che corrono per l'ultima unità non possono entrambe vincere.
+- [x] `CellRuntime` lega il limite alla postura OPSEC (paranoid ×0.6, aggressive ×2.0, default 60) e espone `charge(cell, cap)`; il pool è in `stats`/`to_dict`/roster.
+- [x] `_exec_with_permit`: addebita DOPO aver preso il permesso (un differimento da permesso non spende), rilascia su overspend — `deferred` con motivo "noise budget exhausted".
+- [x] Test: `tests/test_cell_noise_budget.py` (incluso il test di atomicità a 40 thread).
+
+## B3 — Arbitrato sul piano: il DAG come modello mentale `[x]`
+- [x] `brain/plan_graph.py`: `PlanNode`/`PlanGraph` — i nodi del piano, gli archi di dipendenza (solo a salire di rango → DAG per COSTRUZIONE, `is_dag()` eseguibile), i LAYER topologici, il nodo GOAL come sink, e la CRITICAL PATH (una mossa per layer + goal).
+- [x] `CellRuntime.plan_graph(plan, goal_facts)` costruisce ed emette `plan_graph`; wire in `_drive_stage` (`self._plan_model`), così il run vede la catena critica e non solo una lista.
+- [x] **Arbitrato fra VARIANTI di piano** (`brain/plan_arbiter.py`): `PlanVariant`/`PlanChoice`, `readings_for` (progress/evidence/stealth/cost/contact dai DAG), `weights_for` (adattamento ai segnali correnti), `PlanArbiter.choose` con margine (`margin=0.02`) e tie-break deterministico. `build_variants` rigenera lo STESSO planner con un diverso ordine di preferenze (max 3 varianti) e **threada `dead=`** — una variante non può resuscitare una mossa che il run ha ucciso (regressione `test_dead_capabilities_never_return_through_a_variant`).
+- [x] **Adozione conservativa** in `agent._arbitrate_plan`: una variante sostituisce il piano del planner SOLO quando il default non è usabile (incompleto/vuoto) e la vincitrice è completa. Un piano funzionante non viene mai riscritto in silenzio (altrimenti la chain identity reale si rompe: `test_a_working_plan_is_never_silently_rewritten`).
+- [x] Test: `tests/test_plan_graph.py`, `tests/test_plan_arbiter.py` (21+1, incluso il planner reale → DAG valido).
+
+**Nota di onestà.** B3 consegna MODELLO (DAG + critical path), l'arbitrato fra varianti (scoring sui DAG + adozione conservativa) e l'esposizione in stream/report (`plan_variants`). L'arbitrato è conservativo per costruzione: non riscrive un piano che funziona.
+
+---
+
+# Fase L — Learning autonomo (codice + PR + descrizioni) `[x]`
+
+## L1 — Dossier PR `[x]`
+- [x] `publish._dossier`: il body della PR è un dossier revisionabile in un posto — problema chiuso, file scritti, gate, verifica, blast radius, revert, checklist; + `_pr_title` che porta lo stato di verifica nel titolo.
+- [x] Test: `tests/test_evolution_dossier.py`.
+
+## L2 — PR non verificata `[x]`
+- [x] `author(..., require_lab=False)`: gatizza static/registry/units senza lab e restituisce `verified=False`; `maybe_spawn` con `lab_ok=False` NON tace più — autora e pubblica una PR **UNVERIFIED** (banner + casella non spuntata) con la consegna esplicita "run the lab gate before merge".
+- [x] Un artifact non provato non è mai presentato come provato: `verified` viaggia in `AuthorResult` → `publish` → titolo+body.
+- [x] Contratti vecchi ("no lab ⇒ no spawn") aggiornati in `test_evolution.py` / `test_evolution_proposal.py`.
+
+## L3 — Beta-load pre-merge `[x]` (già strutturale, ora pinnato)
+- [x] Una capability PR-open è `beta`: si carica SOLO con `--beta`, con lab raggiungibile, full gate e digest/promozione nel body; `learned` (auto-load) richiede il MERGE. Test: `test_beta_never_loads_without_a_lab` in `tests/test_evolution_dossier.py`.
 
 ---
 
@@ -494,6 +547,75 @@ cd phantom/payloads/beacon/src && g++ -std=c++20 -O1 -pthread -I. test_transport
 
 ---
 
+# Fase I — reasoning identity (mappare senza phishing)
+
+Obiettivo: portare reasoning e passaggi dell'auto-mode al livello della catena
+manuale reale — da un handle → reset password → email offuscata → `crunch` di
+candidati → verifica esistenza → breach per correlare la stessa persona →
+espansione da un campo ristretto, **senza phishing**. Vale per QUALSIASI
+scenario, non solo OSINT. Regola dell'operatore: si mappa tutto ciò che non è
+contatto; il phishing è l'ULTIMA istanza, e va considerato solo a mappatura
+esaurita. Il contatto ha un **consenso dedicato**, separato da `--aggressive`
+(`--identity-active` per le probe attive: SMTP RCPT / reset-enum).
+
+## I1 — Regole di ragionamento identity `[x]`
+Nuovo `automation/brain/identity.py`: `IdentityReasoner` (puro, no I/O, no
+registry) + `Derivation` (kind/key/value/confidence/evidence/hypothesis).
+Kinds NON-gating: `email_masked`, `domain_candidate`, `email_candidate`,
+`email_verified`, `service_account`, `breach_exposure`, `identity_widened`.
+Helper `mask_shape` (prefix/suffix/domain/length/stars), `handle_variants`
+(~12 varianti), `name_parts`. Regole: local-parts, email-candidates (**nessun
+dominio inventato**: solo domini OSSERVATI), expand-from-email, breach
+correlation, e la ladder non-contact-first. `reasoning.py`: nuova
+`_rule_identity_field` (prima in `_rules()`), `_identity_consent()`. `cells.py`:
+`sees_kinds`/`reports_kinds` di identity/osint estesi.
+
+## I2 — Primitive identity-side `[x]`
+Nuovo `automation/identity_ops.py`: `active_consent_enabled`/
+`contact_consent_enabled` (`wm.identity_consent` o env), `email_candidates`
+(offline), `reset_enum` (attiva, 1 richiesta, parsa la maschera),
+`verify_emails` (attiva, bounded `MAX_PROBES=40`, SMTP RCPT senza DATA, con
+**catch-all detection** su probe random → `unknown`), `breach_correlate`.
+4 capability osint + 4 adapter + 4 marker in `guidance/kit.py`; dispatch in
+`agent._run_social_method`; gate di consenso in `_execute_social_capability`
+(senza consenso → `blocked`). Catena flag `--identity-active` da
+`main.py`/`auto.py` fino a `run_autonomous`/`run_campaign`.
+
+## I3 — Dottrina identity non-phishing `[x]`
+`strategy.py`: `TargetModel.contact_allowed`/`identity_mapped`,
+`_demote_identity_delivery` (senza consenso di contatto la stage di delivery
+`identity_beacon` è spostata IN FONDO, mai rimossa), nuova
+`Strategy("identity_field", goal="enrich", weight=88)`. `goals.py`:
+`GOAL_FACTS["enrich"]` esteso coi fact identity + nuovo `NON_CONTACT_GOALS`
+in `goals.py`; `planner.py` non concatena un CONTACT_FACT per un goal
+non-contact (l'enrich worker non lancia mai un lure: se un lure esiste già il
+gate è soddisfatto, altrimenti il ramo resta non raggiungibile invece di
+escalare a `phish_identity`). `fallback.py`, `_GAP_CAP_HINTS` aggiornati.
+
+## I4 — DAG dei campi identity `[x]`
+Nuovo `automation/brain/identity_graph.py`: nodi = campi identity (known finding
+o candidato), archi = deduzioni a livello di KIND (`_DEDUCTION_SCHEMA`, tutti
+rank-increasing → DAG per costruzione, come `plan_graph`). `frontier()` = campi
+raggiungibili da ciò che è noto; `critical_path()` = spina più lunga verso un
+kind TERMINALE (mappato); `next_fields()` = la risposta dell'operatore “quale
+campo allargare prima”: `confidenza/costo`, scontato per classe di contatto,
+modulato da un bonus info-gain **bounded** (R3: `INFO_GAIN_MAX`/`INFO_GAIN_CEIL`,
+solo riordino di quasi-pareggi), con un piccolo nudge se il campo è sulla spina.
+Consenso come in I3: una probe non autorizzata è spostata in basso, mai
+tolta. Wire in `reasoning._rule_identity_field`: il grafo ordina le ipotesi
+identity, cioè le preferenze del planner.
+
+### Verifica di fase (I)
+```
+python -m pytest tests/test_identity_reasoning.py tests/test_identity_ops.py \
+                 tests/test_identity_doctrine.py tests/test_identity_graph.py -q
+python -m pytest tests/test_automation_strategy.py tests/test_mobile_chain.py \
+                 tests/test_gap_tables_checkpoint.py tests/test_fallback_wiring.py \
+                 tests/test_stage_migration.py -q
+```
+
+---
+
 # Risposte alle domande aperte
 1. **Q-1** Auto-persist si tiene documentato e si sistema se ha problemi
 2. **Q-2** Multi-operatore phantom ha solo il .pm che si condivide, però multi-egagement per più target si che c'è l'ha
@@ -529,3 +651,11 @@ _(una riga per sessione: data · item · commit · note)_
 - 2026-09-25 · Fase 7/8/9 (reasoning auto-mode · delivery payload · UX operatore) · (non committato) · **7.1**: nuovo `automation/swarm/profile_policy.py` — il profilo decide chain/difficulty/thin_surface/reason_hint (prima era etichetta inerte); `--chain` esplicito vince; wired su swarm/automode/auto. **Coerenza profilo↔target**: `check_profile_target` rileva i soli 2 conflitti reali, li annuncia via `notifier.warn`, nuovo `--force-profile`. **7.2**: rimosso l'hardcode toolchain nel worker, ora iniettabile (default offline deterministico, path reali `ToolRegistry()`). **7.3**: nuovo `runtime/provision.py` consent-gated (senza consenso non chiama mai l'installer; solo pre-engagement via `--allow-install`). **7.4**: belief revision per-fact + arbiter non silenzioso + evento `contradiction` nel contratto. **7.5**: `brain/trace.py` (DecisionTrace) cablato in agent/contratto/report. **7.6**: la thin-surface policy di `profile_policy` è ora consumata dal recovery di stallo (era codice morto). **7.7**: `test_gap_tables_checkpoint` pinna che ogni chiave di GOAL_FACTS/_GAP_CAP_HINTS abbia un consumatore; rimossa chiave morta in `fallback.py`. **8.1**: stager resiliente (download → retry persistito con endpoint incorporato). **8.2**: `test_beacon_loop_residency` pinna main.cpp (uscita solo EX/MG, backoff capped, ladder). **8.3**: `utils/target_platform.py` unica fonte OS→artefatto, consolidate 5 copie, default silenzioso eliminato e arch preservata. **9.1/9.2**: `utils/hid_builder.py` (pico/flipper/omg), board scelta dall'operatore. **9.3/9.4**: auto-open shell C2 default OFF, override config/env, audit `auto_shell_queued`, UI C2Dashboard. Test nuovi: 14 file (`test_profile_policy`, `test_profile_target_check`, `test_swarm_toolchain`, `test_provision`, `test_belief_revision`, `test_decision_trace`, `test_thin_surface_policy`, `test_gap_tables_checkpoint`, `test_target_platform`, `test_platform_single_source`, `test_resilient_stager`, `test_beacon_loop_residency`, `test_hid_payload`, `test_c2_autoshell`). Verifica: suite completa **3319 passed, 4 skipped, 12 subtests**; `npx tsc --noEmit` exit 0. **Non committato** e 2 compromessi in attesa di conferma: (a) default toolchain worker offline-only vs registry reale, (b) install solo pre-engagement.
 
 - 2026-09-15 · E5-bis (pin nel build ordinario + decisione di rebuild) · (commit dev) · Colmato il buco che rendeva il pin codice morto: `BEACON_SERVER_FINGERPRINT` era emesso solo con `PHANTOM_MTLS_REQUIRED=1`, quindi in ogni build HTTPS ordinario il beacon completava il handshake con QUALSIASI server (payload AE S-GCM sigillato, ma peer non autenticato). Ora `c2_crypto.server_cert_fingerprint(cert_path="")` calcola lo SHA-256 del DER con la sola stdlib (`ssl.PEM_cert_to_DER_cert`), cioè il valore esatto che confrontano `CryptHashCertificate` su Windows e `X509_digest` su OpenSSL; `network.beacon_pin()` lo risolve (`mtls_server.crt` prima quando mTLS è on, altrimenti `server.crt`) con kill-switch `PHANTOM_BEACON_PIN=0`/`c2.pin=0`; `write_beacon_c2_config(pin=...)` lo emette e scarta qualunque valore che non sia un digest di 64 hex (niente escape del literal, niente pin non verificabile); `beacon_auth.py` mette `#ifndef` attorno al proprio define per non combattere con c2_config.h. Secondo fix della sessione: la decisione di rebuild nei 3 chiamanti (`api/server.py`, `modules/payload.py`, `automation/agent.py`) confrontava l'**intero header generato** con quello su disco — dopo E5 sempre diverso, quindi recompilazione forzata ad ogni build e fast path di freschezza mai preso. Ora `beacon_config_endpoint(beacon_dir)` legge C2_HOST/C2_PORT e si ricompila solo se l'endpoint bruciato nel binario cambia. Igiene: `c2_config.h` è l'unico header generato TRACCIATO mentre contiene token payload + stager PS in base64 e dichiara "do not edit manually" (segnalato nel report, non toccato: rimuoverlo dall'indice è una decisione). Test: `tests/test_beacon_transport.py` da 24 a **31** (pin dal certificato, pin nel define, pin malformato scartato, kill-switch, decisione di rebuild); harness C++ ricompilato e LANCIATO anche in versione PINNED (`BEACON_SERVER_FINGERPRINT` definito, `BEACON_PIN_ENFORCED=1`) e `main.cpp` verificato in sintassi con il pin. Verifica: 116 passed su beacon/api/payload/pm + 14 su test_c2_tls.
+
+- 2026-10-02 · C4-bis (il roster diventa l'UNICA autorità: vecchio loop rimosso) · (non committato) · **Decisione dell'operatore**: il verdetto "primo engagement ⇒ prod-ready" era troppo generoso; la base dell'auto-mode non può dipendere dal learning. Si parte dal punto 1: togliere il doppio percorso. **Cos'era davvero**: non due loop ma UN loop (`_drive_stage`) con due autorità — il roster strict solo per i goal in `MIGRATED_STAGES` e solo con `--cell-loop`, e il lead "lenient" per tutto il resto (`return self._execute_capability(step)  # lenient: lead runs it`) più il fallback silenzioso `cells is None → vecchio percorso`. **Cosa è cambiato**: (1) `_ensure_cells` costruisce sempre `strict=True`; (2) `_cell_strict_here()` è vero appena il roster esiste (nessuna appartenenza a una lista); (3) ramo leniente e fallback rimossi — una capability non posseduta è rifiutata CON MOTIVO su ogni goal; (4) roster non costruibile ⇒ `_cells_failed` + halt esplicito in `_drive_stage` ("refusing to fall back to the removed planning path"); (5) `cell_loop`/`--cell-loop` default ON e accettati per compatibilità. **Ledger**: `MIGRATED_STAGES` → `COVERED_GOALS = tuple(GOAL_FACTS) + ("deep",)` (24 goal, alias legacy mantenuto); `ad`/`crack` inclusi senza dover sciogliere alcunché — la copertura recon che ogni goal host-bound già porta con sé risolve il vecchio blocco "chain identity vieta footprint". **Due goal bucati trovati estendendo il gate a tutto il vocabolario**: `web`/`exploit` su target identity offrivano `scan_tcp`/`http_probe` (categoria `recon`) e `hunt_web` (categoria `hunt`) con una chain identity priva sia del ruolo recon sia del ruolo web → `_BEACON_BOUND` rinominato `_HOST_BOUND` e allargato a web/exploit, `STAGE_ROLES["web"]=("web",)`. **Test**: `test_stage_migration.py` riscritto (vocabolario intero × 6 classi + autorità-senza-flag + roster-assente⇒rifiuto + halt); `test_cell_loop_e2e.py` invertito (il vecchio switch `cell_loop=False` non cambia più nulla); `test_cells_runtime.py` e `test_gap_tables_checkpoint.py` aggiornati (lenient→rifiuto, default legacy `cell_loop`). **Verifica**: 66 passed sui 4 file toccati; 751 su automation/automode/agent/brain/cells/reasoning; suite intera a batch (a-c 1454 + d-g 509 + h-m 420 + n-r 555 + s-z 772) = **3710 passed, 4 skipped, 0 failure**; `compileall` pulito. Punto 1 chiuso. Prossimo: base (vista per cellula → parallelismo vero a thread → budget conteso → arbitrato sul piano/DAG), poi learning (lab ermetico, beta-load pre-merge, dossier PR).
+
+- 2026-10-02 · Fase B (base auto-mode: B1/B2/B4/B3) e Fase L (learning: L1/L2/L3) · (non committato) · **B1 — vista per cellula**: nuovo `CellView` + `Cell.view(findings)` (proiezione per `sees_kinds` + conteggio `hidden`), `CellRuntime.views_for/scope_of/report_scope` (evento `cell_scope`), e il secondo parere rate solo ciò di cui la peer è consapevole, con `visibility` derivato dalla SUA vista e `scope` nell'advice. Test `tests/test_cell_worldview.py`. **B2 — parallelismo vero**: `CellRuntime.parallel_opinions` (ThreadPoolExecutor, SOLO cellule `CONTACT_NONE`; la concorrenza è proprietà dell'azione, un ruolo che tocca il target è escluso), `consensus` (più supporto vince), `Tribunal._arb_for` (un arbitro per profilo), wire `_parallel_reasoning` che emette `parallel_reasoning` e aggiunge il consenso alle preferenze del planner. Test `tests/test_cell_parallel.py`. **B4 — budget conteso**: `NoiseBudget` (lock + `charge` atomico + refusals motivati), limite legato alla postura OPSEC, `CellRuntime.charge`, addebito in `_exec_with_permit` DOPO il permesso e rilascio su overspend (`deferred` con motivo). Test `tests/test_cell_noise_budget.py` (atomicità a 40 thread). **B3 — DAG del piano**: nuovo `brain/plan_graph.py` (nodi, archi rank-increasing → DAG per costruzione, layer, GOAL sink, critical path), `CellRuntime.plan_graph` emesso e agganciato a `_drive_stage` (`_plan_model`). Test `tests/test_plan_graph.py`. Onestà: B3 consegna MODELLO + infrastruttura; l'arbitrato fra varianti di piano è il prossimo passo. **L1 — dossier PR**: `publish._dossier` (problema, file, gate, verifica, blast radius, revert, checklist) + `_pr_title`. **L2 — PR non verificata**: `author(require_lab=False)` → `AuthorResult.verified=False`; `maybe_spawn` con `lab_ok=False` non tace più, autora e pubblica una PR UNVERIFIED (banner + casella non spuntata, "run the lab gate before merge"). Contratti vecchi aggiornati. **L3 — beta pre-merge**: già strutturale (beta solo con `--beta` + lab + digest/promozione; `learned` richiede il merge), ora pinnato da `test_beta_never_loads_without_a_lab`. Nuovi test: `tests/test_cell_worldview.py`, `test_cell_parallel.py`, `test_cell_noise_budget.py`, `test_plan_graph.py`, `test_evolution_dossier.py`. **Verifica**: automation/agent/brain/cells/reasoning 780 passed; batch completi a-c 1478 + d-g/h-m 929 + n-r/s-z 1335 (dopo il fix del contratto stream, 3 nuovi kind `cell_scope`/`parallel_reasoning`/`plan_graph` classificati); 0 failure. `compileall` pulito. Fase B e Fase L chiuse.
+
+- 2026-10-03 · Fase I (reasoning identity non-phishing: I1/I2/I3/I4) · (non committato) · **I1**: nuovo `automation/brain/identity.py` (`IdentityReasoner` + `Derivation`, kinds `email_masked`/`domain_candidate`/`email_candidate`/`email_verified`/`service_account`/`breach_exposure`/`identity_widened`, helper `mask_shape`/`handle_variants`, **nessun dominio inventato**), `reasoning._rule_identity_field` + `_identity_consent`, `cells.py` sees/reports estesi. Test `tests/test_identity_reasoning.py` (14). **I2**: nuovo `automation/identity_ops.py` (`email_candidates`, `reset_enum`, `verify_emails` con SMTP RCPT senza DATA + catch-all detection, `breach_correlate`; consenso dedicato `active`/`contact` via `wm.identity_consent` o env), 4 capability osint + adapter + marker in `guidance/kit.py`, dispatch/gate in `agent.py`, flag `--identity-active` da `main.py`/`auto.py` fino a `run_autonomous`/`run_campaign` (aggiunto il param mancante in `run_campaign`/`_run_agent_campaign`: il path campaign non lo portava). Test `tests/test_identity_ops.py` (14). **I3**: `strategy.py` demotion della delivery (`identity_beacon` in fondo, mai rimossa) + `Strategy("identity_field", goal="enrich", w88)`, `GOAL_FACTS["enrich"]` esteso, nuovi `NON_CONTACT_GOALS`/`CONTACT_FACTS` in `goals.py` consumati da `planner.plan` (un goal non-contact non concatena un lure: l'enrich worker non lancia mai phishing), `fallback.py`/`_GAP_CAP_HINTS` aggiornati. Test `tests/test_identity_doctrine.py` (9). **I4**: nuovo `automation/brain/identity_graph.py` (nodi=campi, archi=deduzioni rank-increasing → DAG per costruzione; `frontier()`, `critical_path()` verso un kind terminale, `next_fields()` con bonus info-gain **bounded** R3 e demotion per consenso), wired in `reasoning._rule_identity_field` (il grafo ordina le ipotesi = preferenze del planner). Test `tests/test_identity_graph.py` (12). **Fix trovati dai gate**: (a) `NameError identity_active` sul path campaign → aggiunto il param in `run_campaign`/`_run_agent_campaign`; (b) `_FACT_SOURCES[domain_candidate]`/`[identity_widened]` elencavano fonti che non emettono il fact (audit coverage) → allineati agli effetti reali; (c) la regola identity girava su qualunque target → ora solo su target identity o se esiste già contesto identity (fix `test_no_findings_no_suggestions`); (d) le 4 capability I2 mancavano dal phase index → dichiarate in `phases/__init__.py`. **Verifica**: identity* 51 passed; planner/reasoning/goal/chain/gap/fallback/stage 98 passed; area agent/automode/cell/brain/strategy/swarm 741 passed; batch completi a-c **1478** + d-g **516** + h-m **469** + n-r **563** + s-z **772** = **3798 passed, 4 skipped**, 0 failure. `compileall` pulito. **Non committato**; nessuna validazione su ambiente reale (SMTP RCPT/reset HTTP mockati).
+
+- 2026-10-03 · B3-arbitrato + DAG-stream esposto (I4 in stream/report) · (non committato) · **Arbitrato fra varianti di piano** (`brain/plan_arbiter.py`): `PlanVariant`/`PlanChoice`, `readings_for` (progress/evidence/stealth/cost/contact dai DAG), `weights_for` (adattamento ai segnali correnti), `PlanArbiter.choose` con `margin=0.02` e tie-break deterministico su `variant_id`; `build_variants` rigenera lo STESSO planner con ordini di preferenza diversi (max 3 varianti, gate invariati) e **threada `dead=`** — una variante non può resuscitare una mossa uccisa dal run. Wire in `agent._arbitrate_plan` PRIMA del `plan_graph`, con **adozione conservativa**: una variante sostituisce il piano solo se il default non è usabile (incompleto/vuoto) e la vincitrice è completa; un piano funzionante non è mai riscritto in silenzio (la variante "sembra" completa ma è semanticamente più debole). **DAG-stream**: `agent._identity_field_plan()` (grafo dei campi + `next`) e `_plan_choice` emessi come eventi `identity_field`/`plan_variants`, renderer dedicati in `core/stream_contract.py` (dim/verbose-only), `RawReport.plan_choice`/`identity_field` in `reporting.py`. **Fix trovati dai gate**: (e) `build_variants` non propagava `dead` → un cap novelty-dead (`scan_tcp`) rientrava via variante e veniva eseguito (`test_avoid_caps_steers_off_sibling_move`); ora `dead` è threadato a tutte le varianti. Test: `tests/test_plan_arbiter.py` (22, incluso `test_dead_capabilities_never_return_through_a_variant` e `test_a_working_plan_is_never_silently_rewritten`). **Verifica**: plan_arbiter/plan_graph/stream_contract/cells_runtime/automation_agent/identity_graph 147; automation_deliver/post/resume/exploit_system/cell_loop_e2e 112; swarm 74; batch a-c 1478 + [d-e] 451 + [f-g] 65 + h-m 469 + n-r 584 + s-z 772 = **3819 passed, 4 skipped, 0 failure**; `compileall` pulito. **Non committato**; nessuna validazione su ambiente reale.
