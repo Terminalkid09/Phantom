@@ -32,6 +32,11 @@ data/beacons/beacon_registry.json
 data/phantom_state.json
 data/config.json
 data/network_hosts.json
+# C2 data-plane runtime state (per-beacon replay epoch map, state snapshot,
+# and the operator audit trail: targets/commands, never committed)
+data/c2_replay.json
+data/c2_store.json
+data/c2_audit.jsonl
 # BloodHound/AD graph built from a live engagement (target topology)
 data/ad_graph.json
 # Social-engineering runtime: persona + conversation state, and the capture
@@ -246,6 +251,11 @@ electron/package-lock.json
 
 # Electron runtime state
 electron/out/
+
+# c2d (Go data plane) build outputs: never commit a compiled listener
+c2d/c2d
+c2d/c2d.exe
+c2d/*.test
 
 # Beacon build-test scratch (evasion test artifacts)
 aviso/
