@@ -248,7 +248,8 @@ def _run_agent_single(target, goal, profile, aggressive, paranoid, speed,
                       stop_event: Optional[threading.Event] = None,
                       reason_profile: str = "",
                       resilient_stager: bool = True,
-                      cell_loop: bool = False,
+                      identity_active: bool = False,
+                      cell_loop: bool = True,
                       cell_stages: Optional[List[str]] = None,
                       evolution_mode: str = "code"):
     from phantom.automation.agent import run_autonomous
@@ -276,6 +277,7 @@ def _run_agent_single(target, goal, profile, aggressive, paranoid, speed,
         experience=experience, evolution=evolution, stop_event=stop_event,
         seed_findings=seed, reason_profile=reason_profile,
         resilient_stager=resilient_stager,
+        identity_active=identity_active,
         cell_loop=cell_loop, cell_stages=cell_stages,
         evolution_mode=evolution_mode)
 
@@ -286,6 +288,7 @@ def _run_agent_campaign(targets, goal, profile, aggressive, paranoid, speed,
                         llm: bool = False, state_dir: str = "",
                         experience: bool = False,
                         evolution: bool = False,
+                        identity_active: bool = False,
                         stop_event: Optional[threading.Event] = None):
     from phantom.automation.agent import run_campaign
     n = len(targets)
@@ -311,7 +314,8 @@ def _run_agent_campaign(targets, goal, profile, aggressive, paranoid, speed,
         on_event=_make_agent_stream(verbose, on_event),
         state_dir=state_dir or None,
         threat_intel=_threat_intel_feed(), persist_learning=True, llm=llm,
-        experience=experience, evolution=evolution, stop_event=stop_event)
+        experience=experience, evolution=evolution,
+        identity_active=identity_active, stop_event=stop_event)
 
 
 def _handoff_c2(beacon_id: str) -> None:
@@ -659,7 +663,8 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                   resume: str = "",                   stop_event: Optional[threading.Event] = None,
                    reason_profile: str = "",
                    resilient_stager: bool = True,
-                   cell_loop: bool = False,
+                   identity_active: bool = False,
+                   cell_loop: bool = True,
                    cell_stages: Optional[List[str]] = None,
                    only_markdown: bool = False,
                    engine: str = "agent",
@@ -820,11 +825,15 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
         except Exception:
             net_targets = list(resolved)
         if net_targets:
+            # A-6: auto-mode now FAILS CLOSED without a scope (the agent gate
+            # refuses unless the operator explicitly opted out), so this is
+            # no longer a silent warn-and-continue.
             notifier.warn(
                 "NESSUNO SCOPE impostato su target di rete: l'auto-mode "
-                "non rifiuterà nulla da solo. Imposta 'set scope "
-                "<cidr,...>' (o scope_list) prima di run reali — un "
-                "typo nel target o un CIDR largo colpiscono davvero.")
+                "rifiuterà i target finché non imposti 'set scope "
+                "<cidr,...>' (o scope_list). Per un lab dichiara "
+                "l'eccezione con PHANTOM_ALLOW_UNSCOPED=1 — un typo nel "
+                "target o un CIDR largo colpiscono davvero.")
 
     if plan:
         for t in resolved:
@@ -916,6 +925,7 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
             evolution=evolution, stop_event=stop_event,
             reason_profile=reason_profile, cell_loop=cell_loop,
             cell_stages=cell_stages, resilient_stager=resilient_stager,
+            identity_active=identity_active,
             evolution_mode=("proposal" if only_markdown else "code"))
         tdir, paths = _write_agent_reports(agent, profile, out_root, resolved[0])
         # auto-mode -> manual core: everything the agent learned is merged
@@ -1005,7 +1015,7 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
         resolved, goal, profile, aggressive, stealth, speed,
         scope_list, agents, verbose, on_event, llm,
         state_dir=out_root, experience=_experience_enabled(experience),
-        evolution=evolution,
+        evolution=evolution, identity_active=identity_active,
         stop_event=stop_event)
     elapsed = _fmt_elapsed(time.time() - started_wall)
     per_target = {}

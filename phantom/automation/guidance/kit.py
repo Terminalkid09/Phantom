@@ -258,6 +258,10 @@ _SOCIAL_TOOLS = {
                       "email": ["sherlock"],
                       "phone": []},
     "breach_check": {"username": [], "email": [], "phone": []},
+    "email_candidates": {"username": [], "email": [], "phone": []},
+    "breach_correlate": {"username": [], "email": [], "phone": []},
+    "reset_enum": {"username": [], "email": [], "phone": []},
+    "email_verify": {"username": [], "email": [], "phone": []},
 }
 
 
@@ -710,6 +714,11 @@ _SOCIAL_MARKERS = {
     "identity_resolved": "IDENTITY_RESOLVED:",
     "identity_widened": "IDENTITY_WIDENED:",
     "avatar": "AVATAR:",
+    # identity-field primitives (I2)
+    "email_candidate": "EMAIL_CANDIDATE:",
+    "email_masked": "EMAIL_MASKED:",
+    "email_verified": "EMAIL_VERIFIED:",
+    "service_account": "SERVICE_ACCOUNT:",
 }
 
 
@@ -878,6 +887,41 @@ def _social_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[F
                 value={"handle": kv.get("handle"),
                        "platform": kv.get("platform", "")},
                 confidence=0.5, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["email_candidate"])
+        if kv.get("email"):
+            findings.append(Finding(
+                kind="email_candidate", key=f"email_candidate:{kv['email']}",
+                value={"email": kv.get("email"),
+                       "local_part": kv.get("local", ""),
+                       "domain": kv.get("domain", "")},
+                confidence=0.3, source="email_candidates", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["email_masked"])
+        if kv.get("masked"):
+            findings.append(Finding(
+                kind="email_masked", key=f"email_masked:{kv['masked']}",
+                value={"masked": kv.get("masked"),
+                       "prefix": kv.get("prefix", ""),
+                       "suffix": kv.get("suffix", ""),
+                       "domain": kv.get("domain", ""),
+                       "length": kv.get("length", "")},
+                confidence=0.8, source="reset_enum", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["email_verified"])
+        if kv.get("email"):
+            exists = kv.get("exists", "unknown")
+            conf = 0.85 if exists == "1" else (0.2 if exists == "0" else 0.4)
+            findings.append(Finding(
+                kind="email_verified", key=f"email_verified:{kv['email']}",
+                value={"email": kv.get("email"), "exists": exists,
+                       "reason": kv.get("reason", "")},
+                confidence=conf, source="email_verify", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["service_account"])
+        if kv.get("email"):
+            findings.append(Finding(
+                kind="service_account", key=f"service_account:{kv['email']}",
+                value={"email": kv.get("email"),
+                       "service": kv.get("service", ""),
+                       "known": kv.get("known", "")},
+                confidence=0.4, source="breach_correlate", target=wm.target))
         kv = _parse_marker_line(line, _SOCIAL_MARKERS["avatar"])
         if kv.get("username") and kv.get("url"):
             findings.append(Finding(
@@ -1036,6 +1080,22 @@ def _social_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[F
                        "platform": kv.get("platform", "")},
                 confidence=0.9, source="wait_follow", target=wm.target))
     return findings
+
+
+def _email_candidates_adapter(wm, slots):
+    return f"social-email-candidates {wm.target}"
+
+
+def _reset_enum_adapter(wm, slots):
+    return f"social-reset-enum {wm.target}"
+
+
+def _email_verify_adapter(wm, slots):
+    return f"social-email-verify {wm.target}"
+
+
+def _breach_correlate_adapter(wm, slots):
+    return f"social-breach-correlate {wm.target}"
 
 
 def _osint_identity_adapter(wm, slots):
@@ -3703,6 +3763,48 @@ CAPABILITIES = [
         opsec_cost=0.6, detection_risk=0.05, stealth_level="passive", timeout=30,
         preconditions=[_has_target_type("email", "username")],
         banner="breach check"),
+
+    _mk("email_candidates", "osint",
+        "Compose candidate addresses from the name/handle x OBSERVED "
+        "domains — the identity-aware, bounded 'crunch' step. Offline and "
+        "passive: never invents a domain, never contacts the target",
+        [], ["email_candidate", "domain_candidate"], _email_candidates_adapter,
+        _social_interp,
+        opsec_cost=0.1, detection_risk=0.0, stealth_level="passive", timeout=30,
+        preconditions=[_has_target_type("username", "email", "phone")],
+        banner="compose email candidates"),
+
+    _mk("reset_enum", "osint",
+        "Ask a service's password-reset form to reveal the masked address "
+        "(the operator's reset leak). ACTIVE: needs the dedicated identity "
+        "consent, one bounded request, no retries",
+        [_mk_slot("service_url", "str", False, "reset endpoint URL"),
+         _mk_slot("email", "str", False, "address to probe")],
+        ["email_masked"], _reset_enum_adapter, _social_interp,
+        opsec_cost=0.8, detection_risk=0.3, stealth_level="active", timeout=20,
+        preconditions=[_has_target_type("username", "email", "phone")],
+        banner="enumerate masked address"),
+
+    _mk("email_verify", "osint",
+        "SMTP RCPT + MX verification of candidate addresses, with honest "
+        "catch-all detection. ACTIVE: needs the dedicated identity consent, "
+        "bounded, never sends DATA",
+        [_mk_slot("addresses", "str", False, "comma-separated candidates"),
+         _mk_slot("sender", "str", False, "MAIL FROM address")],
+        ["email_verified"], _email_verify_adapter, _social_interp,
+        opsec_cost=0.6, detection_risk=0.2, stealth_level="active", timeout=60,
+        preconditions=[_has_target_type("username", "email", "phone")],
+        banner="verify email existence"),
+
+    _mk("breach_correlate", "osint",
+        "Correlate breach exposure for a confirmed address: widen the "
+        "identity and surface reusable credentials (same-person link)",
+        [_mk_slot("email", "str", False, "address to correlate")],
+        ["breach_exposure", "identity_widened", "service_account"],
+        _breach_correlate_adapter, _social_interp,
+        opsec_cost=0.4, detection_risk=0.0, stealth_level="passive", timeout=30,
+        preconditions=[_has_target_type("email", "username")],
+        banner="correlate breach exposure"),
 
     _mk("persona_create", "social",
         "Create a disposable persona with a temp mailbox for social engineering",

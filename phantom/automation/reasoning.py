@@ -98,6 +98,7 @@ class ReasoningEngine:
         self.registry = registry
         self.paranoid = paranoid
         self._peers: List[str] = []
+        self._wm: Optional[WorldModel] = None
 
     # ------------------------------------------------------------- helpers
 
@@ -159,6 +160,7 @@ class ReasoningEngine:
 
     def _rules(self):
         return [
+            self._rule_identity_field,
             self._rule_os_inference,
             self._rule_service_roles,
             self._rule_ad_domain,
@@ -233,6 +235,7 @@ class ReasoningEngine:
         to the agent; the attack-path rule uses it to propose lateral moves.
         """
         self._peers = [p for p in (peers or []) if p != wm.target]
+        self._wm = wm
         result = ReasoningResult()
         for rule in self._rules():
             for finding, hyp in rule(wm):
@@ -251,6 +254,95 @@ class ReasoningEngine:
         return result
 
     # ------------------------------------------------------------------ rules
+
+    # ---------------------------------------------------- identity reasoning
+
+    def _identity_consent(self) -> tuple:
+        """The dedicated identity-consent state (I2), read from the world
+        model if the agent stamped it, defaulting to fully closed.
+
+        * active  — SMTP RCPT / reset-enum probes (touch the target's mail
+                    infrastructure); needs an EXPLICIT consent, separate
+                    from --aggressive.
+        * contact — phish/DM; needs the operator's separate contact consent.
+        """
+        consent = getattr(self._wm, "identity_consent", None) if self._wm else None
+        if not isinstance(consent, dict):
+            return (False, False)
+        return (bool(consent.get("active")), bool(consent.get("contact")))
+
+    def _rule_identity_field(self, wm: WorldModel):
+        """Reason over a THIN identity field: handle/masked-email -> local
+        part -> observed domains -> candidate addresses -> verified address
+        -> widened identity. Non-contact first; contact is a last resort.
+
+        All deductions are CANDIDATE findings (no capability gates on
+        them), so this rule can guide the planner but never authorize a
+        move. Domain guessing is forbidden: only observed domains are used.
+        """
+        from phantom.automation.brain.identity import IdentityReasoner
+        from phantom.automation.guidance.targets import is_identity_target
+        self._wm = wm
+        # identity reasoning only applies to an identity TARGET or once the
+        # world already carries identity context; a bare network host must
+        # not sprout identity hypotheses out of nothing (the manual `suggest`
+        # path reuses this engine).
+        if not is_identity_target(getattr(wm, "target_type", "")) and not (
+                wm.has_any("identity") or wm.has_any("profile")
+                or wm.has_any("email_masked") or wm.has_any("email_candidate")
+                or wm.has_any("email_verified")):
+            return []
+        active, contact = self._identity_consent()
+        reasoner = IdentityReasoner(active_consent=active,
+                                    contact_consent=contact)
+        derivations = list(reasoner.reason(wm))
+        # I4: the field graph decides WHICH field to widen first (critical
+        # path + bounded info-gain). Surface that choice as the ORDER of the
+        # identity hypotheses, i.e. the planner's preferences: the field the
+        # graph ranks first yields the first preferred capability. The graph
+        # only ORDERS already-allowed moves, it never gates or authorises.
+        cap_rank = self._identity_field_rank(derivations, wm, active, contact)
+        out = []
+        for d in derivations:
+            finding = None
+            if d.confidence > 0.0 and d.value.get("stage") is None:
+                finding = self._register_finding(
+                    wm, d.kind, d.key, d.value, confidence=d.confidence,
+                    evidence=d.evidence)
+            hyp = None
+            if d.hypothesis:
+                hyp = self._hyp(
+                    d.hypothesis["capability_id"], d.hypothesis["reason"],
+                    cost=d.hypothesis.get("cost", 0.5),
+                    priority=d.hypothesis.get("priority", 0.5))
+            if finding is not None or hyp is not None:
+                out.append((finding, hyp))
+        if cap_rank:
+            # stable: equal-ranked moves keep the rule's own order
+            out.sort(key=lambda pair: cap_rank.get(
+                (pair[1] or {}).get("capability_id", ""), len(cap_rank)))
+        return out
+
+    @staticmethod
+    def _identity_field_rank(derivations, wm: WorldModel,
+                             active: bool = False,
+                             contact: bool = False) -> Dict[str, int]:
+        """Capability rank from the I4 identity field graph (best field
+        first). Consent is honoured exactly as in I3: an unauthorised probe
+        is pushed down, never dropped. Failures degrade to no reordering —
+        the graph guides, never blocks."""
+        try:
+            from phantom.automation.brain.identity_graph import (
+                IdentityFieldGraph)
+            graph = IdentityFieldGraph.from_reasoner(derivations, wm)
+        except Exception:
+            return {}
+        ranks: Dict[str, int] = {}
+        for i, p in enumerate(graph.next_fields(
+                allow_active=active, allow_contact=contact)):
+            if p.capability and p.capability not in ranks:
+                ranks[p.capability] = i
+        return ranks
 
     def _rule_os_inference(self, wm: WorldModel):
         """Infer the OS family from service/banner fingerprints when the

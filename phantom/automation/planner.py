@@ -24,7 +24,9 @@ from phantom.automation.guidance.tailoring import TailoringEngine
 # phantom/automation/goals.py so the agent planner and the swarm engine read
 # ONE source; re-exported here for the many callers that import it from the
 # planner.
-from phantom.automation.goals import GOAL_FACTS  # noqa: E402,F401
+from phantom.automation.goals import (  # noqa: E402,F401
+    CONTACT_FACTS, GOAL_FACTS, NON_CONTACT_GOALS,
+)
 
 # Fact kind -> capabilities that can produce it (reverse index, category priority)
 _FACT_SOURCES = {
@@ -50,7 +52,15 @@ _FACT_SOURCES = {
     "creds": ["web_creds", "ssh_login", "breach_check", "harvest_campaign",
               "cred_spray", "loot_triage"],
     "identity": ["osint_identity", "persona_create", "deep_recon"],
-    "breach_exposure": ["breach_check"],
+    # I2 identity-field primitives: passive composition/verification before
+    # the breach lookup, and the breach correlation for a confirmed address.
+    "email_candidate": ["email_candidates"],
+    "domain_candidate": ["email_candidates"],
+    "email_masked": ["reset_enum"],
+    "email_verified": ["email_verify"],
+    "service_account": ["breach_correlate"],
+    "identity_widened": ["breach_correlate"],
+    "breach_exposure": ["breach_correlate", "breach_check"],
     "persona_profile": ["persona_profile"],
     "dossier": ["dossier_analyze"],
     "profile": ["profile_recon", "deep_recon"],
@@ -186,6 +196,12 @@ class Planner:
         """
         dead = dead or frozenset()
         goal_facts = GOAL_FACTS.get(goal, GOAL_FACTS["complete_kill_chain"])
+        # I3: a non-contact goal must never OPEN a channel. The facts that
+        # only exist because a lure/DM was sent are treated as unreachable
+        # for this plan, so the backward chain degrades to the non-contact
+        # ladder instead of escalating to phish_identity (which would break
+        # the DEEPEN worker's "widen without contact" contract).
+        non_contact = goal in NON_CONTACT_GOALS
         steps: List[PlanStep] = []
         missing = [g for g in goal_facts if not _fact_satisfied(wm, g)]
         if not missing:
@@ -259,6 +275,12 @@ class Planner:
             for pre in cap.preconditions:
                 facts = self._precondition_facts(pre, wm)
                 for pf in facts:
+                    if non_contact and pf in CONTACT_FACTS:
+                        # non-contact goal: a channel-opening fact is not a
+                        # valid sub-goal here (an existing lure is already
+                        # satisfied, so this only fires when it would have
+                        # to SEND one)
+                        continue
                     if not _fact_satisfied(wm, pf) and pf not in frontier \
                             and pf not in used and pf not in _produced:
                         frontier.append(pf)

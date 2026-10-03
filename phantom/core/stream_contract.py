@@ -395,6 +395,49 @@ def _r_stage_scope(d: dict) -> List[str]:
             f"({len(d.get('cells') or [])} cell(s))"]
 
 
+def _r_cell_scope(d: dict) -> List[str]:
+    cells = d.get("cells") or {}
+    hidden = 0
+    for c in cells.values():
+        if isinstance(c, dict):
+            hidden += int(c.get("hidden") or 0)
+    return [f"[~] Cell scope {_tag(d)}{len(cells)} cell(s), "
+            f"{d.get('shared_facts', '?')} shared fact(s), "
+            f"{hidden} hidden from their cell"]
+
+
+def _r_parallel_reasoning(d: dict) -> List[str]:
+    return [f"[~] Parallel reasoning {_tag(d)}{d.get('threads', '?')} quiet "
+            f"cell(s), consensus={d.get('consensus') or '-'}"]
+
+
+def _r_plan_graph(d: dict) -> List[str]:
+    return [f"[~] Plan graph {_tag(d)}{len(d.get('nodes') or [])} node(s), "
+            f"{len(d.get('edges') or [])} edge(s), "
+            f"critical={len(d.get('critical_path') or [])}"]
+
+
+def _r_identity_field(d: dict) -> List[str]:
+    """The identity FIELD DAG: what we know, and which field to widen first."""
+    nodes = d.get("nodes") or []
+    known = sum(1 for n in nodes if isinstance(n, dict) and n.get("known"))
+    nxt = ", ".join(str(x) for x in (d.get("next") or [])) or "-"
+    critical = ", ".join(str(x) for x in (d.get("critical_path") or [])) or "-"
+    return [f"[~] {_tag(d)}Identity field graph: {len(nodes)} node(s) "
+            f"({known} known), {len(d.get('edges') or [])} deduction(s) | "
+            f"widen first: {nxt} | spine: {critical}"]
+
+
+def _r_plan_variants(d: dict) -> List[str]:
+    """B3: which plan variant won, and by how much."""
+    scores = d.get("scores") or {}
+    shown = ", ".join(f"{k}={v:.3f}" for k, v in
+                      sorted(scores.items(), key=lambda kv: (-kv[1], kv[0])))
+    head = (f"[≡] {_tag(d)}Plan variants -> {d.get('winner') or '?'} "
+            f"({d.get('label') or '-'}): {d.get('rule') or '-'}")
+    return [head] + ([f"    {shown}"] if shown else [])
+
+
 def _r_cadence(d: dict) -> List[str]:
     return [f"[~] Cadence {_tag(d)}{d.get('phase')}: attempt "
             f"{d.get('attempt')} delivered={d.get('delivered')} — "
@@ -577,6 +620,15 @@ EVENTS: Dict[str, EventSpec] = {
     # structure / cells
     "roster": EventSpec("dim", _r_roster, verbose_only=True),
     "stage_scope": EventSpec("dim", _r_stage_scope, verbose_only=True),
+    "cell_scope": EventSpec("dim", _r_cell_scope, verbose_only=True),
+    "parallel_reasoning": EventSpec("dim", _r_parallel_reasoning,
+                                    verbose_only=True),
+    "plan_graph": EventSpec("dim", _r_plan_graph, verbose_only=True),
+    "plan_variants": EventSpec("dim", _r_plan_variants, verbose_only=True,
+                              fields=("winner", "rule", "scores")),
+    "identity_field": EventSpec("dim", _r_identity_field,
+                               verbose_only=True,
+                               fields=("next", "critical_path", "nodes")),
     "gate": EventSpec("dim", _r_gate),
     "shared": EventSpec("dim", _r_shared, verbose_only=True),
     "pin": EventSpec("dim", _r_pin, verbose_only=True),

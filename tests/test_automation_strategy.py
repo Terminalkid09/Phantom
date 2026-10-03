@@ -110,8 +110,11 @@ class TestStrategyLibrary(unittest.TestCase):
         identity = TargetModel(target_type="email", is_identity=True)
         stages = applicable_strategies(identity)
         self.assertEqual(stages[0].id, "identity_osint")
-        self.assertEqual(stages[1].id, "identity_breach")
-        self.assertEqual(stages[2].id, "identity_beacon")
+        # I3: the NON-CONTACT field expansion runs right after discovery,
+        # before the breach lookup and long before delivery/contact.
+        self.assertEqual(stages[1].id, "identity_field")
+        self.assertEqual(stages[2].id, "identity_breach")
+        self.assertEqual(stages[3].id, "identity_beacon")
         network = TargetModel(target_type="ip", is_network=True)
         stages = applicable_strategies(network)
         self.assertEqual(stages[0].id, "network_footprint")

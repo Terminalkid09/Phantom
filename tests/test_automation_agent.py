@@ -650,5 +650,37 @@ class TestAutonomousAgent(unittest.TestCase):
         self.assertEqual(share.find("ssh"), ("root", "toor"))
 
 
+class TestAwaitBeaconAttribution(unittest.TestCase):
+    """`_await_beacon` must attach the session to the RIGHT beacon: a plain
+    "first foreign registration" match could queue operator tasks to an
+    unrelated host."""
+
+    def setUp(self):
+        _reset_c2()
+
+    def _agent(self):
+        return AutonomousAgent(target=TARGET, target_type="ip",
+                               profile="enterprise", on_event=lambda k, d: None)
+
+    def test_exact_target_ip_wins_immediately(self):
+        from phantom.core.c2_server import c2_state
+        c2_state.update_beacon("beacon-good", {"ip": TARGET, "os": "Linux"})
+        self.assertEqual(self._agent()._await_beacon(timeout=2.0),
+                         "beacon-good")
+
+    def test_two_foreign_registrations_are_never_guessed(self):
+        from phantom.core.c2_server import c2_state
+        c2_state.update_beacon("beacon-a", {"ip": "203.0.113.9"})
+        c2_state.update_beacon("beacon-b", {"ip": "203.0.113.10"})
+        self.assertIsNone(self._agent()._await_beacon(timeout=0.8),
+                          "an ambiguous window must not be guessed")
+
+    def test_single_foreign_registration_is_accepted_after_stability(self):
+        from phantom.core.c2_server import c2_state
+        c2_state.update_beacon("beacon-solo", {"ip": "203.0.113.11"})
+        self.assertEqual(self._agent()._await_beacon(timeout=3.0),
+                         "beacon-solo")
+
+
 if __name__ == "__main__":
     unittest.main()

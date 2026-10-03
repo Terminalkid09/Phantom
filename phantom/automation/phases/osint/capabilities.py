@@ -13,6 +13,11 @@ OSINT_CAPABILITY_IDS = (
     "osint_identity",
     "breach_check",
     "deep_recon",
+    # identity-field primitives (I2)
+    "email_candidates",
+    "reset_enum",
+    "email_verify",
+    "breach_correlate",
     "surface_map",
     "persona_create",
     "persona_profile",

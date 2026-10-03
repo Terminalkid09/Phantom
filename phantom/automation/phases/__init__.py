@@ -51,6 +51,11 @@ _CAPABILITY_PHASE: Dict[str, str] = {
     # osint
     "osint_identity": "osint",
     "breach_check": "osint",
+    # I2 identity-field primitives
+    "email_candidates": "osint",
+    "reset_enum": "osint",
+    "email_verify": "osint",
+    "breach_correlate": "osint",
     "deep_recon": "osint",
     "surface_map": "osint",
     "persona_create": "osint",
