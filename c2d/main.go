@@ -46,7 +46,8 @@ func run(logger *log.Logger) error {
 			"lab only", cfg.Bind)
 	}
 
-	store := NewStore(cfg.BeaconRegistry)
+	store := NewStorePersistent(cfg.BeaconRegistry, cfg.DataDir)
+	defer store.Close()
 	server := NewServer(cfg, store, logger)
 
 	httpSrv := &http.Server{
@@ -91,6 +92,9 @@ func run(logger *log.Logger) error {
 		}
 	case <-stop:
 		logger.Printf("shutting down")
+		// Persist the last mutations before the process goes away: the
+		// snapshot is flushed by a background ticker, so quit must force it.
+		store.Flush()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return httpSrv.Shutdown(ctx)

