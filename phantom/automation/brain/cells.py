@@ -44,6 +44,7 @@ from phantom.automation.brain.lenses import (
     choose_profile,
     profile_for,
 )
+from phantom.automation.goals import GOAL_FACTS
 
 # ── contact classes ────────────────────────────────────────────────────────
 
@@ -72,35 +73,103 @@ ACTING_CAP_AGGRESSIVE: Dict[str, int] = {
 # by the cost of a thread and by how much disagreement is still readable.
 ADVISORY_CAP = 3
 
+# The run's NOISE BUDGET — the second scarce resource, after contact.
+#
+# The permit serialises WHO touches the target; this rations HOW MUCH noise
+# the run may spend in total. `opsec_cost`/`detection_risk` already exist per
+# capability, but without a shared, finite pool every cell simply spends and
+# the engagement's exposure is only ever OBSERVED (the circuit breaker) after
+# the fact. Here the cells COMPETE for one pool: a charge that would overspend
+# is refused WITH A REASON and the action is deferred, so restraint is a
+# contested resource and not a good intention.
+#
+# Generous by default (a normal chain spends ~1 per action and takes tens of
+# actions), so it only bites on a genuinely loud or looping run — which is
+# exactly when it should.
+NOISE_BUDGET_DEFAULT = 60.0
+
+
+class NoiseBudget:
+    """A finite pool of run noise the cells compete for (thread-safe).
+
+    `charge` is atomic, so two cells racing for the last unit cannot both
+    win. A refusal is recorded with its reason: the loser being deferred is
+    the auditable trace that the run CHOSE restraint. `limit <= 0` means
+    unlimited (the pool is not enforced), which callers use to disable it.
+    """
+
+    def __init__(self, limit: float = NOISE_BUDGET_DEFAULT) -> None:
+        self._lock = threading.Lock()
+        self.limit = float(limit)
+        self.spent = 0.0
+        self.refusals: List[dict] = []
+
+    @property
+    def enforced(self) -> bool:
+        return self.limit > 0
+
+    def remaining(self) -> float:
+        with self._lock:
+            if not self.enforced:
+                return float("inf")
+            return max(0.0, self.limit - self.spent)
+
+    def charge(self, cell_id: str, cost: float,
+               capability: str = "") -> bool:
+        """Try to spend `cost`. False = would overspend; nothing is taken."""
+        try:
+            cost = max(0.0, float(cost))
+        except (TypeError, ValueError):
+            cost = 0.0
+        with self._lock:
+            if not self.enforced:
+                self.spent += cost
+                return True
+            if self.spent + cost > self.limit + 1e-9:
+                self.refusals.append({"cell": cell_id,
+                                      "capability": capability,
+                                      "cost": round(cost, 3),
+                                      "remaining": round(
+                                          max(0.0, self.limit - self.spent), 3)})
+                if len(self.refusals) > 100:
+                    del self.refusals[:-50]
+                return False
+            self.spent += cost
+            return True
+
+    def to_dict(self) -> dict:
+        with self._lock:
+            return {"limit": self.limit, "spent": round(self.spent, 3),
+                    "remaining": (None if not self.enforced
+                                  else round(max(0.0, self.limit - self.spent), 3)),
+                    "refusals": len(self.refusals)}
+
 # how many extra agents the orchestrator may add on ONE role before it is
 # declared a peer storm. Escalation is a second opinion, not a fan-out.
 MAX_PEERS_PER_ROLE = 2
 
-# C4 migration ledger: the STAGES whose planning the cell roster is now the
-# AUTHORITY for. An entry is added only when the roster's coverage owns every
-# capability category the planner can legitimately offer for that stage, on
-# EVERY target class the stage can occur on (the coverage gate in
-# `tests/test_stage_migration.py`, which reads the real planner). The old
-# planning path keeps serving everything else. Growing this tuple IS the
-# migration.
+# C4 IS COMPLETE: the roster is now the SINGLE authority for every goal the
+# planner can be handed, so this tuple is the whole AUDITED vocabulary, not a
+# subset that still cohabits with an older planning path. An entry is here
+# only because it passed the coverage gate (the roster owns every capability
+# category the planner can legitimately offer for that goal, on ip/domain/
+# cidr/email/username/phone) in `tests/test_stage_migration.py`, which reads
+# the real planner. A goal added to `goals.GOAL_FACTS` without a role that
+# covers it now FAILS that gate instead of silently falling back to a second
+# planning path.
 #
 # Vocabulary note, and it is the bug that made the first version of this
 # ledger INERT: `agent._current_stage` is set to the run's GOAL
 # (`_drive_stage(goal)`), not to a doctrine chain stage. A chain stage name
-# like "footprint" therefore never matches, and a ledger holding only chain
-# names turns the strict loop into dead code that still looks switched on.
-# Entries here are goals — the values `_current_stage` really takes.
+# like "footprint" therefore never matches. Entries here are goals.
 #
-# Measured, not assumed: every entry below passes the gate for ip, domain,
-# cidr, email, username and phone targets; `ad` and `crack` are deliberately
-# ABSENT because on an identity-class target the AD stage needs `recon`
-# (ldapsearch/nmap) while the identity chain forbids `footprint`, so those
-# goals keep the old path until that inconsistency is resolved.
-MIGRATED_STAGES: Tuple[str, ...] = (
-    "complete_kill_chain", "deliver", "beacon", "post_exploit", "expand",
-    "lateral", "identity", "social", "cloud", "mobile", "harvest",
-    "evasion",
-)
+# Measured, not assumed: the whole vocabulary below passes the gate. `ad` and
+# `crack` are included because a beacon-bound goal always carries recon
+# coverage (the harvested victim IP still has to be scanned), which is what
+# the old "identity chain forbids footprint" blocker really was.
+COVERED_GOALS: Tuple[str, ...] = tuple(GOAL_FACTS) + ("deep",)
+# legacy name, kept so callers importing the old migration ledger keep working
+MIGRATED_STAGES: Tuple[str, ...] = COVERED_GOALS
 
 
 # ── roles ──────────────────────────────────────────────────────────────────
@@ -167,8 +236,13 @@ CELL_LIBRARY: Dict[str, CellSpec] = {
             "profile", "account_link", "dossier", "breach_exposure",
             "victim_ip", "email", "phone", "handle", "device", "service",
             "environment",
+            # identity-field reasoning (I1): the deductions a thin field
+            # produces — none of these gates a capability.
+            "email_masked", "domain_candidate", "email_candidate",
+            "email_verified", "service_account", "identity_widened",
         }),
-        reports_kinds=frozenset({"identity_conf", "victim_ip", "dossier"})),
+        reports_kinds=frozenset({"identity_conf", "victim_ip", "dossier",
+                                 "identity_widened", "service_account"})),
     "osint": CellSpec(
         role="osint",
         objective="deep open-source intelligence: profiles, links, exposure",
@@ -178,9 +252,14 @@ CELL_LIBRARY: Dict[str, CellSpec] = {
             "identity", "identity_conf", "persona", "persona_profile",
             "profile", "account_link", "dossier", "breach_exposure",
             "victim_ip", "follow_accepted", "dm_sent", "service", "environment",
+            # identity-field reasoning (I1) — the deductions a thin field
+            # produces, so the osint cell can SEE and deepen them.
+            "email_masked", "domain_candidate", "email_candidate",
+            "email_verified", "service_account", "identity_widened",
         }),
         reports_kinds=frozenset({"identity_conf", "victim_ip", "dossier",
-                                 "breach_exposure", "follow_accepted"})),
+                                 "breach_exposure", "follow_accepted",
+                                 "identity_widened", "service_account"})),
     "web": CellSpec(
         role="web",
         objective="attack the web/API surface: parameters, uploads, authz",
@@ -296,6 +375,7 @@ STAGE_ROLES: Dict[str, Tuple[str, ...]] = {
     # doctrine-level stages that the machine roles serve
     "creds": ("exploit",),
     "social": ("osint",),
+    "web": ("web",),
     "exploit": ("web", "exploit"),
     "deliver": ("foothold",),
     "complete_kill_chain": ("foothold",),
@@ -316,6 +396,38 @@ STAGE_ROLES: Dict[str, Tuple[str, ...]] = {
 
 
 # ── the cell ───────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class CellView:
+    """One cell's scoped picture of the shared map.
+
+    `visible` are the findings the cell may READ; `hidden` is how many facts
+    its scope excludes. The isolation is what makes "the scanner does not
+    consult the exploits" a property of the DATA a cell reasons over, not
+    only of the capabilities it is handed.
+    """
+
+    cell_id: str
+    role: str
+    visible: tuple = ()
+    hidden: int = 0
+
+    def kinds(self) -> set:
+        return {str(getattr(f, "kind", "") or "") for f in self.visible}
+
+    def has_any(self, kind: str) -> bool:
+        return any(str(getattr(f, "kind", "") or "") == kind
+                   for f in self.visible)
+
+    def findings_of(self, kind: str) -> List[Any]:
+        return [f for f in self.visible
+                if str(getattr(f, "kind", "") or "") == kind]
+
+    def to_dict(self) -> dict:
+        return {"cell": self.cell_id, "role": self.role,
+                "visible": len(self.visible), "hidden": int(self.hidden),
+                "kinds": sorted(self.kinds())}
+
 
 @dataclass
 class Cell:
@@ -376,6 +488,20 @@ class Cell:
             if self.sees(kind):
                 out.append(f)
         return out
+
+    def view(self, findings: Iterable[Any]) -> "CellView":
+        """This cell's OWN picture of the world (the buco-1 fix).
+
+        Two cells on one run no longer reason from one shared blob: each is
+        handed the projection of the map its `sees_kinds` allows, plus the
+        count of what it cannot see, so isolation is a property of the
+        reasoning input and not merely of the bus answering.
+        """
+        pool = list(findings)
+        visible = self.view_of(pool)
+        return CellView(cell_id=self.cell_id, role=self.spec.role,
+                        visible=tuple(visible),
+                        hidden=max(0, len(pool) - len(visible)))
 
     def can_report(self, kind: str) -> bool:
         return kind in self.spec.reports_kinds
@@ -504,6 +630,8 @@ class CellTeam:
         # doctrine still lists a beacon stage nobody has reached.
         self.active_stages: set = set()
         self.permit = EgressPermit(self.acting_cap())
+        # the run's noise pool: cells COMPETE for it (buco 4)
+        self.budget = NoiseBudget(NOISE_BUDGET_DEFAULT)
         self.escalations: List[dict] = []
 
     def set_active_stage(self, stage: str) -> None:
@@ -680,6 +808,7 @@ class CellTeam:
                 "acting": len(self.acting()),
                 "advisory": len(self.advisory_cells()),
                 "acting_cap": self.permit.acting_cap,
+                "budget": self.budget.to_dict(),
                 "active_stages": sorted(self.active_stages),
                 "holders": self.permit.holders,
                 "escalations": list(self.escalations),

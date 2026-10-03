@@ -1,27 +1,30 @@
-"""C4 acceptance tests — the gradual migration to the cell loop.
+"""C4 acceptance tests — the cell roster is the SINGLE authority.
 
-The migration contract: a GOAL may be moved to the strict cell loop ONLY when
-the roster's coverage owns every capability category the planner can
-legitimately offer for it, on EVERY target class the goal can occur on. That
-is not a review opinion — it is a gate:
+The migration is over. There is no second planning path left to fall back to,
+so the contract these tests pin is no longer "a migrated goal routes correctly
+while the rest keeps the old behaviour" — it is:
 
-    coverage gate     every migrated goal, on every class, plans to a set of
-                      capability categories its coverage roles all own
+    coverage gate     every goal in the audited vocabulary, on every target
+                      class, plans to a set of capability categories the
+                      roster's coverage roles all own;
     registry truth    every capability category in the registry has an owning
                       role somewhere (an unowned category is exactly what the
-                      strict loop refuses mid-chain)
-    strict routing    during a migrated goal, a capability the coverage does
-                      not own is refused AND reported, not silently skipped
-    unmigrated goal   a goal that is not in the ledger keeps the old behaviour
-                      exactly
+                      strict loop refuses mid-chain);
+    single authority  a capability the coverage does not own is refused AND
+                      reported on EVERY goal — there is no lenient fall-back;
+    no roster         if the roster cannot be built the run refuses loudly
+                      instead of reverting to the removed planning path.
 
-The gate has now earned itself twice, and both findings were real:
+The gate has earned itself repeatedly, and every finding was real:
 
   * `ssh_banner`, `smb_enum` and `redis_info` are category `service` — the recon
     role did not own it;
   * `beacon_deploy` is category `beacon` and `ssh_login` is category `creds` —
     NO role owned either, so the strict loop would have refused the two
-    capabilities that constitute "reaching the beacon".
+    capabilities that constitute "reaching the beacon";
+  * `web`/`exploit` on an identity-class target offered `scan_tcp`/`hunt_web`
+    while the identity chain forbids `footprint` and carries no `web` role —
+    the last two goals that had kept the old path open.
 
 Vocabulary note, which is itself a bug that shipped and was caught here: the
 agent sets `_current_stage` to the run's GOAL (`_drive_stage(goal)`), not to a
@@ -32,14 +35,16 @@ on, audited, and never once active. Entries here are goals.
 
 from phantom.automation.brain.cells import (
     CELL_LIBRARY,
+    COVERED_GOALS,
     DEEP_LADDER,
     MIGRATED_STAGES,
     STAGE_ROLES,
 )
 from phantom.automation.brain.cell_runtime import CellRuntime
+from phantom.automation.goals import GOAL_FACTS
 
 
-# every class the ledger's gate is measured against
+# every class the coverage gate is measured against
 TARGET_CLASSES = (
     ("10.0.0.5", "ip"),
     ("example.com", "domain"),
@@ -65,6 +70,19 @@ def _categories(steps):
     return {str(s.capability.category) for s in steps}
 
 
+# ── the vocabulary ────────────────────────────────────────────────────────
+
+def test_the_audited_vocabulary_is_every_goal_plus_deep():
+    """The roster is the authority for EVERY goal the planner can be handed.
+
+    If this fails, somebody added a goal to `GOAL_FACTS` without extending the
+    roster — which is exactly the case that used to fall back to the removed
+    planning path.
+    """
+    assert COVERED_GOALS == tuple(GOAL_FACTS) + ("deep",)
+    assert MIGRATED_STAGES == COVERED_GOALS
+
+
 # ── the gates ─────────────────────────────────────────────────────────────
 
 def test_every_registry_category_has_an_owning_role():
@@ -84,29 +102,26 @@ def test_every_registry_category_has_an_owning_role():
         f"categories no role owns: {sorted(registry_cats - owned)}")
 
 
-def test_every_migrated_goal_passes_its_coverage_gate():
-    """The gate that decides whether a goal CAN be migrated."""
-    for goal in MIGRATED_STAGES:
+def test_every_covered_goal_passes_its_coverage_gate():
+    """The gate that lets a goal be served by the roster at all."""
+    for goal in COVERED_GOALS:
         for target, ttype in TARGET_CLASSES:
             a = _agent(target, ttype)
-            a.cell_loop = True
-            a.cell_stages = (goal,)
             a._current_stage = goal
             a._ensure_cells(goal)
             assert a.cells is not None, f"{goal}/{ttype}: no roster"
             steps = _candidates(a, goal)
-            assert steps, f"{goal}/{ttype}: no planner candidate"
+            # an empty plan is legitimate (the goal is unreachable for this
+            # class right now); there is simply nothing to cover
             gaps = a.cells.missing_coverage_categories(_categories(steps))
-            assert gaps == [], (f"goal '{goal}' on {ttype} cannot be migrated: "
-                                f"its coverage does not own {gaps}")
+            assert gaps == [], (f"goal '{goal}' on {ttype} cannot be served: "
+                                f"coverage does not own {gaps}")
 
 
-def test_every_migrated_goal_routes_every_candidate_when_stage_scoped():
-    for goal in MIGRATED_STAGES:
+def test_every_covered_goal_routes_every_candidate_when_stage_scoped():
+    for goal in COVERED_GOALS:
         for target, ttype in TARGET_CLASSES:
             a = _agent(target, ttype)
-            a.cell_loop = True
-            a.cell_stages = (goal,)
             a._current_stage = goal
             a._ensure_cells(goal)
             refused = [s.capability.id for s in _candidates(a, goal)
@@ -126,14 +141,32 @@ def test_a_beacon_bound_goal_on_an_identity_target_keeps_recon_coverage():
     beacon. A beacon-bound goal therefore always carries recon coverage.
     """
     a = _agent("bob@corp.com", "email")
-    a.cell_loop = True
-    a.cell_stages = ("deliver",)
     a._current_stage = "deliver"
     a._ensure_cells("deliver")
     roles = {c.spec.role for c in a.cells.team.acting()}
     assert "recon" in roles, f"no recon cell in the roster: {sorted(roles)}"
     cap = a.registry.get("scan_tcp")
     assert a.cells.cell_for(cap, "deliver", stage_scoped=True) is not None
+
+
+def test_a_web_goal_on_an_identity_target_keeps_recon_and_web_coverage():
+    """The last two goals that kept the old path open keep it closed.
+
+    `web`/`exploit` on an identity target still probe a SERVICE on the
+    harvested address (`http_probe`, `hunt_web`), so the roster must carry
+    both the recon role (category `recon`) and the web role (category
+    `hunt`) regardless of the identity chain's forbidden stages.
+    """
+    for goal in ("web", "exploit"):
+        a = _agent("bob@corp.com", "email")
+        a._current_stage = goal
+        a._ensure_cells(goal)
+        roles = {c.spec.role for c in a.cells.team.acting()}
+        assert "recon" in roles, (goal, sorted(roles))
+        for cap_id in ("http_probe", "hunt_web"):
+            cap = a.registry.get(cap_id)
+            assert a.cells.cell_for(cap, goal, stage_scoped=True) is not None, \
+                (goal, cap_id)
 
 
 def test_the_deep_ladder_is_pinned_to_the_agent_ladder():
@@ -147,20 +180,28 @@ def test_the_deep_ladder_is_pinned_to_the_agent_ladder():
     assert tuple(DEEP_LADDER) == tuple(DEEP_STAGES)
 
 
-# ── strict vs lenient ─────────────────────────────────────────────────────
+# ── the roster is the single authority ────────────────────────────────────
+
+def test_the_roster_is_the_authority_without_any_flag():
+    """A fresh run is strict by construction: no flag, no migration set."""
+    a = _agent()
+    a._ensure_cells("deliver")
+    a._current_stage = "deliver"
+    assert a.cells is not None
+    assert a.cells.strict is True
+    assert a._cell_strict_here() is True
+
 
 def test_a_category_no_coverage_role_owns_is_refused_and_reported():
     """The strict loop refuses what the roster cannot own — and says why.
 
     `osint_identity` is category `osint`, which no role of a network chain
-    owns. During a migrated goal it is refused; the point is that the refusal
-    is an event (auditable), not a silent skip.
+    owns. It is refused on EVERY goal; the point is that the refusal is an
+    event (auditable), not a silent fall-through.
     """
     from phantom.automation.planner import PlanStep
 
     a = _agent()
-    a.cell_loop = True
-    a.cell_stages = ("deliver",)
     a._ensure_cells("deliver")
     a._current_stage = "deliver"
     assert a.cells.strict is True
@@ -176,76 +217,52 @@ def test_a_category_no_coverage_role_owns_is_refused_and_reported():
     assert any("osint" in str(r) for r in reasons), reasons
 
 
-def test_an_unmigrated_goal_keeps_the_old_behaviour():
-    """`--cell-loop` with an explicit list must leave every other goal exactly
-    as it was: the same capability runs, routed to no one in particular."""
+def test_a_missing_roster_refuses_instead_of_falling_back():
+    """There is no second planning path: no roster means refusal, loudly."""
+    import phantom.automation.brain.cell_runtime as cr
     from phantom.automation.planner import PlanStep
 
     a = _agent()
-    a.cell_loop = True
-    a.cell_stages = ("deliver",)
-    a._ensure_cells("ad")                 # `ad` fails the gate: not in the ledger
-    a._current_stage = "ad"
-    assert a._cell_strict_here() is False
-    cap = a.registry.get("osint_identity")       # would be refused if strict
+    original = cr.CellRuntime
+
+    class _Boom:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("roster construction failed")
+
+    cr.CellRuntime = _Boom
+    try:
+        a._ensure_cells("deliver")
+    finally:
+        cr.CellRuntime = original
+    assert a.cells is None
+    assert a._cells_failed is True
     ran = []
     a._execute_capability = lambda step: ran.append(1) or True
-    assert a._exec_with_permit(PlanStep(capability=cap, slot_values={})) is True
-    assert ran == [1]
-    assert a.cells.refused == 0
+    cap = a.registry.get("scan_tcp")
+    assert a._exec_with_permit(PlanStep(capability=cap, slot_values={})) is False
+    assert ran == []
+    assert a.sink.by_kind("blocked")
 
 
-def test_cell_loop_alone_defaults_to_the_migration_ledger():
+def test_drive_stage_halts_when_the_roster_is_unavailable():
+    """The run must not spin through refusals: the stage halts with a reason."""
     a = _agent()
-    a.cell_loop = True
-    a._ensure_cells("deliver")
-    assert tuple(a.cell_stages) == tuple(MIGRATED_STAGES)
-    assert a.cells.strict is True
+
+    def _fail(goal):            # a roster that cannot be built at all
+        a.cells = None
+        a._cells_failed = True
+
+    a._ensure_cells = _fail
+    ok = a._drive_stage("deliver", 3, None, None, None, 1.0)
+    assert ok is False
+    halts = [d.get("reason", "") for d in a.sink.by_kind("halt")]
+    assert any("roster" in str(r) for r in halts), halts
 
 
-def test_an_explicit_stage_list_overrides_the_ledger():
+# ── the permit follows the stage ──────────────────────────────────────────
+
+def test_an_advisory_peer_is_never_routed_even_in_a_served_goal():
     a = _agent()
-    a.cell_loop = True
-    a.cell_stages = ("deliver",)
-    a._ensure_cells("deliver")
-    assert tuple(a.cell_stages) == ("deliver",)
-    a._current_stage = "deliver"
-    assert a._cell_strict_here() is True
-    a._current_stage = "ad"
-    assert a._cell_strict_here() is False            # not in the explicit list
-
-
-def test_cell_loop_off_means_no_strict_path_at_all():
-    a = _agent()
-    a._ensure_cells("deliver")
-    assert a.cells is not None
-    assert a.cells.strict is False
-    # the roster exists (it adds structure) but is never the authority
-    a._current_stage = "deliver"
-    assert a._cell_strict_here() is False
-    a._current_stage = "identity"
-    assert a._cell_strict_here() is False
-
-
-def test_a_chain_stage_name_is_inert_because_stages_are_goals():
-    """The vocabulary bug, pinned so it cannot come back.
-
-    A chain stage (`footprint`) is never a value `_current_stage` takes, so a
-    ledger entry naming one silently disables the strict path for the whole
-    run. The ledger accepts goal names only, and this test states the reason.
-    """
-    a = _agent()
-    a.cell_loop = True
-    a.cell_stages = ("footprint",)
-    a._ensure_cells("deliver")
-    a._current_stage = "deliver"
-    assert a._cell_strict_here() is False
-
-
-def test_an_advisory_peer_is_never_routed_even_in_a_migrated_goal():
-    a = _agent()
-    a.cell_loop = True
-    a.cell_stages = ("deliver",)
     a._ensure_cells("deliver")
     a._current_stage = "deliver"
     peer = a.cells.on_stall("no_visibility", a.registry.get("scan_tcp"),
@@ -256,9 +273,7 @@ def test_an_advisory_peer_is_never_routed_even_in_a_migrated_goal():
     assert cell is not None and cell.advisory is False
 
 
-# ── the permit follows the stage ──────────────────────────────────────────
-
-def test_the_permit_follows_the_stage_of_a_migrated_run():
+def test_the_permit_follows_the_stage_of_a_run():
     """A roster holding both a quiet role (identity/osint: no contact) and a
     loud one (recon: contact) must widen while the quiet stage is in flight
     and collapse to ONE the moment the chain reaches the target-touching
@@ -279,7 +294,6 @@ def test_a_stage_whose_roles_are_absent_falls_back_to_the_loudest_cap():
     """Conservative default: asking for a stage no roster role serves must
     NOT accidentally widen the permit."""
     a = _agent()                       # network class: recon/web/exploit cells
-    a.cell_loop = True
     a._ensure_cells("deliver")
     a.cells.set_stage("identity")      # no identity cell in this roster
     assert a.cells.team.permit.acting_cap == 1
@@ -295,4 +309,4 @@ def test_every_role_named_by_stage_roles_exists():
     """`STAGE_ROLES` and `CELL_LIBRARY` must not drift: a stage naming a role
     that does not exist plans a roster with a hole in it."""
     used = {r for roles in STAGE_ROLES.values() for r in roles}
-    assert used - set(CELL_LIBRARY) == set()
+    assert used - set(CELL_LIBRARY) == set(), sorted(used - set(CELL_LIBRARY))
