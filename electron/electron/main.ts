@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog } from 'electron'
+import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog, session } from 'electron'
 import { spawn, ChildProcess } from 'child_process'
 import path from 'path'
 import fs from 'fs'
@@ -32,6 +32,35 @@ function getApiUrl(): string {
   return `http://127.0.0.1:${API_PORT}`
 }
 
+// Content-Security-Policy for the renderer. The UI is a single local
+// document that talks ONLY to the loopback API; it must never load remote
+// script/font/style. Self-hosted fonts (public/ + @fontsource) mean no
+// fonts.gstatic.com exception is needed. Vite's dev server injects the React
+// refresh preamble as an inline script, so `script-src` loosens to
+// 'unsafe-inline' in dev only — the packaged build stays strict. The same
+// policy is emitted as a <meta> tag for the packaged build by the custom
+// Vite plugin (vite.config.ts), because webRequest.onHeadersReceived does
+// not fire for the file:// document load.
+function buildCsp(): string {
+  const scriptSrc = isDev ? "'self' 'unsafe-inline'" : "'self'"
+  const connectSrc = isDev
+    ? "'self' http://127.0.0.1:9876 http://localhost:5173 ws://localhost:5173"
+    : "'self' http://127.0.0.1:9876"
+  return [
+    "default-src 'self'",
+    `script-src ${scriptSrc}`,
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self' data:",
+    "media-src 'self' blob: data:",
+    `connect-src ${connectSrc}`,
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+  ].join('; ')
+}
+
 /** Read the auto-generated API token (state file → env override).
  *
  * The state file is the SOURCE OF TRUTH: the Electron-spawned backend resolves
@@ -50,6 +79,17 @@ function getApiToken(): string {
     if (fromState) return fromState
   } catch { /* fall through to env */ }
   return process.env.PHANTOM_API_TOKEN || ''
+}
+
+// C-1: append-only audit of mutating IPC calls. Kept in main (the renderer
+// never sees it) and best-effort — an audit write must never break the UI.
+function auditIpc(method: string, endpoint: string): void {
+  try {
+    const line = `${new Date().toISOString()} ${method.toUpperCase()} ${endpoint}\n`
+    const dir = app.getPath('userData')
+    if (!existsSync(dir)) return
+    fs.appendFileSync(path.join(dir, 'ipc_audit.log'), line)
+  } catch { /* best-effort */ }
 }
 
 // Backend readiness gate: the renderer fires its first fetches while the
@@ -217,6 +257,19 @@ function createTray(): void {
 }
 
 app.whenReady().then(() => {
+  // CSP on every response of the default session (dev http server + any
+  // fetch). Packaged file:// loads are covered by the <meta> tag in the
+  // built index.html; this header keeps dev honest against the same policy.
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    const headers = details.responseHeaders ?? {}
+    const existing = Object.keys(headers).find((k) => k.toLowerCase() === 'content-security-policy')
+    if (existing) {
+      callback({ responseHeaders: headers })
+      return
+    }
+    callback({ responseHeaders: { ...headers, 'Content-Security-Policy': [buildCsp()] } })
+  })
+
   startApiServer()
   createWindow()
   createTray()
@@ -231,6 +284,32 @@ app.whenReady().then(() => {
     const verdict = checkEndpoint(method, endpoint)
     if (!verdict.allowed) {
       return { status: 403, data: { error: verdict.reason ?? 'endpoint not allowlisted' } }
+    }
+    // C-1: the allowlist already told us whether this is a read or a write.
+    // Mutating calls get an audit line; DESTRUCTIVE ones additionally need
+    // an operator confirmation, so a compromised renderer cannot burn the
+    // engagement (kill the listener, revoke identities, rotate secrets)
+    // without a human in the loop.
+    if (verdict.group === 'mutating') {
+      auditIpc(method, endpoint)
+    }
+    if (verdict.confirm) {
+      const parent = BrowserWindow.getFocusedWindow() ?? mainWindow
+      const opts = {
+        type: 'warning' as const,
+        buttons: ['Cancel', 'Proceed'],
+        defaultId: 0,
+        cancelId: 0,
+        title: 'Confirm destructive action',
+        message: `${method} ${endpoint}`,
+        detail: 'This changes C2/session state and may be irreversible.'
+      }
+      const choice = parent
+        ? dialog.showMessageBoxSync(parent, opts)
+        : dialog.showMessageBoxSync(opts)
+      if (choice !== 1) {
+        return { status: 499, data: { error: 'cancelled by operator' } }
+      }
     }
     const url = `${getApiUrl()}${endpoint}`
     const options: RequestInit = {
@@ -297,7 +376,10 @@ app.whenReady().then(() => {
       if (res.canceled || !res.filePath) return { saved: false }
       // dir is an API-relative subdir (recordings, recordings/live, ...);
       // only names coming straight from the artifacts list are accepted.
-      let url = `/api/c2/artifact?name=${encodeURIComponent(payload.name)}`
+      // raw=1: WITHOUT it the backend answers the base64 JSON envelope and we
+      // would write that JSON into an .mp4 — the artifact must be fetched as
+      // raw bytes.
+      let url = `/api/c2/artifact?raw=1&name=${encodeURIComponent(payload.name)}`
       if (dir) url += `&dir=${encodeURIComponent(dir)}`
       const token = getApiToken()
       const r = await fetch(`${getApiUrl()}${url}`, {
@@ -323,7 +405,8 @@ app.whenReady().then(() => {
       }
       const destDir = path.join(app.getPath('desktop'), 'Phantom Recordings')
       fs.mkdirSync(destDir, { recursive: true })
-      let url = `/api/c2/artifact?name=${encodeURIComponent(payload.name)}`
+      // raw=1: save the artifact BYTES, not the base64 JSON envelope.
+      let url = `/api/c2/artifact?raw=1&name=${encodeURIComponent(payload.name)}`
       if (dir) url += `&dir=${encodeURIComponent(dir)}`
       const token = getApiToken()
       const r = await fetch(`${getApiUrl()}${url}`, {

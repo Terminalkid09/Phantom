@@ -18,13 +18,13 @@ const api = {
   request: (method: string, endpoint: string, body?: unknown): Promise<ApiResponse> =>
     ipcRenderer.invoke('api-request', method, endpoint, body),
 
-  // Convenience methods
+  // Convenience methods. Only GET/POST exist: the backend exposes no PUT or
+  // DELETE routes, so exposing `put`/`delete` here would be dead surface
+  // (every call would 403 against the IPC allowlist) — removed to keep the
+  // preload bridge minimal and honest about what the backend actually offers.
   get: (endpoint: string) => ipcRenderer.invoke('api-request', 'GET', endpoint),
   post: (endpoint: string, body?: unknown) =>
     ipcRenderer.invoke('api-request', 'POST', endpoint, body),
-  put: (endpoint: string, body?: unknown) =>
-    ipcRenderer.invoke('api-request', 'PUT', endpoint, body),
-  delete: (endpoint: string) => ipcRenderer.invoke('api-request', 'DELETE', endpoint),
 
   getVersion: (): Promise<string> => ipcRenderer.invoke('get-version'),
 
