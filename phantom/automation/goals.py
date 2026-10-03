@@ -33,8 +33,17 @@ GOAL_FACTS = {
     # enrich: the DEEPEN sub-agent's goal — passive OSINT/breach/profile
     # deepening + grabber polling. Deliberately excludes the phish/dm_sent
     # facts so this worker NEVER launches new lures while the lead waits.
+    # I3: the NON-CONTACT identity ladder lives here. `enrich` is the DEEPEN
+    # worker's goal — passive OSINT/breach/profile deepening that never
+    # launches a lure — so the identity-field primitives (candidate
+    # composition, SMTP verification, breach correlation) are pursued by the
+    # worker whose whole contract is "widen the field without contact".
+    # ANY one fact satisfies the goal, so adding these widens what counts as
+    # "mapped" and never makes the worker spin on an unreachable fact.
     "enrich": ["identity", "persona_profile", "dossier", "profile",
-               "account_link", "breach_exposure", "victim_ip"],
+               "account_link", "breach_exposure", "victim_ip",
+               "email_candidate", "domain_candidate", "email_verified",
+               "service_account", "identity_widened"],
     "complete_kill_chain": ["beacon"],  # beacon injection is the terminal goal
     "deliver": ["beacon", "persistence"],  # deliver mode: beacon + persistence,
     # web: the URL/app chain terminal is the RCE foothold, not a beacon —
@@ -67,6 +76,23 @@ GOAL_FACTS = {
     "cloud_lateral": ["cloud_lateral", "cloud_access"],
     "mobile": ["mobile", "mdm_vendor"],
 }
+
+# ---------------------------------------------------------------------------
+# I3 — non-contact goals and the facts that open a channel to the target.
+# ---------------------------------------------------------------------------
+# A NON-CONTACT goal is the contract "widen what we know WITHOUT ever
+# opening a channel to the target". `enrich` is the DEEPEN worker's goal:
+# it must reach the identity-field primitives but must NEVER launch a lure.
+# The planner, however, would happily chain a NEW phish to satisfy
+# `victim_ip` (poll_hits needs a sent lure), which violates the contract.
+# CONTACT_FACTS are the facts that only exist because a channel was opened
+# (a lure sent, a DM delivered). For a non-contact goal the planner treats
+# them as UNREACHABLE: if a lure already exists the dependent gate is
+# already satisfied (so polling still works), otherwise the branch simply
+# stays unsatisfied rather than escalating to contact.
+NON_CONTACT_GOALS = frozenset({"enrich"})
+CONTACT_FACTS = frozenset({"phish", "dm_sent", "dm_stage", "dm_plan"})
+
 
 # goal -> swarm chain template. Goals without a swarm chain (cleanup…)
 # fall back to the single-agent path with a notice (honest, not silent).

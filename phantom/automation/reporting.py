@@ -59,6 +59,11 @@ class RawReport:
     # drove each decision and in which stage — the audit of the PLANNING,
     # where `actions` is the audit of the execution.
     decision_trace: List[Dict[str, Any]] = field(default_factory=list)
+    # B3: the plan-variant arbitration (which plan won, every variant's score)
+    # and I4: the identity field DAG (which field to widen first). Both are
+    # None when the run never built them (a network run, a stub agent).
+    plan_choice: Optional[Dict[str, Any]] = None
+    identity_field: Optional[Dict[str, Any]] = None
     # chronological narrative: findings + actions + failures + noise + C2
     timeline: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -77,6 +82,8 @@ class RawReport:
             opsec_spent=wm.opsec_spent,
             c2_evidence=cls._c2_evidence(agent),
             decision_trace=cls._decision_trace(agent),
+            plan_choice=getattr(agent, "_plan_choice", None),
+            identity_field=getattr(agent, "_identity_field_model", None),
             timeline=cls._timeline(agent),
         )
 
@@ -209,6 +216,8 @@ class RawReport:
             "campaign_trail": self.campaign_trail,
             "c2_evidence": self.c2_evidence,
             "decision_trace": self.decision_trace,
+            "plan_choice": self.plan_choice,
+            "identity_field": self.identity_field,
             "timeline": self.timeline,
         }
 

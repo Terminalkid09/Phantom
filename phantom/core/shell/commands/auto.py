@@ -116,19 +116,23 @@ def cmd_auto(shell, arg: str):
                              "stealth_first (buy quiet), evidence_first "
                              "(buy information), force_first (only sane "
                              "with --aggressive)")
-    parser.add_argument("--cell-loop", dest="cell_loop",
+    parser.add_argument("--identity-active", dest="identity_active",
                         action="store_true", default=False,
-                        help="CELL LOOP: the cell roster becomes the "
-                             "AUTHORITY for the migrated goals (the "
-                             "migration ledger; e.g. deliver, identity, "
-                             "post_exploit). Goals that have not been "
-                             "migrated stay on the old planner.")
+                        help="DEDICATED consent for ACTIVE identity probes "
+                             "(password-reset enumeration, SMTP RCPT email "
+                             "verification). Separate from --aggressive; "
+                             "without it those probes refuse. Only use on "
+                             "targets you are authorised to probe")
+    parser.add_argument("--cell-loop", dest="cell_loop",
+                        action="store_true", default=True,
+                        help="CELL LOOP (always on): the cell roster is the "
+                             "AUTHORITY for every goal; the flag is accepted "
+                             "for compatibility")
     parser.add_argument("--cell-stages", dest="cell_stages", default="",
                         metavar="G1,G2",
-                        help="which GOALS the cell loop owns "
-                             "(comma-separated, e.g. "
-                             "deliver,post_exploit; requires "
-                             "--cell-loop)")
+                        help="constrain the roster to these GOALS "
+                             "(comma-separated; trialling only — the "
+                             "roster stays the authority)")
     parser.add_argument("--oM", "--only-markdown", dest="only_markdown",
                         action="store_true", default=False,
                         help="LEARNING MODE: draft markdown proposals in "
@@ -382,6 +386,7 @@ def cmd_auto(shell, arg: str):
         resume=args.resume,
         reason_profile=args.reason,
         resilient_stager=not args.no_resilient,
+        identity_active=args.identity_active,
         cell_loop=args.cell_loop,
         cell_stages=[s.strip() for s in args.cell_stages.split(",")
                      if s.strip()],

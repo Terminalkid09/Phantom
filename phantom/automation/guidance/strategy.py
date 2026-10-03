@@ -91,6 +91,18 @@ class TargetModel:
     mobile_managed: bool = False
     open_services: List[str] = field(default_factory=list)
     software: Dict[str, str] = field(default_factory=dict)
+    # I3 — identity doctrine: phishing is the LAST resort. `contact_allowed`
+    # is the operator's explicit contact consent; when it is absent the
+    # delivery stage (which is the phishing stage for an identity target)
+    # is DEMOTED below every non-contact stage rather than removed — the
+    # operator's rule is "map everything first; contact only if nothing
+    # else is left", so the stage stays reachable, just last.
+    contact_allowed: bool = False
+    # the non-contact ladder produced what it could: an identity resolved
+    # and either an address verified, breach exposure correlated, or a
+    # service account mapped. Recorded so the report can say WHY contact
+    # became reachable.
+    identity_mapped: bool = False
 
     @property
     def profile(self) -> str:
@@ -118,6 +130,15 @@ class ProfileDetector:
         model.has_os = bool(wm.find("os"))
         model.is_mobile = wm.target_type == "phone"
         model.has_mobile = bool(wm.find("mobile") or wm.find("mdm_vendor"))
+        # I3: the contact consent lives on the WorldModel (stamped by the
+        # agent from the dedicated flag). Absent = closed = phishing last.
+        consent = getattr(wm, "identity_consent", None)
+        if isinstance(consent, dict):
+            model.contact_allowed = bool(consent.get("contact"))
+        model.identity_mapped = bool(
+            wm.find("identity")
+            and (wm.find("email_verified") or wm.find("breach_exposure")
+                 or wm.find("service_account")))
         for f in wm.find("mobile_platform"):
             v = f.value if isinstance(f.value, dict) else {}
             for p in (v.get("platforms") or []):
@@ -192,6 +213,14 @@ STRATEGIES: List[Strategy] = [
     Strategy("identity_osint", "Identity OSINT discovery",
              "identity", _identity, weight=90,
              description="osint_identity / persona_create -> identity facts"),
+    # I3 — the NON-CONTACT ladder, before any breach/contact move: compose
+    # candidate addresses (passive), then verify them (active, consent), then
+    # correlate breach exposure. Weights sit just under identity_osint so a
+    # fresh identity target walks the non-contact ladder in order.
+    Strategy("identity_field", "Identity field expansion (non-contact)",
+             "enrich", _identity, weight=88,
+             description="email_candidates -> email_verify -> "
+                         "breach_correlate: widen the field, no contact"),
     Strategy("identity_breach", "Identity breach-lookup",
              "creds", _identity, weight=85,
              description="breach_check first for identity targets"),
@@ -309,7 +338,31 @@ def thin_surface_caps(policy: str) -> tuple:
     return tuple(THIN_SURFACE_CAPS.get((policy or "").strip().lower(), ()))
 
 
+def _demote_identity_delivery(model: TargetModel,
+                              stages: List[Strategy]) -> List[Strategy]:
+    """I3 — phishing is the LAST resort for an identity target.
+
+    The operator's rule: map everything non-contact first; only when that
+    is exhausted may contact be considered. So the delivery stage
+    (`identity_beacon`, the stage whose capabilities are phish/DM) is
+    DEMOTED to the end of the applicable list unless the operator gave
+    explicit contact consent. It is never REMOVED: with the rest of the
+    ladder satisfied it is still reachable, and an explicit `--goal
+    beacon` still selects it directly (that is an operator choice, not an
+    automatic default).
+    """
+    if not model.is_identity or model.contact_allowed:
+        return stages
+    delivery = [s for s in stages if s.id == "identity_beacon"]
+    if not delivery:
+        return stages
+    rest = [s for s in stages if s.id != "identity_beacon"]
+    return rest + delivery
+
+
 def applicable_strategies(model: TargetModel) -> List[Strategy]:
     """The strategies that fit the current target profile, best first."""
-    return sorted((s for s in STRATEGIES if s.requires(model)),
-                  key=lambda s: (-s.weight, s.id))
+    ordered = sorted((s for s in STRATEGIES if s.requires(model)),
+                     key=lambda s: (-s.weight, s.id))
+    return _demote_identity_delivery(model, ordered)
+

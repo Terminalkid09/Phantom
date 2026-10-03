@@ -113,8 +113,13 @@ FALLBACK_CHAINS: Dict[str, List[str]] = {
     ],
     "identity_breach": [
         "identity_breach",     # try another breach source
-        "identity_phish",      # phish the target
+        "identity_field",      # I3: widen the field, still no contact
         "identity_osint",      # gather more OSINT
+    ],
+    "identity_field": [
+        "identity_field",      # try another candidate / domain
+        "identity_breach",     # correlate breach exposure
+        "identity_osint",      # more OSINT to compose against
     ],
     # NOTE: this key used to read "identity_phish", an id no strategy in
     # `guidance.strategy.STRATEGIES` has (the identity stages are
@@ -126,6 +131,7 @@ FALLBACK_CHAINS: Dict[str, List[str]] = {
     "identity_beacon": [
         "identity_beacon",     # try another channel (SMS vs email)
         "identity_breach",     # re-check breach data
+        "identity_field",      # I3: before contact, widen the field again
         "identity_osint",      # more OSINT might reveal new targets
     ],
 }
@@ -184,6 +190,8 @@ class FallbackEngine:
             return bool(wm.find("creds")) or bool(wm.find("rce"))
         if strategy == "identity_breach":
             return bool(wm.find("identity"))
+        if strategy == "identity_field":
+            return bool(wm.find("identity") or wm.find("profile"))
         if strategy == "identity_phish":
             return bool(wm.find("identity")) and bool(wm.find("contact"))
         if strategy == "identity_osint":

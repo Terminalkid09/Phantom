@@ -31,15 +31,21 @@ def main():
                              "(default), stealth_first (buy quiet), "
                              "evidence_first (buy information), force_first "
                              "(only sane with --aggressive)")
+    parser.add_argument("--identity-active", dest="identity_active",
+                        action="store_true", default=False,
+                        help="auto-mode DEDICATED consent for ACTIVE identity "
+                             "probes (reset enumeration, SMTP email verify); "
+                             "separate from --aggressive")
     parser.add_argument("--cell-loop", dest="cell_loop", action="store_true",
-                        help="auto-mode CELL LOOP: the cell roster becomes "
-                             "the AUTHORITY for the migrated goals (default: "
-                             "the migration ledger)")
+                        default=True,
+                        help="auto-mode CELL LOOP (always on): the cell "
+                             "roster is the AUTHORITY for every goal; the "
+                             "flag is accepted for compatibility")
     parser.add_argument("--cell-stages", dest="cell_stages", default="",
                         metavar="G1,G2",
-                        help="auto-mode: which GOALS the cell loop owns "
+                        help="auto-mode: constrain the roster to these GOALS "
                              "(comma-separated, e.g. deliver,post_exploit; "
-                             "requires --cell-loop)")
+                             "trialling only — the roster stays the authority)")
     parser.add_argument("--oM", "--only-markdown", dest="only_markdown",
                         action="store_true",
                         help="auto-mode LEARNING MODE: draft markdown proposals "
@@ -128,6 +134,7 @@ def main():
             beta=args.beta,
             resume=args.resume,
             reason_profile=args.reason,
+            identity_active=args.identity_active,
             cell_loop=args.cell_loop,
             cell_stages=[s.strip() for s in args.cell_stages.split(",")
                          if s.strip()],
