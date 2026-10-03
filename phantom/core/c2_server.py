@@ -7,6 +7,7 @@ Handles beacon check-ins, task distribution, and encrypted result collection.
 
 import asyncio
 import threading
+import time
 import json
 import base64
 import hmac
@@ -49,6 +50,12 @@ from phantom.utils.state import beacon_auth_required, use_mtls
 
 # Load optional environment overrides (secrets are auto-generated)
 load_dotenv()
+
+# B-2: how long a persisted nonce->epoch binding stays meaningful. A replay
+# outside this window is already refused by the request-timestamp freshness
+# check, so keeping it forever would only lock out a peer that reused a nonce
+# long ago. 300s covers the 120s freshness window with margin.
+_REPLAY_TTL_SECONDS = 300.0
 
 
 # ── Shared State ────────────────────────────────────────────────────────────
@@ -118,6 +125,14 @@ class C2State:
         # epoch a nonce was first seen under (per beacon): a nonce that shows
         # up under a DIFFERENT epoch than it was issued in is a replay.
         self._nonce_epoch: dict[str, dict[str, str]] = {}
+        # B-2: the epoch map is PERSISTED (see _load/_persist_replay_state),
+        # otherwise it is wiped by the same restart that wipes auth_nonces and
+        # the stale-epoch check can never fire. The in-memory nonce SET is
+        # deliberately not restored: the epoch mismatch is the guard.
+        self._nonce_time: dict[str, dict[str, float]] = {}
+        self._replay_state_path = self._resolve_replay_state_path()
+        self._replay_persist_last = 0.0
+        self._load_replay_state()
         # Review-3: the remote-session modules get their OWN expiring token.
         # The global payload token unlocks EVERY payload forever; a remote
         # session is a time-boxed capability grant with its own revocation,
@@ -127,6 +142,74 @@ class C2State:
         # `health` task). Off by default — see `_auto_shell_allowed` —
         # and togglable at runtime from the UI/API.
         self.auto_shell: bool = _auto_shell_allowed()
+
+    @staticmethod
+    def _resolve_replay_state_path() -> str:
+        try:
+            from phantom.utils.paths import data_dir
+            return os.path.join(data_dir(), "c2_replay.json")
+        except Exception:
+            return ""
+
+    def _load_replay_state(self) -> None:
+        """Reload persisted nonce->epoch bindings (B-2).
+
+        Entries older than `_REPLAY_TTL_SECONDS` are DROPPED: a replay outside
+        the freshness window is already refused by the timestamp check, so
+        keeping it forever would only lock out a peer that (wrongly) reused a
+        nonce long ago. A restart within the window still refuses the replay.
+        """
+        path = self._replay_state_path
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            return
+        by_node = data.get("by_node") if isinstance(data, dict) else None
+        if not isinstance(by_node, dict):
+            return
+        now = time.time()
+        for beacon_id, entries in by_node.items():
+            if not isinstance(entries, dict):
+                continue
+            clean, times = {}, {}
+            for nonce, val in entries.items():
+                if isinstance(val, list) and len(val) == 2:
+                    epoch, ts = str(val[0]), float(val[1] or 0)
+                else:
+                    epoch, ts = str(val), 0.0
+                if not epoch or epoch == self.auth_epoch:
+                    continue
+                if now - ts > _REPLAY_TTL_SECONDS:
+                    continue
+                clean[str(nonce)] = epoch
+                times[str(nonce)] = ts
+            if clean:
+                self._nonce_epoch[str(beacon_id)] = clean
+                self._nonce_time[str(beacon_id)] = times
+
+    def _persist_replay_state(self) -> None:
+        """Atomically persist the epoch map with timestamps (B-2)."""
+        path = self._replay_state_path
+        if not path:
+            return
+        try:
+            payload = {"by_node": {}}
+            for beacon_id, epochs in self._nonce_epoch.items():
+                if not epochs:
+                    continue
+                times = self._nonce_time.get(beacon_id, {})
+                payload["by_node"][beacon_id] = {
+                    n: [e, times.get(n, time.time())]
+                    for n, e in epochs.items()}
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"))
+            os.replace(tmp, path)
+        except Exception:
+            pass
 
     def set_auto_shell(self, enabled: bool) -> bool:
         """Turn auto-open shell on/off for this run (audited)."""
@@ -249,14 +332,17 @@ class C2State:
             # epoch (i.e. issued before the last server restart) is a
             # replay: refuse it even though the in-memory set was wiped.
             epochs = self._nonce_epoch.setdefault(beacon_id, {})
+            times = self._nonce_time.setdefault(beacon_id, {})
             prior_epoch = epochs.get(nonce)
-            if prior_epoch is not None and prior_epoch != self.auth_epoch:
+            if prior_epoch is not None and prior_epoch != self.auth_epoch \
+                    and time.time() - times.get(nonce, 0.0) <= _REPLAY_TTL_SECONDS:
                 logger.warning(
                     f"Replay (stale epoch) detected for beacon {beacon_id}: "
                     f"nonce issued under {prior_epoch}, server epoch is "
                     f"{self.auth_epoch}")
                 return False
             epochs[nonce] = self.auth_epoch
+            times[nonce] = time.time()
             used_nonces.add(nonce)
             # Bound memory while retaining enough history for the replay window.
             if len(used_nonces) > 256:
@@ -265,6 +351,8 @@ class C2State:
                 kept = self.auth_nonces[beacon_id]
                 self._nonce_epoch[beacon_id] = {
                     n: e for n, e in epochs.items() if n in kept}
+                self._nonce_time[beacon_id] = {
+                    n: t for n, t in times.items() if n in kept}
             # Counter is advisory (high-water mark, used only for telemetry):
             # after a migrate or process restart the beacon's counter resets,
             # and a strict monotonic check would permanently lock it out.
@@ -273,6 +361,12 @@ class C2State:
             last_counter = self.auth_counters.get(beacon_id, -1)
             if counter_value > last_counter:
                 self.auth_counters[beacon_id] = counter_value
+            # B-2: persist the epoch map (throttled to once a second) so the
+            # stale-epoch refusal survives the next restart.
+            now_mono = time.monotonic()
+            if now_mono - self._replay_persist_last >= 1.0:
+                self._replay_persist_last = now_mono
+                self._persist_replay_state()
         return True
 
     def update_beacon(self, beacon_id: str, info: dict[str, Any]) -> None:

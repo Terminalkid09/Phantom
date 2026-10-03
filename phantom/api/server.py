@@ -3175,10 +3175,13 @@ async def cors_middleware(request: web.Request, handler) -> web.Response:
     callers (the Electron main process) send no Origin and need no CORS.
     """
     response = await handler(request)
+    # B-6: ALWAYS vary on Origin, even when this origin is NOT allowed. A
+    # shared cache must never replay a response computed for one origin (or
+    # for no Origin at all) to another origin that would get CORS headers.
+    response.headers["Vary"] = "Origin"
     origin = request.headers.get("Origin", "")
     if origin and (origin in _LOCAL_ORIGINS or origin == "null"):
         response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Vary"] = "Origin"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response

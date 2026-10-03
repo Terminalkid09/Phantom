@@ -206,6 +206,98 @@ def _c2_backend_check() -> Check:
     return Check("c2-backend", "pass", "python data plane (default)")
 
 
+def _c2_operator_auth_check() -> Check:
+    """C-4: refuse an operator API with no authentication on a public bind.
+
+    The listener's REST control surface is guarded by mTLS AND/OR the API
+    token. On a non-loopback bind with NEITHER, anyone who can reach the port
+    can drive the engagement (queue tasks, revoke identities). The Python
+    listener and c2d both refuse to start in that shape; the doctor flags it
+    so it is caught at setup time, not at bind time.
+    """
+    from phantom.utils import config as cfg
+    try:
+        bind = cfg.get_str("c2.bind", "0.0.0.0",
+                           env="PHANTOM_C2_BIND") or "0.0.0.0"
+        mtls = cfg.get_bool("c2.mtls", True)
+    except Exception as exc:
+        return Check("c2-operator-auth", "warn", f"config unreadable: {exc}")
+    try:
+        from phantom.utils.c2_crypto import get_api_token
+        token = str(get_api_token() or "").strip()
+    except Exception:
+        token = ""
+    loopback = bind.strip().lower() in ("127.0.0.1", "::1", "localhost")
+    if loopback:
+        return Check("c2-operator-auth", "pass", f"bind {bind} (loopback only)")
+    if mtls or token:
+        gate = "mTLS" if mtls else "API token"
+        return Check("c2-operator-auth", "pass",
+                     f"bind {bind}; {gate} required")
+    return Check("c2-operator-auth", "warn",
+                 f"bind {bind} with NEITHER mTLS nor an API token",
+                 hint="the operator REST API would be unauthenticated; set "
+                      "c2.mtls=true or generate an API token")
+
+
+def _c2d_capabilities_check() -> Check:
+    """C-3/D-2: which surfaces the Go data plane does NOT port.
+
+    c2d answers /api/v1/capabilities; anything false there stays in the
+    Python control plane and returns 501 from the Go listener. Reported so a
+    `transport_backend=go` run does not discover the boundary mid-engagement.
+    """
+    from phantom.utils import config as cfg
+    try:
+        backend = str(cfg.get("c2.transport_backend", "python")
+                      or "python").strip().lower()
+    except Exception:
+        backend = "python"
+    if backend != "go":
+        return Check("c2d-capabilities", "pass",
+                     "python data plane (full surface)")
+    gaps = "task policy (capability/grant), /s/android stager"
+    return Check("c2d-capabilities", "warn",
+                 f"go data plane: {gaps} stay in Python (answered 501)",
+                 hint="audit trail and replay persistence ARE ported; see "
+                      "GET /api/v1/capabilities on the listener")
+
+
+def _secrets_at_rest_check() -> Check:
+    """D-3: the state files hold every secret IN THE CLEAR.
+
+    Encrypting the file contents is not possible without giving Node and Go
+    a matching DPAPI reader, so the protection is FILE PERMISSIONS. This
+    check confirms the owner-only hardening actually took (Windows used to be
+    a silent no-op because `chmod` only toggles the read-only bit there).
+    """
+    from phantom.utils.secret_store import locked_down
+    paths = []
+    try:
+        from phantom.utils.state import state_file
+        paths.append(state_file())
+    except Exception:
+        pass
+    try:
+        from phantom.utils.beacon_auth import registry_path
+        paths.append(registry_path())
+    except Exception:
+        pass
+    present = [p for p in paths if p and os.path.exists(p)]
+    if not present:
+        return Check("secrets-at-rest", "pass", "no state file yet")
+    weak = [p for p in present if not locked_down(p)]
+    if weak:
+        return Check("secrets-at-rest", "warn",
+                     "owner-only perms not confirmed",
+                     hint="the C2 key / API token / beacon secrets sit in the "
+                          "clear in these files — restrict them to the owner "
+                          "(POSIX chmod 0600, Windows icacls)")
+    return Check("secrets-at-rest", "pass",
+                 f"owner-only perms on {len(present)} state file(s)"
+                 " (values are plaintext at rest)")
+
+
 def _c2_front_check() -> Check:
     """Redirector-first: is the backend kept OUT of the compiled beacon?
 
@@ -420,9 +512,10 @@ def run_doctor(net: bool = False) -> DoctorReport:
     """Run the checks and return the report (never raises)."""
     fns: List[CheckFn] = [
         _python_check, _core_deps_check, _toolchain_check, _ad_tools_check,
-        _data_dir_check, _config_check, _c2_hardening_check, _c2_front_check,
-        _c2_backend_check, _experience_check, _llm_check, _scopes_check,
-        _data_usage_check,
+        _data_dir_check, _config_check, _c2_hardening_check,
+        _c2_operator_auth_check, _c2_front_check,
+        _c2_backend_check, _c2d_capabilities_check, _secrets_at_rest_check,
+        _experience_check, _llm_check, _scopes_check, _data_usage_check,
     ]
     if net:
         fns += [_c2_reachable_check, _msf_check, _dead_drop_net_check]

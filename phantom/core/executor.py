@@ -679,6 +679,13 @@ def execute_quiet(
     input. Applies the same scope / safe-target / tool-availability guards as
     run_command unless explicitly disabled.
 
+    `shell=True` is intentional and load-bearing: module commands are shell
+    LINES (pipes, redirections, `wsl -d <distro> ...`, `&&` chains) produced
+    by the planner's templates and the CLI, not argv lists. The injection
+    boundary is therefore the interpolated TARGET, validated by
+    `_is_safe_target` above (and by shlex.quote in the ssh/remote wrappers);
+    a new adapter that interpolates other untrusted text MUST quote it.
+
     Returns a QuietResult (never raises for command failure).
     """
     started = time.time()
@@ -769,6 +776,10 @@ def execute_quiet_bg(cmd: str, target_ip: str = "") -> "BackgroundProcess":
     """
     if target_ip and session.scope and not is_in_scope(target_ip, session.scope):
         raise PermissionError(f"out of scope target: {target_ip}")
+    # Parity with run_command/execute_quiet: an unsafe target (shell
+    # metacharacters) must never reach the shell=True child here either.
+    if target_ip and not _is_safe_target(target_ip):
+        raise ValueError(f"unsafe target chars: {target_ip}")
     if not _is_tool_installed(cmd):
         raise FileNotFoundError(f"tool '{cmd.split()[0] if cmd.split() else '?'}' not installed")
 

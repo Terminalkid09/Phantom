@@ -10,6 +10,7 @@ Coverage:
 """
 import asyncio
 import os
+import secrets
 import shutil
 import tempfile
 import time
@@ -158,7 +159,11 @@ class TestC2ServerTls(unittest.TestCase):
                 await site.start()
                 port = site._server.sockets[0].getsockname()[1]
                 timestamp = str(int(time.time()))
-                nonce = "mtls-test-nonce"
+                # A random nonce, not a fixed one: the listener now refuses a
+                # nonce it has seen before (replay guard persisted across
+                # restarts), so a reused literal would make a RE-RUN of this
+                # test fail for a reason unrelated to mTLS.
+                nonce = "mtls-" + secrets.token_hex(8)
                 counter = "1"
                 body = ""
                 headers = {
@@ -238,7 +243,7 @@ class TestC2ServerTls(unittest.TestCase):
                 from phantom.utils.c2_crypto import (
                     encrypt_for_beacon, decrypt_for_beacon)
                 ts = str(int(_time.time()))
-                nonce_val = "test-nonce-checkin"
+                nonce_val = "checkin-" + secrets.token_hex(8)
                 counter_val = "1"
                 telemetry = encrypt_for_beacon(_json.dumps({
                     "sysinfo": "OS: Linux 5.15\nUser: root\nArch: x64\nHost: test",
@@ -263,7 +268,7 @@ class TestC2ServerTls(unittest.TestCase):
                         decrypted = decrypt_for_beacon(body, "beacon-tls-1")
                         self.assertIn("tasks", decrypted)
                     result_ts = str(int(_time.time()))
-                    result_nonce = "test-nonce-result"
+                    result_nonce = "result-" + secrets.token_hex(8)
                     result_counter = "2"
                     result_body = encrypt_for_beacon(_json.dumps({
                         "task_id": "t-1", "output": "PERSISTENCE_OK"}),

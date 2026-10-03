@@ -27,11 +27,14 @@ def state_file() -> str:
 
 
 def _secure_file(path: str) -> None:
-    if os.name != "nt":
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+    """Owner-only access to the state file (D-3).
+
+    Delegates to the shared `secret_store` helper so Windows gets the icacls
+    path too: `chmod` there only toggles the read-only bit and left the C2
+    key / API token readable by anything that inherited the directory ACL.
+    """
+    from phantom.utils.secret_store import harden_file
+    harden_file(path, 0o600)
 
 
 def _read() -> dict[str, Any]:

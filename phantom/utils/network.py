@@ -308,7 +308,9 @@ def get_c2_front() -> Optional[tuple]:
             port = int(cfg.get("c2.port", 8080) or 8080)
         except (TypeError, ValueError):
             port = 8080
-    return host, port, bool(cfg.get("c2.ssl", True))
+    # B-1: bool("false") is True — parse the value canonically so a
+    # `c2.ssl = false` / PHANTOM_C2_SSL=0 actually disables TLS.
+    return host, port, cfg.get_bool("c2.ssl", True, env="PHANTOM_C2_SSL")
 
 
 def get_c2_front_cert() -> str:

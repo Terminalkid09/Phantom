@@ -125,13 +125,43 @@ _TEXT_SECRET_RE = re.compile(
 # when the value is NOT purely numeric.
 _FLAG_SECRET_RE = re.compile(
     r"(?:^|\s)(?:-p|--password|--pass|--secret|--token)"
-    r"(?:\s|=)(?P<val>[^\s\"']+)")
+    r"(?:\s|=)(?P<val>\"[^\"]*\"|'[^']*'|[^\s\"']+)")
+
+# Concatenated short-flag secret: `mysql -pS3cr3t`, `mysqldump -phunter2`
+# (NO separator). `_FLAG_SECRET_RE` above requires a space or `=`, so the
+# classic `mysql -p<password>` form leaked. Kept SEPARATE because `-p` also
+# starts ordinary flags (`-path`, `-port`, `-pid`, `-profile`, `-proxy`, …):
+# the negative lookahead below refuses those continuations so we never mask a
+# benign option, and `_mask_flag` still leaves a purely numeric value
+# (`-p3306`) alone because that is a port.
+_RX_SHORT_P_SECRET = re.compile(
+    r"(?<![\w-])-p"
+    r"(?!ath\b|ort\b|id\b|rofile\b|roxy\b|ing\b|ersist\b|refix\b|olicy\b"
+    r"|ass\b|erm\b|rov\b|lugins\b|art\b)"
+    r"(?P<val>\"[^\"]*\"|'[^']*'|[A-Za-z0-9!@#$%^&*_+][^\s'\"]*)")
+
+
+# Env-assignment shape in a command line (`SSHPASS='p;w'`, `PGPASSWORD=...`,
+# `API_TOKEN="..."`). The generic `_TEXT_SECRET_RE` cannot handle a
+# shell-QUOTED value (it excludes quotes), but `shlex.quote` wraps a password
+# carrying metacharacters in single quotes — exactly the case that used to
+# leak. A-1 ships the ssh password as `SSHPASS=<quoted>` instead of
+# `sshpass -p`, so this shape must be masked explicitly.
+_RX_ENV_SECRET = re.compile(
+    r"(?i)\b([A-Za-z0-9_]*"
+    r"(?:password|passwd|pwd|secret|token|api[_-]?key|sshpass)"
+    r"[A-Za-z0-9_]*)\s*=\s*"
+    r"(\"[^\"]*\"|'[^']*'|[^\s,;]+)")
 
 
 def _mask_key_value(m: "re.Match") -> str:
     head = m.group(0)
     key = head.split("=", 1)[0].split(":", 1)[0]
     return key + "=[REDACTED]"
+
+
+def _mask_env_secret(m: "re.Match") -> str:
+    return m.group(1) + "=[REDACTED]"
 
 
 # ── Secret: the non-persistible credential type (P1-10) ────────────────────
@@ -224,6 +254,8 @@ def redact_text(text: Any) -> str:
     if not isinstance(text, str):
         return "" if text is None else str(text)
     out = _TEXT_SECRET_RE.sub(_mask_key_value, text)
+    out = _RX_ENV_SECRET.sub(_mask_env_secret, out)
     out = _RX_JWT.sub("<jwt>", out)
     out = _RX_B64.sub(_mask_b64, out)
-    return _FLAG_SECRET_RE.sub(_mask_flag, out)
+    out = _FLAG_SECRET_RE.sub(_mask_flag, out)
+    return _RX_SHORT_P_SECRET.sub(_mask_flag, out)
