@@ -10,6 +10,13 @@
  * references (grep of src/), grouped read-only vs mutating. Unknown
  * endpoints are REFUSED in the main process; a missing group match on a
  * parameterized path falls back to exact/prefix rules below.
+ *
+ * DELIBERATELY NOT BRIDGED (backend-only, reached from the CLI / API, not the
+ * desktop renderer): POST /api/dm, /api/persona-profile, /api/profile-recon,
+ * /api/dossier, /api/video-lure. They are social-engineering features whose
+ * inputs are free text; exposing them here would widen the IPC attack surface
+ * for a panel that does not exist yet. Add a rule (mutating, some with
+ * confirm) only when a panel actually calls them.
  */
 
 export type EndpointGroup = 'readonly' | 'mutating'
@@ -19,6 +26,15 @@ interface Rule {
   pattern: string
   methods: readonly string[]
   group: EndpointGroup
+  /**
+   * C-1: a MUTATING endpoint that is destructive/irreversible (kills live
+   * sessions, burns identities, rotates secrets). The main process asks the
+   * operator to confirm before forwarding the request; a compromised
+   * renderer can no longer burn the engagement silently. The group is what
+   * tells read from write; this flag is the extra guard for the few calls
+   * worth a dialog.
+   */
+  confirm?: boolean
 }
 
 const RULES: readonly Rule[] = [
@@ -70,34 +86,37 @@ const RULES: readonly Rule[] = [
   { pattern: '/api/session/load', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/session/next', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/session/notes', methods: ['POST'], group: 'mutating' },
-  { pattern: '/api/session/knowledge/reset', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/session/knowledge/reset', methods: ['POST'], group: 'mutating', confirm: true },
   { pattern: '/api/session/profile/save', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/session/profile/load', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/session/set', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/c2/listener/start', methods: ['POST'], group: 'mutating' },
-  { pattern: '/api/c2/listener/stop', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/c2/listener/stop', methods: ['POST'], group: 'mutating', confirm: true },
   { pattern: '/api/c2/generate', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/c2/beacon-auth', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/c2/beacon-auth', methods: ['POST'], group: 'mutating' },
-  { pattern: '/api/c2/beacon-auth/revoke', methods: ['POST'], group: 'mutating' },
-  { pattern: '/api/c2/beacon-auth/rotate', methods: ['POST'], group: 'mutating' },
-  { pattern: '/api/c2/certs/uninstall', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/c2/beacon-auth/revoke', methods: ['POST'], group: 'mutating', confirm: true },
+  { pattern: '/api/c2/beacon-auth/rotate', methods: ['POST'], group: 'mutating', confirm: true },
+  { pattern: '/api/c2/certs/uninstall', methods: ['POST'], group: 'mutating', confirm: true },
   { pattern: '/api/c2/config/mtls-toggle', methods: ['POST'], group: 'mutating' },
-  { pattern: '/api/c2/config/rotate-api-token', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/c2/config/rotate-api-token', methods: ['POST'], group: 'mutating', confirm: true },
   { pattern: '/api/network/scan', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/network/vulnerable', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/automode/plan', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/automode/run', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/automode/stop', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/automode/llm', methods: ['POST'], group: 'mutating' },
-  { pattern: '/api/osint/preview', methods: ['POST'], group: 'readonly' },
+  // OSINT preview runs the real recon/social engine for the requested
+  // handle (outbound provider queries, identity checks) — it is a write-side
+  // action, not a pure read. Was mislabelled `readonly`.
+  { pattern: '/api/osint/preview', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/identity/checks', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/identity/confirm', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/craft', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/backend/detect', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/backend/install-tool', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/backend/config', methods: ['POST'], group: 'mutating' },
-  { pattern: '/api/learning/reset', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/learning/reset', methods: ['POST'], group: 'mutating', confirm: true },
   { pattern: '/api/pm/export', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/pm/import', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/reports/generate', methods: ['POST'], group: 'mutating' },
@@ -120,6 +139,8 @@ const PREFIX_GROUPS: readonly { prefix: string; methods: readonly string[]; grou
 export interface CheckResult {
   allowed: boolean
   group?: EndpointGroup
+  /** the endpoint is destructive and the main process must confirm (C-1) */
+  confirm?: boolean
   reason?: string
 }
 
@@ -135,12 +156,12 @@ export function checkEndpoint(method: string, endpoint: string): CheckResult {
     const pat = r.pattern.replace(/\/+$/, '')
     if (pat.endsWith('*')) {
       if (path.startsWith(pat.slice(0, -1)) && r.methods.includes(m)) {
-        return { allowed: true, group: r.group }
+        return { allowed: true, group: r.group, confirm: r.confirm }
       }
       continue
     }
     if (path === pat && r.methods.includes(m)) {
-      return { allowed: true, group: r.group }
+      return { allowed: true, group: r.group, confirm: r.confirm }
     }
   }
 
