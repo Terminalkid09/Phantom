@@ -49,11 +49,14 @@ def _read_registry() -> dict[str, Any]:
 
 
 def _secure_file(path: str, mode: int = 0o600) -> None:
-    if os.name != "nt":
-        try:
-            os.chmod(path, mode)
-        except OSError:
-            pass
+    """Owner-only access to the beacon registry (D-3).
+
+    Delegates to the shared `secret_store` helper: the registry holds every
+    beacon's HMAC secret, so on Windows it must get real ACL hardening
+    (icacls), not the no-op `chmod` that never ran.
+    """
+    from phantom.utils.secret_store import harden_file
+    harden_file(path, mode)
 
 
 def _write_registry(data: dict[str, Any]) -> None:

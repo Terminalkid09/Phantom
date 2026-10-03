@@ -163,6 +163,23 @@ def is_in_scope(target: str, scope_list: List[str]) -> bool:
     return _authorized(ip_obj, scope_list)
 
 
+def unscoped_allowed() -> bool:
+    """Explicit opt-out for running against targets with NO engagement scope.
+
+    Default OFF: an authorization gate must fail closed. The documented
+    escape hatch for lab/CTF work is ``engagement.allow_unscoped`` in the
+    config file or ``PHANTOM_ALLOW_UNSCOPED=1``. This is the SAME switch the
+    desktop API already honours, so auto-mode and the API can never disagree
+    about what unscoped means (A-6).
+    """
+    try:
+        from phantom.utils import config as cfg
+        return cfg.get_bool("engagement.allow_unscoped", False,
+                            env="PHANTOM_ALLOW_UNSCOPED")
+    except Exception:
+        return False
+
+
 def scope_status(target: str, scope_list: List[str]) -> str:
     """Tri-state for policy gates: 'ok' | 'unscoped' | 'out_of_scope'.
 

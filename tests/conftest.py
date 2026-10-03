@@ -57,6 +57,19 @@ def _hermetic_fingerprint_probes(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _allow_unscoped_auto_mode(monkeypatch):
+    """A-6: auto-mode now FAILS CLOSED without an engagement scope.
+
+    The suite deliberately exercises the lab path (no scope list) across
+    dozens of agent tests, so it opts out here exactly the way an operator
+    would. `tests/test_security_fixes.py::test_unscoped_auto_mode_fails_closed`
+    removes this override and asserts the refusal.
+    """
+    monkeypatch.setenv("PHANTOM_ALLOW_UNSCOPED", "1")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _stop_leaked_servers():
     """Tear down any server a test left running (best-effort, never fails)."""
     # snapshot the config module's cached state so a test that repoints
