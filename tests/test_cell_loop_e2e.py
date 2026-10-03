@@ -1,11 +1,12 @@
-"""C4 end-to-end acceptance — the strict cell loop must not starve a run.
+"""C4 end-to-end acceptance — the cell roster is the ONLY loop.
 
-The unit tests prove that a migrated goal ROUTES every legitimate capability
-and REFUSES the ones its coverage does not own. This file proves the other
-half of the migration contract, which is the one that matters in production:
+The unit tests prove that every goal ROUTES its legitimate capabilities and
+REFUSES the ones its coverage does not own. This file proves the part that
+matters in production:
 
-    switching the strict cell loop on must not change the run's OUTCOME,
-    and must not change the SEQUENCE of capabilities it involves.
+    the roster must not starve a run — every chain still reaches its beacon
+    with zero refusals — and the old `--cell-loop` switch must no longer
+    change anything, because there is no second planning path to switch to.
 
 Both chains are exercised with the real agent loop (fake runner, fake sandbox,
 fake beacon builder — no network). The identity chain is the interesting one:
@@ -105,19 +106,21 @@ class TestStrictLoopDoesNotStarveTheChain(unittest.TestCase):
         self.assertIn("osint", kinds)
         self.assertIn("phish", kinds)
 
-    def test_the_migration_is_behaviour_preserving(self):
-        """Same target, same flags: strict vs lenient must produce the same
-        capability SEQUENCE and the same terminal outcome. Anything else
-        means the roster is silently changing the plan."""
+    def test_the_old_switch_no_longer_changes_anything(self):
+        """There is ONE loop. Passing the retired `cell_loop=False` must give
+        the exact same capability SEQUENCE and outcome as the default: if it
+        did not, a second planning path would still exist."""
         for target, ttype in ((NET_TARGET, "ip"), (ID_TARGET, "auto")):
             events_a, events_b = [], []
-            lenient = _agent(target, ttype, events_a, runner=_fake_runner(),
-                             social=_FakeSocialEngine())
+            legacy = _agent(target, ttype, events_a, runner=_fake_runner(),
+                            social=_FakeSocialEngine(), cell_loop=False)
             strict = _agent(target, ttype, events_b, runner=_fake_runner(),
                             social=_FakeSocialEngine(), cell_loop=True,
                             cell_stages=("deliver",))
-            result_a = _run(lenient)
+            result_a = _run(legacy)
             result_b = _run(strict)
+            self.assertTrue(legacy.cells.strict, target)
+            self.assertTrue(strict.cells.strict, target)
             self.assertEqual(result_a["beacon_established"],
                              result_b["beacon_established"], target)
             self.assertEqual(result_a["persistence_installed"],
@@ -144,7 +147,7 @@ class TestStrictLoopDoesNotStarveTheChain(unittest.TestCase):
         self.assertEqual(agent.cells.refused, before + 1)
         reasons = [str(d.get("reason", "")) for k, d in events
                    if k == "blocked"]
-        self.assertTrue(any("cell-scoped" in r for r in reasons), reasons)
+        self.assertTrue(any("no cell owns" in r for r in reasons), reasons)
 
 
 if __name__ == "__main__":

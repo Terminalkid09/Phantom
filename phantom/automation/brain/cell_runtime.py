@@ -38,8 +38,10 @@ from phantom.automation.brain.bus import CellBus
 from phantom.automation.brain.cells import (
     CONTACT_NONE,
     DEEP_LADDER,
+    NOISE_BUDGET_DEFAULT,
     Cell,
     CellTeam,
+    CellView,
     STAGE_ROLES,
     team_for_goal,
 )
@@ -51,7 +53,7 @@ from phantom.automation.brain.lenses import (
     adversarial_profile,
     choose_profile,
 )
-from phantom.automation.brain.tribunal import Dispute, Tribunal
+from phantom.automation.brain.tribunal import Dispute, Opinion, Tribunal
 
 # How long an action waits for the egress permit before the run defers it.
 #
@@ -67,9 +69,16 @@ PERMIT_WAIT_S = 120.0
 # always passes through recon of some address (the target itself, or the
 # victim IP an identity chain harvested), whatever the doctrine chain of the
 # target class says.
-_BEACON_BOUND = frozenset({
+#
+# `web` and `exploit` are here for the same measured reason as the beacon
+# goals: on an identity-class target the planner still offers `scan_tcp` /
+# `http_probe` (it probes a SERVICE on the harvested address), so a roster
+# built from the identity chain alone owns no `recon` cell and the strict loop
+# would refuse the very first move. Measured with the coverage gate, not assumed.
+_HOST_BOUND = frozenset({
     "deliver", "beacon", "post_exploit", "expand", "ad", "crack",
     "lateral", "harvest", "evasion", "deep", "complete_kill_chain",
+    "web", "exploit",
 })
 
 
@@ -80,7 +89,7 @@ class CellRuntime:
                  stages: Optional[Sequence[str]] = None,
                  aggressive: bool = False, paranoid: bool = False,
                  speed: bool = False, explicit_profile: str = "",
-                 strict: bool = False,
+                 strict: bool = False, noise_budget: Optional[float] = None,
                  emit: Optional[Callable[[str, dict], None]] = None) -> None:
         self.goal = goal or "deliver"
         self.cls = cls or ""
@@ -97,6 +106,17 @@ class CellRuntime:
         self.team: CellTeam = team_for_goal(
             self.goal, target_type, aggressive=aggressive, paranoid=paranoid,
             speed=speed, explicit_profile=explicit_profile, stages=self.stages)
+        # buco 4: the run's noise pool follows the OPSEC posture — a paranoid
+        # run has LESS to spend, an aggressive one buys more exposure.
+        if noise_budget is None:
+            pool = NOISE_BUDGET_DEFAULT
+            if paranoid:
+                pool *= 0.6
+            elif aggressive:
+                pool *= 2.0
+        else:
+            pool = float(noise_budget)
+        self.team.budget.limit = max(0.0, float(pool))
         self.bus = CellBus(self.team.cells)
         self.tribunal = Tribunal(base, adversarial_profile(base))
         # how long an action waits for the permit before the run defers it
@@ -136,7 +156,7 @@ class CellRuntime:
         # chain forbids `footprint` as a chain stage. Without this the strict
         # loop refused `scan_tcp` eleven times on an email target and the run
         # never reached its beacon — measured, not theorised.
-        if goal in _BEACON_BOUND:
+        if goal in _HOST_BOUND:
             extra.append("footprint")
         for st in extra:
             if st not in chain:
@@ -168,6 +188,7 @@ class CellRuntime:
             "search_policy": self.profile.search_policy,
             "chain": list(self.stages),
             "strict": self.strict,
+            "noise_budget": self.team.budget.to_dict(),
             "per_cell": [c.to_dict() for c in self.team.cells],
         }
         self._emit("roster", **payload)
@@ -287,6 +308,21 @@ class CellRuntime:
                 owned |= set(c.spec.uses_categories)
         return sorted({str(cat) for cat in categories if cat not in owned})
 
+    # ── noise budget (buco 4) ──────────────────────────────────────────
+    def charge(self, cell: Optional[Cell], cap: Any) -> bool:
+        """Charge the run's noise pool for an action. False = overspend.
+
+        The cost is the capability's `opsec_cost`, falling back to its
+        detection risk when it declares none. Refusal is recorded by the
+        budget itself, so "we chose restraint here" is auditable.
+        """
+        cost = float(getattr(cap, "opsec_cost", 1.0) or 0.0)
+        if cost <= 0:
+            cost = float(getattr(cap, "detection_risk", 0.0) or 0.0)
+        cid = getattr(cell, "cell_id", "") if cell is not None else ""
+        return self.team.budget.charge(
+            cid, cost, capability=str(getattr(cap, "id", "") or ""))
+
     # ── permit ─────────────────────────────────────────────────────────
     def admit(self, cell: Optional[Cell], wait: Optional[float] = None) -> bool:
         """Try to take the egress permit for a cell.
@@ -322,21 +358,140 @@ class CellRuntime:
         self._emit("escalation", **self.team.escalations[-1])
         return peer
 
+    # ── per-cell world view (buco 1) ───────────────────────────────────
+    def views_for(self, findings: Sequence[Any]) -> Dict[str, CellView]:
+        """Each cell's OWN projection of the shared map.
+
+        The roster used to differ only in the capabilities a cell may USE;
+        this is the other half — the facts it may SEE. Reasoning is then
+        scoped on the data, not merely on the hands.
+        """
+        pool = list(findings)
+        return {c.cell_id: c.view(pool) for c in self.team.cells}
+
+    def scope_of(self, cell_id: str, findings: Sequence[Any]) -> CellView:
+        for c in self.team.cells:
+            if c.cell_id == cell_id:
+                return c.view(list(findings))
+        return CellView(cell_id=cell_id, role="", visible=(), hidden=0)
+
+    def report_scope(self, findings: Sequence[Any]) -> dict:
+        """Emit what each cell can and cannot see (auditability)."""
+        pool = list(findings)
+        views = self.views_for(pool)
+        payload = {"shared_facts": len(pool),
+                   "cells": {cid: v.to_dict() for cid, v in views.items()}}
+        self._emit("cell_scope", **payload)
+        return payload
+
     # ── second opinion ─────────────────────────────────────────────────
     def second_opinion(self, views: Sequence[Any],
                        base_of: Dict[str, float],
                        signals: WorldSignals,
-                       lead_cell: str = "lead") -> Optional[Dispute]:
-        """Rate the candidate set through both profiles and adjudicate."""
+                       lead_cell: str = "lead",
+                       peer_views: Optional[Sequence[Any]] = None,
+                       peer_signals: Optional[WorldSignals] = None
+                       ) -> Optional[Dispute]:
+        """Rate the candidate set through both profiles and adjudicate.
+
+        `peer_views`/`peer_signals` are the peer's OWN world (buco 1): when
+        given, the peer rates only what it can see, so its opinion is a
+        second REASONING over a scoped map, not a relabel of the lead's.
+        """
         if not views:
             return None
         peer_cell = next((c.cell_id for c in self.team.advisory_cells()),
                          "peer")
         dispute = self.tribunal.adjudicate(
-            views, base_of, signals, lead_cell=lead_cell, peer_cell=peer_cell)
+            views, base_of, signals, lead_cell=lead_cell, peer_cell=peer_cell,
+            peer_views=peer_views, peer_signals=peer_signals)
         if not dispute.agreed:
             self._emit("advice", **dispute.to_dict())
         return dispute
+
+    # ── parallel reasoning (buco 2) ────────────────────────────────────
+    def parallel_opinions(self, views_by_cell: Dict[str, Sequence[Any]],
+                          base_of: Dict[str, float], signals: WorldSignals,
+                          max_workers: int = 4) -> List[Opinion]:
+        """Rate the SAME candidates in PARALLEL, one thread per QUIET cell.
+
+        Concurrency is a property of the ACTION (the operator's rule): only
+        cells with CONTACT_NONE take part; a target-touching role is
+        serialised and therefore excluded here. Each cell rates the
+        candidates IT is aware of, through its OWN profile, over its OWN
+        world view — the `views_by_cell` map is what makes those two facts
+        true, so the threads are genuinely independent reasoners rather
+        than N copies of the lead.
+
+        Returns the opinions in roster order (deterministic), and emits a
+        `parallel_reasoning` event so the operator can see them.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        quiet = {c.cell_id: c for c in self.team.cells
+                 if not c.advisory and c.spec.contact == CONTACT_NONE}
+        pairs = [(cid, list(views_by_cell.get(cid, ())))
+                 for cid in quiet if views_by_cell.get(cid)]
+        if not pairs:
+            return []
+        order = [cid for cid, _ in pairs]
+        opinions: List[Opinion] = []
+        workers = max(1, min(int(max_workers), len(pairs)))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(self.tribunal.opinion, cid, quiet[cid].profile,
+                              vs, base_of, signals): cid
+                    for cid, vs in pairs}
+            for fut in as_completed(futs):
+                try:
+                    opinions.append(fut.result())
+                except Exception:
+                    continue
+        opinions.sort(key=lambda o: order.index(o.cell_id))
+        consensus, score = self.consensus(opinions)
+        self._emit("parallel_reasoning", threads=len(pairs),
+                   cells=[o.to_dict() for o in opinions],
+                   consensus=consensus, consensus_score=round(score, 4))
+        return opinions
+
+    @staticmethod
+    def consensus(opinions: Sequence[Opinion]) -> tuple:
+        """Merge concurrent opinions: the move with the most SUPPORT wins,
+        ties broken by aggregate score.
+
+        Support counts cells that rank a move at all (so N quiet cells
+        agreeing beat one cell's strong preference), which is the useful
+        reading of "N angles converge". Returns (capability, score) or
+        (None, 0.0) when nothing was ranked.
+        """
+        support: Dict[str, int] = {}
+        score: Dict[str, float] = {}
+        for op in opinions:
+            for cid, value in op.ranking:
+                support[cid] = support.get(cid, 0) + 1
+                score[cid] = score.get(cid, 0.0) + float(value)
+        if not support:
+            return None, 0.0
+        best = max(support, key=lambda c: (support[c], score[c], c))
+        return best, score[best]
+
+    # ── the plan as a DAG (buco 3) ─────────────────────────────────────
+    def plan_graph(self, plan: Any,
+                   goal_facts: Sequence[str] = ()) -> Optional[dict]:
+        """Build and EMIT the run's plan as an explicit DAG.
+
+        The planner hands back an ordered list; this is the same plan seen as
+        the run's mental model — nodes, dependency edges, layers and the
+        critical path to the goal — so the operator (and the run) can tell a
+        move on the critical path from a side branch. Never raises into the
+        run.
+        """
+        try:
+            from phantom.automation.brain.plan_graph import PlanGraph
+            graph = PlanGraph.from_plan(plan, goal_facts=goal_facts)
+            payload = graph.to_dict()
+            self._emit("plan_graph", **payload)
+            return payload
+        except Exception:
+            return None
 
     # ── introspection ──────────────────────────────────────────────────
     def stats(self) -> dict:
@@ -344,11 +499,13 @@ class CellRuntime:
                 "tribunal": self.tribunal.stats(), "routed": self.routed,
                 "unrouted": self.unrouted, "deferred": self.deferred,
                 "refused": self.refused, "strict": self.strict,
+                "budget": self.team.budget.to_dict(),
                 "chain": list(self.stages)}
 
     def to_dict(self) -> dict:
         return {"chain": list(self.stages), "profile": self.profile.name,
                 "strict": self.strict,
+                "budget": self.team.budget.to_dict(),
                 "team": self.team.stats(),
                 "cells": [c.to_dict() for c in self.team.cells],
                 "advice": [d.to_dict() for d in self.tribunal.disagreements()]}

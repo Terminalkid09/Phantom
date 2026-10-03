@@ -123,7 +123,22 @@ class Tribunal:
         self.peer_profile = peer_profile or adversarial_profile(self.lead_profile)
         self._lead = Arbitrator(self.lead_profile)
         self._peer = Arbitrator(self.peer_profile)
+        # a per-profile arbitrator cache: parallel reasoning rates the same
+        # candidates through MANY cells' profiles, not only lead/peer
+        self._arbs: Dict[str, Arbitrator] = {}
         self.history: List[Dispute] = []
+
+    def _arb_for(self, profile: ReasoningProfile) -> Arbitrator:
+        """The arbitrator for a profile (thread-safe: pure after build)."""
+        if profile is self.lead_profile:
+            return self._lead
+        if profile is self.peer_profile:
+            return self._peer
+        arb = self._arbs.get(profile.name)
+        if arb is None:
+            arb = Arbitrator(profile)
+            self._arbs[profile.name] = arb
+        return arb
 
     # ── one opinion ────────────────────────────────────────────────────
     def opinion(self, cell_id: str, profile: ReasoningProfile,
@@ -131,8 +146,8 @@ class Tribunal:
                 signals: WorldSignals) -> Opinion:
         """Rate every candidate with ONE profile. `views` are CapabilityView
         (or anything `evaluate` accepts), `base_of` maps id -> expected
-        value."""
-        arb = self._lead if profile is self.lead_profile else self._peer
+        value. Pure: safe to call from several threads at once."""
+        arb = self._arb_for(profile)
         op = Opinion(cell_id=cell_id, profile=profile.name,
                      search_policy=arb.search_policy(signals))
         scored: List[Tuple[str, float]] = []
@@ -153,9 +168,16 @@ class Tribunal:
     def adjudicate(self, views: Sequence[Any], base_of: Dict[str, float],
                    signals: WorldSignals,
                    lead_cell: str = "lead",
-                   peer_cell: str = "peer") -> Dispute:
+                   peer_cell: str = "peer",
+                   peer_views: Optional[Sequence[Any]] = None,
+                   peer_signals: Optional[WorldSignals] = None) -> Dispute:
+        # the peer rates its OWN world when one is supplied (buco 1): a peer
+        # that cannot see a fact cannot let it swing the decision.
         lead = self.opinion(lead_cell, self.lead_profile, views, base_of, signals)
-        peer = self.opinion(peer_cell, self.peer_profile, views, base_of, signals)
+        peer = self.opinion(peer_cell, self.peer_profile,
+                            views if peer_views is None else peer_views,
+                            base_of,
+                            signals if peer_signals is None else peer_signals)
         dispute = Dispute(lead=lead, peer=peer)
 
         if not lead.ranking and not peer.ranking:

@@ -117,7 +117,9 @@ class TestCheckpointKeepsTheRunSettings:
         from phantom.automation.agent import AutonomousAgent
         clone = AutonomousAgent.from_state(str(path))
         assert clone.reason_profile == ""
-        assert clone.cell_loop is False and clone.cell_stages == ()
+        # the roster is the authority unconditionally now, so the legacy
+        # default is True; only the (unused) stage list stays empty
+        assert clone.cell_loop is True and clone.cell_stages == ()
 
     def test_belief_revisions_and_the_trace_are_in_the_checkpoint(
             self, tmp_path):

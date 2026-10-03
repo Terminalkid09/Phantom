@@ -17,7 +17,7 @@ import pytest
 from phantom.automation.brain.bus import CellBus
 from phantom.automation.brain.cells import (
     CELL_LIBRARY,
-    MIGRATED_STAGES,
+    COVERED_GOALS,
     Cell,
     CellTeam,
 )
@@ -436,14 +436,13 @@ def test_the_roster_does_not_own_every_category():
 
 
 def test_agent_strict_mode_refuses_what_no_cell_owns():
+    """Strict is not a mode any more: it is the only mode."""
     from phantom.automation.planner import PlanStep
 
     a = _agent()
-    a.cell_loop = True
-    a.cell_stages = ("footprint",)
     a._ensure_cells("footprint")
     a._current_stage = "footprint"
-    a.cells.strict = True
+    assert a.cells.strict is True
     ran = []
     a._execute_capability = lambda step: ran.append(1) or True
     cap = _unowned_capability(a)
@@ -455,7 +454,8 @@ def test_agent_strict_mode_refuses_what_no_cell_owns():
     assert a.sink.by_kind("blocked")
 
 
-def test_agent_lenient_mode_lets_an_unowned_capability_through():
+def test_agent_refuses_an_unowned_capability_by_default():
+    """The lenient fall-through is gone: no flag enables it back."""
     from phantom.automation.planner import PlanStep
 
     a = _agent()
@@ -465,10 +465,11 @@ def test_agent_lenient_mode_lets_an_unowned_capability_through():
     a._execute_capability = lambda step: ran.append(1) or True
     cap = _unowned_capability(a)
     assert cap is not None
-    assert a.cells.cell_for(cap, "footprint") is None
-    assert a._exec_with_permit(PlanStep(capability=cap, slot_values={})) is True
-    assert ran == [1]
+    assert a.cells.cell_for(cap, "footprint", stage_scoped=True) is None
+    assert a._exec_with_permit(PlanStep(capability=cap, slot_values={})) is False
+    assert ran == []
     assert a.cells.unrouted == 1
+    assert a.cells.refused == 1
 
 
 def test_agent_never_routes_to_an_advisory_cell():
@@ -502,6 +503,8 @@ def test_agent_finalize_carries_the_cell_telemetry():
     assert "team" in result["cell_stats"]
 
 
-def test_migrated_stages_is_a_real_ledger():
-    assert isinstance(MIGRATED_STAGES, tuple)
-    assert all(isinstance(s, str) for s in MIGRATED_STAGES)
+def test_covered_goals_is_the_audited_vocabulary():
+    assert isinstance(COVERED_GOALS, tuple)
+    assert all(isinstance(s, str) for s in COVERED_GOALS)
+    assert "ad" in COVERED_GOALS and "crack" in COVERED_GOALS
+    assert "deep" in COVERED_GOALS
