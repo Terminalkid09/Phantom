@@ -508,3 +508,228 @@ func mustReq(t *testing.T, method, url string) *http.Request {
 	}
 	return req
 }
+
+// ── A-5: a bare "IP: " line must not panic the telemetry parser ──────────
+
+func TestApplyTelemetryBareIPLineDoesNotPanic(t *testing.T) {
+	info := map[string]any{}
+	// Exactly "IP: " with nothing after it: strings.Fields("")[0] used to
+	// panic and take the whole beacon handler (and the listener goroutine)
+	// down — a remote DoS from a malformed beacon body.
+	applyTelemetry(info, `{"netinfo":"IP: "}`)
+	applyTelemetry(info, `{"netinfo":"eth0: IP: \nIP (v4): 10.0.0.5"}`)
+	applyTelemetry(info, `{"sysinfo":"OS: Linux\nUser: root","netinfo":"IP: "}`)
+	if info["os"] != "Linux" {
+		t.Errorf("sysinfo must still parse: %v", info)
+	}
+}
+
+// ── A-4: an unauthenticated operator API must be refused at load time ───
+
+func TestLoadConfigRefusesOpenOperatorAPI(t *testing.T) {
+	dir := t.TempDir()
+	cfgJSON := `{"c2":{"bind":"0.0.0.0","mtls":false,"ssl":false,"allow_plaintext":true}}`
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(cfgJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateJSON := `{"PHANTOM_C2_KEY":"deadbeefdeadbeefdeadbeefdeadbeef"}`
+	if err := os.WriteFile(filepath.Join(dir, "phantom_state.json"), []byte(stateJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PHANTOM_DATA_DIR", dir)
+	t.Setenv("PHANTOM_STATE_FILE", "")
+	t.Setenv("PHANTOM_C2_KEY", "")
+	t.Setenv("PHANTOM_C2_BIND", "")
+	t.Setenv("PHANTOM_API_TOKEN", "")
+
+	if _, err := LoadConfig(); err == nil {
+		t.Error("a non-loopback bind with neither mTLS nor a token must be refused")
+	}
+	t.Setenv("PHANTOM_API_TOKEN", "tok")
+	if _, err := LoadConfig(); err != nil {
+		t.Errorf("with an API token it must load: %v", err)
+	}
+}
+
+// ── B-2: the replay epoch survives a restart ────────────────────────────
+
+func TestReplayGuardPersistsAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c2_replay.json")
+	g1 := NewReplayGuardAt(path)
+	if err := g1.Check("B-1", "nonce-x", 1); err != nil {
+		t.Fatalf("first use: %v", err)
+	}
+	// A fresh guard models a process RESTART: the in-memory nonce set is
+	// gone, but the persisted epoch map makes the stale-epoch check fire.
+	g2 := NewReplayGuardAt(path)
+	if err := g2.Check("B-1", "nonce-x", 1); err == nil {
+		t.Error("a nonce issued before the restart must be refused")
+	}
+	if err := g2.Check("B-1", "nonce-y", 2); err != nil {
+		t.Errorf("a fresh nonce after a restart must pass: %v", err)
+	}
+}
+
+// ── B-4: a malformed operator query is a 400, not a 200 ─────────────────
+
+func TestResultsWithoutBeaconIDIs400(t *testing.T) {
+	h := newHarness(t)
+	req := mustReq(t, "GET", h.srv.URL+"/api/v1/results")
+	req.Header.Set("X-Api-Token", "api-token")
+	resp := h.do(req)
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Errorf("missing beacon_id must be 400, got %d", resp.StatusCode)
+	}
+}
+
+// ── C-3: the capability endpoint advertises the data-plane boundary ─────
+
+func TestCapabilitiesEndpoint(t *testing.T) {
+	h := newHarness(t)
+	req := mustReq(t, "GET", h.srv.URL+"/api/v1/capabilities")
+	req.Header.Set("X-Api-Token", "api-token")
+	resp := h.do(req)
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("capabilities = %d", resp.StatusCode)
+	}
+	var caps map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&caps); err != nil {
+		t.Fatal(err)
+	}
+	if caps["task_policy"] != false {
+		t.Error("task_policy must be advertised false until it is ported (D-2)")
+	}
+	if caps["checkin"] != true || caps["results"] != true {
+		t.Errorf("core surfaces must be advertised true: %v", caps)
+	}
+}
+
+// ── B-5: the catch-all routes on the JSON FIELD, not a substring ────────
+
+func TestCatchAllDoesNotMisrouteOnSubstring(t *testing.T) {
+	h := newHarness(t)
+	h.do(h.signed("POST", "/api/v1/ping", "", "b5p-1", 1)).Body.Close()
+
+	// Telemetry whose text MENTIONS task_id: the old substring sniff sent it
+	// to handleResult and answered 400 (or dropped the check-in).
+	payload := `{"sysinfo":"saw a task_id field in the logs","netinfo":""}`
+	enc, _ := Encrypt(h.envKey, payload)
+	resp := h.do(h.signed("POST", "/AsSeTs/a.css", enc, "b5p-2", 2))
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("a telemetry body mentioning task_id must check in, got %d",
+			resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	plain, err := Decrypt(h.envKey, string(body))
+	if err != nil {
+		t.Fatalf("expected an encrypted check-in response: %v", err)
+	}
+	if !strings.Contains(plain, "tasks") {
+		t.Fatalf("unexpected check-in response: %q", plain)
+	}
+}
+
+func TestCatchAllStoresResult(t *testing.T) {
+	h := newHarness(t)
+	h.do(h.signed("POST", "/api/v1/ping", "", "b5r-1", 1)).Body.Close()
+
+	qreq, _ := http.NewRequest("POST", h.srv.URL+"/api/v1/queue",
+		strings.NewReader(`{"beacon_id":"B-TEST","command":"id"}`))
+	qreq.Header.Set("X-Api-Token", "api-token")
+	h.do(qreq).Body.Close()
+
+	res := h.do(h.signed("POST", "/api/v1/ping", "", "b5r-2", 2))
+	resbody, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	plain, _ := Decrypt(h.envKey, string(resbody))
+	var leased struct {
+		Tasks []struct {
+			TaskID string `json:"task_id"`
+		} `json:"tasks"`
+	}
+	_ = json.Unmarshal([]byte(plain), &leased)
+	if len(leased.Tasks) != 1 {
+		t.Fatalf("expected a leased task: %q", plain)
+	}
+	resultJSON, _ := json.Marshal(map[string]string{
+		"task_id": leased.Tasks[0].TaskID, "output": "uid=0(root)"})
+	enc, _ := Encrypt(h.envKey, string(resultJSON))
+	rr := h.do(h.signed("POST", "/AsSeTs/b.js", enc, "b5r-3", 3))
+	defer rr.Body.Close()
+	if rr.StatusCode != 200 {
+		t.Fatalf("a result through the catch-all must store, got %d",
+			rr.StatusCode)
+	}
+	if len(h.store.Results("B-TEST")) != 1 {
+		t.Error("the result must be recorded exactly once")
+	}
+}
+
+// ── D-1: audit trail + state snapshot on DataDir ────────────────────────
+
+func TestStoreAuditAndPersistence(t *testing.T) {
+	dir := t.TempDir()
+	reg := filepath.Join(dir, "beacon_registry.json")
+	if err := os.WriteFile(reg, []byte(`{"version":1,"beacons":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st := NewStorePersistent(reg, dir)
+	if !st.auditEnabled() {
+		t.Fatal("a data dir must enable the audit trail")
+	}
+	st.UpdateBeacon("B-P", map[string]any{"ip": "1.2.3.4"})
+	if _, err := st.QueueTask("B-P", "whoami"); err != nil {
+		t.Fatal(err)
+	}
+	st.audit("unit_event", map[string]any{"beacon_id": "B-P"})
+
+	// The snapshot is flushed by a debounced ticker; a graceful shutdown (or
+	// this Flush) must persist the pending mutations before the "restart".
+	st.Flush()
+
+	audit, err := os.ReadFile(filepath.Join(dir, "c2_audit.jsonl"))
+	if err != nil || !strings.Contains(string(audit), "unit_event") {
+		t.Fatalf("audit trail not written: %v %q", err, audit)
+	}
+
+	// A fresh store models a restart: state must be reloaded.
+	st2 := NewStorePersistent(reg, dir)
+	if !st2.Registered("B-P") {
+		t.Error("a beacon must survive a restart")
+	}
+	if len(st2.PendingTasks("B-P")) != 1 {
+		t.Error("a queued task must survive a restart")
+	}
+}
+
+// The snapshot is debounced: a mutation must NOT write synchronously, but the
+// background ticker must persist it shortly after without an explicit Flush.
+func TestStoreDebouncedFlush(t *testing.T) {
+	dir := t.TempDir()
+	reg := filepath.Join(dir, "beacon_registry.json")
+	if err := os.WriteFile(reg, []byte(`{"version":1,"beacons":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st := NewStorePersistent(reg, dir)
+	defer st.Close()
+	st.UpdateBeacon("B-D", map[string]any{"ip": "9.9.9.9"})
+	if _, err := st.QueueTask("B-D", "id"); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		st2 := NewStorePersistent(reg, dir)
+		persisted := st2.Registered("B-D") && len(st2.PendingTasks("B-D")) >= 1
+		st2.Close()
+		if persisted {
+			return // the ticker flushed without an explicit Flush()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("debounced flush never persisted the snapshot")
+}

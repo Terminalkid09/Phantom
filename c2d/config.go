@@ -197,6 +197,17 @@ func LoadConfig() (*Config, error) {
 	c.AESKey = deriveToLength([]byte(key), 32)
 	c.APIToken = envOr("PHANTOM_API_TOKEN", strAny(stateMap["PHANTOM_API_TOKEN"]))
 	c.PayloadToken = envOr("PHANTOM_PAYLOAD_TOKEN", strAny(stateMap["PHANTOM_PAYLOAD_TOKEN"]))
+
+	// A-4: the operator endpoints are guarded by mTLS AND/OR the API token.
+	// If BOTH are absent on a non-loopback bind, the control plane is open to
+	// anyone who can reach the port: refuse to start rather than expose it.
+	if !c.MTLS && strings.TrimSpace(c.APIToken) == "" &&
+		!isLoopbackHost(c.Bind) {
+		return nil, fmt.Errorf("refusing to start: c2.bind=%q is not loopback "+
+			"and neither c2.mtls nor PHANTOM_API_TOKEN is set — the operator "+
+			"API would be unauthenticated (set c2.mtls=true or an API token)",
+			c.Bind)
+	}
 	return c, nil
 }
 
