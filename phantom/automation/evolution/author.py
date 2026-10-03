@@ -176,6 +176,10 @@ class AuthorResult:
     attempts: int = 0
     gate_history: List[Dict] = field(default_factory=list)
     error: str = ""
+    # False when the LAB stage could not run (no lab reachable): the artifact
+    # is still publishable as an explicitly UNVERIFIED PR, but it must never
+    # be presented as proven and must never auto-load before a human merges.
+    verified: bool = True
 
 
 class AuthorUnavailable(Exception):
@@ -206,10 +210,17 @@ def dynamic_attempts(case_stats: Dict, floor: int = 3, ceil: int = 5) -> int:
 def author(proposal_id: str, case: Dict, advisor,
            sandbox: Optional[Sandbox] = None,
            max_attempts: Optional[int] = None,
-           case_stats: Optional[Dict] = None) -> AuthorResult:
+           case_stats: Optional[Dict] = None,
+           require_lab: bool = True) -> AuthorResult:
     """Run the write->gate->repair loop. Returns a structured result; on
     total failure everything flushed is rolled back and a POSTMORTEM is
-    staged for loop.py to persist."""
+    staged for loop.py to persist.
+
+    `require_lab=False` is the UNVERIFIED path: the lab stage is skipped and
+    a gate-clean (static/registry/units) artifact is returned with
+    `verified=False`, so it can be offered as an explicitly unverified PR a
+    human must still prove before merge. It is never silently "proven".
+    """
     if advisor is None or not getattr(advisor, "available", lambda: False)():
         raise AuthorUnavailable("no LLM transport available for authoring")
 
@@ -261,13 +272,15 @@ def author(proposal_id: str, case: Dict, advisor,
                        "three allowed roots and the .py-only rule."
             continue
 
-        ok, results = gate_mod.run_gate(cap_rel, test_rel, skip_lab=False)
+        ok, results = gate_mod.run_gate(cap_rel, test_rel,
+                                        skip_lab=not require_lab)
         gate_history.extend(r.as_dict() for r in results)
         if ok:
             return AuthorResult(ok=True, cap_relpath=cap_rel,
                                 test_relpath=test_rel,
                                 proposal_relpath=proposal_rel,
-                                attempts=attempt, gate_history=gate_history)
+                                attempts=attempt, gate_history=gate_history,
+                                verified=bool(require_lab))
         first_fail = next(r for r in results if not r.ok)
         feedback = ("GATE FAILURE. " + first_fail.failure_report()
                     + "\nFix ONLY this problem and re-emit ALL files.")

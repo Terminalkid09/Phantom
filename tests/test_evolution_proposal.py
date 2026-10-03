@@ -257,16 +257,27 @@ def test_maybe_spawn_in_proposal_mode_needs_no_lab_and_no_llm(monkeypatch,
     assert st._d["gate_runs"] == 0                   # capability budget untouched
 
 
-def test_maybe_spawn_in_code_mode_still_requires_the_lab(monkeypatch, tmp_path):
-    spawned = []
-    monkeypatch.setattr(evo_loop.threading, "Thread",
-                        lambda **kw: type("T", (), {"start": lambda self: spawned.append(1)})())
+def test_maybe_spawn_in_code_mode_without_lab_authors_unverified(monkeypatch,
+                                                                 tmp_path):
+    """No lab no longer means silence: the loop authors and offers an
+    explicitly UNVERIFIED PR a human must prove before merge."""
+    spawned_threads = []
+
+    class FakeThread:
+        def __init__(self, **kw):
+            spawned_threads.append(kw)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(evo_loop.threading, "Thread", FakeThread)
     st = evo_loop.EvolutionState(tmp_path / "state.json")
     out = evo_loop.maybe_spawn([dict(PAT_GAP)], advisor=None, wm=None,
                                emit=lambda k, d: None, state=st, lab_ok=False,
                                mode="code")
-    assert out == []
-    assert spawned == []
+    assert out, "the loop must not go silent when the lab is unreachable"
+    assert spawned_threads[0]["kwargs"]["unverified"] is True
+    assert st._d["gate_runs"] == 1        # the capability budget is still spent
 
 
 def test_mode_is_validated():

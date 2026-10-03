@@ -315,14 +315,21 @@ class TestTrigger:
                                             state=st, lab_ok=True)
             assert spawned2 == []
 
-    def test_no_lab_no_spawn(self, tmp_path):
+    def test_no_lab_still_spawns_unverified(self, tmp_path):
+        """Contract change: no lab no longer means silence. The loop authors
+        and offers an explicitly UNVERIFIED PR a human must prove before
+        merge; the worker is told it is unverified so it skips the lab stage."""
         st = EvolutionState(tmp_path / "state.json")
         pat = [{"technique": "x", "cause": "not_found", "n": 3,
                 "sig_hash": "ccccdddd", "missing_fact": "web_app"}]
         advisor = type("A", (), {"available": staticmethod(lambda: True)})()
-        spawned = loop_mod.maybe_spawn(pat, advisor, None, emit=None,
-                                       state=st, lab_ok=False)
-        assert spawned == []
+        with patch.object(loop_mod.threading, "Thread") as th:
+            th.return_value = type("T", (), {"start": lambda s: None,
+                                             "daemon": True})()
+            spawned = loop_mod.maybe_spawn(pat, advisor, None, emit=None,
+                                           state=st, lab_ok=False)
+        assert len(spawned) == 1
+        assert th.call_args.kwargs["kwargs"]["unverified"] is True
 
     def test_no_llm_no_author(self, tmp_path):
         """AuthorUnavailable must be a clean skip, not a crash."""

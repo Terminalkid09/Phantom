@@ -13,7 +13,10 @@ Flow:
 
 Governance baked in (agreed):
     * off by default; enabled with --evolution or flags evolution on
-    * the lab must be reachable: no lab, no proof, no PR, no auto-load
+    * the lab must be reachable for a PROVEN PR; without it the loop still
+      authors, but publishes an explicitly UNVERIFIED PR a human must prove
+      before merge — an unproven artifact is never presented as proof, and
+      an unverified capability never auto-loads
     * daily budgets on gate runs and opened PRs (quota hygiene)
     * never edits engine code (sandbox enforces it mechanically)
 """
@@ -314,10 +317,17 @@ def maybe_spawn(patterns: List[Dict], advisor, wm,
         h = _sig_hash(pat)
         if _already_authoring(h, state):
             continue
+        unverified = False
         if not proposal_mode and not lab_ok:
-            _emit_note(emit, "evolution skipped: lab unreachable "
-                             "(no proof, no PR)")
-            continue
+            # The operator's call: no lab does NOT mean silence. Author with
+            # the lab stage skipped, and publish an explicitly UNVERIFIED PR
+            # (a human must run the lab gate before merge). It never
+            # auto-loads, and the beta loader refuses a candidate whose lab
+            # proof is missing.
+            unverified = True
+            _emit_note(emit, "evolution: lab unreachable — authoring an "
+                             "UNVERIFIED PR (never auto-loads; run the lab "
+                             "gate before merge)")
         # P1-4: claim the slot ATOMICALLY before spawning — the old
         # can_gate()-check + count_gate()-after-run window let concurrent
         # workers over-admit past the daily budget
@@ -335,7 +345,8 @@ def maybe_spawn(patterns: List[Dict], advisor, wm,
         th = threading.Thread(
             target=_worker,
             args=(pid, pat, advisor, state, emit),
-            kwargs={"mode": mode, "roster": roster, "case": (cases or {}) and
+            kwargs={"mode": mode, "roster": roster, "unverified": unverified,
+                    "case": (cases or {}) and
                     next((c for c in (cases or [])
                           if getattr(c, "sig_hash", "") == h), None)},
             daemon=True, name=f"evolution-{h}")
@@ -350,7 +361,7 @@ def maybe_spawn(patterns: List[Dict], advisor, wm,
 
 def _worker(pid: str, pat: Dict, advisor, state: EvolutionState,
             emit: Optional[Callable], mode: str = MODE_CODE,
-            roster=None, case=None) -> None:
+            roster=None, case=None, unverified: bool = False) -> None:
     from phantom.automation.evolution import publish as publish_mod
 
     h = pat.get("sig_hash") or _sig_hash(pat)
@@ -367,7 +378,8 @@ def _worker(pid: str, pat: Dict, advisor, state: EvolutionState,
     try:
         stats = {"author_success_rate": state.author_success_rate(h)}
         result = author_mod.author(pid, case, advisor, sandbox=sb,
-                                   case_stats=stats)
+                                   case_stats=stats,
+                                   require_lab=not unverified)
     except author_mod.AuthorUnavailable as exc:
         # the gate never ran: give the daily budget its slot back
         state.release_gate_slot()
