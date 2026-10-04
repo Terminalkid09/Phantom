@@ -1,0 +1,22 @@
+{
+  "id": "dnscan_subdomains",
+  "tool": "dnscan",
+  "category": "recon",
+  "description": "Passive subdomain discovery via dnscan (crt.sh / zone data)",
+  "effects": ["hostname"],
+  "command": "dnscan -d {target} -r 6 -w -o -",
+  "requires": ["target"],
+  "markers": [
+    {
+      "prefix": "DNSCAN:",
+      "kind": "hostname",
+      "key": "hostname:{name}",
+      "fields": ["name"],
+      "confidence": 0.6
+    }
+  ],
+  "opsec_cost": 0.2,
+  "detection_risk": 0.05,
+  "stealth_level": "passive",
+  "timeout": 60
+}

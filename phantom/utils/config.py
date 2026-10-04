@@ -152,6 +152,12 @@ DEFAULTS: Dict[str, Any] = {
     #       "requires_service": ["http"], "note": "..."} ]}
     "toolbelt": {
         "extra": {},
+        # Runtime DRIVER discovery: scan the (gitignored) data/drivers and
+        # `drivers_dir` directories for declarative tool manifests and turn
+        # each valid one into a live, plannable capability. A fresh checkout
+        # has no manifests, so this is a no-op until the operator adds one.
+        "drivers": True,
+        "drivers_dir": "",         # os.pathsep-separated extra dirs
     },
     "osint": {
         # Region used to parse a NATIONAL-format phone number that carries no
@@ -335,6 +341,8 @@ SCHEMA: Dict[str, Dict[str, Any]] = {
     "llm.enabled": {"type": bool, "env": "PHANTOM_LLM_ENABLED"},
     "automation.experience": {"type": bool, "env": None},
     "toolbelt.extra": {"type": dict, "env": None},
+    "toolbelt.drivers": {"type": bool, "env": None},
+    "toolbelt.drivers_dir": {"type": str, "env": "PHANTOM_DRIVERS_DIR"},
     "osint.default_region": {"type": str, "env": "PHANTOM_DEFAULT_REGION"},
     "engagement.allow_unscoped": {"type": bool,
                                   "env": "PHANTOM_ALLOW_UNSCOPED"},

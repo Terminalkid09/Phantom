@@ -355,6 +355,18 @@ class Planner:
                      cycle=None
                      ) -> Optional[Capability]:
         order = _FACT_SOURCES.get(fact, [])
+        # runtime-DISCOVERED capabilities (drivers) are deliberately absent
+        # from the static reverse index — it is code, they are data. Consult
+        # them here so a tool registered at runtime becomes plannable for a
+        # fact it declares, without a code change and without disturbing the
+        # static ordering the coverage audit pins.
+        if self.registry is not None:
+            discovered = [c.id for c in self.registry.all()
+                          if getattr(c, "discovered", False)
+                          and fact in (c.effects or ())]
+            if discovered:
+                order = list(order) + [c for c in discovered
+                                       if c not in order]
         if self.tailoring is not None:
             allow_banned = wm is not None and wm.has_any("beacon")
             order = self.tailoring.source_order(fact, order,

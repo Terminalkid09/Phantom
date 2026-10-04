@@ -585,6 +585,36 @@ def _dead_drop_net_check() -> Check:
                  hint="publish one: config dead-drop publish <host> <port>")
 
 
+def _drivers_check() -> Check:
+    """Runtime-discovered tool drivers (declarative tool manifests).
+
+    A driver registers a tool Phantom has never shipped as a plannable
+    capability. This is OFFLINE and cheap: it lists the manifests found and
+    flags a capability id that would collide with a built-in (which the
+    registry refuses — better to see it here).
+    """
+    try:
+        from phantom.automation.runtime import drivers as drv
+        rows = drv.driver_summary()
+    except Exception as exc:
+        return Check("drivers", "warn", f"discovery unavailable: {exc}")
+    if not rows:
+        return Check("drivers", "pass", "no runtime drivers (built-in set only)")
+    try:
+        from phantom.automation.guidance.kit import CAPABILITIES
+        builtins = {c.id for c in CAPABILITIES}
+        collisions = [r["id"] for r in rows if r["id"] in builtins]
+    except Exception:
+        collisions = []
+    detail = (f"{len(rows)} driver(s): "
+              + ", ".join(r["id"] for r in rows[:6]))
+    if collisions:
+        return Check("drivers", "warn", detail,
+                     hint=f"id collides with a built-in and is ignored: "
+                          f"{', '.join(collisions)}")
+    return Check("drivers", "pass", detail)
+
+
 # ── runner ───────────────────────────────────────────────────────────────
 
 def run_doctor(net: bool = False) -> DoctorReport:
@@ -592,7 +622,7 @@ def run_doctor(net: bool = False) -> DoctorReport:
     fns: List[CheckFn] = [
         _python_check, _core_deps_check, _toolchain_check, _ad_tools_check,
         _data_dir_check, _config_check, _c2_hardening_check, _toolbelt_check,
-        _external_services_check,
+        _external_services_check, _drivers_check,
         _c2_operator_auth_check, _c2_front_check,
         _c2_backend_check, _c2d_capabilities_check, _secrets_at_rest_check,
         _experience_check, _llm_check, _scopes_check, _data_usage_check,
