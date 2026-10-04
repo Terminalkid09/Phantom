@@ -109,6 +109,25 @@ def test_llm_check_off_is_a_pass(monkeypatch):
     assert doctor._llm_check().status == "pass"
 
 
+def test_toolbelt_check_flags_unrouted_capability():
+    from phantom.automation.brain.toolbelt import Toolbelt
+    from phantom.automation.runtime.toolchain import ToolRegistry
+    # nothing offensive installed: every shell capability is unrouted, but
+    # the in-process ssh-banner engine still counts as available
+    c = doctor._toolbelt_check(Toolbelt(ToolRegistry(installed=set())))
+    assert c.status == "warn"
+    assert "no installed tool" in c.detail and c.hint
+
+
+def test_toolbelt_check_passes_when_tools_present():
+    from phantom.automation.brain.toolbelt import Toolbelt
+    from phantom.automation.runtime.toolchain import ToolRegistry
+    belt = Toolbelt(ToolRegistry(installed={
+        "masscan", "nmap", "nc", "smbmap", "hydra", "curl", "redis-cli"}))
+    c = doctor._toolbelt_check(belt)
+    assert c.status == "pass"
+
+
 # ── net probes ──────────────────────────────────────────────────────────
 
 def test_net_adds_probes_but_never_fails_closed(monkeypatch):

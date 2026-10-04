@@ -369,6 +369,43 @@ def _human_bytes(n: float) -> str:
     return f"{n:.1f}TB"
 
 
+def _toolbelt_check(belt=None) -> Check:
+    """Which implementer the run will actually pick per capability.
+
+    The planner routes each capability to the best INSTALLED tool for the
+    target's surface (``brain/toolbelt.py``). A capability with no
+    implementer on this box is a move the run can never make, so it is
+    named up front instead of surfacing as a mid-run ``tool_missing``.
+    ``belt`` is injectable so the check is testable without spawning WSL
+    probes for every catalogue entry.
+    """
+    try:
+        from phantom.automation.brain.toolbelt import Toolbelt
+        from phantom.automation.runtime.toolchain import ToolRegistry
+        # native PATH only by default: WSL resolution costs a probe per tool
+        # and the toolbelt scans ~9 capabilities, so the bulk check stays
+        # fast. A tool that only exists in WSL is reported by _ad_tools_check
+        # (which does resolve through WSL) — this check is the native map.
+        belt = belt or Toolbelt(ToolRegistry(wsl=False))
+        status = belt.status()
+    except Exception as exc:
+        return Check("toolbelt", "warn", f"selection unavailable: {exc}")
+    if not status:
+        return Check("toolbelt", "pass", "no capabilities to route")
+    unrouted = sorted(cap for cap, ch in status.items() if ch.tool is None)
+    if unrouted:
+        hint = "; ".join(
+            f"{cap} \u2190 {', '.join(status[cap].alternatives_missing)}"
+            for cap in unrouted[:4])
+        return Check(
+            "toolbelt", "warn",
+            f"{len(unrouted)} capability(ies) with no installed tool: "
+            f"{', '.join(unrouted)}",
+            hint=hint + " — these moves are unavailable (others fall back)")
+    return Check("toolbelt", "pass",
+                 f"{len(status)} capability(ies) routed to an installed tool")
+
+
 def _data_dir_check() -> Check:
     from phantom.utils.paths import data_dir
     d = data_dir()
@@ -512,7 +549,7 @@ def run_doctor(net: bool = False) -> DoctorReport:
     """Run the checks and return the report (never raises)."""
     fns: List[CheckFn] = [
         _python_check, _core_deps_check, _toolchain_check, _ad_tools_check,
-        _data_dir_check, _config_check, _c2_hardening_check,
+        _data_dir_check, _config_check, _c2_hardening_check, _toolbelt_check,
         _c2_operator_auth_check, _c2_front_check,
         _c2_backend_check, _c2d_capabilities_check, _secrets_at_rest_check,
         _experience_check, _llm_check, _scopes_check, _data_usage_check,
