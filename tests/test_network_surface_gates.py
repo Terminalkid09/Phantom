@@ -130,5 +130,30 @@ class TestPlannerHonesty(unittest.TestCase):
         self.assertNotIn("loot_triage", ids)  # needs a beacon; would close a cycle
 
 
+class TestBruteSshIsPlannable(unittest.TestCase):
+    """A host whose ONLY access surface is ssh must have a creds path.
+
+    `brute_ssh` was absent from the planner's creds reverse index, so on an
+    ssh-only box (no web, no breach material) the chain simply had no source
+    for `creds` and stopped — even under an explicit --aggressive run where
+    the brute is exactly the intended move.
+    """
+
+    def test_brute_ssh_is_the_last_creds_source(self):
+        from phantom.automation.planner import _FACT_SOURCES
+        self.assertIn("brute_ssh", _FACT_SOURCES["creds"])
+        # quiet/derived sources rank first; the loud brute is the floor
+        self.assertEqual(_FACT_SOURCES["creds"][-1], "brute_ssh")
+
+    def test_brute_ssh_viable_only_with_ssh_service(self):
+        cap = make_registry().get("brute_ssh")
+        ssh_wm = WorldModel(target="10.0.0.1", target_type="ip")
+        _add_service(ssh_wm, 22, "ssh")
+        no_ssh_wm = WorldModel(target="10.0.0.2", target_type="ip")
+        _add_service(no_ssh_wm, 445, "microsoft-ds")
+        self.assertTrue(Planner._precondition_viable(cap, ssh_wm))
+        self.assertFalse(Planner._precondition_viable(cap, no_ssh_wm))
+
+
 if __name__ == "__main__":
     unittest.main()
