@@ -135,6 +135,24 @@ DEFAULTS: Dict[str, Any] = {
         "hibp_api_key": "",
         "custom_api": "",          # alternative breach API endpoint
     },
+    # External-service credentials. Persisted here so the CLI (`config keys`)
+    # and the Electron settings panel can set them WITHOUT touching .env;
+    # the legacy PHANTOM_* env vars still win (see phantom.utils.api_keys).
+    "api_keys": {
+        "shodan": "",
+        "nvd": "",
+        "github": "",
+    },
+    # Operator-declared tool options for the toolbelt. The built-in catalog
+    # ships a fixed set of known implementers; this lets an operator register
+    # a tool without a code change, so a superior tool the operator has
+    # installed is actually selectable. Shape:
+    #   toolbelt.extra = {"<capability>": [ {"name": "myTool", "rank": 10,
+    #       "styles": ["default", "stealth"],
+    #       "requires_service": ["http"], "note": "..."} ]}
+    "toolbelt": {
+        "extra": {},
+    },
     "llm": {
         "model_path": "",          # empty -> bundled default (Qwen) when present
         "enabled": False,
@@ -304,10 +322,14 @@ SCHEMA: Dict[str, Dict[str, Any]] = {
     "transports.sms_carrier": {"type": str, "env": None},
     "breach.hibp_api_key": {"type": str, "env": "PHANTOM_HIBP_API_KEY"},
     "breach.custom_api": {"type": str, "env": "PHANTOM_BREACH_API"},
+    "api_keys.shodan": {"type": str, "env": "PHANTOM_SHODAN_KEY"},
+    "api_keys.nvd": {"type": str, "env": "PHANTOM_NVD_API_KEY"},
+    "api_keys.github": {"type": str, "env": "PHANTOM_GITHUB_TOKEN"},
     # LLM advisor + engagement governance
     "llm.model_path": {"type": str, "env": "PHANTOM_LLM_MODEL"},
     "llm.enabled": {"type": bool, "env": "PHANTOM_LLM_ENABLED"},
     "automation.experience": {"type": bool, "env": None},
+    "toolbelt.extra": {"type": dict, "env": None},
     "engagement.allow_unscoped": {"type": bool,
                                   "env": "PHANTOM_ALLOW_UNSCOPED"},
     "engagement.ransom_sim_allow": {"type": bool,

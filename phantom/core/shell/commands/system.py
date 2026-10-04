@@ -226,8 +226,78 @@ def _cmd_config_dead_drop(parts) -> None:
                       "<host> <port>")
 
 
+def _cmd_config_keys(parts) -> None:
+    """`config keys` sub-handler — manage external-service credentials.
+
+    config keys                     -> list every declared key + its state
+    config keys set <name> <value>  -> persist a key to data/config.json
+    config keys clear <name>        -> remove a persisted key
+
+    Values are written to data/config.json (never .env); the legacy
+    PHANTOM_* env var, when set, still wins over the file.
+    """
+    from rich.table import Table
+    from phantom.utils import api_keys
+
+    if not parts or parts[0].lower() in ("list", "ls", "status"):
+        st = api_keys.status()
+        table = Table(title="[bold]External service keys[/]",
+                      border_style="magenta")
+        table.add_column("Name", style="cyan")
+        table.add_column("Service", style="white")
+        table.add_column("State", style="white")
+        table.add_column("Value", style="dim")
+        table.add_column("Env override", style="dim")
+        for name, info in st.items():
+            state = "set" if info["configured"] else "—"
+            if info["source"] == "env":
+                state = "set (env)"
+            table.add_row(name, info["label"], state,
+                          info["masked"] or "", info["env"])
+        _sh.console.print(table)
+        notifier.info("Set one with: config keys set <name> <value>. "
+                      "Keys persist in data/config.json (no .env editing).")
+        return
+
+    verb = parts[0].lower()
+    if verb in ("set", "add"):
+        if len(parts) < 3:
+            notifier.error("Usage: config keys set <name> <value>")
+            return
+        name, value = parts[1].lower(), " ".join(parts[2:])
+        if name not in api_keys.KEY_REGISTRY:
+            notifier.error(f"Unknown key '{name}'. Known: "
+                           f"{', '.join(api_keys.names())}")
+            return
+        try:
+            api_keys.set(name, value)
+        except Exception as e:
+            notifier.error(f"Could not save '{name}': {e}")
+            return
+        notifier.success(f"{api_keys.KEY_REGISTRY[name]['label']} key saved "
+                         f"to data/config.json ({api_keys.mask(value)}).")
+        return
+    if verb in ("clear", "unset", "remove", "rm"):
+        if len(parts) < 2:
+            notifier.error("Usage: config keys clear <name>")
+            return
+        name = parts[1].lower()
+        if name not in api_keys.KEY_REGISTRY:
+            notifier.error(f"Unknown key '{name}'. Known: "
+                           f"{', '.join(api_keys.names())}")
+            return
+        api_keys.set(name, "")
+        notifier.warn(f"{name} cleared from data/config.json "
+                      "(env override, if any, still applies).")
+        return
+    notifier.error("Usage: config keys [list|set <name> <value>|clear <name>]")
+
+
 def cmd_config(shell, arg: str):
-    """config [status|rotate-api-token|dead-drop <url>|dead-drop publish <host> <port>] - Operator state.
+    """config [status|rotate-api-token|keys|dead-drop <url>|dead-drop publish <host> <port>] - Operator state.
+
+    'keys' manages external-service credentials (Shodan, NVD, GitHub, HIBP,
+    breach aggregator) in data/config.json, so no .env editing is needed.
 
     'dead-drop' manages the beacon's endpoint indirection: one neutral URL
     holding the current C2 endpoint, consulted BEFORE the first check-in when
@@ -241,6 +311,9 @@ def cmd_config(shell, arg: str):
     _parts = arg.strip().split()
     if _parts and _parts[0].lower() in ("dead-drop", "dead_drop", "deaddrop"):
         _cmd_config_dead_drop(_parts)
+        return
+    if _parts and _parts[0].lower() in ("keys", "key", "apikeys", "api-keys"):
+        _cmd_config_keys(_parts[1:])
         return
     if action in ("regenerate", "rotate", "rotate-api-token", "regenerate-api-token"):
         try:

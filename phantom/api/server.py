@@ -2499,6 +2499,48 @@ async def config_get(_request: web.Request) -> web.Response:
     return _json(state_status())
 
 
+@routes.get("/api/config/keys")
+async def config_keys_get(_request: web.Request) -> web.Response:
+    """External-service credentials this operator has configured.
+
+    Returns only masked values — the raw secret never crosses the bridge,
+    so a compromised Electron renderer cannot read the keys back.
+    Config-file keys are editable from the Settings panel without editing
+    .env; a legacy PHANTOM_* env var still overrides the file."""
+    try:
+        from phantom.utils import api_keys
+        return _json({"keys": api_keys.status()})
+    except Exception as exc:
+        return _error(f"key registry unavailable: {exc}")
+
+
+@routes.post("/api/config/keys")
+async def config_keys_set(request: web.Request) -> web.Response:
+    """Persist one external-service key (empty value clears it).
+
+    Body: {name: <shodan|nvd|github|hibp|breach_api>, value: <secret>}.
+    An unknown name is a 400 so a typo never silently writes nothing.
+    """
+    try:
+        body = await request.json() or {}
+    except Exception:
+        return _error("invalid JSON body")
+    name = str(body.get("name") or "").strip().lower()
+    value = str(body.get("value") or "").strip()
+    try:
+        from phantom.utils import api_keys
+    except Exception as exc:
+        return _error(f"key registry unavailable: {exc}")
+    if name not in api_keys.KEY_REGISTRY:
+        return _error(f"unknown key '{name}'", status=400)
+    try:
+        api_keys.set(name, value)
+    except Exception as exc:
+        return _error(f"could not save '{name}': {exc}", status=500)
+    return _json({"ok": True, "name": name,
+                  "keys": api_keys.status()})
+
+
 # ── Global Search ────────────────────────────────────────────────────────────
 
 @routes.post("/api/search")

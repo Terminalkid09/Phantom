@@ -426,22 +426,26 @@ def _external_services_check() -> Check:
         return Check("external-services", "warn", f"unavailable: {exc}")
     if not wired:
         return Check("external-services", "warn", "no external intel wired")
-    key = os.environ.get("SHODAN_API_KEY", "")
-    if not key:
-        try:
-            from phantom.core.session import session
-            key = str(session.results.get("config", {})
-                      .get("shodan_key", "") or "")
-        except Exception:
-            key = ""
+    # Which credentials are configured tells the operator how deep the
+    # external intel can go. The `api_keys` registry is the single source
+    # (env override OR data/config.json), so this reflects exactly what the
+    # CLI/Electron panel set.
     detail = ("available: " + ", ".join(wired)
               + " (shodan keyless InternetDB)")
-    if key:
+    try:
+        from phantom.utils import api_keys
+        st = api_keys.status()
+        set_keys = [name for name, info in st.items() if info["configured"]]
+    except Exception:
+        set_keys = []
+    if set_keys:
         return Check("external-services", "pass",
-                     detail + "; authenticated Shodan search enabled")
+                     detail + "; credentials set: " + ", ".join(set_keys))
     return Check("external-services", "pass", detail,
-                 hint="set a Shodan key (`set-key <key>`) for search/stats "
-                      "beyond the keyless InternetDB host lookup")
+                 hint="add keys with `config keys set <name> <value>` "
+                      "(or the Electron Settings panel) — e.g. shodan for "
+                      "search/stats beyond the keyless host lookup, nvd/github "
+                      "for higher rate limits, hibp/breach_api for breach data")
 
 
 def _data_dir_check() -> Check:
