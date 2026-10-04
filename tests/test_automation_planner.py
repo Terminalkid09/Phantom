@@ -78,7 +78,12 @@ class TestPlanner(unittest.TestCase):
     def test_suggest_next_cheapest(self):
         step = self.planner.suggest_next(self.wm, goal="footprint")
         self.assertIsNotNone(step)
-        self.assertIn(step.capability.id, ("ssh_banner", "http_probe", "scan_tcp"))
+        # cheapest usable recon step toward footprint. external_recon is now
+        # the cheapest (passive, cost 0.1) — `suggest_next` is the "cheapest"
+        # helper only; plan()/plan_strategic() keep the scan-first ORDER, so
+        # the real chain still scans before falling back to external data.
+        self.assertIn(step.capability.id, ("ssh_banner", "http_probe",
+                                           "scan_tcp", "external_recon"))
 
     def test_identity_goal_on_network_target_degrades_to_footprint(self):
         # "identity" on an IP/domain used to produce an empty plan -> the
