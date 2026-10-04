@@ -219,4 +219,15 @@ def make_registry() -> Registry:
                 reg.register(cap)
     except ImportError:
         pass
+    # Runtime DRIVERS: declarative tool manifests discovered on disk. They
+    # are how a tool Phantom has never shipped becomes a plannable
+    # capability without a code change. A collision with an existing id is
+    # refused (never shadow a built-in) rather than silently overriding it.
+    try:
+        from phantom.automation.runtime.drivers import load_driver_capabilities
+        for cap in load_driver_capabilities():
+            if reg.get(cap.id) is None:
+                reg.register(cap)
+    except ImportError:
+        pass
     return reg

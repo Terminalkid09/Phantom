@@ -293,6 +293,40 @@ def _cmd_config_keys(parts) -> None:
     notifier.error("Usage: config keys [list|set <name> <value>|clear <name>]")
 
 
+def _cmd_config_drivers(parts) -> None:
+    """`config drivers` — inspect the runtime-discovered tool drivers.
+
+    config drivers        -> every manifest found + the dirs that were scanned
+
+    A driver is a JSON manifest that turns a tool Phantom has never shipped
+    into a live capability: it declares the binary, the command template and
+    the output markers. Drop one in data/drivers/ (gitignored) and it is
+    planned like any built-in move.
+    """
+    from rich.table import Table
+    from phantom.automation.runtime import drivers as drv
+
+    rows = drv.driver_summary()
+    if not rows:
+        notifier.info("No tool drivers found. Drop a JSON manifest in "
+                      "data/drivers/ (or toolbelt.drivers_dir) to register "
+                      "a tool Phantom has never seen.")
+    else:
+        table = Table(title="[bold]Discovered tool drivers[/]",
+                      border_style="magenta")
+        table.add_column("Capability", style="cyan")
+        table.add_column("Tool", style="white")
+        table.add_column("Category", style="white")
+        table.add_column("Effects", style="dim")
+        table.add_column("Manifest", style="dim")
+        for row in rows:
+            table.add_row(row["id"], row["tool"], row["category"],
+                          ", ".join(row["effects"]),
+                          row["source"] or "-")
+        _sh.console.print(table)
+    notifier.info("Scanned: " + ", ".join(drv.driver_dirs()))
+
+
 def cmd_config(shell, arg: str):
     """config [status|rotate-api-token|keys|dead-drop <url>|dead-drop publish <host> <port>] - Operator state.
 
@@ -314,6 +348,9 @@ def cmd_config(shell, arg: str):
         return
     if _parts and _parts[0].lower() in ("keys", "key", "apikeys", "api-keys"):
         _cmd_config_keys(_parts[1:])
+        return
+    if _parts and _parts[0].lower() in ("drivers", "driver", "tools"):
+        _cmd_config_drivers(_parts[1:])
         return
     if action in ("regenerate", "rotate", "rotate-api-token", "regenerate-api-token"):
         try:
