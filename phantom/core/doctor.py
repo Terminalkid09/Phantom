@@ -406,6 +406,44 @@ def _toolbelt_check(belt=None) -> Check:
                  f"{len(status)} capability(ies) routed to an installed tool")
 
 
+def _external_services_check() -> Check:
+    """Which passive external-intel services the operator can lean on.
+
+    These augment a local scan with the wider internet's view: Shodan
+    exposure, crt.sh CT-log subdomains, NVD CVE correlation, BGP netblocks.
+    They are called by the capabilities that need them, never speculatively.
+    This check is OFFLINE: it reports what is wired and whether an optional
+    Shodan key upgrades the keyless InternetDB host lookup.
+    """
+    try:
+        from phantom.utils import api as ext
+        wired = [label for fn, label in (
+            (ext.shodan_lookup, "shodan/internetdb"),
+            (ext.crtsh_lookup, "crt.sh"),
+            (ext.nvd_lookup, "nvd"),
+            (ext.bgp_lookup, "bgp")) if callable(fn)]
+    except Exception as exc:
+        return Check("external-services", "warn", f"unavailable: {exc}")
+    if not wired:
+        return Check("external-services", "warn", "no external intel wired")
+    key = os.environ.get("SHODAN_API_KEY", "")
+    if not key:
+        try:
+            from phantom.core.session import session
+            key = str(session.results.get("config", {})
+                      .get("shodan_key", "") or "")
+        except Exception:
+            key = ""
+    detail = ("available: " + ", ".join(wired)
+              + " (shodan keyless InternetDB)")
+    if key:
+        return Check("external-services", "pass",
+                     detail + "; authenticated Shodan search enabled")
+    return Check("external-services", "pass", detail,
+                 hint="set a Shodan key (`set-key <key>`) for search/stats "
+                      "beyond the keyless InternetDB host lookup")
+
+
 def _data_dir_check() -> Check:
     from phantom.utils.paths import data_dir
     d = data_dir()
@@ -550,6 +588,7 @@ def run_doctor(net: bool = False) -> DoctorReport:
     fns: List[CheckFn] = [
         _python_check, _core_deps_check, _toolchain_check, _ad_tools_check,
         _data_dir_check, _config_check, _c2_hardening_check, _toolbelt_check,
+        _external_services_check,
         _c2_operator_auth_check, _c2_front_check,
         _c2_backend_check, _c2d_capabilities_check, _secrets_at_rest_check,
         _experience_check, _llm_check, _scopes_check, _data_usage_check,

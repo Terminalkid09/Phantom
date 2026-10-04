@@ -109,6 +109,20 @@ def test_llm_check_off_is_a_pass(monkeypatch):
     assert doctor._llm_check().status == "pass"
 
 
+def test_external_services_check_lists_wired_apis(monkeypatch):
+    monkeypatch.delenv("SHODAN_API_KEY", raising=False)
+    c = doctor._external_services_check()
+    assert c.status == "pass"
+    assert "shodan" in c.detail and "crt.sh" in c.detail
+    assert c.hint  # keyless -> the authenticated-search hint
+
+
+def test_external_services_check_notes_key(monkeypatch):
+    monkeypatch.setenv("SHODAN_API_KEY", "k")
+    c = doctor._external_services_check()
+    assert c.status == "pass" and "authenticated" in c.detail
+
+
 def test_toolbelt_check_flags_unrouted_capability():
     from phantom.automation.brain.toolbelt import Toolbelt
     from phantom.automation.runtime.toolchain import ToolRegistry
