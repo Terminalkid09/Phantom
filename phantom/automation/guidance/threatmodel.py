@@ -42,7 +42,12 @@ class BlueTeamModel:
 
     @classmethod
     def for_profile(cls, profile: str = "enterprise") -> "BlueTeamModel":
-        return cls(profile=profile, layers=_DEFAULT_STACK[profile])
+        # A profile this model does not know (e.g. a reasoning/difficulty
+        # label passed by mistake, or a future profile) must degrade to the
+        # generic enterprise stack, never KeyError mid-run. The model is
+        # advisory: an unknown defender is still a defender.
+        layers = _DEFAULT_STACK.get(profile) or _DEFAULT_STACK["enterprise"]
+        return cls(profile=profile, layers=layers)
 
     def risk(self, category: str, stealth_level: str, opsec_cost: float) -> float:
         if not self.layers:

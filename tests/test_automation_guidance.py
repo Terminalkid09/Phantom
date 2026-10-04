@@ -93,6 +93,15 @@ class TestThreatModel(unittest.TestCase):
         ent = BlueTeamModel.for_profile("enterprise")
         self.assertGreater(len(ent.recommendations()), 3)
 
+    def test_unknown_profile_falls_back_to_enterprise(self):
+        # a reasoning/difficulty label passed by mistake (or a future
+        # profile) must degrade, not KeyError mid-run
+        unknown = BlueTeamModel.for_profile("balanced")
+        ent = BlueTeamModel.for_profile("enterprise")
+        self.assertEqual(unknown.profile, "balanced")
+        self.assertEqual(len(unknown.layers), len(ent.layers))
+        self.assertGreater(unknown.risk("brute", "active", 1.0), 0)
+
 
 class TestStealth(unittest.TestCase):
 
