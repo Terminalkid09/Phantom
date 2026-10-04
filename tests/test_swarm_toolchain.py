@@ -29,29 +29,45 @@ def _ran_capabilities(toolchain):
     from phantom.automation.swarm.worker import run_swarm_task
     board = Board([T])
     task = build_tasks("footprint", [T], budget=3)[0]
-    kinds = []
+    events = []
     run_swarm_task(task, T, board, runner=_runner,
-                   on_event=lambda k, d: kinds.append(k),
+                   on_event=lambda k, d: events.append(
+                       (k, (d or {}).get("capability"))),
                    toolchain=toolchain)
-    return kinds
+    return events
+
+
+def _ran(events):
+    return {cap for kind, cap in events if kind == "run"}
 
 
 class TestInjectedToolchain:
-    def test_empty_toolchain_blocks_planning(self):
+    def test_empty_toolchain_blocks_tool_dependent_moves(self):
         from phantom.automation.runtime.toolchain import ToolRegistry
-        kinds = _ran_capabilities(ToolRegistry(installed=set()))
-        assert "run" not in kinds
+        events = _ran_capabilities(ToolRegistry(installed=set()))
+        ran = _ran(events)
+        # every TOOL-DEPENDENT move is blocked by the missing tool...
+        assert "scan_tcp" not in ran
+        assert "curl_probe" not in ran
+        assert "version_detect" not in ran
+        # ...and each is reported as tool_missing, not silently skipped
+        missing = {cap for kind, cap in events if kind == "tool_missing"}
+        assert {"scan_tcp", "curl_probe", "version_detect"} <= missing
+        # a TOOL-FREE passive engine (external_recon needs no binary) may
+        # still run: with no scanner on the box the passive public-intel
+        # fallback is exactly what keeps the footprint moving.
+        assert ran <= {"external_recon"}
 
     def test_standard_toolchain_plans_a_move(self):
         from phantom.automation.runtime.toolchain import ToolRegistry
-        kinds = _ran_capabilities(
+        events = _ran_capabilities(
             ToolRegistry(installed={"nmap", "curl", "nc"}))
-        assert "run" in kinds
+        assert _ran(events)
 
     def test_default_is_the_offline_planning_set(self):
         # no injection: the documented offline default, not a hidden one
-        kinds = _ran_capabilities(None)
-        assert "run" in kinds
+        events = _ran_capabilities(None)
+        assert _ran(events)
 
 
 class TestOperatorPathsInjectRealDetection:
