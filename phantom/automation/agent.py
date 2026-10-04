@@ -3469,7 +3469,12 @@ class AutonomousAgent:
                     if not all(p(self.wm) for p in step.capability.preconditions):
                         continue  # deferred: needs facts this plan produces
                 except Exception:
-                    pass
+                    # a precondition that RAISES is NOT satisfied: defer, do
+                    # not submit. This mirrors _execute_capability exactly —
+                    # submitting a step whose gate blew up only puts it back
+                    # in the queue to be deferred again, and (worse) reads a
+                    # bug as an open door.
+                    continue
                 orch.submit(step.capability.id, self.target,
                             priority=self._priority(step),
                             slot_values=step.slot_values)
@@ -3508,15 +3513,18 @@ class AutonomousAgent:
                         and not getattr(self, "_fuzzed", False):
                     self._fuzzed = True
                     self._run_web_fuzz()
-            except Exception:
-                pass
+            except Exception as exc:
+                # the pass is non-blocking by design, but SILENTLY eating the
+                # failure hides a broken fuzz engine behind a plain "no
+                # findings": surface it as a degradation instead.
+                self._degrade("web_fuzz", exc)
             # ONE-SHOT origin discovery once an edge is known (or the gate
             # fired): public data only, bounded, and it unlocks the whole
             # footprint stage against the machine behind the CDN.
             try:
                 self._maybe_origin_discovery()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._degrade("origin_discovery", exc)
             if checkpoint_path:
                 try:
                     self.save_state(checkpoint_path)

@@ -214,6 +214,24 @@ class TestAutonomousAgent(unittest.TestCase):
         self.assertIn("opsec_spent", result)
         self.assertNotIn("opsec_budget_left", result)
 
+    def test_broken_fuzz_is_reported_not_swallowed(self):
+        # a non-blocking one-shot pass (the web fuzz) must not vanish into a
+        # bare `except: pass`: a broken engine has to surface as a degradation
+        # event, otherwise "no findings" reads the same as "engine died".
+        agent = self._agent()
+        agent.wm.add_finding("web_header", "http://10.0.0.5/",
+                             {"server": "nginx"}, confidence=0.9,
+                             source="sim")
+
+        def _boom():
+            raise RuntimeError("fuzz broke")
+
+        agent._run_web_fuzz = _boom
+        agent.run(goal="footprint", max_iterations=1)
+        degraded = [d for k, d in self.events if k == "degraded"]
+        self.assertTrue(any(d.get("layer") == "web_fuzz" for d in degraded),
+                        self.events)
+
     def test_failed_move_recovered_on_stall(self):
         # the agent no longer gives up on the first dead-end: bounded stall
         # recovery re-arms a failed move and keeps pushing toward the beacon
