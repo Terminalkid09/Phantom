@@ -49,8 +49,13 @@ _FACT_SOURCES = {
     "web_app": ["http_probe"],
     "smb_share": ["smb_enum"],
     "redis": ["redis_info"],
+    # creds sources, quiet-first. `brute_ssh` is deliberately LAST: it is
+    # forceful/aggressive, so `_stealth_ok`/the R2 veto drop it outside an
+    # explicit --aggressive run — but on a host whose ONLY access surface is
+    # ssh (no web, no breach material) it is the one move that can still
+    # produce creds, so it must be plannable at all rather than absent.
     "creds": ["web_creds", "ssh_login", "breach_check", "harvest_campaign",
-              "cred_spray", "loot_triage"],
+              "cred_spray", "loot_triage", "brute_ssh"],
     "identity": ["osint_identity", "persona_create", "deep_recon"],
     # I2 identity-field primitives: passive composition/verification before
     # the breach lookup, and the breach correlation for a confirmed address.
