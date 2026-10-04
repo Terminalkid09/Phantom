@@ -358,24 +358,26 @@ def _ready_now(step, wm: WorldModel) -> bool:
         return False
 
 
-_WEB_PORTS = {80, 443, 8080, 8081, 8443, 8000, 8888, 3000, 5000, 9090}
-
-
 def _web_triggers(wm: WorldModel) -> List[Tuple[str, str]]:
-    """Services that make `_has_web_service()` return True — including the
-    ones that are NOT web (an `ssl/ldap` 636 is read as `ssl`)."""
+    """Services that actually make `_has_web_service()` fire, evaluated with
+    the REAL gate so the reading can never drift from kit.py.
+
+    Each finding is probed on its own: an `ssl/ldap` 636 is not web, an
+    `ssl/http` on any port is, and `ssl` alone is web only on a web port."""
+    from phantom.automation.guidance.kit import _has_web_service
+    gate = _has_web_service()
     out = []
     for f in wm.find("service"):
         v = f.value if isinstance(f.value, dict) else {}
-        svc = str(v.get("service", "")).lower()
+        probe = WorldModel(target=str(wm.target), target_type="ip")
+        probe.add_finding("service", f.key, v, confidence=0.9, source="sim")
         try:
-            port = int(v.get("port", 0))
-        except (TypeError, ValueError):
-            port = 0
-        if (svc in ("http", "https", "ssl", "http-alt", "www")
-                or svc.startswith("http") or "web" in svc
-                or port in _WEB_PORTS):
-            out.append((str(v.get("port", "?")), svc))
+            is_web = gate(probe)
+        except Exception:
+            is_web = False
+        if is_web:
+            out.append((str(v.get("port", "?")),
+                        str(v.get("service", "")).lower()))
     return out
 
 
