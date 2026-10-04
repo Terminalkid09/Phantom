@@ -124,6 +124,12 @@ jobs:
       - name: C2, auth, state-store and UX tests
         run: |
           python -m pytest tests/test_c2*.py tests/test_beacon_auth*.py tests/test_state_store.py tests/test_manual_ux.py tests/test_manual_core.py -v --timeout=60
+      - name: End-to-end C2 <-> beacon protocol smoke
+        # starts the REAL listener and drives check-in -> task -> replay ->
+        # result over HTTP with the real HMAC auth and envelope crypto. This
+        # is the interface a compiled beacon speaks to — the break nothing
+        # else on this runner sees.
+        run: python scripts/e2e_c2_beacon_smoke.py
 
   beacon-syntax:
     runs-on: ${{ matrix.os }}
