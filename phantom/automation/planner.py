@@ -221,6 +221,26 @@ class Planner:
         # facts that will be produced by a capability already in the plan
         # (so a precondition depending on them doesn't re-enter the frontier)
         _produced: set = set()
+        # backward dependency edges, populated as steps are added:
+        #   needs[fact] = the unmet precondition facts its producer requires
+        # Used to refuse a source that would close a cycle (sourcing `creds`
+        # via a move that itself needs `beacon`, when the beacon is what the
+        # creds are for). Without this the planner accepted a mutually
+        # dependent pair as a "complete", never-executable plan.
+        needs: dict = {}
+
+        def _would_cycle(cap: Capability) -> bool:
+            for pre in cap.preconditions:
+                try:
+                    if pre(wm):
+                        continue
+                except Exception:
+                    continue
+                for pf in self._precondition_facts(pre, wm):
+                    if pf == fact or self._fact_needs(pf, needs, fact):
+                        return True
+            return False
+
         # transparency ledger: every capability considered for a fact but
         # NOT chosen, with the concrete reason the operator can read
         rejected: List[RejectedPath] = []
@@ -234,7 +254,7 @@ class Planner:
                 continue
             cap = self._pick_source(fact, used, dead, wm, preference,
                                     _tried=_source_attempts.get(fact, set()),
-                                    rejected=rejected)
+                                    rejected=rejected, cycle=_would_cycle)
             if cap is None:
                 # no source for this fact: try backtracking to the parent
                 # (e.g. creds unsourceable -> retry beacon with next source)
@@ -275,6 +295,8 @@ class Planner:
             for pre in cap.preconditions:
                 facts = self._precondition_facts(pre, wm)
                 for pf in facts:
+                    if not _fact_satisfied(wm, pf):
+                        needs.setdefault(fact, set()).add(pf)
                     if non_contact and pf in CONTACT_FACTS:
                         # non-contact goal: a channel-opening fact is not a
                         # valid sub-goal here (an existing lure is already
@@ -294,11 +316,28 @@ class Planner:
                     blocked_reason="" if complete else "no affordable path to goal",
                     exploit_hint=exploit_hint, rejected=rejected)
 
+    @staticmethod
+    def _fact_needs(start: str, needs: dict, target: str) -> bool:
+        """True when `start` transitively requires `target` in the backward
+        dependency graph being built for this plan (cycle detection)."""
+        seen: set = set()
+        stack = [start]
+        while stack:
+            f = stack.pop()
+            if f == target:
+                return True
+            if f in seen:
+                continue
+            seen.add(f)
+            stack.extend(needs.get(f, ()))
+        return False
+
     def _pick_source(self, fact: str, used: set, dead: frozenset = frozenset(),
                      wm: Optional["WorldModel"] = None,
                      preference: Optional[List[str]] = None,
                      _tried: Optional[set] = None,
-                     rejected: Optional[List[RejectedPath]] = None
+                     rejected: Optional[List[RejectedPath]] = None,
+                     cycle=None
                      ) -> Optional[Capability]:
         order = _FACT_SOURCES.get(fact, [])
         if self.tailoring is not None:
@@ -338,6 +377,17 @@ class Planner:
                         fact=fact, capability=cap_id,
                         reason="preconditions unplannable for this target type "
                                "(gate can never become true here)",
+                        priority_hint="alternative"))
+                continue
+            if cycle is not None and cycle(cap):
+                # mutually dependent source: this move needs something whose
+                # producer (already in the plan) needs THIS fact — a cycle
+                # that would read as complete but can never execute
+                if rejected is not None:
+                    rejected.append(RejectedPath(
+                        fact=fact, capability=cap_id,
+                        reason="would close a dependency cycle with a move "
+                               "already in the plan",
                         priority_hint="alternative"))
                 continue
             candidates.append(cap)
@@ -445,6 +495,28 @@ class Planner:
         return novel
 
     @staticmethod
+    def _service_requirement(pre) -> str:
+        """The specific service a precondition gates on (e.g. 'ssh'), or ''.
+
+        Set by ``kit._has_service_kind`` as ``_phantom_requires_service``.
+        """
+        return str(getattr(pre, "_phantom_requires_service", "") or "").lower()
+
+    @staticmethod
+    def _target_services(wm: "WorldModel") -> set:
+        """The service labels the scan has actually observed on the target."""
+        out: set = set()
+        try:
+            for f in wm.find("service"):
+                v = f.value if isinstance(f.value, dict) else {}
+                svc = str(v.get("service", "")).lower()
+                if svc:
+                    out.add(svc)
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
     def _precondition_viable(cap: Capability, wm: "WorldModel") -> bool:
         """True when no precondition is provably unplannable.
 
@@ -461,6 +533,16 @@ class Planner:
                 continue
             if not Planner._precondition_facts(pre):
                 return False
+            # service-SPECIFIC gate (ssh_banner / ssh_login / brute_ssh):
+            # once the scan has produced service facts and the required
+            # service is not among them, no plan can conjure it. When no
+            # service is known yet the gate stays plannable (a scan may
+            # still reveal it), so the initial footprint is unaffected.
+            req = Planner._service_requirement(pre)
+            if req:
+                known = Planner._target_services(wm)
+                if known and req not in known:
+                    return False
         return True
 
     def _stealth_ok(self, cap: Capability) -> bool:

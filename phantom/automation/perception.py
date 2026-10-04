@@ -24,8 +24,13 @@ def _p(**kw) -> Dict[str, Any]:
 # nmap
 # ---------------------------------------------------------------------------
 
+# nmap labels a TLS-wrapped service with the WRAPPED protocol after a
+# slash (`ssl/http` on 443, `ssl/ldap` on 636, `ssl/smtp` on 465). Keep the
+# full token: truncating it to `ssl` erases the distinction between an
+# HTTPS server and an LDAPS/IMAPS/SMTPS service, which made the web gates
+# (`web_creds`/`web_rce`) fire against a non-web surface.
 _NMAP_PORT_RE = re.compile(
-    r"(\d+)/(tcp|udp)[ \t]+open[ \t]+([\w\-\.]+)(?:[ \t]+([^\n]*))?"
+    r"(\d+)/(tcp|udp)[ \t]+open[ \t]+([\w\-\./]+)(?:[ \t]+([^\n]*))?"
 )
 # nc -zv floor sweep: "Connection to 10.0.0.9 22 port [tcp/ssh] succeeded!"
 # (BSD netcat) or "connect to 10.0.0.9 22 port 22 tcp: Connection refused"-style
