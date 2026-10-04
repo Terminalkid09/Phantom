@@ -1,17 +1,55 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useStore } from '@/store'
-import { useApi } from '@/hooks/useApi'
+import { useApi, useApiError } from '@/hooks/useApi'
 import {
   Settings, Cpu, Server, Shield, Key, Eye, EyeOff,
-  RotateCw, CheckCircle2, AlertTriangle, Film
+  RotateCw, CheckCircle2, AlertTriangle, Film, Globe
 } from 'lucide-react'
+
+interface KeyInfo {
+  label: string
+  hint: string
+  env: string
+  configured: boolean
+  source: string
+  masked: string
+}
 
 export default function SettingsPanel() {
   const { settings, setSettings, listener } = useStore()
   const { api, pollC2 } = useApi()
+  const apiError = useApiError()
   const [apiToken, setApiToken] = useState('')
   const [showToken, setShowToken] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [apiKeys, setApiKeys] = useState<Record<string, KeyInfo>>({})
+  const [keyDrafts, setKeyDrafts] = useState<Record<string, string>>({})
+  const [keySaved, setKeySaved] = useState('')
+
+  const loadKeys = async () => {
+    const res = await api('GET', '/api/config/keys')
+    if (res.status === 200 && res.data) {
+      const d = res.data as { keys: Record<string, KeyInfo> }
+      setApiKeys(d.keys || {})
+    }
+  }
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { loadKeys() }, [])
+
+  const saveKey = async (name: string) => {
+    const value = keyDrafts[name] ?? ''
+    const res = await api('POST', '/api/config/keys', { name, value })
+    if (res.status === 200 && res.data) {
+      const d = res.data as { keys: Record<string, KeyInfo> }
+      setApiKeys(d.keys || {})
+      setKeyDrafts((s) => ({ ...s, [name]: '' }))
+      setKeySaved(name)
+      setTimeout(() => setKeySaved(''), 2500)
+    } else {
+      apiError(res, `Save ${name} key`)
+    }
+  }
 
   const handleRotateApiToken = async () => {
     const res = await api('POST', '/api/c2/config/rotate-api-token')
@@ -197,6 +235,73 @@ export default function SettingsPanel() {
                 {listener.certs_present ? '✓ Present' : '⚠ Missing'}
               </span>
             </div>
+          </div>
+        </div>
+
+        {/* External services (API keys) */}
+        <div className="bg-surface-card border border-surface-border rounded-lg p-3 col-span-2">
+          <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-1 flex items-center gap-1.5">
+            <Globe size={13} /> External services
+          </h2>
+          <p className="text-[10px] text-text-dim mb-3">
+            API keys are stored in data/config.json — no .env editing needed.
+            A legacy PHANTOM_* environment variable, when set, still overrides
+            the value here.
+          </p>
+          <div className="space-y-3">
+            {Object.entries(apiKeys).map(([name, info]) => (
+              <div key={name} className="border-t border-surface-border pt-3 first:border-t-0 first:pt-0">
+                <div className="flex items-center justify-between mb-1">
+                  <div>
+                    <p className="text-xs font-medium text-text-primary flex items-center gap-1.5">
+                      {info.label}
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded ${
+                        info.configured
+                          ? 'bg-phantom-green/20 text-phantom-green'
+                          : 'bg-surface-border text-text-dim'
+                      }`}>
+                        {info.configured
+                          ? (info.source === 'env' ? 'set · env' : 'set')
+                          : 'not set'}
+                      </span>
+                    </p>
+                    <p className="text-[10px] text-text-dim mt-0.5">{info.hint}</p>
+                  </div>
+                  {info.configured && info.masked && (
+                    <span className="text-[10px] font-mono text-text-dim">{info.masked}</span>
+                  )}
+                </div>
+                <div className="flex gap-2 mt-1.5">
+                  <input
+                    type="password"
+                    value={keyDrafts[name] ?? ''}
+                    onChange={(e) => setKeyDrafts((s) => ({ ...s, [name]: e.target.value }))}
+                    placeholder={info.env}
+                    className="flex-1 bg-surface border border-surface-border rounded px-2.5 py-1.5
+                      text-xs font-mono text-text-primary placeholder-text-dim
+                      focus:outline-none focus:border-phantom-cyan"
+                  />
+                  <button
+                    onClick={() => saveKey(name)}
+                    className="px-3 py-1.5 rounded text-xs font-medium
+                      bg-phantom-green/20 text-phantom-green hover:bg-phantom-green/30
+                      transition-colors"
+                  >
+                    Save
+                  </button>
+                </div>
+                {keySaved === name && (
+                  <div className="flex items-center gap-1 text-phantom-green text-[10px] mt-1">
+                    <CheckCircle2 size={11} /> Saved
+                  </div>
+                )}
+              </div>
+            ))}
+            {Object.keys(apiKeys).length === 0 && (
+              <p className="text-[10px] text-text-dim">
+                No key registry available (backend offline or older build).
+              </p>
+            )}
           </div>
         </div>
 
