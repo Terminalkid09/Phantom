@@ -7,6 +7,7 @@ entity an operator may be handed:
 
     * a bare device IP (SMB / RDP / DB only, no web)
     * a normal server IP (ssh + web + db)
+    * a full URL (https://host:port/path)
     * a domain
     * a social username
     * an email address
@@ -343,6 +344,32 @@ def build_scenarios() -> List[Scenario]:
                          "445/tcp open  microsoft-ds\n"
                          "636/tcp open  ssl/ldap"),
         ),
+    ))
+
+    # 9 ── full URL target: the operator hands over a link, not a host ---- #
+    # The scope gate authorizes a URL through its HOST, and every adapter
+    # must normalize the URL back to a bare host before tooling. This
+    # scenario pins that: a URL target gets the same footprint, the same
+    # web gate and the same creds path as the bare-IP form of the same box.
+    S.append(Scenario(
+        key="url_target",
+        title="URL target (https://10.13.37.9:8443/app)",
+        target="https://10.13.37.9:8443/app",
+        target_type="url",
+        goal="complete_kill_chain",
+        seeds=[
+            {"cap": "scan_tcp"},
+            {"cap": "version_detect"},
+            {"cap": "http_probe",
+             "slots": {"url": "https://10.13.37.9:8443/app"},
+             "output": FRTX_HEADERS},
+        ],
+        runner=make_runner(
+            version_banner=("8443/tcp open  ssl/http FRTX-Admin 2.1"),
+            port_banner=("8443/tcp open  ssl/https"),
+            web_headers=FRTX_HEADERS,
+        ),
+        notes="A URL target must normalize to its host and still fire the web gate.",
     ))
     return S
 
