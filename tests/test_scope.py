@@ -1,6 +1,6 @@
 import pytest
 
-from phantom.core.scope import is_in_scope
+from phantom.core.scope import is_in_scope, scope_reason, scope_status
 
 
 class TestScope:
@@ -26,3 +26,29 @@ class TestScope:
         """Invalid scope entries should not crash and should be ignored."""
         assert is_in_scope("10.0.0.5", ["not-a-cidr", "10.0.0.0/24"]) is True
         assert is_in_scope("10.0.1.5", ["not-a-cidr"]) is False
+
+    def test_url_authorized_through_its_host(self):
+        """A URL is authorized by its HOST, not by the raw URL string.
+
+        Without this, an in-scope URL never matched a host/CIDR entry and
+        failed closed, so auto-mode dropped the very target the operator
+        handed in."""
+        assert is_in_scope("https://10.0.0.5/app", ["10.0.0.0/24"]) is True
+        assert is_in_scope("http://10.0.0.5:8080/x?y=1",
+                           ["10.0.0.0/24"]) is True
+
+    def test_url_out_of_scope_is_refused(self):
+        assert is_in_scope("https://10.0.1.5/app", ["10.0.0.0/24"]) is False
+
+    def test_url_with_declared_hostname(self):
+        assert is_in_scope("https://corp.example.com/login",
+                           ["corp.example.com"]) is True
+        assert scope_status("https://corp.example.com/login",
+                            ["corp.example.com"]) == "ok"
+        assert scope_reason("https://corp.example.com/login",
+                            ["corp.example.com"]) is None
+
+    def test_out_of_scope_url_reason_names_the_host(self):
+        reason = scope_reason("https://10.0.1.5/app", ["10.0.0.0/24"])
+        assert reason and "10.0.1.5" in reason
+        assert "10.0.1.5/" not in reason  # the host, not the URL
