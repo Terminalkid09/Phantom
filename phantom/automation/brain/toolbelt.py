@@ -139,6 +139,52 @@ _TOOL_CATALOG: Dict[str, List[ToolOption]] = {
 _PROFILE_SENSITIVE = {"scan_tcp"}
 
 
+_ALL_STYLES = ("default", "stealth", "speed", "aggressive")
+
+
+def _extra_catalog() -> Dict[str, List["ToolOption"]]:
+    """Operator-declared tool options loaded from ``toolbelt.extra``.
+
+    The built-in ``_TOOL_CATALOG`` is a fixed, curated set. This lets an
+    operator register a tool Phantom has never shipped (a faster scanner, a
+    house-standard brute-forcer) purely through config, so the choice is not
+    frozen to the tools the code hard-codes. Malformed entries are dropped
+    silently — a bad config must never break the planner loop.
+    """
+    try:
+        from phantom.utils import config as cfg
+        raw = cfg.get("toolbelt.extra", {}, env=None)
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, List[ToolOption]] = {}
+    for cap, opts in raw.items():
+        if not isinstance(opts, list):
+            continue
+        parsed: List[ToolOption] = []
+        for o in opts:
+            if not isinstance(o, dict):
+                continue
+            name = str(o.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                rank = int(o.get("rank", 50))
+            except (TypeError, ValueError):
+                rank = 50
+            styles = tuple(str(s) for s in (o.get("styles") or _ALL_STYLES))
+            req = tuple(str(s).lower()
+                        for s in (o.get("requires_service") or []))
+            parsed.append(ToolOption(
+                name, rank=rank, styles=styles,
+                note=str(o.get("note") or "operator-declared"),
+                requires_service=req))
+        if parsed:
+            out[str(cap)] = parsed
+    return out
+
+
 class Toolbelt:
     """Picks the best available tool per capability on THIS operator box."""
 
@@ -214,14 +260,26 @@ class Toolbelt:
         """Every catalogued capability with its current selection —
         rendered by `setup status` / the Electron tool panel."""
         out: Dict[str, ToolChoice] = {}
-        for cap in _TOOL_CATALOG:
+        for cap in self._catalog():
             out[cap] = self.pick(cap)
         return out
+
+    def _catalog(self) -> Dict[str, List[ToolOption]]:
+        """Built-in options merged with operator-declared ones.
+
+        Extra options are concatenated (not overriding): the rank decides
+        the winner, so an operator can rank a preferred tool ahead of the
+        built-in default without removing the default as a fallback."""
+        merged: Dict[str, List[ToolOption]] = {
+            cap: list(opts) for cap, opts in _TOOL_CATALOG.items()}
+        for cap, opts in _extra_catalog().items():
+            merged[cap] = merged.get(cap, []) + opts
+        return merged
 
     # ── resolution ─────────────────────────────────────────────────────
     def _resolve(self, capability: str, style: str,
                  target: Optional[TargetSurface] = None) -> ToolChoice:
-        options = _TOOL_CATALOG.get(capability, [])
+        options = self._catalog().get(capability, [])
         if not options:
             return ToolChoice(capability, None, reason="no tool options registered")
         pool = [o for o in options if style in o.styles or "default" in o.styles]
