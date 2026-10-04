@@ -111,16 +111,26 @@ def test_llm_check_off_is_a_pass(monkeypatch):
 
 def test_external_services_check_lists_wired_apis(monkeypatch):
     monkeypatch.delenv("SHODAN_API_KEY", raising=False)
+    monkeypatch.delenv("PHANTOM_SHODAN_KEY", raising=False)
+    # deterministic: no credentials configured, whatever the local config file
+    from phantom.utils import api_keys
+    monkeypatch.setattr(api_keys, "status", lambda: {
+        name: {"label": name, "hint": "", "env": "",
+               "configured": False, "source": "none", "masked": ""}
+        for name in api_keys.names()})
     c = doctor._external_services_check()
     assert c.status == "pass"
     assert "shodan" in c.detail and "crt.sh" in c.detail
-    assert c.hint  # keyless -> the authenticated-search hint
+    assert c.hint  # keyless -> the key-registration hint
 
 
 def test_external_services_check_notes_key(monkeypatch):
+    # legacy SHODAN_API_KEY is still honoured, and the check now reports the
+    # key plane by name instead of a single "authenticated" flag
     monkeypatch.setenv("SHODAN_API_KEY", "k")
     c = doctor._external_services_check()
-    assert c.status == "pass" and "authenticated" in c.detail
+    assert c.status == "pass" and "credentials set" in c.detail
+    assert "shodan" in c.detail
 
 
 def test_toolbelt_check_flags_unrouted_capability():
