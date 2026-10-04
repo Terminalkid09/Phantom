@@ -121,7 +121,7 @@ def _cache_key(software: str, version: str) -> str:
 def _wait_nvd_rate_limit() -> None:
     """Enforce NVD public rate: 1 request per 6s without API key."""
     global _last_nvd_request
-    if os.getenv("NVD_API_KEY"):
+    if _nvd_api_key():
         return
     with _nvd_lock:
         elapsed = time.time() - _last_nvd_request
@@ -130,10 +130,22 @@ def _wait_nvd_rate_limit() -> None:
         _last_nvd_request = time.time()
 
 
+def _nvd_api_key() -> str:
+    """NVD key from the legacy env var first, then the config plane."""
+    env = os.getenv("NVD_API_KEY", "").strip()
+    if env:
+        return env
+    try:
+        from phantom.utils import api_keys
+        return api_keys.get("nvd")
+    except Exception:
+        return ""
+
+
 def _nvd_request(params: dict) -> requests.Response:
     _wait_nvd_rate_limit()
     headers = {}
-    api_key = os.getenv("NVD_API_KEY", "").strip()
+    api_key = _nvd_api_key()
     if api_key:
         headers["apiKey"] = api_key
 
@@ -223,7 +235,16 @@ def crtsh_lookup(domain: str) -> List[str]:
 
 
 def shodan_lookup(ip: str, api_key: str = "") -> Dict[str, Any]:
-    """Get host info from Shodan's free InternetDB."""
+    """Get host info from Shodan's free InternetDB (or the full API when a
+    key is available). The key falls back to the config plane, so a key set
+    via `config keys` / the Electron panel is honoured without passing it
+    at every call site."""
+    if not api_key:
+        try:
+            from phantom.utils import api_keys
+            api_key = api_keys.get("shodan")
+        except Exception:
+            api_key = ""
     try:
         if api_key:
             url = f"https://api.shodan.io/shodan/host/{ip}?key={api_key}"
@@ -263,8 +284,16 @@ def github_poc_lookup(cve_id: str) -> bool:
 
     url = "https://api.github.com/search/repositories"
     params = {"q": f"{cve_id} in:name,description,readme", "per_page": 1}
+    headers = {}
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        from phantom.utils import api_keys
+        token = api_keys.get("github")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    except Exception:
+        pass
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
         if resp.status_code == 403:
             _github_rate_limited_until = time.time() + 3600
             console.print("[yellow][!] GitHub API rate limited — skipping PoC checks for 1h.[/]")

@@ -230,7 +230,15 @@ class OsintModule(BaseModule):
         """shodan <query> - Execute a Shodan search (Key required in session config)."""
         api_key = session.results.get("config", {}).get("shodan_key", "")
         if not api_key:
-            notifier.warn("Shodan API key not found. Run 'set-key <key>' or use free InternetDB lookups.")
+            try:
+                from phantom.utils import api_keys
+                api_key = api_keys.get("shodan")
+            except Exception:
+                api_key = ""
+        if not api_key:
+            notifier.warn("Shodan API key not found. Run 'set-key <key>, "
+                          "'config keys set shodan <key>' or use free "
+                          "InternetDB lookups.")
             return
 
         def _call():
@@ -247,11 +255,18 @@ class OsintModule(BaseModule):
             notifier.error(f"Shodan error: {e}")
 
     def do_set_key(self, key):
-        """set-key <key> - Save Shodan API key for the session."""
+        """set-key <key> - Save Shodan API key (session AND config plane,
+        so it survives a restart without editing .env)."""
+        key = key.strip()
         config = session.results.get("config", {})
-        config["shodan_key"] = key.strip()
+        config["shodan_key"] = key
         session.add_result("config", config)
-        notifier.success("Shodan key saved.")
+        try:
+            from phantom.utils import api_keys
+            api_keys.set("shodan", key)
+        except Exception:
+            pass
+        notifier.success("Shodan key saved (session + data/config.json).")
 
     def _display_shodan_results(self, data):
         table = Table(title="Shodan Insights")
