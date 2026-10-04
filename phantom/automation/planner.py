@@ -30,7 +30,13 @@ from phantom.automation.goals import (  # noqa: E402,F401
 
 # Fact kind -> capabilities that can produce it (reverse index, category priority)
 _FACT_SOURCES = {
-    "service": ["scan_tcp", "version_detect", "curl_probe"],
+    # `external_recon` is LAST on purpose: it is a passive public-data view
+    # (Shodan/crt.sh) that only runs when a real scan is unavailable or has
+    # already failed, so it never displaces a working scanner — but it keeps
+    # the chain moving on a box with no tooling, and on a stealth profile.
+    "service": ["scan_tcp", "version_detect", "curl_probe", "external_recon"],
+    # passive subdomain discovery (crt.sh): additive, feeds origin discovery
+    "hostname": ["external_recon"],
     "fingerprint": ["fingerprint_services"],
     "exploit_plan": ["service_exploit"],
     "hunt_anomaly": ["hunt_web"],

@@ -12,6 +12,9 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from phantom.automation.belief import WorldModel, Finding
+from phantom.automation.external_intel import (
+    external_intel_engine, external_intel_interp,
+)
 from phantom.automation.guidance.commands import Capability, InputSlot
 from phantom.automation.perception import (
     parse_nmap_ports,
@@ -3321,6 +3324,13 @@ def _origin_adapter(wm, slots):
     return "edge://origin-discovery (in-process)"
 
 
+def _external_intel_adapter(wm, slots):
+    """Marker stub: external intel executes in-process (Shodan/crt.sh/BGP
+    HTTP lookups) and sends NO packet at the target. The adapter exists
+    only to keep the 'adapter is the command source' invariant."""
+    return "ext://external-recon (in-process)"
+
+
 def _idor_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
     """Parse IDOR: markers into idor findings (authorization flaws)."""
     from phantom.automation.belief import Finding
@@ -3542,6 +3552,23 @@ CAPABILITIES = [
         opsec_cost=0.2, detection_risk=0.05, stealth_level="passive",
         timeout=120, preconditions=[_has_network_host()],
         banner="origin discovery", tools=[]),
+
+    # Passive external intel: the wider internet's view of the target
+    # (Shodan InternetDB/keyed, crt.sh CT logs, BGP). It sends NOTHING at
+    # the target, so it is usable on every goal and profile — including a
+    # stealth run that will not tolerate a loud scan. It is the LAST source
+    # for `service` (a real scan wins when a scanner is installed and works)
+    # and the only source for `hostname`, which feeds origin discovery.
+    _mk("external_recon", "recon",
+        "Passive external intel: Shodan host view (open ports + hostnames) "
+        "for an IP, crt.sh CT-log subdomains for a domain, BGP netblock. "
+        "Sends no packet at the target — public data only.",
+        [], ["service", "hostname"], _external_intel_adapter,
+        external_intel_interp,
+        exec_class="in_process_engine", engine=external_intel_engine,
+        opsec_cost=0.1, detection_risk=0.0, stealth_level="passive",
+        timeout=45, preconditions=[_has_network_host()],
+        banner="external intel", tools=[]),
 
     _mk("version_detect", "recon", "Service version fingerprinting",
         [_mk_slot("port", "port", False, "target port")],
