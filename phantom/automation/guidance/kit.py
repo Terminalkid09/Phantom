@@ -33,13 +33,20 @@ def _has_service(kind_service: str, port: str):
 def _has_service_kind(kind_service: str, service_name: str):
     """True when a service finding exists for ``service_name`` on ANY port
     (SSH on 22, 2222, 22222 ...). Port-exact preconditions silently skip
-    non-standard management ports that labs and hardened hosts hide behind."""
+    non-standard management ports that labs and hardened hosts hide behind.
+
+    The closure carries ``_phantom_requires_service`` so the planner can tell
+    a service-SPECIFIC gate ("this needs an SSH service") from a generic
+    ``service`` fact: a scan can reveal an unknown service, but once the
+    target's services are known and none is the required one, the move is a
+    deterministic dead end rather than an optimistic step."""
     def _requires_service(wm: WorldModel) -> bool:
         for finding in wm.find(kind_service):
             value = finding.value if isinstance(finding.value, dict) else {}
             if str(value.get("service", "")).lower() == service_name:
                 return True
         return False
+    _requires_service._phantom_requires_service = service_name
     return _requires_service
 
 
@@ -47,8 +54,15 @@ _WEB_PORTS = {80, 443, 8080, 8081, 8443, 8000, 8888, 3000, 5000, 9090}
 
 
 def _has_web_service():
-    """True when the scan found a web-capable service: an http/ssl service
-    label on ANY port, or a service on a well-known web port."""
+    """True when the scan found a web-capable service: an http/https label
+    (bare or as the wrapped protocol of a TLS token, ``ssl/http``) on ANY
+    port, any ``http*``/``web`` label, or a service on a well-known web port.
+
+    A bare ``ssl`` label is deliberately NOT web: nmap prints ``ssl/<proto>``
+    for every TLS-wrapped service (``ssl/ldap`` on 636, ``ssl/smtp`` on 465,
+    ``ssl/imap`` on 993). Accepting ``ssl`` alone marked ``web_creds`` /
+    ``web_rce`` as READY on a bare directory server, so the planner spent the
+    credential path on a surface that carries no web app at all."""
     def _requires_web(wm: WorldModel) -> bool:
         for finding in wm.find("service"):
             value = finding.value if isinstance(finding.value, dict) else {}
@@ -57,9 +71,12 @@ def _has_web_service():
                 port = int(value.get("port", 0))
             except (TypeError, ValueError):
                 port = 0
-            if service in ("http", "https", "ssl", "http-alt", "www"):
+            # composite TLS token: the WRAPPED protocol decides, not the
+            # `ssl` wrapper
+            proto = service.rsplit("/", 1)[-1] if "/" in service else service
+            if proto in ("http", "https", "http-alt", "www"):
                 return True
-            if service.startswith("http") or "web" in service:
+            if proto.startswith("http") or "web" in proto:
                 return True
             if port in _WEB_PORTS:
                 return True
