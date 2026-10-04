@@ -130,9 +130,14 @@ class ToolRegistry:
     """Detects which offensive tools are installed on the operator box."""
 
     def __init__(self, installed: Optional[Set[str]] = None,
-                 detect: Optional[Callable[[str], bool]] = None) -> None:
+                 detect: Optional[Callable[[str], bool]] = None,
+                 wsl: bool = True) -> None:
         self._installed = installed          # injected in tests
         self._detect = detect or (lambda name: shutil.which(name) is not None)
+        # WSL fallback resolution costs a subprocess probe per unique tool
+        # (seconds each). A caller that must stay fast — the doctor's bulk
+        # toolbelt scan — can opt out and report NATIVE availability only.
+        self._wsl = wsl
         self._cache: Dict[str, bool] = {}
 
     def has(self, name: str) -> bool:
@@ -147,7 +152,7 @@ class ToolRegistry:
                     # alias-aware: impacket-<name> satisfies the .py names
                     found = any(cand != name and self._detect(cand)
                                 for cand in tool_candidates(name))
-                if not found and _wsl_which(name):
+                if not found and self._wsl and _wsl_which(name):
                     # Windows-native miss -> the tool exists in a WSL distro
                     # (Kali toolbox): usable via the `wsl -d <distro>` wrapper.
                     found = True
