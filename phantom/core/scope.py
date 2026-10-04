@@ -21,6 +21,7 @@ import socket
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 # How long an approved resolution is trusted. Long enough to cover one
 # operation's check-then-use window, short enough that a rotated CDN does not
@@ -30,6 +31,25 @@ _RESOLUTION_TTL_SECONDS = 300
 _LOCK = threading.Lock()
 # target(lower) -> (expires_at_monotonic, tuple(addresses))
 _FROZEN: Dict[str, Tuple[float, Tuple[str, ...]]] = {}
+
+
+def _scope_host(target: str) -> str:
+    """The entity a scope decision applies to: for a URL, its HOST.
+
+    Authorization is about the host, not the path: ``https://corp.example.com/
+    app`` is authorized exactly when ``corp.example.com`` is. Without this a
+    URL target never matched a hostname/CIDR entry, so it failed closed and
+    auto-mode silently dropped it — the operator handed in a URL and the run
+    refused it as "does not resolve".
+    """
+    if "://" in target:
+        try:
+            host = urlsplit(target).hostname
+            if host:
+                return host
+        except ValueError:
+            pass
+    return target
 
 
 def resolve_addresses(target: str) -> List[str]:
@@ -138,6 +158,9 @@ def is_in_scope(target: str, scope_list: List[str]) -> bool:
         # (the API gate refuses targeted commands; the CLI warns loudly)
         return True
 
+    # a URL is authorized through its host (see _scope_host)
+    target = _scope_host(target)
+
     try:
         ip_obj = ipaddress.ip_address(target)
     except ValueError:
@@ -201,6 +224,9 @@ def scope_reason(target: str, scope_list: List[str]) -> Optional[str]:
     """
     if not scope_list or is_in_scope(target, scope_list):
         return None
+    # normalize the same way the decision did, so the messages and the
+    # resolution below describe the host the gate actually judged
+    target = _scope_host(target)
     try:
         ipaddress.ip_address(target)
         return f"{target} is not in the engagement scope"
