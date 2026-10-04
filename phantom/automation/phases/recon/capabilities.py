@@ -15,6 +15,8 @@ RECON_CAPABILITY_IDS = (
     # the EDGE gate's own move: must come before any packet-level recon,
     # because scanning a CDN hits the provider instead of the target
     "origin_discovery",
+    # passive public-data recon (Shodan/crt.sh/BGP): no packet at the target
+    "external_recon",
     "scan_tcp",
     "version_detect",
     "curl_probe",
