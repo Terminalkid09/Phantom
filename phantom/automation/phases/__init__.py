@@ -51,6 +51,7 @@ _CAPABILITY_PHASE: Dict[str, str] = {
     "mobile_mdm_fingerprint": "recon",
     # osint
     "osint_identity": "osint",
+    "phone_osint": "osint",
     "breach_check": "osint",
     # I2 identity-field primitives
     "email_candidates": "osint",

@@ -11,6 +11,8 @@ from typing import List
 
 OSINT_CAPABILITY_IDS = (
     "osint_identity",
+    # passive phone metadata (offline): phone + geolocation facts
+    "phone_osint",
     "breach_check",
     "deep_recon",
     # identity-field primitives (I2)

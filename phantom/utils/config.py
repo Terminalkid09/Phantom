@@ -153,6 +153,11 @@ DEFAULTS: Dict[str, Any] = {
     "toolbelt": {
         "extra": {},
     },
+    "osint": {
+        # Region used to parse a NATIONAL-format phone number that carries no
+        # country code ("02 1234 5678"); international numbers ignore it.
+        "default_region": "",
+    },
     "llm": {
         "model_path": "",          # empty -> bundled default (Qwen) when present
         "enabled": False,
@@ -330,6 +335,7 @@ SCHEMA: Dict[str, Dict[str, Any]] = {
     "llm.enabled": {"type": bool, "env": "PHANTOM_LLM_ENABLED"},
     "automation.experience": {"type": bool, "env": None},
     "toolbelt.extra": {"type": dict, "env": None},
+    "osint.default_region": {"type": str, "env": "PHANTOM_DEFAULT_REGION"},
     "engagement.allow_unscoped": {"type": bool,
                                   "env": "PHANTOM_ALLOW_UNSCOPED"},
     "engagement.ransom_sim_allow": {"type": bool,
