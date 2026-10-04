@@ -15,6 +15,9 @@ from phantom.automation.belief import WorldModel, Finding
 from phantom.automation.external_intel import (
     external_intel_engine, external_intel_interp,
 )
+from phantom.automation.phone_intel import (
+    phone_intel_engine, phone_intel_interp,
+)
 from phantom.automation.guidance.commands import Capability, InputSlot
 from phantom.automation.perception import (
     parse_nmap_ports,
@@ -195,6 +198,22 @@ def _has_target_type(*types):
     def _requires_type(wm: WorldModel) -> bool:
         return wm.target_type in types
     return _requires_type
+
+
+def _has_phone_number():
+    """Precondition: a phone number is available to enrich — the
+    engagement target IS a phone, or a breach/identity finding surfaced a
+    number for this identity."""
+    def _requires_phone(wm: WorldModel) -> bool:
+        if getattr(wm, "target_type", "") == "phone":
+            return True
+        for kind in ("phone", "identity"):
+            for finding in wm.find(kind):
+                value = finding.value if isinstance(finding.value, dict) else {}
+                if value.get("phone") or value.get("e164"):
+                    return True
+        return False
+    return _requires_phone
 
 
 def _has_finding(kind: str):
@@ -3331,6 +3350,14 @@ def _external_intel_adapter(wm, slots):
     return "ext://external-recon (in-process)"
 
 
+def _phone_intel_adapter(wm, slots):
+    """Marker stub: phone intel executes in-process against the offline
+    ``phonenumbers`` metadata database and sends NOTHING at the target (it
+    is not even a network capability). The adapter exists only to keep the
+    'adapter is the command source' invariant, like external_recon."""
+    return "phone://metadata (in-process, offline)"
+
+
 def _idor_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
     """Parse IDOR: markers into idor findings (authorization flaws)."""
     from phantom.automation.belief import Finding
@@ -3569,6 +3596,24 @@ CAPABILITIES = [
         opsec_cost=0.1, detection_risk=0.0, stealth_level="passive",
         timeout=45, preconditions=[_has_network_host()],
         banner="external intel", tools=[]),
+
+    # Passive phone / geolocation intel: OFFLINE metadata (the phonenumbers
+    # database) over a number we already hold — the engagement target or a
+    # number a breach/identity finding surfaced. It sends NOTHING anywhere
+    # (not even a public API), so it is usable on every profile, and it is
+    # the ONE source for `phone` and `geolocation`, the facts the report
+    # writer and the engagement planner need to shape phone pretexts and
+    # calling windows.
+    _mk("phone_osint", "osint",
+        "Passive phone-number intel: canonical E.164, validity, line type "
+        "(mobile/fixed/VoIP), carrier, region and timezone from the offline "
+        "phonenumbers metadata database. Sends nothing — no request at all.",
+        [_mk_slot("phone", "str", False, "phone number (default: target/finding)")],
+        ["phone", "geolocation"], _phone_intel_adapter, phone_intel_interp,
+        exec_class="in_process_engine", engine=phone_intel_engine,
+        opsec_cost=0.1, detection_risk=0.0, stealth_level="passive",
+        timeout=20, preconditions=[_has_phone_number()],
+        banner="phone intel", tools=[]),
 
     _mk("version_detect", "recon", "Service version fingerprinting",
         [_mk_slot("port", "port", False, "target port")],

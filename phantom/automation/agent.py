@@ -867,6 +867,15 @@ class AutonomousAgent:
         # network access + credentials, no beacon foothold required.
         if cap.category == "ad":
             return self._execute_ad_capability(cap, slots)
+        # in-process ENGINE capabilities in the identity lane (phone_osint:
+        # offline metadata lookup) run through the ENGINE channel, exactly
+        # like the recon engines — the social channel owns SIDE EFFECTS
+        # (sherlock, breach APIs, phish delivery), not an offline net-less
+        # lookup, so a social-category engine must not be routed to it.
+        if cap.category in ("osint", "social") \
+                and getattr(cap, "exec_class", "") == "in_process_engine" \
+                and getattr(cap, "engine", None) is not None:
+            return self._execute_engine_capability(cap, slots)
         # social/osint capabilities execute through the SocialEngine channel
         # (OSINT discovery, breach lookup, persona, phish, IP-grabber polling)
         if cap.category in ("osint", "social"):

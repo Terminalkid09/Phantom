@@ -37,6 +37,10 @@ _FACT_SOURCES = {
     "service": ["scan_tcp", "version_detect", "curl_probe", "external_recon"],
     # passive subdomain discovery (crt.sh): additive, feeds origin discovery
     "hostname": ["external_recon"],
+    # offline phone metadata: the ONE source for the number's line class,
+    # carrier and coarse region — no network, so it is plannable always.
+    "phone": ["phone_osint"],
+    "geolocation": ["phone_osint"],
     "fingerprint": ["fingerprint_services"],
     "exploit_plan": ["service_exploit"],
     "hunt_anomaly": ["hunt_web"],
