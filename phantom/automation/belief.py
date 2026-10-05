@@ -30,9 +30,39 @@ class Finding:
     evidence: str = ""              # raw snippet proving the belief
     target: str = ""                # entity this belief refers to
     ts: float = field(default_factory=time.time)
+    # Provenance / quality — a raw provider result and a locally verified
+    # probe must not be weighed the same even at equal `confidence`. These
+    # are additive (defaulted) so positional construction stays compatible.
+    source_reliability: float = 0.5  # how trustworthy the SOURCE is (0..1)
+    evidence_quality: float = 0.5    # how strongly the evidence proves it (0..1)
+    observed_at: float = field(default_factory=time.time)
+    ttl: float = 0.0                 # seconds until stale (0 = no expiry)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    def freshness(self, now: Optional[float] = None) -> float:
+        """1.0 when just observed, decaying linearly to 0.0 at ``ttl``.
+
+        A finding with no ttl (0.0) never goes stale -> always 1.0.
+        """
+        if self.ttl <= 0:
+            return 1.0
+        now = time.time() if now is None else now
+        age = max(0.0, now - self.observed_at)
+        return max(0.0, 1.0 - age / self.ttl)
+
+    def expired(self, now: Optional[float] = None) -> bool:
+        return self.ttl > 0 and self.freshness(now) <= 0.0
+
+    def belief_score(self, now: Optional[float] = None) -> float:
+        """confidence x source_reliability x evidence_quality x freshness.
+
+        An ordering signal that keeps the raw fields intact; NOT a
+        replacement for them.
+        """
+        return (self.confidence * self.source_reliability
+                * self.evidence_quality * self.freshness(now))
 
 
 @dataclass
@@ -332,6 +362,10 @@ class WorldModel:
                 evidence=fd.get("evidence", ""),
                 target=fd.get("target", ""),
                 ts=fd.get("ts", time.time()),
+                source_reliability=fd.get("source_reliability", 0.5),
+                evidence_quality=fd.get("evidence_quality", 0.5),
+                observed_at=fd.get("observed_at", fd.get("ts", time.time())),
+                ttl=fd.get("ttl", 0.0),
             )
             wm._findings[(f.kind, f.key)] = f
         for hd in data.get("hypotheses", []):
