@@ -187,6 +187,18 @@ DEFAULTS: Dict[str, Any] = {
         "allow_unscoped": False,   # PHANTOM_ALLOW_UNSCOPED equivalent
         "ransom_sim_allow": False, # PHANTOM_RANSOM_SIM_ALLOW equivalent
     },
+    # External data providers (NVD, crt.sh, Shodan, GitHub, bgpview) go
+    # through the single transport seam in phantom.utils.provider_contract.
+    # `fixtures_dir` turns REPLAY on: any request with a matching fixture is
+    # answered from disk with no network, which is how the suite stays
+    # hermetic and how an AutoMode decision is reproduced offline.
+    # `record` captures LIVE responses back into that directory with any
+    # API key / token redacted first. Both empty/false by default, so a
+    # normal run is unchanged.
+    "providers": {
+        "fixtures_dir": "",        # empty -> no replay, live calls only
+        "record": False,            # True -> capture live responses as fixtures
+    },
 }
 
 _loaded: Optional[Dict[str, Any]] = None
@@ -362,6 +374,10 @@ SCHEMA: Dict[str, Dict[str, Any]] = {
     "engagement.ransom_sim_allow": {"type": bool,
                                      "env": "PHANTOM_RANSOM_SIM_ALLOW"},
     "phishing.aitm": {"type": bool, "env": "PHANTOM_AITM"},
+    # External data providers: offline fixtures + record/replay
+    "providers.fixtures_dir": {"type": str,
+                               "env": "PHANTOM_PROVIDER_FIXTURES"},
+    "providers.record": {"type": bool, "env": "PHANTOM_PROVIDER_RECORD"},
 }
 
 _TRUTHY = ("1", "true", "yes", "on")
