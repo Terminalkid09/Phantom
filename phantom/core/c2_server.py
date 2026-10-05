@@ -920,8 +920,13 @@ async def api_auth_middleware(request: web.Request, handler):
 
 
 # P0-10: the route x principal x method authorization matrix, EXPLICIT.
-# Every route family declares which principals may call it and with which
-# methods; anything not listed is denied by the matrix middleware.
+# Every DECLARED path lists which principals may call it and with which
+# methods. `auth_matrix_middleware` is the enforcement point for these paths:
+# a method not declared for the path, or the wrong identity namespace, is
+# refused 403 BEFORE the handler — so a new method or a slash variant cannot
+# silently slip past. Paths OUTSIDE the matrix (the malleable catch-all, the
+# payload/stager downloads) are deliberately not governed here: they
+# authenticate inside their own handlers.
 #   beacon   = per-beacon HMAC identity (verified inside the handler)
 #   operator = PHANTOM_API_TOKEN bearer (REST control endpoints)
 #   any      = no auth required (health/malleable catch-all funnel)
@@ -937,12 +942,49 @@ AUTH_MATRIX: dict[str, dict[str, tuple]] = {
 
 def matrix_allows(path: str, method: str, principal: str) -> bool:
     """True when (path, method) is explicitly granted to `principal` or to
-    principal 'any'. Used by tests and available to future middlewares."""
+    principal 'any'."""
     for principal_name in (principal, "any"):
         table = AUTH_MATRIX.get(principal_name, {})
         if method in table.get(path, ()):
             return True
     return False
+
+
+# Paths the matrix governs, split by the identity namespace they belong to.
+_OPERATOR_PATHS = frozenset(AUTH_MATRIX.get("operator", {}))
+_BEACON_PATHS = frozenset(AUTH_MATRIX.get("beacon", {}))
+_MATRIX_PATHS = frozenset(
+    path for table in AUTH_MATRIX.values() for path in table)
+
+
+def _normalize_path(path: str) -> str:
+    """Matrix keys are slash-less; a trailing-slash variant must not bypass."""
+    return path.rstrip("/") or "/"
+
+
+@web.middleware
+async def auth_matrix_middleware(request: web.Request, handler):
+    """Enforce the matrix on the paths it DECLARES (deny-by-default there).
+
+    For a declared path: the method must be listed by some principal, and a
+    beacon identity (X-Beacon-Id) must never drive an operator control
+    endpoint (nor an operator call a beacon-only endpoint). Paths outside the
+    matrix pass through to their own handler-level authentication.
+    """
+    path = _normalize_path(request.path)
+    if path not in _MATRIX_PATHS:
+        return await handler(request)
+    method = request.method.upper()
+    declared = any(method in AUTH_MATRIX.get(pr, {}).get(path, ())
+                   for pr in AUTH_MATRIX)
+    is_beacon = bool(request.headers.get("X-Beacon-Id"))
+    wrong_namespace = ((path in _OPERATOR_PATHS and is_beacon)
+                       or (path in _BEACON_PATHS and not is_beacon))
+    if not declared or wrong_namespace:
+        logger.warning("auth matrix denied %s %s from %s",
+                       method, path, request.remote)
+        return web.Response(status=403, text="Forbidden")
+    return await handler(request)
 
 
 @web.middleware
@@ -1583,7 +1625,9 @@ class C2Server:
 
     def _setup_app(self) -> web.Application:
         app = web.Application(client_max_size=50*1024*1024,
-                              middlewares=[mtls_auth_middleware, api_auth_middleware])
+                              middlewares=[auth_matrix_middleware,
+                                          mtls_auth_middleware,
+                                          api_auth_middleware])
         # Check-in: Support malleable URIs
         app.router.add_get("/api/v1/ping", handle_checkin)
         app.router.add_post("/api/v1/ping", handle_checkin)
