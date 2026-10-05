@@ -253,87 +253,101 @@ def _dispatch(action, board, runner=None, profile="enterprise",
     scope = getattr(action, "targets", None)
     if not scope:
         scope = task.effective_targets(board)
+    # A (task, target) RUN slot is leased for the duration of the worker:
+    # a requeue or helper racing a still-in-flight worker is denied instead
+    # of double-spending the task budget. The lease is always released.
+    lease_owner = (getattr(action, "capability_id", "")
+                   or f"{task.id}:{id(action)}")
     for target in scope:
-        worker_profile = getattr(action, "worker_profile", None)
-        if worker_profile is None:
-            worker_profile = task.profile
-        worker_avoid = getattr(action, "worker_avoid", None)
-        if worker_avoid is None:
-            worker_avoid = task.avoid_caps
-        worker_seed = getattr(action, "worker_seed", None)
-
-        def _capture(kind, data, _t=target):
-            if kind == "run" and (data or {}).get("capability"):
-                with tried_lock:
-                    tried.setdefault((task.id, _t), set()).add(
-                        data["capability"])
-            _events(kind, {**data, "task": task.id, "target": _t})
-
-        try:
-            result = run_swarm_task(
-                task, target, board, runner=runner, profile=profile,
-                aggressive=aggressive, llm=session_llm,
-                worker_profile=worker_profile,
-                worker_avoid=worker_avoid, worker_seed=worker_seed,
-                toolchain=toolchain,
-                scope_list=list(scope_list or []) if scope_list else None,
-                resilient_stager=resilient_stager,
-                on_event=_capture,
-            )
-        except Exception as exc:  # noqa: BLE001 — pool contract
-            from .failures import AGENT, package_case
-            task.attempts += 1
-            task.status = "failed"
-            task.failure_kind = AGENT
-            task.note = f"crashed: {str(exc)[:200]}"
-            crashed = TaskResult(task_id=task.id, target=target, ok=False,
-                                 crashed=True, note=task.note)
-            record = {"task": task.id, "goal": task.goal,
-                      "profile": task.profile or "balanced", "target": target,
-                      "kind": AGENT, "stall": "", "failures": 0, "actions": 0,
-                      "note": task.note,
-                      "llm_requested": True, "llm_suggestions": []}
-            sink["failures"].append(record)
-            suggestions, why = _consult(task, target, board, llm_approval,
-                                        advisor_factory, registry,
-                                        "worker crashed", _events)
-            record["llm_suggestions"] = suggestions
-            record["llm_state"] = why
-            case = package_case(task, target, crashed, board=board,
-                                registry=registry)
-            if case is not None:
-                try:
-                    sink["cases"].append(case.to_dict())
-                except Exception:
-                    pass
-            _events("failed", {"task": task.id, "target": target,
-                               "output": str(exc)[:200]})
-            ok_all = False
+        if not board.leases.claim(task.id, target, lease_owner):
+            _events("lease_denied", {"task": task.id, "target": target,
+                                     "owner": lease_owner})
             continue
-        record = commit_result(board, task, target, result, priors=priors,
-                               registry=registry, sink=sink)
         try:
-            sink["actions"] = int(sink.get("actions", 0)) + int(
-                getattr(result, "actions_taken", 0) or 0)
-        except Exception:
-            pass
-        if record is not None and record.get("kind") == "agent":
-            record["llm_requested"] = True
-            suggestions, why = _consult(
-                task, target, board, llm_approval, advisor_factory,
-                registry,
-                f"task failed ({result.stall or result.note or 'no progress'})",
-                _events)
-            record["llm_suggestions"] = suggestions
-            record["llm_state"] = why
-        _events("task_target", {"task": task.id, "target": target,
-                                "ok": result.ok,
-                                "staged": len(result.staged)})
-        # what the task actually produced: emitted as a verbose-only event so
-        # the default stream stays readable and `--verbose` shows the detail
-        _events("task_found", {"task": task.id, "target": target,
-                               "findings": _staged_lines(result.staged)})
-        ok_all = ok_all and result.ok
+            worker_profile = getattr(action, "worker_profile", None)
+            if worker_profile is None:
+                worker_profile = task.profile
+            worker_avoid = getattr(action, "worker_avoid", None)
+            if worker_avoid is None:
+                worker_avoid = task.avoid_caps
+            worker_seed = getattr(action, "worker_seed", None)
+
+            def _capture(kind, data, _t=target):
+                if kind == "run" and (data or {}).get("capability"):
+                    with tried_lock:
+                        tried.setdefault((task.id, _t), set()).add(
+                            data["capability"])
+                _events(kind, {**data, "task": task.id, "target": _t})
+
+            try:
+                result = run_swarm_task(
+                    task, target, board, runner=runner, profile=profile,
+                    aggressive=aggressive, llm=session_llm,
+                    worker_profile=worker_profile,
+                    worker_avoid=worker_avoid, worker_seed=worker_seed,
+                    toolchain=toolchain,
+                    scope_list=list(scope_list or []) if scope_list else None,
+                    resilient_stager=resilient_stager,
+                    on_event=_capture,
+                )
+            except Exception as exc:  # noqa: BLE001 — pool contract
+                from .failures import AGENT, package_case
+                task.attempts += 1
+                task.status = "failed"
+                task.failure_kind = AGENT
+                task.note = f"crashed: {str(exc)[:200]}"
+                crashed = TaskResult(task_id=task.id, target=target, ok=False,
+                                     crashed=True, note=task.note)
+                record = {"task": task.id, "goal": task.goal,
+                          "profile": task.profile or "balanced",
+                          "target": target,
+                          "kind": AGENT, "stall": "", "failures": 0,
+                          "actions": 0, "note": task.note,
+                          "llm_requested": True, "llm_suggestions": []}
+                sink["failures"].append(record)
+                suggestions, why = _consult(task, target, board, llm_approval,
+                                            advisor_factory, registry,
+                                            "worker crashed", _events)
+                record["llm_suggestions"] = suggestions
+                record["llm_state"] = why
+                case = package_case(task, target, crashed, board=board,
+                                    registry=registry)
+                if case is not None:
+                    try:
+                        sink["cases"].append(case.to_dict())
+                    except Exception:
+                        pass
+                _events("failed", {"task": task.id, "target": target,
+                                   "output": str(exc)[:200]})
+                ok_all = False
+                continue
+            record = commit_result(board, task, target, result,
+                                   priors=priors, registry=registry, sink=sink)
+            try:
+                sink["actions"] = int(sink.get("actions", 0)) + int(
+                    getattr(result, "actions_taken", 0) or 0)
+            except Exception:
+                pass
+            if record is not None and record.get("kind") == "agent":
+                record["llm_requested"] = True
+                suggestions, why = _consult(
+                    task, target, board, llm_approval, advisor_factory,
+                    registry,
+                    f"task failed "
+                    f"({result.stall or result.note or 'no progress'})",
+                    _events)
+                record["llm_suggestions"] = suggestions
+                record["llm_state"] = why
+            _events("task_target", {"task": task.id, "target": target,
+                                    "ok": result.ok,
+                                    "staged": len(result.staged)})
+            # what the task actually produced: emitted as a verbose-only event
+            # so the default stream stays readable and `--verbose` shows it
+            _events("task_found", {"task": task.id, "target": target,
+                                   "findings": _staged_lines(result.staged)})
+            ok_all = ok_all and result.ok
+        finally:
+            board.leases.release(task.id, target, lease_owner)
     return ok_all
 
 
