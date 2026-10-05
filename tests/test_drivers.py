@@ -49,6 +49,16 @@ class TestParse(unittest.TestCase):
         m = dict(_MINIMAL, effects=[])
         self.assertIsNone(drv.parse_driver(m))
 
+    def test_rejects_binary_that_is_not_the_declared_tool(self):
+        # command mode: the tool must appear as a token
+        self.assertIsNone(drv.parse_driver(dict(_MINIMAL, command="evil {target}")))
+        # argv mode: argv[0] must be the tool
+        self.assertIsNone(drv.parse_driver(
+            dict(_MINIMAL, command="", argv=["evil", "{target}"])))
+        # but `sudo <tool>` / `wsl ... <tool>` still match in command mode
+        self.assertIsNotNone(
+            drv.parse_driver(dict(_MINIMAL, command="sudo dnscan {target}")))
+
 
 class TestCapabilityBuild(unittest.TestCase):
     def _cap(self):
@@ -63,11 +73,25 @@ class TestCapabilityBuild(unittest.TestCase):
         self.assertEqual(cmd, "dnscan -d example.com -o -")
 
     def test_missing_field_is_a_clear_error(self):
-        m = dict(_MINIMAL, command="tool {nonexistent} {target}")
+        # the binary must still be the declared tool, so keep `dnscan` and
+        # only the SLOT is unknown
+        m = dict(_MINIMAL, command="dnscan {nonexistent} {target}")
         cap = drv.driver_capability(drv.parse_driver(m))
         wm = WorldModel(target="example.com")
         with self.assertRaises(ValueError):
             cap.make_command(wm, {})
+
+    def test_argv_form_is_shell_quoted(self):
+        import shlex
+        m = dict(_MINIMAL, command="",
+                 argv=["dnscan", "-d", "{target}", "-o", "-"])
+        d = drv.parse_driver(m)
+        self.assertIsNotNone(d)
+        cap = drv.driver_capability(d)
+        # a target with a space must survive as ONE argv token, not split
+        wm = WorldModel(target="a b.example")
+        self.assertEqual(shlex.split(cap.make_command(wm, {})),
+                         ["dnscan", "-d", "a b.example", "-o", "-"])
 
     def test_interpreter_parses_markers(self):
         wm = WorldModel(target="example.com", target_type="domain")
@@ -122,6 +146,30 @@ class TestDiscovery(unittest.TestCase):
     def test_packaged_dir_present_by_default(self):
         # the default scan set exists even with no config/env
         self.assertIn(drv._PACKAGED_DIR, drv.driver_dirs())
+
+
+class TestApprovalGate(unittest.TestCase):
+    def test_found_driver_is_inert_until_approved(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "a.json"), "w", encoding="utf-8") as fh:
+                json.dump(dict(_MINIMAL), fh)
+            saved_dirs = drv.driver_dirs
+            saved_approved = drv.approved_ids
+            drv.driver_dirs = lambda: [d]
+            drv.approved_ids = lambda: set()
+            try:
+                # found, but NOT plannable
+                self.assertEqual(drv.load_driver_capabilities(), [])
+                # and still surfaced as a candidate
+                summary = drv.driver_summary()
+                self.assertEqual([r["id"] for r in summary], ["dnscan_subdomains"])
+                self.assertFalse(summary[0]["approved"])
+                drv.approved_ids = lambda: {"dnscan_subdomains"}
+                ids = [c.id for c in drv.load_driver_capabilities()]
+            finally:
+                drv.driver_dirs = saved_dirs
+                drv.approved_ids = saved_approved
+        self.assertEqual(ids, ["dnscan_subdomains"])
 
 
 class TestRegistryWiring(unittest.TestCase):

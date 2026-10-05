@@ -22,6 +22,20 @@ set. Inspect what was found with `phantom` → `config drivers`.
 A driver may **never** shadow a built-in capability id; the registry refuses
 the collision (and `phantom doctor` flags it under the `drivers` check).
 
+## Approval gate (a found manifest is NOT executable)
+
+Discovery is not authorisation. A manifest that is merely *found* is a
+**candidate**: it is listed by `config drivers` and `doctor` but is **not**
+loaded into the planner. To make it executable, approve its id explicitly:
+
+* in `data/config.json`: `"toolbelt": { "approved": "dnscan_subdomains" }`
+  (comma- or os.pathsep-separated for several ids)
+* or per environment: `PHANTOM_APPROVED_DRIVERS=dnscan_subdomains`
+  (comma- or os.pathsep-separated).
+
+Approval lives in config, **never** in the manifest, so a dropped file cannot
+approve itself. The executable must also be the declared `tool` (see below).
+
 ## Manifest shape
 
 ```json
@@ -31,7 +45,7 @@ the collision (and `phantom doctor` flags it under the `drivers` check).
   "category": "recon",
   "description": "Passive subdomain discovery via dnscan",
   "effects": ["hostname"],
-  "command": "dnscan -d {target} -r 6 -w -o -",
+  "argv": ["dnscan", "-d", "{target}", "-r", "6", "-w", "-o", "-"],
   "requires": ["target"],
   "markers": [
     {"prefix": "DNSCAN:", "kind": "hostname",
@@ -44,12 +58,21 @@ the collision (and `phantom doctor` flags it under the `drivers` check).
 }
 ```
 
-Required fields: `id`, `tool`, `category`, `command` (must interpolate at
-least one `{field}`), `effects` (non-empty).
+Required fields: `id`, `tool`, `category`, a command (`argv` OR `command`,
+which must interpolate at least one `{field}`), `effects` (non-empty).
 
-* `command` — uses `{target}` (the engagement target) and any `{slot}`
-  declared under `inputs`. A field with no value fails the move with a
-  clear reason instead of running a broken command.
+* `argv` (**preferred**) — an explicit argument vector. Each element may use
+  `{target}` / `{slot}`; every interpolated token is shell-quoted
+  (`shlex.join`), so a value can never become shell syntax. The executable
+  (`argv[0]`) must be the declared `tool`.
+* `command` — a shell template, for pipelines that `argv` cannot express.
+  Uses `{target}` and any `{slot}` under `inputs`. A field with no value
+  fails the move with a clear reason instead of running a broken command.
+
+The declared `tool` must be the binary actually run (checked at parse time):
+`argv[0]` for `argv`, or a token of the command for `command` (so
+`sudo nmap ...` and `wsl -d kali-linux nmap ...` both match, while a manifest
+that names `nmap` but runs something else is refused).
 * `markers` — each entry parses lines beginning with `prefix` as
   `key=value` pairs and emits a finding of `kind`. `key` is a template over
   the parsed fields (`{name}`, …); `fields` selects which pairs land in the

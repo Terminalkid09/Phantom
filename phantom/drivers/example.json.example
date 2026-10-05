@@ -4,7 +4,7 @@
   "category": "recon",
   "description": "Passive subdomain discovery via dnscan (crt.sh / zone data)",
   "effects": ["hostname"],
-  "command": "dnscan -d {target} -r 6 -w -o -",
+  "argv": ["dnscan", "-d", "{target}", "-r", "6", "-w", "-o", "-"],
   "requires": ["target"],
   "markers": [
     {

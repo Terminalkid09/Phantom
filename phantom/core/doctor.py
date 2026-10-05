@@ -612,6 +612,12 @@ def _drivers_check() -> Check:
         return Check("drivers", "warn", detail,
                      hint=f"id collides with a built-in and is ignored: "
                           f"{', '.join(collisions)}")
+    unapproved = [r["id"] for r in rows if not r.get("approved")]
+    if unapproved:
+        return Check(
+            "drivers", "warn", detail,
+            hint=f"not approved (inert until added to toolbelt.approved): "
+                 f"{', '.join(unapproved[:6])}")
     return Check("drivers", "pass", detail)
 
 

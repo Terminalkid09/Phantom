@@ -45,8 +45,10 @@ Safety posture:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shlex
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -74,6 +76,7 @@ class ToolDriver:
     category: str
     description: str
     command: str
+    argv: Tuple[str, ...] = ()          # preferred: an explicit argument vector
     effects: Tuple[str, ...] = ()
     markers: Tuple[Dict[str, Any], ...] = ()
     requires: Tuple[str, ...] = ()
@@ -86,6 +89,7 @@ class ToolDriver:
     styles: Tuple[str, ...] = ("default", "stealth", "speed", "aggressive")
     requires_service: Tuple[str, ...] = ()
     source_path: str = ""
+    digest: str = ""                     # sha256 of the manifest (provenance)
 
 
 def _as_float(value: Any, default: float) -> float:
@@ -115,12 +119,47 @@ def _as_str_tuple(value: Any) -> Tuple[str, ...]:
     return tuple(out)
 
 
+def _norm_binary(name: Any) -> str:
+    base = os.path.basename(str(name or "").strip()).lower()
+    return base[:-4] if base.endswith(".exe") else base
+
+
+def _binary_matches(tool: str, command: str, argv: Tuple[str, ...]) -> bool:
+    """The declared executable must actually be the declared tool.
+
+    argv mode: ``argv[0]`` must be the tool. Command mode: the tool must
+    appear as a token (so ``sudo nmap ...`` and ``wsl -d kali-linux nmap``
+    still match, while a manifest that names ``nmap`` but runs something
+    else is refused). Unparseable commands fall back to a substring check.
+    """
+    want = _norm_binary(tool)
+    if not want:
+        return False
+    if argv:
+        return _norm_binary(argv[0]) == want
+    try:
+        tokens = [_norm_binary(tok) for tok in shlex.split(command)]
+    except ValueError:
+        return want in command.lower()
+    return want in tokens
+
+
+def _manifest_digest(data: Any) -> str:
+    try:
+        blob = json.dumps(data, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
+    except (TypeError, ValueError):
+        return ""
+
+
 def parse_driver(data: Any, source_path: str = "") -> Optional[ToolDriver]:
     """Validate one manifest dict -> ToolDriver, or None when unusable.
 
     Strict on the fields an EXECUTABLE capability needs (id, tool,
-    category, command, a non-empty effects list); lenient on the rest, so a
-    minimal manifest is enough and the optional knobs default sensibly.
+    category, a command OR an argv vector, a non-empty effects list); lenient
+    on the rest, so a minimal manifest is enough and the optional knobs
+    default sensibly. Approval is NOT a manifest field: it lives in config
+    (`toolbelt.approved`), so a found file cannot approve itself.
     """
     if not isinstance(data, dict):
         return None
@@ -128,14 +167,21 @@ def parse_driver(data: Any, source_path: str = "") -> Optional[ToolDriver]:
     tool = str(data.get("tool") or "").strip()
     category = str(data.get("category") or "").strip().lower()
     command = str(data.get("command") or "").strip()
+    raw_argv = data.get("argv")
+    argv: Tuple[str, ...] = ()
+    if isinstance(raw_argv, (list, tuple)):
+        argv = tuple(str(a).strip() for a in raw_argv if str(a).strip())
     effects = _as_str_tuple(data.get("effects"))
-    if not cap_id or not tool or not command or not effects:
+    if not cap_id or not tool or not effects or not (command or argv):
         return None
     if category not in _KNOWN_CATEGORIES:
         return None
-    # the command MUST refer to the target or a declared slot; a template
+    # the template MUST consume the target or a declared slot; a command
     # that consumes nothing is a constant string, not a driver.
-    if "{" not in command:
+    if "{" not in command + " " + " ".join(argv):
+        return None
+    # allowlist: the executable must be the declared tool
+    if not _binary_matches(tool, command, argv):
         return None
 
     markers: List[Dict[str, Any]] = []
@@ -176,7 +222,7 @@ def parse_driver(data: Any, source_path: str = "") -> Optional[ToolDriver]:
     return ToolDriver(
         id=cap_id, tool=tool, category=category,
         description=str(data.get("description") or cap_id),
-        command=command, effects=effects, markers=tuple(markers),
+        command=command, argv=argv, effects=effects, markers=tuple(markers),
         requires=_as_str_tuple(data.get("requires")),
         inputs=tuple(inputs),
         opsec_cost=_as_float(data.get("opsec_cost"), 1.0),
@@ -188,6 +234,7 @@ def parse_driver(data: Any, source_path: str = "") -> Optional[ToolDriver]:
                ("default", "stealth", "speed", "aggressive"),
         requires_service=_as_str_tuple(data.get("requires_service")),
         source_path=source_path,
+        digest=_manifest_digest(data),
     )
 
 
@@ -268,8 +315,34 @@ def _fill_template(template: str, wm, slots: Dict[str, Any]) -> str:
         raise ValueError(f"driver command template is invalid: {exc}") from exc
 
 
+def _fill_argv(argv: Tuple[str, ...], wm, slots: Dict[str, Any]) -> str:
+    """Interpolate each argv element, then shell-quote every token.
+
+    The argv form removes the interpolation-from-untrusted-text surface: a
+    slot value (username, url, path) is a single quoted token, never shell
+    syntax. `shlex.join` produces a POSIX-quoted line (the WSL/ssh path);
+    native Windows drivers should prefer this over the raw `command` form.
+    """
+    values: Dict[str, Any] = dict(slots or {})
+    values.setdefault("target", getattr(wm, "target", ""))
+    values.setdefault("host", getattr(wm, "target", ""))
+    out: List[str] = []
+    for elem in argv:
+        try:
+            out.append(str(elem).format(**values))
+        except KeyError as exc:
+            raise ValueError(
+                f"driver argv needs an unset field {exc} "
+                f"(declare it under 'inputs' or supply it as a slot)") from exc
+        except (IndexError, ValueError) as exc:
+            raise ValueError(f"driver argv template is invalid: {exc}") from exc
+    return shlex.join(out)
+
+
 def _driver_adapter(drv: ToolDriver):
     def _adapter(wm, slots):
+        if drv.argv:
+            return _fill_argv(drv.argv, wm, slots or {})
         return _fill_template(drv.command, wm, slots or {})
     return _adapter
 
@@ -354,10 +427,40 @@ def driver_capability(drv: ToolDriver):
     return cap
 
 
-def load_driver_capabilities() -> List[Any]:
-    """All discovered drivers as capabilities (never fatal)."""
+def approved_ids() -> set:
+    """Driver ids the operator approved (config `toolbelt.approved`).
+
+    Approval is DELIBERATELY separate from the manifest: a manifest found in
+    a scanned directory is a CANDIDATE and never executable until its id is
+    listed here (or in ``PHANTOM_APPROVED_DRIVERS``).
+    """
+    ids: set = set()
+    try:
+        from phantom.utils import config as cfg
+        raw = cfg.get("toolbelt.approved", "", env="PHANTOM_APPROVED_DRIVERS")
+        if isinstance(raw, (list, tuple)):
+            raw = os.pathsep.join(str(x) for x in raw)
+        for part in str(raw or "").replace(",", os.pathsep).split(os.pathsep):
+            text = part.strip()
+            if text:
+                ids.add(text)
+    except Exception:
+        pass
+    return ids
+
+
+def load_driver_capabilities(approved_only: bool = True) -> List[Any]:
+    """Discovered drivers as capabilities (never fatal).
+
+    With ``approved_only`` (the default, and what the planner uses) a driver
+    is loaded only when its id is approved — a found manifest is inert until
+    then. Pass ``approved_only=False`` to inspect every candidate.
+    """
+    approved = approved_ids()
     out: List[Any] = []
     for drv in load_drivers():
+        if approved_only and drv.id not in approved:
+            continue
         try:
             out.append(driver_capability(drv))
         except Exception:
@@ -367,10 +470,13 @@ def load_driver_capabilities() -> List[Any]:
 
 def driver_summary() -> List[Dict[str, Any]]:
     """Plain-data view for the CLI / doctor (never executes anything)."""
+    approved = approved_ids()
     out: List[Dict[str, Any]] = []
     for drv in load_drivers():
         out.append({
             "id": drv.id, "tool": drv.tool, "category": drv.category,
             "effects": list(drv.effects), "source": drv.source_path,
+            "approved": drv.id in approved,
+            "digest": drv.digest[:12],
         })
     return out
