@@ -20,6 +20,8 @@ import re
 import threading
 from typing import Any, Dict, List, Tuple
 
+from .leases import LeaseTable
+
 _IPV4 = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
 
@@ -33,6 +35,11 @@ class Board:
         except Exception:
             classify_target = None  # type: ignore
         self._lock = threading.Lock()
+        # Ownership of a (task, target) RUN slot: the board serializes
+        # commits, the lease table serializes the right to execute a unit
+        # of work (so a requeue racing an in-flight worker cannot double-run
+        # it and spend the budget twice). See swarm/leases.py.
+        self.leases = LeaseTable()
         self._wms: Dict[str, Any] = {}
         for target in targets or []:
             ttype = "ip"
