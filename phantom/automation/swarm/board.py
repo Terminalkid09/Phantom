@@ -6,8 +6,9 @@ contract that makes multi-agent reasoning safe:
 * workers READ committed facts any time (shared reads);
 * workers NEVER write the board — they run on a snapshot and return
   staged findings (private scratch by construction);
-* the orchestrator COMMITS staged findings under the lock,
-  first-writer-wins per (kind, key), every decision counted.
+* the orchestrator COMMITS staged findings under the lock, merging
+  per (kind, key) by EVIDENCE (a stronger observation supersedes a weaker
+  one, an identical repeat is idempotent), every decision counted.
 
 A second worker on the same task therefore reasons over the same
 committed truth WITHOUT seeing its sibling's in-flight hypotheses —
@@ -148,30 +149,46 @@ class Board:
 
     def commit(self, task_id: str, target: str,
                staged: List[dict]) -> Tuple[int, int]:
-        """Merge staged findings: new (kind, key) pairs are added,
-        duplicates are skipped. Returns (added, skipped)."""
+        """Merge staged findings into the committed model, by EVIDENCE.
+
+        A duplicate (kind, key) is no longer dropped on sight: the merge
+        defers to ``WorldModel.add_finding``, so a STRONGER observation
+        supersedes a weaker one instead of losing to scheduling order. An
+        identical repeat (idempotency) and a rejected weaker restatement are
+        counted as skipped. Returns (added, skipped).
+        """
         wm = self._wms.get(target)
         if wm is None or not staged:
             return 0, 0
         added = skipped = 0
         with self._lock:
-            known = {(f.get("kind", ""), f.get("key", ""))
-                     for f in wm.to_dict().get("findings", [])}
             for s in staged:
                 kind = s.get("kind", "")
                 key = s.get("key", "")
-                if not kind or not key or (kind, key) in known:
+                if not kind or not key:
                     skipped += 1
                     continue
+                value = s.get("value", {})
+                confidence = s.get("confidence", 0.5)
+                prev = wm.get(kind, key)
                 try:
-                    wm.add_finding(kind, key, s.get("value", {}),
-                                   confidence=s.get("confidence", 0.5),
-                                   source=s.get("source") or task_id)
+                    stored = wm.add_finding(kind, key, value,
+                                            confidence=confidence,
+                                            source=s.get("source") or task_id)
                 except Exception:
                     skipped += 1
                     continue
-                known.add((kind, key))
-                added += 1
+                # `add_finding` returns the belief that is NOW stored: the
+                # staged one when it won, the retained one when it lost.
+                if stored is prev:
+                    skipped += 1          # rejected weaker restatement
+                elif prev is None:
+                    added += 1            # brand-new fact
+                elif (stored.value != prev.value
+                      or stored.confidence > prev.confidence):
+                    added += 1            # superseded / corroborated stronger
+                else:
+                    skipped += 1          # identical repeat (idempotency)
         self.added += added
         self.skipped += skipped
         return added, skipped

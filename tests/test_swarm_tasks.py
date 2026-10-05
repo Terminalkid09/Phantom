@@ -94,12 +94,33 @@ class TestBoard:
                          confidence=0.9, source="sibling")
         assert board.has(TARGET, "service") is False
 
-    def test_commit_first_writer_wins(self):
+    def test_commit_identical_repeat_is_idempotent(self):
         from phantom.automation.swarm.board import Board
         board = Board([TARGET])
         assert board.commit("a", TARGET, _svc_staged()) == (1, 0)
         assert board.commit("b", TARGET, _svc_staged()) == (0, 1)
         assert board.has(TARGET, "service") is True
+
+    def test_commit_stronger_finding_supersedes_weaker(self):
+        # ManusReview 4.1: the first writer must not permanently own a fact;
+        # a later, STRONGER observation supersedes it deterministically.
+        from phantom.automation.swarm.board import Board
+        board = Board([TARGET])
+        weak = [{"kind": "service", "key": "tcp/443",
+                 "value": {"port": "443", "service": "unknown"},
+                 "confidence": 0.5, "source": "external"}]
+        strong = [{"kind": "service", "key": "tcp/443",
+                   "value": {"port": "443", "service": "https"},
+                   "confidence": 0.95, "source": "scan"}]
+        assert board.commit("ext", TARGET, weak) == (1, 0)
+        assert board.commit("scan", TARGET, strong) == (1, 0)
+        stored = board.worldmodel(TARGET).get("service", "tcp/443")
+        assert stored.value["service"] == "https"
+        assert stored.confidence == 0.95
+        # a later WEAKER restatement cannot undo the stronger belief
+        assert board.commit("ext2", TARGET, weak) == (0, 1)
+        still = board.worldmodel(TARGET).get("service", "tcp/443")
+        assert still.value["service"] == "https"
 
 
 class TestWorker:
