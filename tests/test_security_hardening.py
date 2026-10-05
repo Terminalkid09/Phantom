@@ -21,6 +21,7 @@ import threading
 import time
 import unittest
 
+import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 _ENV_KEYS = ("PHANTOM_STATE_FILE", "PHANTOM_API_TOKEN", "PHANTOM_C2_KEY",
@@ -115,6 +116,7 @@ class TestScopeFailClosed(SecurityHardenBase):
         self.assertIsNone(
             backend_dispatcher._gate_target("nmap -sV 10.0.0.5", "10.0.0.5"))
 
+    @pytest.mark.integration_tool
     def test_unscoped_opt_out_executes_when_tool_present(self):
         # Integration companion: with the opt-out set, a real run must not be
         # refused BY SCOPE. It needs a native nmap, so it is explicitly a
