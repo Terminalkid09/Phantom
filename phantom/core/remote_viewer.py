@@ -259,16 +259,24 @@ def make_app(beacon_id: str, session_token: str = "") -> web.Application:
         denied = _check(request)
         if denied:
             return denied
-        # newest frame artifacts for this beacon (data/remote/)
+        # newest frame artifacts OWNED BY this beacon (data/remote/).
+        # Ownership comes from the explicit index, not the filename prefix:
+        # the prefix is a 16-char truncation that two hosts can collide on.
         from phantom.utils.paths import data_dir
+        from phantom.core.artifact_ownership import owned_names
         import os
         d = os.path.join(data_dir(), "remote")
+        mine = owned_names("remote", bid)
         out = []
         if os.path.isdir(d):
-            for name in sorted(os.listdir(d), reverse=True)[:8]:
+            for name in sorted(os.listdir(d), reverse=True):
+                if name not in mine:
+                    continue
                 p = os.path.join(d, name)
                 if os.path.isfile(p):
                     out.append({"name": name, "size": os.path.getsize(p)})
+                if len(out) >= 8:
+                    break
         return web.json_response({"frames": out, "beacon": bid})
 
     @routes.get("/frame")
@@ -277,10 +285,13 @@ def make_app(beacon_id: str, session_token: str = "") -> web.Application:
         if denied:
             return denied
         from phantom.utils.paths import data_dir
+        from phantom.core.artifact_ownership import owner_of
         import os
         name = os.path.basename(request.query.get("name", ""))
         p = os.path.join(data_dir(), "remote", name)
-        if not name or not os.path.isfile(p):
+        # the artifact must be owned by THIS beacon — a viewer session for
+        # beacon A must never serve beacon B's frame by name
+        if not name or owner_of("remote", name) != bid or not os.path.isfile(p):
             return web.Response(status=404, text="no such frame")
         with open(p, "rb") as fh:
             raw = fh.read()

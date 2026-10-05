@@ -89,6 +89,46 @@ def test_viewer_send_queues_task(viewer, fake_beacon):
     assert c2_state.tasks[fake_beacon][-1]["command"] == "remote input move 5 6"
 
 
+def test_viewer_only_serves_its_own_beacon_frames(tmp_path, monkeypatch):
+    """F-02: a viewer authenticated for beacon A must neither LIST nor
+    FETCH beacon B's frames, even though both live in data/remote/."""
+    monkeypatch.setenv("PHANTOM_DATA_DIR", str(tmp_path))
+    from phantom.core.c2_server import c2_state
+    from phantom.core import remote_viewer
+    from phantom.core.artifact_ownership import record_owner
+
+    c2_state.beacons["R-ABCDEF01"] = {"id": "R-ABCDEF01", "hostname": "a",
+                                      "status": "LIVE"}
+    c2_state.beacons["R-ABCDEF02"] = {"id": "R-ABCDEF02", "hostname": "b",
+                                      "status": "LIVE"}
+    d = tmp_path / "remote"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "a_frame.jpg").write_bytes(b"\xff\xd8A")
+    (d / "b_frame.jpg").write_bytes(b"\xff\xd8B")
+    record_owner("remote", "a_frame.jpg", "R-ABCDEF01")
+    record_owner("remote", "b_frame.jpg", "R-ABCDEF02")
+
+    port, _t, token = remote_viewer.launch_viewer("R-ABCDEF01",
+                                                  open_browser=False)
+    time.sleep(0.4)
+    try:
+        frames = json.loads(
+            _get(f"http://127.0.0.1:{port}/frames", token))["frames"]
+        names = {f["name"] for f in frames}
+        assert "a_frame.jpg" in names
+        assert "b_frame.jpg" not in names
+        # B's frame is not fetchable BY NAME either — 404, not the bytes
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _get(f"http://127.0.0.1:{port}/frame?name=b_frame.jpg", token)
+        assert exc.value.code == 404
+        # A's own frame is served
+        body = _get(f"http://127.0.0.1:{port}/frame?name=a_frame.jpg", token)
+        assert body.startswith(b"\xff\xd8")
+    finally:
+        c2_state.beacons.pop("R-ABCDEF01", None)
+        c2_state.beacons.pop("R-ABCDEF02", None)
+
+
 def test_viewer_ambiguous_prefix_rejected(fake_beacon):
     from phantom.core.c2_server import c2_state
     c2_state.beacons["R-VIEWTEST2"] = {"id": "R-VIEWTEST2", "hostname": "h2"}
