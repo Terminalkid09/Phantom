@@ -237,12 +237,18 @@ def save_config(patch: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(_CONFIG_PATH), exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(_CONFIG_PATH),
                                prefix=".config.", suffix=".tmp")
+    # The config carries API keys / breach credentials in clear (F-06):
+    # owner-only at rest, like the state files. Hardening is best-effort and
+    # never raises — a config file must always stay writable.
+    from phantom.utils.secret_store import harden_file
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(cfg, fh, indent=2, sort_keys=True)
             fh.flush()
             os.fsync(fh.fileno())
+        harden_file(tmp, 0o600)
         os.replace(tmp, _CONFIG_PATH)
+        harden_file(_CONFIG_PATH, 0o600)
     finally:
         if os.path.exists(tmp):
             try:
