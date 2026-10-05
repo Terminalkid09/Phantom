@@ -36,6 +36,43 @@ def test_matrix_any_covers_public_funnel():
     assert matrix_allows("/", "GET", "any")
 
 
+def test_matrix_middleware_enforces_declared_paths():
+    """The matrix is now a REAL middleware, not a test-only helper."""
+    from phantom.core.c2_server import auth_matrix_middleware
+
+    async def handler(_request):
+        return web.Response(text="ok")
+
+    app = web.Application(middlewares=[auth_matrix_middleware])
+    app.router.add_route("*", "/api/v1/beacons", handler)
+    app.router.add_route("*", "/api/v1/result", handler)
+    app.router.add_route("*", "/api/v1/ping", handler)
+    app.router.add_route("*", "/{tail:.*}", handler)
+
+    async def requester(s, port):
+        base = f"http://127.0.0.1:{port}"
+        # declared method, operator namespace -> allowed
+        assert (await s.get(base + "/api/v1/beacons")).status == 200
+        # declared path, UNDECLARED method -> 403
+        assert (await s.delete(base + "/api/v1/beacons")).status == 403
+        # a beacon identity must not drive an operator control endpoint
+        assert (await s.get(base + "/api/v1/beacons",
+                            headers={"X-Beacon-Id": "R-1"})).status == 403
+        # a trailing-slash variant does not bypass the method gate
+        assert (await s.delete(base + "/api/v1/beacons/")).status == 403
+        # 'any' path with a beacon identity -> allowed
+        assert (await s.post(base + "/api/v1/ping",
+                             headers={"X-Beacon-Id": "R-1"})).status == 200
+        # beacon-only path requires a beacon identity
+        assert (await s.post(base + "/api/v1/result")).status == 403
+        assert (await s.post(base + "/api/v1/result",
+                             headers={"X-Beacon-Id": "R-1"})).status == 200
+        # a path outside the matrix is deferred to its own handler
+        assert (await s.get(base + "/anything.js")).status == 200
+
+    _run(app, requester)
+
+
 # ── P0-4: enrollment fail-closed on non-loopback ────────────────────────────
 
 def test_unenrolled_refused_on_non_loopback(monkeypatch):
