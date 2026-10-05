@@ -725,6 +725,10 @@ class C2State:
             path = os.path.join(d, safe_name)
             with open(path, "wb") as fh:
                 fh.write(raw)
+            # Ownership index: the per-beacon remote viewer filters on this,
+            # NOT on the (collidable, truncated) filename prefix.
+            from phantom.core.artifact_ownership import record_owner
+            record_owner(subdir, safe_name, beacon_id)
             from phantom.utils.audit_log import audit_log
             audit_log.append("artifact_saved", beacon_id=beacon_id,
                              path=path, size=len(raw))
