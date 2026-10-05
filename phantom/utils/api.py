@@ -18,6 +18,7 @@ from typing import List, Dict, Any, Callable, Optional
 from rich.console import Console
 
 from phantom.utils.paths import cve_cache_path, cve_cache_dir
+from phantom.utils import provider_contract
 
 console = Console()
 
@@ -150,7 +151,8 @@ def _nvd_request(params: dict) -> requests.Response:
         headers["apiKey"] = api_key
 
     def _call():
-        return requests.get(NVD_URL, params=params, headers=headers, timeout=15)
+        return provider_contract.http_get("nvd", NVD_URL, params=params,
+                                          headers=headers, timeout=15)
 
     return with_backoff(_call)()
 
@@ -218,7 +220,8 @@ def crtsh_lookup(domain: str) -> List[str]:
     """Query crt.sh for subdomains matching the given domain."""
     try:
         params = {"q": f"%.{domain}", "output": "json"}
-        resp = requests.get(CRTSH_URL, params=params, timeout=15)
+        resp = provider_contract.http_get("crtsh", CRTSH_URL, params=params,
+                                          timeout=15)
         resp.raise_for_status()
         data = resp.json()
         subdomains = set()
@@ -248,9 +251,11 @@ def shodan_lookup(ip: str, api_key: str = "") -> Dict[str, Any]:
     try:
         if api_key:
             url = f"https://api.shodan.io/shodan/host/{ip}?key={api_key}"
+            provider = "shodan"
         else:
             url = f"{SHODAN_INTERNETDB}/{ip}"
-        resp = requests.get(url, timeout=10)
+            provider = "shodan_internetdb"
+        resp = provider_contract.http_get(provider, url, timeout=10)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -293,7 +298,8 @@ def github_poc_lookup(cve_id: str) -> bool:
     except Exception:
         pass
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp = provider_contract.http_get("github", url, params=params,
+                                          headers=headers, timeout=10)
         if resp.status_code == 403:
             _github_rate_limited_until = time.time() + 3600
             console.print("[yellow][!] GitHub API rate limited — skipping PoC checks for 1h.[/]")
@@ -320,7 +326,7 @@ def bgp_lookup(ip_or_asn: str) -> dict:
         url = f"https://api.bgpview.io/ip/{query}"
 
     try:
-        resp = requests.get(url, timeout=10)
+        resp = provider_contract.http_get("bgpview", url, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         if data.get("status") != "ok":

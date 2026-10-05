@@ -24,6 +24,7 @@ from typing import Any, Dict, List
 from urllib.parse import urlsplit
 
 from phantom.automation.belief import Finding
+from phantom.utils.provider_contract import reliability_of
 
 
 # Well-known TCP ports -> service name. Shodan returns PORT NUMBERS, but the
@@ -138,7 +139,10 @@ def external_intel_interp(output: str, wm, slots: Dict[str, Any]) -> List[Findin
     """Marker lines -> `service` / `hostname` facts.
 
     Confidence is deliberately below a real scan: an external view is a
-    lead, and a later nmap finding for the same port overwrites it.
+    lead, and a later nmap finding for the same port overwrites it. The
+    ``source_reliability`` is taken from the provider's contract, so the
+    belief score also reflects WHICH service said it (a CT-log subdomain
+    and a Shodan port are not equally strong evidence).
     """
     findings: List[Finding] = []
     for line in (output or "").splitlines():
@@ -156,16 +160,19 @@ def external_intel_interp(output: str, wm, slots: Dict[str, Any]) -> List[Findin
                 kind="service", key=f"tcp/{port}",
                 value={"port": str(port), "service": svc, "host": host,
                        "derived": "external_intel"},
-                confidence=0.5, source="external_recon", target=wm.target))
+                confidence=0.5, source="external_recon", target=wm.target,
+                source_reliability=reliability_of("shodan")))
         elif line.startswith("HOSTNAME:"):
             kv = _parse_marker(line[len("HOSTNAME:"):])
             name = kv.get("host", "").strip().strip(".")
             if not name:
                 continue
+            src = kv.get("source", "")
             findings.append(Finding(
                 kind="hostname", key=f"hostname:{name}",
-                value={"hostname": name, "source": kv.get("source", "")},
-                confidence=0.5, source="external_recon", target=wm.target))
+                value={"hostname": name, "source": src},
+                confidence=0.5, source="external_recon", target=wm.target,
+                source_reliability=reliability_of(src or "crtsh")))
         elif line.startswith("BGP:"):
             kv = _parse_marker(line[len("BGP:"):])
             prefix = kv.get("prefix", "")
@@ -173,5 +180,6 @@ def external_intel_interp(output: str, wm, slots: Dict[str, Any]) -> List[Findin
                 findings.append(Finding(
                     kind="netblock", key=f"netblock:{prefix}",
                     value={"prefix": prefix},
-                    confidence=0.5, source="external_recon", target=wm.target))
+                    confidence=0.5, source="external_recon", target=wm.target,
+                    source_reliability=reliability_of("bgpview")))
     return findings
