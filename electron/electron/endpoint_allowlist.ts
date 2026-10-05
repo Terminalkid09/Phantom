@@ -79,6 +79,7 @@ const RULES: readonly Rule[] = [
   { pattern: '/api/automode/stream', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/vault', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/launcher', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/config/keys', methods: ['GET'], group: 'readonly' },
 
   // ── mutating (each one changes backend state — still operator-driven) ──
   { pattern: '/api/session/run', methods: ['POST'], group: 'mutating' },
@@ -123,6 +124,7 @@ const RULES: readonly Rule[] = [
   { pattern: '/api/reports/export', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/reports/export-all', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/export-campaign', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/config/keys', methods: ['POST'], group: 'mutating' },
 ]
 
 /** dynamic segments: /api/<area>/<id>[/<action>] — matched by first segment */
