@@ -1077,6 +1077,15 @@ class AutonomousAgent:
             return False
         if findings:
             self._emit_found(cap.id, findings)
+        # POSTCONDITION: success is judged on EVIDENCE, not the exit code.
+        # The move must have produced at least one of the effects it declares;
+        # findings of some other kind (effect drift) leave it unverified.
+        from phantom.automation.postconditions import declared_effects_met
+        met, missing = declared_effects_met(cap.effects, findings)
+        if not met:
+            self._emit("unverified", capability=cap.id,
+                       detail="postcondition not met: no declared effect "
+                              "observed (" + ", ".join(missing) + ")")
         # v3.0: record success for fallback/learning engine
         self._fallback.record(
             cap.category, cap.id, self.target, ok=True,

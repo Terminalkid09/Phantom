@@ -312,6 +312,29 @@ class TestAutonomousAgent(unittest.TestCase):
         self.assertTrue(any("precondition error" in r for r in reasons),
                         reasons)
 
+    def test_drifted_effects_are_reported_unverified(self):
+        # Success is judged on EVIDENCE: a move that emits findings of a kind
+        # it does NOT declare leaves the postcondition unverified (exit code
+        # alone, and even "some finding", is not proof of the declared effect).
+        agent = self._agent()
+        cap = next(c for c in make_registry().all() if c.id == "scan_tcp")
+        from phantom.automation.belief import Finding
+        original = cap.interpret
+        cap.interpret = lambda out, wm, slots: [
+            Finding(kind="totally_unrelated", key="x:1", value={},
+                    confidence=0.9)]
+
+        class _Step:
+            capability = cap
+            slot_values = {}
+
+        try:
+            agent._execute_capability(_Step())
+        finally:
+            cap.interpret = original
+        kinds = [k for k, _ in self.events]
+        self.assertIn("unverified", kinds, self.events)
+
     def test_a_blocked_event_carries_the_unblock_condition(self):
         agent = self._agent()
         agent._mark_failed("ssh_login")
