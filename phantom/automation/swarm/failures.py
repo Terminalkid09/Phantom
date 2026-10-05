@@ -72,6 +72,7 @@ def package_case(task, target: str, result, board=None,
     aggregates by case_id across operations.
     """
     from phantom.automation.brain.triage import Triage
+    from phantom.automation.failure_taxonomy import classify_failure
     from .profiles import technique
     tech = technique(task.goal, getattr(task, "profile", "") or "balanced")
     missing = missing_provides(task, board, target) if board is not None \
@@ -80,6 +81,7 @@ def package_case(task, target: str, result, board=None,
     cid = case_id_for(tech, cause, missing[0] if missing else "")
     pattern = {
         "cause": cause,
+        "failure_kind": classify_failure(result),
         "missing_fact": missing[0] if missing else "",
         "n": 1,
         "technique": tech,
