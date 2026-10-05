@@ -317,13 +317,22 @@ def _cmd_config_drivers(parts) -> None:
         table.add_column("Capability", style="cyan")
         table.add_column("Tool", style="white")
         table.add_column("Category", style="white")
+        table.add_column("Approved", style="white")
         table.add_column("Effects", style="dim")
         table.add_column("Manifest", style="dim")
         for row in rows:
             table.add_row(row["id"], row["tool"], row["category"],
+                          "yes" if row.get("approved") else "no",
                           ", ".join(row["effects"]),
                           row["source"] or "-")
         _sh.console.print(table)
+        unapproved = [r["id"] for r in rows if not r.get("approved")]
+        if unapproved:
+            notifier.warn(
+                "Not approved (inert — the planner will not run them): "
+                + ", ".join(unapproved)
+                + "\nApprove by adding the id to toolbelt.approved in "
+                  "data/config.json (or via PHANTOM_APPROVED_DRIVERS).")
     notifier.info("Scanned: " + ", ".join(drv.driver_dirs()))
 
 

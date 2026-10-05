@@ -158,6 +158,12 @@ DEFAULTS: Dict[str, Any] = {
         # has no manifests, so this is a no-op until the operator adds one.
         "drivers": True,
         "drivers_dir": "",         # os.pathsep-separated extra dirs
+        # APPROVAL GATE for runtime drivers: a discovered driver is a
+        # CANDIDATE, not an executable capability. Only ids listed here
+        # (comma/os.pathsep-separated) are loaded into the planner (F-04: a
+        # manifest found in a configured directory must never become
+        # executable on its own).
+        "approved": "",
     },
     "osint": {
         # Region used to parse a NATIONAL-format phone number that carries no
@@ -349,6 +355,7 @@ SCHEMA: Dict[str, Dict[str, Any]] = {
     "toolbelt.extra": {"type": dict, "env": None},
     "toolbelt.drivers": {"type": bool, "env": None},
     "toolbelt.drivers_dir": {"type": str, "env": "PHANTOM_DRIVERS_DIR"},
+    "toolbelt.approved": {"type": str, "env": "PHANTOM_APPROVED_DRIVERS"},
     "osint.default_region": {"type": str, "env": "PHANTOM_DEFAULT_REGION"},
     "engagement.allow_unscoped": {"type": bool,
                                   "env": "PHANTOM_ALLOW_UNSCOPED"},
