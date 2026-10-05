@@ -103,14 +103,32 @@ class TestScopeFailClosed(SecurityHardenBase):
         self.assertIn("out of scope", r.error)
 
     def test_unscoped_opt_out_env(self):
+        # This covers the SCOPE GATE: an explicit opt-out must not refuse an
+        # unscoped target. Asserted on `_gate_target` itself so the test is
+        # hermetic — asserting on `run()` made it depend on nmap being
+        # installed on the runner (a tool prerequisite, not a scope
+        # regression). See the integration companion below.
+        os.environ["PHANTOM_ALLOW_UNSCOPED"] = "1"
+        from phantom.api.backend import backend_dispatcher
+        from phantom.core.session import session
+        session.scope = []
+        self.assertIsNone(
+            backend_dispatcher._gate_target("nmap -sV 10.0.0.5", "10.0.0.5"))
+
+    def test_unscoped_opt_out_executes_when_tool_present(self):
+        # Integration companion: with the opt-out set, a real run must not be
+        # refused BY SCOPE. It needs a native nmap, so it is explicitly a
+        # tool-prerequisite test and skips (visibly) only when the tool is
+        # absent — never silently passing as if the scope logic were wrong.
+        import shutil
+        if shutil.which("nmap") is None:
+            self.skipTest("requires native nmap (integration-tool)")
         os.environ["PHANTOM_ALLOW_UNSCOPED"] = "1"
         from phantom.api.backend import backend_dispatcher
         from phantom.core.session import session
         session.scope = []
         r = backend_dispatcher.run("nmap -sV 10.0.0.5", "10.0.0.5", timeout=5)
-        self.assertNotEqual(r.returncode, -1)
-        self.assertIsNone(r.error) or self.assertNotIn(
-            "no engagement scope", r.error or "")
+        self.assertNotIn("no engagement scope", r.error or "")
 
     def test_multi_a_record_hostname_in_scope(self):
         """ALL resolved addresses must be authorized: a CDN whose addresses
