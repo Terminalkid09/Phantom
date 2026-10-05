@@ -881,7 +881,21 @@ class C2State:
 
 c2_state = C2State()
 PAYLOAD_AUTH_TOKEN = get_payload_token()
-API_TOKEN = get_api_token()
+
+
+def _current_api_token() -> str:
+    """Read the operator API token at CALL time, not at import time.
+
+    The token is rotatable at runtime (``regenerate_api_token``). A value
+    captured once at import keeps accepting the OLD secret until the
+    process restarts — a revocation that does not actually revoke, and a
+    divergence from ``phantom.api.server`` which already reads it live.
+    Reading it here makes rotation take effect in-process.
+    """
+    try:
+        return get_api_token()
+    except Exception:
+        return ""
 
 
 # ── Auth Middleware ─────────────────────────────────────────────────────────
@@ -891,10 +905,11 @@ async def api_auth_middleware(request: web.Request, handler):
     """Protect REST API control endpoints with PHANTOM_API_TOKEN.
     If PHANTOM_API_TOKEN is empty (unset), auth is disabled for backward compat."""
     protected = ("/api/v1/beacons", "/api/v1/queue", "/api/v1/results")
-    if request.path in protected and API_TOKEN:
+    expected = _current_api_token()
+    if request.path in protected and expected:
         token = request.headers.get("X-Api-Token", "")
         # timing-safe: plain == leaks match-length byte-by-byte
-        if not hmac.compare_digest(token.encode(), API_TOKEN.encode()):
+        if not hmac.compare_digest(token.encode(), expected.encode()):
             logger.warning(f"Unauthorized API access to {request.path} from {request.remote}")
             return web.Response(status=403, text="Forbidden")
     return await handler(request)
