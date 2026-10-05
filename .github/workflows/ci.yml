@@ -54,7 +54,10 @@ jobs:
           # `tail`, never `head`: with pipefail a truncated pipe sends SIGPIPE to
           # pytest and fails the step even when every test passed. `--maxfail`
           # instead of `-x` so one flake does not hide the rest of the run.
-          python -m pytest $TEST_FILES -v --timeout=120 --maxfail=25 2>&1 | tail -200
+          # HERMETIC gate: tool-dependent tests are deselected and run in the
+          # separate `integration-tools` job below, so a missing binary never
+          # masquerades as a product regression here.
+          python -m pytest $TEST_FILES -m "not integration_tool" -v --timeout=120 --maxfail=25 2>&1 | tail -200
 
       - name: Verify core module imports
         run: |
@@ -348,22 +351,73 @@ jobs:
     needs: lint-and-test
     steps:
       - uses: actions/checkout@v4
-      - name: Run bandit security scan
+      - name: Run bandit security scan (blocking on unbaselined HIGH)
         run: |
           pip install bandit
-          bandit -r phantom/ -f json -o bandit-results.json || true
+          # .bandit holds the reviewed, accepted-by-design HIGH checks; any
+          # OTHER high-severity finding now FAILS the job (it used to only
+          # warn, so a real regression could merge unseen).
+          bandit -r phantom/ -c .bandit -f json -o bandit-results.json || true
           python -c "
           import json
           with open('bandit-results.json') as f:
               data = json.load(f)
           high = [r for r in data.get('results', []) if r.get('issue_severity') == 'HIGH']
           if high:
-              print(f'WARNING: {len(high)} high-severity issues found')
-              for r in high[:5]:
-                  print(f'  - {r[\"test_id\"]}: {r[\"issue_text\"]}')
-          else:
-              print('No high-severity security issues found')
+              print(f'FAIL: {len(high)} high-severity issue(s) outside the .bandit baseline')
+              for r in high[:10]:
+                  print(f'  - {r[\"test_id\"]}: {r[\"issue_text\"]} @ {r[\"filename\"]}:{r[\"line_number\"]}')
+              raise SystemExit(1)
+          print('No unbaselined high-severity issues found')
           "
+
+  integration-tools:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    # External-tool tests are NOT hermetic: they need nmap and may fail for
+    # environment reasons. Kept separate (and non-blocking) so a missing
+    # binary never blocks a merge nor masquerades as a product regression —
+    # the hermetic job above is the required gate.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies + external tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          sudo apt-get update && sudo apt-get install -y nmap
+      - name: Run integration-tool tests
+        run: |
+          set -o pipefail
+          python -m pytest tests/ -m "integration_tool" -v --timeout=120 2>&1 | tail -100
+
+  security-sweep:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Security invariant tests
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_security_sweep_round2.py tests/test_p0_phase2.py \
+            tests/test_c2_token_rotation.py tests/test_remote_viewer.py \
+            tests/test_config_secret_perms.py tests/test_security_hardening.py \
+            tests/test_electron_allowlist_sync.py tests/test_endpoint_allowlist_drift.py \
+            -v --timeout=120 2>&1 | tail -100
 
   docker-test:
     runs-on: ubuntu-latest
