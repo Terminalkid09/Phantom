@@ -77,6 +77,16 @@ def _decl(name: str) -> Dict[str, str]:
     return KEY_REGISTRY.get(name, {}) or {}
 
 
+def os_store_enabled() -> bool:
+    """Whether keys should prefer the OS keychain over the config file.
+
+    Off by default: existing installs keep their hardened config file. When
+    on but no ``keyring`` backend is usable, every path degrades to the file
+    unchanged (see phantom.utils.secret_store).
+    """
+    return cfg.get_bool("secrets.os_store", False, env="PHANTOM_OS_KEYSTORE")
+
+
 def _env_value(decl: Dict[str, str]) -> str:
     """The first non-empty environment override for a key (primary, then
     the legacy spelling)."""
@@ -100,16 +110,34 @@ def get(name: str, default: str = "") -> str:
     env_value = _env_value(decl)
     if env_value:
         return env_value
+    if os_store_enabled():
+        from phantom.utils.secret_store import os_get
+        os_value = os_get(name)
+        if os_value:
+            return str(os_value).strip()
     value = cfg.get(decl["config"], default, env=None)
     return default if value is None else str(value).strip()
 
 
 def set(name: str, value: str) -> None:
-    """Persist a key to data/config.json (empty string clears it)."""
+    """Persist a key to the OS keychain when enabled, else the hardened
+    config file (empty string clears it). A successful OS write also clears
+    any plaintext copy left in the file."""
     decl = _decl(name)
     if not decl:
         raise KeyError(f"unknown api key: {name}")
-    cfg.set(decl["config"], str(value or "").strip())
+    value = str(value or "").strip()
+    if os_store_enabled():
+        from phantom.utils.secret_store import os_delete, os_set
+        if value:
+            if os_set(name, value):
+                cfg.set(decl["config"], "")   # no plaintext duplicate
+                return
+        else:
+            os_delete(name)
+            cfg.set(decl["config"], "")
+            return
+    cfg.set(decl["config"], value)
 
 
 def source(name: str) -> str:
@@ -119,6 +147,10 @@ def source(name: str) -> str:
         return "none"
     if _env_value(decl):
         return "env"
+    if os_store_enabled():
+        from phantom.utils.secret_store import os_get
+        if os_get(name):
+            return "os"
     value = cfg.get(decl["config"], "")
     if value is not None and str(value).strip():
         return "config"
@@ -148,5 +180,6 @@ def status() -> Dict[str, Dict[str, Any]]:
             "configured": bool(value),
             "source": source(name),
             "masked": mask(value),
+            "backend": "os" if os_store_enabled() else "config",
         }
     return out

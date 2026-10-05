@@ -199,6 +199,13 @@ DEFAULTS: Dict[str, Any] = {
         "fixtures_dir": "",        # empty -> no replay, live calls only
         "record": False,            # True -> capture live responses as fixtures
     },
+    # At-rest secret handling. `os_store` moves external-service API keys
+    # from data/config.json (hardened 0600) into the OS keychain
+    # (DPAPI/Keychain/Secret Service) when a `keyring` backend is usable;
+    # without one every call degrades to the hardened file unchanged.
+    "secrets": {
+        "os_store": False,
+    },
 }
 
 _loaded: Optional[Dict[str, Any]] = None
@@ -378,6 +385,8 @@ SCHEMA: Dict[str, Dict[str, Any]] = {
     "providers.fixtures_dir": {"type": str,
                                "env": "PHANTOM_PROVIDER_FIXTURES"},
     "providers.record": {"type": bool, "env": "PHANTOM_PROVIDER_RECORD"},
+    # Secret storage: prefer the OS keychain over the config file
+    "secrets.os_store": {"type": bool, "env": "PHANTOM_OS_KEYSTORE"},
 }
 
 _TRUTHY = ("1", "true", "yes", "on")
