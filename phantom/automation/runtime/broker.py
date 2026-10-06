@@ -118,8 +118,8 @@ class ExecutionBroker:
         cap_id = getattr(driver, "id", "")
 
         # 2. registry trust state
+        record = None
         if self.registry is not None:
-            record = None
             try:
                 record = self.registry.of(cap_id)
             except Exception:
@@ -129,8 +129,14 @@ class ExecutionBroker:
             elif not record.enabled:
                 reasons.append(f"{cap_id} is {record.state}, not enabled")
 
-        # 3. approval policy
-        decision = _approval.decide(driver, source=source, lab=self.lab)
+        # 3. approval policy. An APPROVED registry record is operator-vetted,
+        # so its original (possibly untrusted) source no longer disqualifies
+        # it: the review the policy demands has happened.
+        effective_source = source
+        if record is not None and record.approved:
+            effective_source = "operator-local"
+        decision = _approval.decide(driver, source=effective_source,
+                                    lab=self.lab)
         if decision.action == _approval.ACTION_DENY:
             reasons.append(f"policy denies: {decision.reason}")
 

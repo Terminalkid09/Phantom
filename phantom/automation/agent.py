@@ -790,6 +790,39 @@ class AutonomousAgent:
         self.wm.chosen_tool = {"capability": cap.id, "tool": choice.tool,
                                "reason": choice.reason}
 
+    def _authorize_driver(self, cap, slots):
+        """Execution-broker gate for a runtime-DISCOVERED driver.
+
+        Re-checks the trust registry, the approval policy, scope, tool
+        availability and required inputs through the single choke point
+        (AutoModeBrief §13.5) and returns the AUTHORITATIVE command the broker
+        built. Failure of the gate itself is fail-CLOSED: an un-vetted driver
+        must not run because the checker broke.
+        """
+        try:
+            from phantom.automation.runtime.broker import (
+                BrokerDecision, ExecutionBroker)
+            from phantom.automation.runtime.capability_registry import (
+                CapabilityRegistry)
+            reg = getattr(self, "_cap_registry", None)
+            if reg is None:
+                reg = CapabilityRegistry()
+                reg.load()
+                self._cap_registry = reg
+            broker = getattr(self, "_broker", None)
+            if broker is None:
+                broker = ExecutionBroker(
+                    registry=reg, toolchain=self.toolchain,
+                    scope_list=list(self.scope_list or []), lab=False,
+                    cancel=getattr(self, "_cancel", None))
+                self._broker = broker
+            return broker.preflight(cap.driver, target=self.target, slots=slots)
+        except Exception as exc:  # noqa: BLE001 — fail closed
+            from types import SimpleNamespace
+            return SimpleNamespace(allowed=False,
+                                   reasons=[f"broker unavailable: {exc}"],
+                                   command="")
+
     def _execute_capability(self, step: PlanStep) -> bool:
         cap = step.capability
         slots = dict(step.slot_values)
@@ -1043,6 +1076,26 @@ class AutonomousAgent:
                         self._emit_found("ad_awareness", labels=["ad_domain"])
             except Exception:
                 pass
+        # EXECUTION BROKER: a runtime-DISCOVERED driver never runs without
+        # passing the single gate (trust state + policy + scope +
+        # availability + inputs). The broker's command is authoritative.
+        # Only a REAL ToolDriver is gated: `isinstance`, not truthiness, so a
+        # test double / a capability without a manifest is never mis-gated.
+        from phantom.automation.runtime.drivers import ToolDriver
+        if isinstance(getattr(cap, "driver", None), ToolDriver):
+            decision = self._authorize_driver(cap, slots)
+            if decision is None or not decision.allowed:
+                reason = ("broker refused: "
+                          + "; ".join(decision.reasons if decision else
+                                      ["unavailable"]))
+                self._mark_failed(cap.id)
+                self._emit("blocked", capability=cap.id, reason=reason)
+                self.wm.record_failure(cap.id, reason)
+                _audit_decision("policy_decision", subject=cap.id,
+                                decision="deny", policy="execution_broker",
+                                reason=reason[:200])
+                return False
+            cmd = decision.command or cmd
         run = self.runtime.run(cmd, category=cap.category,
                                stealth_level=cap.stealth_level,
                                agent="agent-1", timeout=cap.timeout)
