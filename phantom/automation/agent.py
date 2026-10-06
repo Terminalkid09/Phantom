@@ -58,6 +58,15 @@ from phantom.automation.agent_support import (
     _best_origin,
 )
 
+
+def _audit_decision(kind: str, **fields: Any) -> None:
+    """Best-effort decision telemetry (never takes the planner down)."""
+    try:
+        from phantom.automation import decision_audit as _audit
+        _audit.record(kind, **fields)
+    except Exception:
+        pass
+
 # Bump when a checkpoint field changes MEANING (not when one is added):
 # from_state reads every field defensively, so a mismatch is a warning to
 # the operator, never a hard failure.
@@ -770,6 +779,8 @@ class AutonomousAgent:
             self._emit("blocked", capability=cap.id,
                        reason=f"target {self.target} out of scope")
             self.wm.record_failure(cap.id, f"out of scope: {self.target}")
+            _audit_decision("scope_decision", target=self.target, decision="deny",
+                            reason=f"{cap.id}: target out of scope")
             return False
         # R2 stealth veto: once the engagement has spent its noise budget the
         # stealth lens refuses LOUD moves outright. It is narrow on purpose
@@ -782,6 +793,8 @@ class AutonomousAgent:
             self._emit("blocked", capability=cap.id,
                        reason=f"stealth veto: {veto}")
             self.wm.record_failure(cap.id, f"stealth veto: {veto}")
+            _audit_decision("policy_decision", subject=cap.id, decision="deny",
+                            policy="stealth_veto", reason=str(veto))
             return False
         # EDGE gate: an address behind Cloudflare/Akamai/Fastly/… is the
         # PROVIDER's reverse proxy, not the target. Packet-level work against

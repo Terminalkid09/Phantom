@@ -224,6 +224,14 @@ def _refuse_out_of_scope(targets, scope_list) -> list:
                 continue
             if not is_in_scope(target, scope_list):
                 refused.append(target)
+                try:
+                    from phantom.automation import decision_audit as _audit
+                    _audit.record("scope_decision", target=target,
+                                  decision="deny",
+                                  scope=",".join(scope_list or []),
+                                  reason="target outside engagement scope")
+                except Exception:
+                    pass
         except Exception:
             continue
     return refused

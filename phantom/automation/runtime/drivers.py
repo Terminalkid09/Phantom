@@ -465,6 +465,15 @@ def load_driver_capabilities(approved_only: bool = True) -> List[Any]:
             out.append(driver_capability(drv))
         except Exception:
             continue
+        # auditable telemetry: WHO enabled WHICH discovered capability, under
+        # which approval policy (`toolbelt.approved`), with the manifest hash.
+        try:
+            from phantom.automation import decision_audit as _audit
+            _audit.record("capability_enabled", capability=drv.id,
+                          approver="operator", policy="toolbelt.approved",
+                          source=drv.source_path, digest=drv.digest[:12])
+        except Exception:
+            pass
     return out
 
 
