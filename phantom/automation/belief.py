@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +37,12 @@ class Finding:
     evidence_quality: float = 0.5    # how strongly the evidence proves it (0..1)
     observed_at: float = field(default_factory=time.time)
     ttl: float = 0.0                 # seconds until stale (0 = no expiry)
+    # Corroboration: how many INDEPENDENT sources observed the SAME value.
+    # 0/1 = a single observation; a second, independent source raises the
+    # belief via ``independence_bonus`` instead of merely rewriting it.
+    # ``sources`` is the deduplicated set that ``independent_sources`` counts.
+    independent_sources: int = 0
+    sources: Tuple[str, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -55,14 +61,27 @@ class Finding:
     def expired(self, now: Optional[float] = None) -> bool:
         return self.ttl > 0 and self.freshness(now) <= 0.0
 
+    def independence_bonus(self) -> float:
+        """A bounded reward for corroboration (brief §8.2).
+
+        One observation is neutral (1.0); each ADDITIONAL independent source
+        adds 10%, capped at 1.3, so corroboration tilts an ordering without
+        letting one much-copied fact dominate a genuinely stronger source.
+        """
+        extra = max(0, int(self.independent_sources) - 1)
+        return min(1.3, 1.0 + 0.1 * extra)
+
     def belief_score(self, now: Optional[float] = None) -> float:
-        """confidence x source_reliability x evidence_quality x freshness.
+        """confidence x source_reliability x evidence_quality x freshness
+        x independence_bonus.
 
         An ordering signal that keeps the raw fields intact; NOT a
-        replacement for them.
+        replacement for them. With no corroboration the bonus is 1.0, so a
+        single-source finding scores exactly as before.
         """
         return (self.confidence * self.source_reliability
-                * self.evidence_quality * self.freshness(now))
+                * self.evidence_quality * self.freshness(now)
+                * self.independence_bonus())
 
 
 @dataclass
@@ -117,6 +136,81 @@ class Revision:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class MergeResult:
+    """The evidence-aware merge of every belief about one (kind, key).
+
+    Instead of first-writer-wins (§9), the merge keeps ALL contributions and
+    names the best current belief by ``belief_score``, while retaining the
+    corroborating observations and the CONTradicting ones (the rejected
+    evidence), so nothing is silently overwritten (§9.3).
+    """
+
+    kind: str
+    key: str
+    current: Optional[Finding] = None
+    alternatives: List[Finding] = field(default_factory=list)
+    rejected: List[Finding] = field(default_factory=list)
+    corroborating: List[Finding] = field(default_factory=list)
+    reason: str = ""
+
+    @property
+    def independent_sources(self) -> int:
+        """Distinct sources that observed the CURRENT value (1 + corroborators)."""
+        if self.current is None:
+            return 0
+        return 1 + len({f.source for f in self.corroborating if f.source})
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind, "key": self.key,
+            "current": self.current.to_dict() if self.current else None,
+            "alternatives": [f.to_dict() for f in self.alternatives],
+            "rejected": [f.to_dict() for f in self.rejected],
+            "corroborating": [f.to_dict() for f in self.corroborating],
+            "independent_sources": self.independent_sources,
+            "reason": self.reason,
+        }
+
+
+def merge_findings(kind: str, key: str, candidates: List[Finding],
+                   now: Optional[float] = None) -> MergeResult:
+    """Reconcile several beliefs about one fact by evidence, not order.
+
+    Deterministic: candidates are ranked by ``belief_score`` (then
+    confidence, then source id), so two runs over the same set resolve the
+    SAME way regardless of arrival order. Contradicting candidates are
+    RETAINED in ``rejected`` rather than dropped — the operator can see what
+    was overruled and why.
+    """
+    cands = [c for c in (candidates or []) if c is not None]
+    if not cands:
+        return MergeResult(kind=kind, key=key, reason="no candidates")
+    scored = sorted(cands, key=lambda f: (-f.belief_score(now),
+                                          -f.confidence, f.source or ""))
+    current = scored[0]
+    alternatives: List[Finding] = []
+    rejected: List[Finding] = []
+    corroborating: List[Finding] = []
+    for f in scored[1:]:
+        if f.value == current.value:
+            if f.source and f.source != current.source:
+                corroborating.append(f)
+            else:
+                alternatives.append(f)      # same value/source: a repeat
+        else:
+            rejected.append(f)
+    reason = (f"best belief score {current.belief_score(now):.3f} via "
+              f"{current.source or '?'}; {len(rejected)} contradicting "
+              f"candidate(s) retained")
+    sources = {f.source for f in corroborating if f.source}
+    if sources:
+        reason += f"; corroborated by {len(sources)} independent source(s)"
+    return MergeResult(kind=kind, key=key, current=current,
+                       alternatives=alternatives, rejected=rejected,
+                       corroborating=corroborating, reason=reason)
 
 
 class WorldModel:
@@ -191,6 +285,22 @@ class WorldModel:
             f.confidence = max(prev.confidence, f.confidence)
             if not f.evidence:
                 f.evidence = prev.evidence
+            # an INDEPENDENT source (different id) seeing the same value is
+            # corroboration: fold it into the deduplicated source SET (a
+            # repeat from a known source never inflates the count) and keep
+            # the stronger evidence quality.
+            seen = set(prev.sources or ())
+            if prev.source:
+                seen.add(prev.source)
+            if f.source:
+                seen.add(f.source)
+            seen.discard("")
+            f.sources = tuple(sorted(seen))
+            f.independent_sources = len(seen)
+            f.evidence_quality = max(f.evidence_quality, prev.evidence_quality)
+        elif f.source and not f.sources:
+            f.sources = (f.source,)
+            f.independent_sources = 1
         self._findings[(kind, key)] = f
         return f
 
@@ -366,6 +476,8 @@ class WorldModel:
                 evidence_quality=fd.get("evidence_quality", 0.5),
                 observed_at=fd.get("observed_at", fd.get("ts", time.time())),
                 ttl=fd.get("ttl", 0.0),
+                independent_sources=fd.get("independent_sources", 0),
+                sources=tuple(fd.get("sources") or ()),
             )
             wm._findings[(f.kind, f.key)] = f
         for hd in data.get("hypotheses", []):
