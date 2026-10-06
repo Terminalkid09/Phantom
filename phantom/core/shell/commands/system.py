@@ -69,6 +69,7 @@ def cmd_help(shell, arg: str):
     t2b.add_row("craft ipgrab|reel|image|pixel|beacon|hits|wait", "Build social-engineering lures (IP grabber, zero-click pixel, disguised beacon link)")
     t2b.add_row("map [cidr]", "Discover live hosts on the network and feed the WorldModel")
     t2b.add_row("install <tool>", "Install a missing tool (apt/brew/choco/pip, auto-selected)")
+    t2b.add_row("tool list|import <binary>|approve <id>|enable <id>|disable <id>", "Runtime tool drivers: discover a new tool (probe --help/--version only), review, approve, enable")
     t2b.add_row("wordlists list|use|search|info", "Manage attack dictionaries (rockyou, seclists, custom)")
     t2b.add_row("ad tree|paths|add-user|add-dc|add-edge|reset", "BloodHound-style AD graph: ingest auto-mode data + manual nodes, shortest paths to Domain Admin")
     t2b.add_row("coverage [profile]", "Audit that every declared capability/goal/phase actually resolves (catches silent plan dead-ends)")
@@ -869,9 +870,136 @@ def cmd_quit(shell, arg: str):
 cmd_quit.__doc__ = cmd_exit.__doc__
 
 
+def cmd_tool(shell, arg: str):
+    """tool list|import <binary>|approve <id>|enable <id>|disable <id> - Runtime tool drivers.
+
+    Manage capabilities Phantom discovers at runtime (a JSON manifest in
+    data/drivers/). Every capability crosses explicit trust states
+    (discovered -> candidate -> reviewed -> approved -> enabled) before the
+    planner may load it: a found file is a CANDIDATE, never executable on
+    its own.
+
+      tool list              show every discovered capability + its state
+      tool import <binary>   probe a new binary (--help/--version only) and
+                             propose a DISABLED candidate manifest
+      tool approve <id>      review + approve (walks the state machine)
+      tool enable <id>       approve if needed, then enable for the planner
+      tool disable <id>      revoke: demote to discovered, clear approval
+    """
+    import os
+
+    from rich.table import Table
+
+    from phantom.automation.runtime import capability_registry as reg_mod
+    from phantom.automation.runtime import import_tool as imp
+
+    parts = arg.split()
+    sub = parts[0].lower() if parts else "list"
+    reg = reg_mod.CapabilityRegistry()
+    reg.load()
+
+    if sub in ("list", "ls", "status"):
+        rows = reg.report()
+        if not rows:
+            notifier.info("No runtime capabilities registered. Discover one "
+                          "with 'tool import <binary>'.")
+            return
+        table = Table(title="[bold]Runtime capabilities[/]",
+                      border_style="magenta")
+        table.add_column("Capability", style="cyan")
+        table.add_column("Tool", style="white")
+        table.add_column("State", style="white")
+        table.add_column("Enabled", style="white")
+        table.add_column("Source", style="dim")
+        table.add_column("sha256", style="dim")
+        for r in rows:
+            table.add_row(r["capability"], r["tool"], r["state"],
+                          "yes" if r.get("enabled") else "no",
+                          r.get("source", ""), (r.get("sha256") or "")[:12])
+        _sh.console.print(table)
+        return
+
+    if sub in ("import", "add", "probe"):
+        if len(parts) < 2:
+            notifier.usage("tool import", "<binary> [category]",
+                           hint="probes --help/--version only and leaves a "
+                                "disabled candidate")
+            return
+        binary = parts[1]
+        category = parts[2].lower() if len(parts) > 2 else "recon"
+        proposal = imp.propose(binary, category=category, registry=reg)
+        reg.save()
+        if not proposal.probe.found:
+            notifier.error(f"Binary not found: {binary}",
+                           hint="pass a name on PATH or an absolute path")
+            return
+        try:
+            from phantom.utils.paths import data_dir
+            drivers_dir = os.path.join(data_dir(), "drivers")
+        except Exception:
+            drivers_dir = "drivers"
+        path = imp.render_manifest(proposal, drivers_dir)
+        notifier.success(
+            f"Candidate '{proposal.cap_id}' created (DISABLED).")
+        notifier.info(
+            f"Probe: {proposal.probe.version or 'no version output'}")
+        if path:
+            notifier.info(f"Manifest skeleton: {path}")
+        notifier.info(
+            "Add the real command/argv to the manifest, then run "
+            f"'tool approve {proposal.cap_id}' and 'tool enable "
+            f"{proposal.cap_id}'.")
+        return
+
+    if sub == "approve":
+        if len(parts) < 2:
+            notifier.usage("tool approve", "<id>")
+            return
+        ok = reg.approve(parts[1])
+        reg.save()
+        if ok:
+            notifier.success(f"{parts[1]} approved (state "
+                             f"{reg.of(parts[1]).state}).")
+        else:
+            notifier.error(f"Cannot approve '{parts[1]}'.",
+                           hint="is the id registered? 'tool list' shows ids")
+        return
+
+    if sub == "enable":
+        if len(parts) < 2:
+            notifier.usage("tool enable", "<id>")
+            return
+        ok = reg.enable(parts[1])
+        reg.save()
+        if ok:
+            notifier.success(f"{parts[1]} enabled — the planner may load it.")
+        else:
+            notifier.error(f"Cannot enable '{parts[1]}'.",
+                           hint="approve it first: 'tool approve <id>'")
+        return
+
+    if sub in ("disable", "revoke", "demote"):
+        if len(parts) < 2:
+            notifier.usage("tool disable", "<id>")
+            return
+        ok = reg.demote(parts[1], reason="revoked by operator")
+        reg.save()
+        if ok:
+            notifier.warn(f"{parts[1]} demoted to discovered (approval "
+                          "cleared).")
+        else:
+            notifier.info(f"'{parts[1]}' was not enabled.")
+        return
+
+    notifier.unknown("subcommand", sub,
+                     ["list", "import", "approve", "enable", "disable"],
+                     hint="'tool list' shows the registry")
+
+
 COMMANDS = {
     "help": cmd_help,
     "config": cmd_config,
+    "tool": cmd_tool,
     "setup": cmd_setup,
     "coverage": cmd_coverage,
     "doctor": cmd_doctor,

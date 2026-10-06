@@ -291,6 +291,26 @@ class CapabilityRegistry:
             row.note = "integrity mismatch: approval invalidated"
             return False
 
+    def demote(self, capability: str, reason: str = "") -> bool:
+        """Send a capability back to ``discovered`` and clear its approval.
+
+        The operator's revoke: an enabled capability stops being loadable
+        until it is reviewed and approved again. False when unknown or
+        already discovered.
+        """
+        self._ensure_loaded()
+        with self._lock:
+            row = self._rows.get(capability)
+            if row is None or row.state == "discovered":
+                return False
+            row.state = "discovered"
+            row.approved_at = 0.0
+            row.approved_by = ""
+            row.status_history.append("discovered")
+            if reason:
+                row.note = reason[:200]
+            return True
+
     # -------------------------------------------------------------- reads
 
     def of(self, capability: str) -> Optional[CapabilityRecord]:
