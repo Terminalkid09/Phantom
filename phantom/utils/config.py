@@ -182,6 +182,11 @@ DEFAULTS: Dict[str, Any] = {
         # everything stays in the local data dir; `automation.experience:
         # false` (or --no-experience) keeps the memory run-only.
         "experience": True,
+        # Auditable decision telemetry: append a tamper-evident record when a
+        # capability is enabled, a policy allows/denies a move, a target is
+        # admitted/refused by scope, or the arbiter picks a move. Separate
+        # from the C2 audit log; never blocks the planner.
+        "decision_audit": True,
     },
     "engagement": {
         "allow_unscoped": False,   # PHANTOM_ALLOW_UNSCOPED equivalent
@@ -397,6 +402,9 @@ SCHEMA: Dict[str, Dict[str, Any]] = {
     "providers.record": {"type": bool, "env": "PHANTOM_PROVIDER_RECORD"},
     # Secret storage: prefer the OS keychain over the config file
     "secrets.os_store": {"type": bool, "env": "PHANTOM_OS_KEYSTORE"},
+    # Auditable AutoMode decision telemetry
+    "automation.decision_audit": {"type": bool,
+                                  "env": "PHANTOM_DECISION_AUDIT"},
     # Per-target budgets (0 = unlimited)
     "budget.per_target_actions": {"type": int,
                                   "env": "PHANTOM_PER_TARGET_ACTIONS"},
