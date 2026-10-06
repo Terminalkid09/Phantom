@@ -187,6 +187,10 @@ DEFAULTS: Dict[str, Any] = {
         # admitted/refused by scope, or the arbiter picks a move. Separate
         # from the C2 audit log; never blocks the planner.
         "decision_audit": True,
+        # Persisted per-capability health ledger (success/failure history,
+        # worst-first report). Read-only signal for the operator/report; the
+        # planner's in-run multiplier stays EnterpriseBrain's job.
+        "capability_health": True,
     },
     "engagement": {
         "allow_unscoped": False,   # PHANTOM_ALLOW_UNSCOPED equivalent
@@ -405,6 +409,9 @@ SCHEMA: Dict[str, Dict[str, Any]] = {
     # Auditable AutoMode decision telemetry
     "automation.decision_audit": {"type": bool,
                                   "env": "PHANTOM_DECISION_AUDIT"},
+    # Persisted capability health ledger
+    "automation.capability_health": {"type": bool,
+                                     "env": "PHANTOM_CAPABILITY_HEALTH"},
     # Per-target budgets (0 = unlimited)
     "budget.per_target_actions": {"type": int,
                                   "env": "PHANTOM_PER_TARGET_ACTIONS"},

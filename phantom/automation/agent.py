@@ -67,6 +67,26 @@ def _audit_decision(kind: str, **fields: Any) -> None:
     except Exception:
         pass
 
+
+def _health_enabled() -> bool:
+    try:
+        from phantom.utils import config as cfg
+        return cfg.get_bool("automation.capability_health", True,
+                            env="PHANTOM_CAPABILITY_HEALTH")
+    except Exception:
+        return True
+
+
+def _record_health(cap_id: str, ok: bool, reason: str = "") -> None:
+    """Best-effort per-capability health ledger update (never fatal)."""
+    if not _health_enabled():
+        return
+    try:
+        from phantom.automation import capability_health as _ch
+        _ch.instance().record(cap_id, ok, reason)
+    except Exception:
+        pass
+
 # Bump when a checkpoint field changes MEANING (not when one is added):
 # from_state reads every field defensively, so a mismatch is a warning to
 # the operator, never a hard failure.
@@ -3200,6 +3220,13 @@ class AutonomousAgent:
                 self.enterprise.persist()
             except Exception:
                 pass
+            # flush the persisted capability health ledger (best-effort)
+            if _health_enabled():
+                try:
+                    from phantom.automation import capability_health as _ch
+                    _ch.instance().save()
+                except Exception:
+                    pass
             # v3.0: persist historical self-learning
             if self._history:
                 try:
@@ -4103,6 +4130,7 @@ class AutonomousAgent:
         # recorded), never deferrals/blocks; ok == made new progress
         if len(self.wm.actions_taken) > before:
             self.enterprise.record(cap.id, ok)
+            _record_health(cap.id, ok)
         return ok
 
     def _compute_job_pin(self) -> Dict[str, Any]:
