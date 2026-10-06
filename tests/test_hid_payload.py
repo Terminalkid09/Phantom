@@ -82,10 +82,21 @@ class TestTheTypedCommand:
         notes = build_hid_payload("pico", "whoami").notes
         assert any("must match the TARGET os" in n for n in notes), notes
 
-    def test_a_windows_run_dialog_on_a_linux_target_is_flagged(self):
+    def test_a_linux_opener_is_used_instead_of_the_windows_one(self):
+        # --run used to be Windows-only and a linux target got a warning; the
+        # opener is now universal (one chord per target family).
         notes = build_hid_payload("flipper", "whoami", target="linux",
                                   open_run=True).notes
-        assert any("WINDOWS keystroke" in n for n in notes), notes
+        assert any("Ctrl+Alt+T" in n for n in notes), notes
+        body = build_hid_payload("flipper", "whoami", target="linux",
+                                 open_run=True).content
+        assert "HOLD CTRL ALT T" in body
+        assert "HOLD GUI R" not in body
+
+    def test_a_target_without_a_known_opener_is_flagged(self):
+        notes = build_hid_payload("flipper", "whoami", target="android",
+                                  open_run=True).notes
+        assert any("no opener is known" in n for n in notes), notes
 
     def test_a_windows_command_on_a_linux_target_is_flagged(self):
         notes = build_hid_payload(
