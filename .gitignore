@@ -49,6 +49,10 @@ data/beacons/*.crt
 .data-c2/
 data/payload_history.json
 data/c2_audit.log.lock
+data/decision_audit.log
+data/decision_audit.log.lock
+data/capability_health.json
+data/capability_registry.json
 
 data/logs/
 data/engagement_history.json
