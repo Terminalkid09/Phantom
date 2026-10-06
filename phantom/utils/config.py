@@ -206,6 +206,16 @@ DEFAULTS: Dict[str, Any] = {
     "secrets": {
         "os_store": False,
     },
+    # Per-TARGET spend limits, SEPARATE from the run-wide budget: a multi-
+    # target engagement can cap what a single noisy host is allowed to
+    # spend, so one loud target cannot drain the whole operation before the
+    # others are reached. 0 = UNLIMITED (the default), so an engagement with
+    # no policy is byte-for-byte the previous behaviour.
+    "budget": {
+        "per_target_actions": 0,   # planner actions a single target may spend
+        "per_target_noise": 0.0,   # noise units a single target may spend
+        "per_target_requests": 0,  # network requests a single target may make
+    },
 }
 
 _loaded: Optional[Dict[str, Any]] = None
@@ -387,6 +397,13 @@ SCHEMA: Dict[str, Dict[str, Any]] = {
     "providers.record": {"type": bool, "env": "PHANTOM_PROVIDER_RECORD"},
     # Secret storage: prefer the OS keychain over the config file
     "secrets.os_store": {"type": bool, "env": "PHANTOM_OS_KEYSTORE"},
+    # Per-target budgets (0 = unlimited)
+    "budget.per_target_actions": {"type": int,
+                                  "env": "PHANTOM_PER_TARGET_ACTIONS"},
+    "budget.per_target_noise": {"type": float,
+                                "env": "PHANTOM_PER_TARGET_NOISE"},
+    "budget.per_target_requests": {"type": int,
+                                   "env": "PHANTOM_PER_TARGET_REQUESTS"},
 }
 
 _TRUTHY = ("1", "true", "yes", "on")
@@ -428,6 +445,17 @@ def get_int(key: str, default: int = 0,
     not parseable (never raises)."""
     try:
         return int(str(get(key, default, env=env)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def get_float(key: str, default: float = 0.0,
+              env: Optional[str] = None) -> float:
+    """Read ``key`` as a float, falling back to ``default`` when unset or
+    not parseable (never raises). Fractional settings (noise budgets, rate
+    thresholds) need the same typed accessor the int/bool/str kinds have."""
+    try:
+        return float(str(get(key, default, env=env)).strip())
     except (TypeError, ValueError):
         return default
 

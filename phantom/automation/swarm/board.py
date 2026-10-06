@@ -40,6 +40,11 @@ class Board:
         # of work (so a requeue racing an in-flight worker cannot double-run
         # it and spend the budget twice). See swarm/leases.py.
         self.leases = LeaseTable()
+        # Per-target spend allowance, SEPARATE from the run-wide budget: a
+        # loud host cannot drain the whole operation's budget. Unlimited by
+        # default (see automation/budget.py).
+        from phantom.automation.budget import BudgetLedger
+        self.budgets = BudgetLedger()
         self._wms: Dict[str, Any] = {}
         for target in targets or []:
             ttype = "ip"

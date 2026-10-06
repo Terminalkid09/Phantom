@@ -84,7 +84,7 @@ def run_swarm(targets, chain="", runner=None, profile="enterprise",
               priors=None, failure_log=None, llm_approval=None,
               advisor_factory=None, seed_facts=None, scope_list=None,
               reason_profile="", toolchain=None,
-              resilient_stager: bool = True):
+              resilient_stager: bool = True, budgets=None):
     """Run one swarm operation: tasks by chain template, one
     orchestrator+pool PER TARGET (shared semaphore caps total workers),
     commit to the board. Deterministic given a deterministic runner +
@@ -143,6 +143,10 @@ def run_swarm(targets, chain="", runner=None, profile="enterprise",
         # identity-led). An explicit --chain always wins.
         chain = chain_for_profile(profile)
     board = Board(targets)
+    # Per-TARGET budget: separate from the run-wide budget above. Derived
+    # from config when not injected, and UNLIMITED unless a limit was set.
+    from phantom.automation.budget import ledger_from_config
+    board.budgets = budgets if budgets is not None else ledger_from_config()
     tasks = build_tasks(chain, targets, seed=seed, budget=budget,
                         aggressive=aggressive)
     if reason_profile:
@@ -184,6 +188,7 @@ def run_swarm(targets, chain="", runner=None, profile="enterprise",
                        ceiling=MAX_AGENTS_CEILING, max_agents=width)
     summary["ok"] = all(t["status"] == "done" for t in summary["tasks"])
     summary["board_ref"] = board  # live board: merge/report downstream
+    summary["budgets"] = board.budgets.snapshot()
     if failure_log:
         from .failures import persist_cases
         summary["cases_persisted"] = persist_cases(
@@ -258,7 +263,20 @@ def _dispatch(action, board, runner=None, profile="enterprise",
     # of double-spending the task budget. The lease is always released.
     lease_owner = (getattr(action, "capability_id", "")
                    or f"{task.id}:{id(action)}")
+    budgets = getattr(board, "budgets", None)
+    if budgets is None:
+        # a board shape that predates the ledger (test doubles): attach an
+        # unlimited one so the dispatch contract is unchanged.
+        from phantom.automation.budget import BudgetLedger
+        budgets = board.budgets = BudgetLedger()
     for target in scope:
+        # Per-target budget is checked BEFORE the lease: an exhausted
+        # target is skipped with a typed reason instead of charging a run.
+        if budgets.exhausted(target):
+            _events("budget_exhausted", {"task": task.id, "target": target,
+                                         "reason": budgets.reason(target)})
+            ok_all = False
+            continue
         if not board.leases.claim(task.id, target, lease_owner):
             _events("lease_denied", {"task": task.id, "target": target,
                                      "owner": lease_owner})
@@ -324,8 +342,10 @@ def _dispatch(action, board, runner=None, profile="enterprise",
             record = commit_result(board, task, target, result,
                                    priors=priors, registry=registry, sink=sink)
             try:
-                sink["actions"] = int(sink.get("actions", 0)) + int(
-                    getattr(result, "actions_taken", 0) or 0)
+                actions = int(getattr(result, "actions_taken", 0) or 0)
+                sink["actions"] = int(sink.get("actions", 0)) + actions
+                # charge the target for what the worker actually spent
+                budgets.spend(target, actions=actions)
             except Exception:
                 pass
             if record is not None and record.get("kind") == "agent":

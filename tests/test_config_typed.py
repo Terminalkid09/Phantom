@@ -93,9 +93,9 @@ class TestGetStr(unittest.TestCase):
 class TestSchema(unittest.TestCase):
     def test_every_entry_is_wellformed(self):
         # dict is allowed for structured settings (e.g. toolbelt.extra);
-        # scalars remain str/int/bool
+        # scalar settings remain str/int/bool/float
         for key, spec in cfg.SCHEMA.items():
-            self.assertIn(spec["type"], (str, int, bool, dict), key)
+            self.assertIn(spec["type"], (str, int, bool, float, dict), key)
             env = spec["env"]
             self.assertTrue(env is None or
                             (isinstance(env, str) and env.startswith("PHANTOM_")),
@@ -113,7 +113,8 @@ class TestSchema(unittest.TestCase):
 
     def test_declared_keys_resolve_without_raising(self):
         for key, spec in cfg.SCHEMA.items():
-            sentinel = {str: "", int: 0, bool: False, dict: {}}[spec["type"]]
+            sentinel = {str: "", int: 0, bool: False, float: 0.0,
+                        dict: {}}[spec["type"]]
             # must not raise and must return the declared kind (or default)
             value = cfg.get(key, sentinel)
             self.assertIn(type(value), (spec["type"], dict), key)
