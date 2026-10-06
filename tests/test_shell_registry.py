@@ -20,7 +20,7 @@ EXPECTED = {
     "auto", "agent",
     "c2", "malleable", "ad", "wordlists", "export",
     "help", "config", "setup", "coverage", "doctor", "experience",
-    "why",
+    "why", "tool",
     "back", "exit", "quit",
 }
 
