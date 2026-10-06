@@ -424,6 +424,9 @@ def driver_capability(drv: ToolDriver):
     # and the coverage audit (which pins the static set) ignores them.
     cap.discovered = True            # type: ignore[attr-defined]
     cap.source_path = drv.source_path  # type: ignore[attr-defined]
+    # the manifest itself, so the EXECUTION BROKER can re-authorize the move
+    # (registry trust state, approval policy, availability) at run time.
+    cap.driver = drv                 # type: ignore[attr-defined]
     return cap
 
 
