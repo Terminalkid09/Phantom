@@ -84,7 +84,8 @@ def run_swarm(targets, chain="", runner=None, profile="enterprise",
               priors=None, failure_log=None, llm_approval=None,
               advisor_factory=None, seed_facts=None, scope_list=None,
               reason_profile="", toolchain=None,
-              resilient_stager: bool = True, budgets=None):
+              resilient_stager: bool = True, budgets=None, cancel=None,
+              idempotency=None):
     """Run one swarm operation: tasks by chain template, one
     orchestrator+pool PER TARGET (shared semaphore caps total workers),
     commit to the board. Deterministic given a deterministic runner +
@@ -146,7 +147,13 @@ def run_swarm(targets, chain="", runner=None, profile="enterprise",
     # Per-TARGET budget: separate from the run-wide budget above. Derived
     # from config when not injected, and UNLIMITED unless a limit was set.
     from phantom.automation.budget import ledger_from_config
+    from .cancellation import NullToken
+    from .idempotency import IdempotencyRegistry
     board.budgets = budgets if budgets is not None else ledger_from_config()
+    # Cancellation tree + one-run-per-key registry (shared by every worker).
+    cancel = cancel if cancel is not None else NullToken()
+    idempotency = (idempotency if idempotency is not None
+                   else IdempotencyRegistry())
     tasks = build_tasks(chain, targets, seed=seed, budget=budget,
                         aggressive=aggressive)
     if reason_profile:
@@ -171,7 +178,8 @@ def run_swarm(targets, chain="", runner=None, profile="enterprise",
             aggressive=aggressive, on_event=on_event, priors=priors,
             registry=registry, sink=sink, llm_approval=approval,
             advisor_factory=advisor_factory, toolchain=toolchain,
-            resilient_stager=resilient_stager,
+            resilient_stager=resilient_stager, cancel=cancel,
+            idempotency=idempotency,
             scope_list=list(scope_list or []))
 
     def _orch_factory(sem, per_pool):
@@ -189,6 +197,7 @@ def run_swarm(targets, chain="", runner=None, profile="enterprise",
     summary["ok"] = all(t["status"] == "done" for t in summary["tasks"])
     summary["board_ref"] = board  # live board: merge/report downstream
     summary["budgets"] = board.budgets.snapshot()
+    summary["idempotency"] = idempotency.snapshot()
     if failure_log:
         from .failures import persist_cases
         summary["cases_persisted"] = persist_cases(
@@ -224,7 +233,7 @@ def _dispatch(action, board, runner=None, profile="enterprise",
               aggressive=False, on_event=None, priors=None,
               registry=None, sink=None, llm_approval=None,
               advisor_factory=None, scope_list=None, toolchain=None,
-              resilient_stager: bool = True):
+              resilient_stager: bool = True, cancel=None, idempotency=None):
     """Orchestrator worker: run every target of the action's task, commit
     staged findings, report task-level success. Exceptions never escape
     (the pool marks the action FAILED and keeps draining) — a crashed
@@ -239,6 +248,12 @@ def _dispatch(action, board, runner=None, profile="enterprise",
     from .llm import SESSION, consult
     from .scheduler import commit_result
     from .worker import TaskResult
+    if cancel is None:
+        from .cancellation import NullToken
+        cancel = NullToken()
+    if idempotency is None:
+        from .idempotency import IdempotencyRegistry
+        idempotency = IdempotencyRegistry()
     task = action.task
     sink = sink if sink is not None else {"failures": [], "cases": []}
     tried = sink.setdefault("tried", {})
@@ -270,6 +285,12 @@ def _dispatch(action, board, runner=None, profile="enterprise",
         from phantom.automation.budget import BudgetLedger
         budgets = board.budgets = BudgetLedger()
     for target in scope:
+        # An operator stop reaches every worker between targets.
+        if cancel.cancelled:
+            _events("cancelled", {"task": task.id, "target": target,
+                                  "reason": cancel.reason})
+            ok_all = False
+            break
         # Per-target budget is checked BEFORE the lease: an exhausted
         # target is skipped with a typed reason instead of charging a run.
         if budgets.exhausted(target):
@@ -277,7 +298,17 @@ def _dispatch(action, board, runner=None, profile="enterprise",
                                          "reason": budgets.reason(target)})
             ok_all = False
             continue
+        # One run per (task, target): a re-dispatch of an already-SUCCEEDED
+        # unit reuses the prior result instead of spending the budget twice.
+        idem_key = idempotency.key_for(task.id, target)
+        if not idempotency.begin(idem_key):
+            _events("idempotent_skip", {"task": task.id, "target": target})
+            prior = idempotency.outcome(idem_key)
+            if prior is not None:
+                ok_all = ok_all and bool(getattr(prior, "ok", False))
+            continue
         if not board.leases.claim(task.id, target, lease_owner):
+            idempotency.fail(idem_key)   # not our run: let the owner finish
             _events("lease_denied", {"task": task.id, "target": target,
                                      "owner": lease_owner})
             continue
@@ -310,6 +341,7 @@ def _dispatch(action, board, runner=None, profile="enterprise",
                 )
             except Exception as exc:  # noqa: BLE001 — pool contract
                 from .failures import AGENT, package_case
+                idempotency.fail(idem_key)   # crashed: a retry may still run
                 task.attempts += 1
                 task.status = "failed"
                 task.failure_kind = AGENT
@@ -365,6 +397,12 @@ def _dispatch(action, board, runner=None, profile="enterprise",
             # so the default stream stays readable and `--verbose` shows it
             _events("task_found", {"task": task.id, "target": target,
                                    "findings": _staged_lines(result.staged)})
+            # idempotency: a SUCCESS is remembered (never re-run); a failed
+            # attempt is released so a policy-driven retry can still run.
+            if result.ok:
+                idempotency.complete(idem_key, result)
+            else:
+                idempotency.fail(idem_key)
             ok_all = ok_all and result.ok
         finally:
             board.leases.release(task.id, target, lease_owner)
