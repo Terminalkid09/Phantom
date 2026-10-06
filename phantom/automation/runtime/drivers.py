@@ -449,14 +449,34 @@ def approved_ids() -> set:
     return ids
 
 
+def registry_enabled_ids() -> set:
+    """Ids ENABLED in the capability trust registry (the governed gate).
+
+    A driver enabled with ``tool enable <id>`` becomes loadable even when it
+    is not listed in ``toolbelt.approved``. A registry with no records
+    contributes nothing, so the legacy config path is unchanged, and any
+    error (missing/broken store) degrades to an empty set.
+    """
+    try:
+        from phantom.automation.runtime.capability_registry import \
+            CapabilityRegistry
+        return CapabilityRegistry().enabled_ids()
+    except Exception:
+        return set()
+
+
 def load_driver_capabilities(approved_only: bool = True) -> List[Any]:
     """Discovered drivers as capabilities (never fatal).
 
     With ``approved_only`` (the default, and what the planner uses) a driver
-    is loaded only when its id is approved — a found manifest is inert until
-    then. Pass ``approved_only=False`` to inspect every candidate.
+    is loaded only when its id is approved — via the config list
+    (``toolbelt.approved``) OR enabled in the trust registry. A found
+    manifest is inert until one of those gates admits it. Pass
+    ``approved_only=False`` to inspect every candidate.
     """
-    approved = approved_ids()
+    config_approved = approved_ids()
+    registry_approved = registry_enabled_ids()
+    approved = config_approved | registry_approved
     out: List[Any] = []
     for drv in load_drivers():
         if approved_only and drv.id not in approved:
@@ -470,7 +490,9 @@ def load_driver_capabilities(approved_only: bool = True) -> List[Any]:
         try:
             from phantom.automation import decision_audit as _audit
             _audit.record("capability_enabled", capability=drv.id,
-                          approver="operator", policy="toolbelt.approved",
+                          approver="operator",
+                          policy=("registry" if drv.id in registry_approved
+                                  else "toolbelt.approved"),
                           source=drv.source_path, digest=drv.digest[:12])
         except Exception:
             pass
@@ -479,7 +501,7 @@ def load_driver_capabilities(approved_only: bool = True) -> List[Any]:
 
 def driver_summary() -> List[Dict[str, Any]]:
     """Plain-data view for the CLI / doctor (never executes anything)."""
-    approved = approved_ids()
+    approved = approved_ids() | registry_enabled_ids()
     out: List[Dict[str, Any]] = []
     for drv in load_drivers():
         out.append({
