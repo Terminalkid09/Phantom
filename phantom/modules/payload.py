@@ -261,7 +261,16 @@ class PayloadModule(BaseModule):
           --delay <ms>    wait before typing (default 1500: the host has to
                           enumerate the HID device first)
           --no-enter      do not press Enter after the command
-          --run           open the run dialog first (Windows targets)
+          --run           open a console first (one chord per target:
+                          Win+R on Windows, Ctrl+Alt+T on Linux,
+                          Cmd+Space on macOS)
+          --flash <port>  Arduino board only: build and upload the sketch
+                          with arduino-cli (compile then upload), e.g.
+                          --flash COM5. The sketch folder is created with
+                          the name the Arduino toolchain requires.
+          --fqbn <fqbn>   board id for --flash (default arduino:avr:micro)
+          --arduino-cli <path>  arduino-cli binary for --flash (default:
+                          PATH, else $PHANTOM_ARDUINO_CLI)
 
         Examples:
           payload hid pico --stager windows --target windows --run
@@ -284,6 +293,9 @@ class PayloadModule(BaseModule):
         delay_ms = 1500
         press_enter = True
         open_run = False
+        flash = ""
+        fqbn = ""
+        arduino_cli = ""
 
         i = 0
         while i < len(parts):
@@ -302,6 +314,18 @@ class PayloadModule(BaseModule):
                 continue
             if tok == "--out" and i + 1 < len(parts):
                 out = parts[i + 1]
+                i += 2
+                continue
+            if tok == "--flash" and i + 1 < len(parts):
+                flash = parts[i + 1]
+                i += 2
+                continue
+            if tok == "--fqbn" and i + 1 < len(parts):
+                fqbn = parts[i + 1]
+                i += 2
+                continue
+            if tok == "--arduino-cli" and i + 1 < len(parts):
+                arduino_cli = parts[i + 1]
                 i += 2
                 continue
             if tok == "--delay" and i + 1 < len(parts):
@@ -331,6 +355,10 @@ class PayloadModule(BaseModule):
 
         if not board:
             notifier.error(f"hid wants a board: {', '.join(BOARDS)}")
+            return
+        if flash and board not in ARDUINO_BOARDS:
+            notifier.error("--flash uploads through arduino-cli, which only "
+                           "serves the 'arduino' board")
             return
         if stager:
             if target and target != stager:
@@ -378,6 +406,21 @@ class PayloadModule(BaseModule):
             notifier.warn(note)
         for note in board_notes(board):
             notifier.info(note)
+        if flash:
+            from phantom.utils.arduino_flash import DEFAULT_FQBN, flash_sketch
+            notifier.status(f"Flashing {os.path.basename(out)} to {flash} "
+                            f"with arduino-cli...")
+            result = flash_sketch(os.path.dirname(os.path.abspath(out)), flash,
+                                  fqbn=(fqbn or DEFAULT_FQBN),
+                                  cli=(arduino_cli or None))
+            for step in result.steps:
+                notifier.info(f"  {step.summary()}")
+                if not step.ok and step.output:
+                    notifier.warn(step.output[-400:])
+            if result.ok:
+                notifier.success(result.summary())
+            else:
+                notifier.error(result.summary())
         session.add_note(f"HID payload ({board}) -> {out}")
 
     def _get_lhost(self) -> str:
