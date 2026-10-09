@@ -85,7 +85,11 @@ inline unsigned long rel(void* obj) {
 // dynamically load MF
 inline HMODULE mfplat() { return GetModuleHandleA("mfplat.dll") ? GetModuleHandleA("mfplat.dll") : LoadLibraryA("mfplat.dll"); }
 inline HMODULE mfread() { return LoadLibraryA("mfreadwrite.dll"); }
-inline HMODULE mfutils() { return LoadLibraryA("mf.dll"); }
+// MFEnumDeviceSources is exported by mfplat.dll (Windows 8+), NOT by the
+// legacy mf.dll core: loading mf.dll here made GetProcAddress return NULL and
+// killed the entire Media Foundation capture path (every camera command fell
+// back). Load the same module the other MF entry points come from.
+inline HMODULE mfutils() { return GetModuleHandleA("mfplat.dll") ? GetModuleHandleA("mfplat.dll") : LoadLibraryA("mfplat.dll"); }
 
 typedef long (__stdcall *FnMFStartup)(unsigned long, unsigned long);
 typedef long (__stdcall *FnMFShutdown)();

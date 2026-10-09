@@ -706,6 +706,12 @@ bResult = winhttp_dyn::WinHttpReceiveResponseDynamic(hRequest, nullptr);
             if (!winhttp_dyn::WinHttpQueryDataAvailableDynamic(hRequest, &dwSize)) break;
             if (dwSize == 0) break;
 
+            // Security: dwSize is server-controlled (WinHttpQueryDataAvailable).
+            // Cap the response exactly like the POSIX read path (10 MiB) so a
+            // buggy or hostile C2 cannot make us allocate/buffer arbitrarily.
+            constexpr size_t kMaxResponseBytes = 10 * 1024 * 1024;
+            if (dwSize > kMaxResponseBytes ||
+                response_body.size() + dwSize > kMaxResponseBytes) break;
             std::vector<char> buffer(dwSize + 1, 0);
             DWORD dwDownloaded = 0;
             if (winhttp_dyn::WinHttpReadDataDynamic(hRequest, buffer.data(), dwSize, &dwDownloaded)) {

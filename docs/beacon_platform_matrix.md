@@ -41,8 +41,11 @@ name — documented rather than stubbed. The test
 `tests/test_beacon_posix_parity.py` pins this list so a new header either ships
 a POSIX path or is added here on purpose.
 
-- `stack_spoof.h` — call-stack spoofing against unwinder-based EDR. POSIX
-  unwinding models differ; no equivalent is shipped.
+- Call-stack spoofing against unwinder-based EDR ships through
+  `sleep_mask.h` (`sleepmask::spoof_stack`, ThreadStackSpoofer class);
+  the earlier standalone `stack_spoof.h` / `stack_spoofer.asm` pair was
+  never called by the beacon and was removed as dead code. POSIX
+  unwinding models differ; no equivalent is shipped there.
 - `syscalls.h` — direct/indirect NT syscalls to bypass userland hooks. POSIX has
   no userland syscall-hook layer to dodge.
 - `apc_injection.h` — APC injection (a Windows scheduling primitive).

