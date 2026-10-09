@@ -59,6 +59,36 @@ def _default_path() -> str:
         return "capability_registry.json"
 
 
+# ── validation ladder (a DIFFERENT axis from trust) ──────────────────────────
+# `state` answers "may this run?"; `validation` answers "how well was it
+# proven?". Conflating them is what made a placeholder that reached `validated`
+# look better proven than a lab-proven capability that was merely `enabled` —
+# and left an operator unable to ask the question at all.
+#
+# Ranks (higher = more evidence):
+VALIDATION_ORDER: Dict[str, int] = {
+    "implemented": 0,
+    "unit_tested": 1,
+    "integration_tested": 2,
+    "lab_validated": 3,
+}
+# Non-ranks: these describe SCOPE, not maturity, so they never outrank anything.
+SCOPE_FLAGS = ("platform_limited", "placeholder", "unsupported")
+VALIDATION_TIERS: Tuple[str, ...] = tuple(VALIDATION_ORDER) + SCOPE_FLAGS
+
+
+def validation_rank(value: str) -> int:
+    return VALIDATION_ORDER.get(value, -1)
+
+
+def is_validated(value: str) -> bool:
+    return validation_rank(value) >= VALIDATION_ORDER["unit_tested"]
+
+
+def is_lab_validated(value: str) -> bool:
+    return validation_rank(value) >= VALIDATION_ORDER["lab_validated"]
+
+
 def sha256_file(path: str) -> str:
     """sha256 of a file, or '' when unreadable (never raises)."""
     import hashlib
@@ -91,10 +121,49 @@ class CapabilityRecord:
     approved_at: float = 0.0
     approved_by: str = ""
     note: str = ""
+    # ── validation tier: evidence, not permission ──
+    #: one of VALIDATION_TIERS. Defaults to the weakest honest claim.
+    validation: str = "implemented"
+    #: what backs the tier — a test path, a lab note, a date. REQUIRED for
+    #: `lab_validated`: a tier nobody can cite is a wish, not evidence.
+    validation_evidence: str = ""
+    #: why the capability is narrower than its name suggests (platform_limited)
+    scope_note: str = ""
 
     @property
     def approved(self) -> bool:
         return _ORDER.get(self.state, -1) >= _ORDER["approved"]
+
+    @property
+    def tested(self) -> bool:
+        """Has any real test exercised this?"""
+        return is_validated(self.validation)
+
+    @property
+    def proven(self) -> bool:
+        """Validated against a real target, with evidence recorded."""
+        return is_lab_validated(self.validation) and bool(
+            self.validation_evidence.strip())
+
+    def declaration_errors(self) -> List[str]:
+        """Self-inconsistent declarations, so a bad claim is visible not silent.
+
+        These are the ways a record can lie: an unrecognised tier, a lab claim
+        with nothing to back it, a scope flag with no explanation, a 'proven'
+        record that never reached the top of the ladder.
+        """
+        problems: List[str] = []
+        if self.validation not in VALIDATION_TIERS:
+            problems.append(
+                f"unknown validation tier {self.validation!r} "
+                f"(expected one of {', '.join(VALIDATION_TIERS)})")
+        if is_lab_validated(self.validation) and not self.validation_evidence.strip():
+            problems.append(
+                "claims lab_validated without validation_evidence")
+        if self.validation in SCOPE_FLAGS and not self.scope_note.strip():
+            problems.append(
+                f"marked {self.validation} without a scope_note saying why")
+        return problems
 
     @property
     def enabled(self) -> bool:
@@ -108,6 +177,11 @@ class CapabilityRecord:
         data["platforms"] = list(self.platforms)
         data["approved"] = self.approved
         data["enabled"] = self.enabled
+        data["tested"] = self.tested
+        data["proven"] = self.proven
+        # Surfaced so a lying record is visible in any dump of the registry,
+        # not only when someone remembers to call declaration_errors().
+        data["declaration_errors"] = self.declaration_errors()
         return data
 
     @classmethod
@@ -129,6 +203,9 @@ class CapabilityRecord:
             approved_at=float(data.get("approved_at") or 0.0),
             approved_by=str(data.get("approved_by") or ""),
             note=str(data.get("note") or ""),
+            validation=str(data.get("validation") or "implemented"),
+            validation_evidence=str(data.get("validation_evidence") or ""),
+            scope_note=str(data.get("scope_note") or ""),
         )
 
 
@@ -241,6 +318,50 @@ class CapabilityRegistry:
             if reason:
                 row.note = reason[:200]
             return True
+
+    def set_validation(self, capability: str, tier: str, evidence: str = "",
+                       scope_note: str = "") -> bool:
+        """Record HOW PROVEN a capability is. False when the claim is refused.
+
+        Refusals are the point. `lab_validated` with no evidence, an unknown
+        tier, or a scope flag that does not say what is missing: all three are
+        ways a capability registry starts advertising fiction, and a registry
+        that lies is worse than one that admits ignorance.
+        """
+        self._ensure_loaded()
+        with self._lock:
+            row = self._rows.get(capability)
+            if row is None:
+                return False
+            if tier not in VALIDATION_TIERS:
+                return False
+            if is_lab_validated(tier) and not (evidence or "").strip():
+                return False
+            if tier in SCOPE_FLAGS and not (scope_note or "").strip():
+                return False
+            row.validation = tier
+            row.validation_evidence = (evidence or "").strip()[:400]
+            if scope_note:
+                row.scope_note = scope_note.strip()[:200]
+            return True
+
+    def unproven(self) -> List[Dict[str, Any]]:
+        """Records whose declaration does not hold up.
+
+        The list an operator reviews before trusting a capability inventory:
+        anything claiming more than it can show, or quietly narrowing its scope
+        without saying so.
+        """
+        self._ensure_loaded()
+        with self._lock:
+            out: List[Dict[str, Any]] = []
+            for row in self._rows.values():
+                problems = row.declaration_errors()
+                if problems:
+                    out.append({"capability": row.capability,
+                                "validation": row.validation,
+                                "problems": problems})
+            return out
 
     def approve(self, capability: str, actor: str = "operator",
                 reason: str = "") -> bool:
