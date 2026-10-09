@@ -479,6 +479,22 @@ class TestCppInvariants(unittest.TestCase):
         block = self.main.split("if (cfg.on_failure())", 1)[1].split("}", 1)[0]
         self.assertIn("g_ctx.cleanup()", block)
 
+    def test_the_windows_response_read_is_capped_before_it_allocates(self):
+        """dwSize is server-controlled (WinHttpQueryDataAvailable); a buggy or
+        hostile C2 can report an absurd size. The read loop must reject it
+        BEFORE `std::vector<char> buffer(dwSize + 1)`, exactly like the POSIX
+        read path — otherwise the beacon allocates whatever the server asks."""
+        alloc = self.network.index("std::vector<char> buffer(dwSize + 1")
+        head = self.network[:alloc]
+        self.assertRegex(
+            head, r"kMaxResponseBytes\s*=\s*10\s*\*\s*1024\s*\*\s*1024")
+        # both the single chunk AND the running total are bounded
+        self.assertIn("dwSize > kMaxResponseBytes", head)
+        self.assertIn("response_body.size() + dwSize > kMaxResponseBytes", head)
+        # and the guard must BREAK, not fall through to the allocation
+        guard = head[head.rindex("if (dwSize > kMaxResponseBytes"):]
+        self.assertIn("break;", guard)
+
     def test_the_transport_harness_exists(self):
         """The ladder/proxy logic is proven by running this TU, so it must
         stay in the tree and stay self-contained."""
