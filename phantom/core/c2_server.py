@@ -564,6 +564,9 @@ class C2State:
         ]
 
     def add_result(self, beacon_id: str, task_id: str, output: str) -> None:
+        # How many oldest results this call drops; reported AFTER the lock
+        # is released (see the tail of this method).
+        pruned = 0
         with self.lock:
             # A retry after a lost 200 response must be idempotent.
             existing = self.results.setdefault(beacon_id, [])
@@ -586,6 +589,7 @@ class C2State:
                 "time": datetime.now().isoformat(timespec="seconds"),
             })
             if len(existing) > MAX_RESULTS_PER_BEACON:
+                pruned = len(existing) - MAX_RESULTS_PER_BEACON
                 del existing[:-MAX_RESULTS_PER_BEACON]
             self._ack_task_locked(beacon_id, task_id)
             # Binary artifacts (screenshot / camera / exfil) land as real
@@ -674,6 +678,32 @@ class C2State:
                     info["exited_at"] = datetime.now().isoformat(timespec="seconds")
                 from phantom.utils.audit_log import audit_log
                 audit_log.append("beacon_exited", beacon_id=beacon_id)
+
+        # Pruning used to be SILENT: `del existing[:-MAX_RESULTS_PER_BEACON]`
+        # dropped the OLDEST results with no trace, so on a long engagement
+        # the operator's first proof-of-access could vanish and nothing said
+        # so. Announce it on the audit chain (chain of custody) AND on the
+        # campaign timeline the UI renders. Emitted outside the lock: the
+        # hash-chained append does an fsync, which must not block the
+        # listener while it holds the state lock.
+        if pruned:
+            logger.warning(
+                f"Pruned {pruned} oldest result(s) for beacon {beacon_id} "
+                f"(cap {MAX_RESULTS_PER_BEACON})")
+            try:
+                from phantom.utils.audit_log import audit_log
+                audit_log.append("results_pruned", beacon_id=beacon_id,
+                                 pruned=pruned, kept=MAX_RESULTS_PER_BEACON)
+            except Exception:
+                pass
+            try:
+                from phantom.api.server import _push_timeline
+                _push_timeline(
+                    "c2", "results_pruned",
+                    f"{pruned} oldest result(s) pruned for beacon "
+                    f"{beacon_id[:16]} (cap {MAX_RESULTS_PER_BEACON})")
+            except Exception:
+                pass
 
     @staticmethod
     def _sniff_ext(raw: bytes) -> str:
