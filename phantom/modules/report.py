@@ -18,12 +18,15 @@ Commands (inside `use report`):
   export pdf <file>   -> client-grade PDF (sanitized)
   export md <file>    -> operator markdown (everything)
   export client <f>   -> sanitized client markdown
+  export capabilities <file.json> -> machine-readable, per-capability
+                         evidence (typed kind, key, confidence, source)
 """
 
 import json
 import os
 import re
 from datetime import datetime
+from typing import Optional
 
 from phantom.modules.base_module import BaseModule
 from phantom.core.session import session
@@ -117,6 +120,33 @@ def _methodology() -> list:
     return steps
 
 
+def _phase_state(modules, count: int) -> str:
+    """The THREE honest states of one kill-chain phase.
+
+    "not executed" is not the same as "executed and found nothing". The old
+    summary collapsed both into "identified no critical vulnerabilities
+    through automated correlation", so a report produced BEFORE the exploit
+    module ever ran read exactly like a clean assessment: the client could
+    not tell an untested target from a hardened one. The state is read from
+    ``session.results`` — never inferred from a missing finding list.
+    """
+    if isinstance(modules, str):
+        modules = (modules,)
+    if not any(m in session.results for m in modules):
+        return "not-run"
+    return "found" if count else "empty"
+
+
+def _phase_clause(subject: str, modules, count: int, noun: str) -> str:
+    """One executive-summary clause for a phase, in its real state."""
+    state = _phase_state(modules, count)
+    if state == "not-run":
+        return f"{subject} was **not executed** in this engagement"
+    if state == "empty":
+        return f"{subject} ran and found **no** {noun}"
+    return f"{subject} found **{count}** {noun}"
+
+
 def _executive_summary() -> str:
     target = session.target or "Unknown"
     ranked = _ranked()
@@ -127,15 +157,29 @@ def _executive_summary() -> str:
     os_info = kb.get("os_info") or {}
 
     parts = [f"The security assessment of target **{target}**"]
-    if ranked:
-        parts.append(f"identified **{len(ranked)}** potential vulnerabilities"
-                     f" (of which **{high_risk}** HIGH risk)")
+
+    # Reconnaissance — "found nothing" is only claimable if it actually ran.
+    parts.append(_phase_clause(
+        "Reconnaissance", ("scan", "service_summary"),
+        len(services), "exposed services"))
+
+    # Vulnerability identification, with the HIGH-risk breakdown.
+    if _phase_state(("exploit",), len(ranked)) == "not-run":
+        parts.append("Vulnerability identification was **not executed** "
+                     "(no exploitation/correlation phase ran)")
+    elif ranked:
+        parts.append(f"Vulnerability identification found **{len(ranked)}** "
+                     f"potential vulnerabilities (of which **{high_risk}** "
+                     "HIGH risk)")
     else:
-        parts.append("identified **no** critical vulnerabilities through automated correlation")
-    if services:
-        parts.append(f"Reconnaissance found **{len(services)}** exposed services")
-    if creds:
-        parts.append(f"Credential testing recovered **{len(creds)}** credential set(s)")
+        parts.append("Vulnerability identification ran and found **no** "
+                     "exploitable vulnerabilities")
+
+    # Credential testing.
+    parts.append(_phase_clause(
+        "Credential testing", ("brute",),
+        len(creds), "credential set(s)"))
+
     if os_info.get("os"):
         parts.append(f"Operating system identified as **{os_info['os']}**")
     return " ".join(parts) + "."
@@ -149,7 +193,139 @@ def _hardening_for(service: str) -> str:
     return "Patch the affected software to the latest stable version and restrict exposure to trusted networks only."
 
 
+def _unique_dir(root: str, name: str) -> str:
+    """Create and return a report directory that cannot silently collide.
+
+    Two reports generated in the same wall-clock second used to land in the
+    SAME ``report_<target>_<YYYYmmdd_HHMMSS>`` directory; ``makedirs(...,
+    exist_ok=True)`` then let the second run overwrite ``raw_audit`` and
+    ``client_report`` — the first engagement's evidence was destroyed with
+    no warning. The human-readable timestamp stays; only a real collision
+    gets a ``-2``, ``-3`` suffix. ``makedirs`` without ``exist_ok`` is used
+    so the check and the create are the same syscall-level step.
+    """
+    n = 1
+    while True:
+        candidate = os.path.join(root, name if n == 1 else f"{name}-{n}")
+        try:
+            os.makedirs(candidate)
+        except FileExistsError:
+            n += 1
+            if n > 1000:
+                raise
+            continue
+        return candidate
+
+
+def _confidence_text(kind: str, key: str) -> str:
+    """Confidence of a finding, looked up in the shared WorldModel.
+
+    The manual modules already compute a confidence for every finding
+    (``scan.py`` service = 0.7, ``exploit.py`` privesc = 0.7-0.9) and store
+    it in the WorldModel, but the report only read ``session.results`` — so
+    the number never reached the client. A finding without a confidence is a
+    finding the client cannot weigh. Returns "not recorded" when the
+    WorldModel holds no matching evidence (never fabricate a value).
+    """
+    try:
+        from phantom.core.knowledge import session_wm
+        for f in session_wm().all_findings():
+            if f.kind == kind and f.key == key:
+                return f"{float(f.confidence):.2f}"
+    except Exception:
+        pass
+    return "not recorded"
+
+
+_OUTCOME_LABEL = {
+    "ok": "executed — output captured",
+    "empty": "executed — no output",
+    "error": "blocked / failed",
+    "not-run": "not executed",
+}
+
+
+def _module_outcomes() -> list:
+    """Every module the session ran, with the REAL outcome of its run.
+
+    "the tool was not installed", "the target was unreachable" and "nothing
+    was found" all used to reach the reader as the same empty result. The
+    outcome is read from the recorded run status (see ``Session.add_result``)
+    — never guessed from the data.
+    """
+    rows = []
+    for mod in session.results:
+        if mod.startswith("_"):
+            continue
+        st = session.result_status.get(mod) or {}
+        err = st.get("error") if isinstance(st, dict) else None
+        rows.append((mod, session.result_outcome(mod), err))
+    return rows
+
+
+def _capabilities() -> list:
+    """Machine-readable evidence, ONE RECORD PER CAPABILITY (G18).
+
+    The report was only readable by a human: the JSON dump carried the raw
+    per-module blobs, so nothing downstream (a ticketing system, a coverage
+    tracker, a diff between two engagements) could consume a finding without
+    re-parsing stdout. Every WorldModel finding is emitted here with its
+    typed kind, its key, the confidence the evidence model assigned and the
+    source that produced it.
+    """
+    rows = []
+    try:
+        from phantom.core.knowledge import session_wm
+        for f in session_wm().all_findings():
+            rows.append({
+                "capability": f.kind,
+                "key": f.key,
+                "confidence": float(f.confidence),
+                "source": f.source,
+                "evidence": f.value,
+            })
+    except Exception:
+        pass
+    return rows
+
+
+def _bold_to_html(text: str, open_tag: str, close_tag: str) -> str:
+    """Convert markdown ``**bold**`` to markup, alternating open/close.
+
+    ``text.replace("**", "<strong>")`` (the old code) replaced EVERY marker
+    with an opening tag; there was no ``**`` left for the closing pass, so
+    every client HTML/PDF executive summary shipped with unclosed tags.
+    """
+    parts = text.split("**")
+    out = [parts[0]]
+    for i, chunk in enumerate(parts[1:], start=1):
+        out.append(open_tag if i % 2 == 1 else close_tag)
+        out.append(chunk)
+    return "".join(out)
+
+
 # ── Markdown builders ──────────────────────────────────────────────────────
+
+def _guardrails_markdown() -> list:
+    """The protection level THIS engagement ran at, as report lines.
+
+    The manifest is the only record an operator can point at when a client
+    asks which controls were active, and it is the reason the API report and
+    the CLI report must come from the same generator: when the API built its
+    own text, the manifest was silently absent from every UI-produced report.
+
+    Best-effort by design: a reporting problem must never lose the report, so
+    a failure degrades to one line saying so instead of raising.
+    """
+    try:
+        from phantom.utils import guardrails as gr
+        manifest = gr.build(
+            scope=getattr(session, "scope", None),
+            targets=[session.target] if session.target else None)
+        return ["", gr.report_block(manifest)]
+    except Exception as exc:
+        return ["", f"_Guardrail manifest unavailable ({type(exc).__name__})._"]
+
 
 def _build_operator_markdown() -> str:
     """Everything the operator needs: creds, commands, full output."""
@@ -181,7 +357,22 @@ def _build_operator_markdown() -> str:
     w(f"- Credentials recovered: **{len(creds)}**")
     w(f"- Commands executed: **{len(session.history)}**")
     w(f"- Notes: **{len(session.notes)}**")
+    if kb.get("persistence_set") or (kb.get("status") or {}).get("persistence_set"):
+        w("- Persistence installed: **yes** — clear it with the beacon's "
+          "`unpersist` before demobilizing")
     w()
+
+    # Run outcomes: what actually happened, per module. The raw module
+    # output below says nothing about whether a tool was missing.
+    outcomes = _module_outcomes()
+    if outcomes:
+        w("## Module Outcomes")
+        w()
+        w("| Module | Outcome | Reason |")
+        w("|--------|---------|--------|")
+        for mod, outcome, err in outcomes:
+            w(f"| {mod} | {_OUTCOME_LABEL.get(outcome, outcome)} | {err or '—'} |")
+        w()
 
     # OS / KB intelligence
     os_info = kb.get("os_info") or {}
@@ -247,8 +438,10 @@ def _build_operator_markdown() -> str:
                 badges.append("PoC")
             svc_port = getattr(svc, "port", None) or (svc.get("port") if isinstance(svc, dict) else None)
             svc_name = getattr(svc, "service", None) or (svc.get("service") if isinstance(svc, dict) else None)
-            w(f"### {cve.get('id', 'Unknown')} — {svc_name}/{svc_port} [{_severity(score)} {score}/100]"
-              + (f" ({', '.join(badges)})" if badges else ""))
+            cve_id = cve.get('id', 'Unknown')
+            w(f"### {cve_id} — {svc_name}/{svc_port} [{_severity(score)} {score}/100]"
+              + (f" ({', '.join(badges)})" if badges else "")
+              + f" — confidence {_confidence_text('vuln', cve_id)}")
             w()
             w(f"{cve.get('description', 'No description')}")
             w()
@@ -305,6 +498,8 @@ def _build_operator_markdown() -> str:
             w(f"- **[{n.get('timestamp', '')}]** {n.get('text', '')}")
         w()
 
+    out.extend(_guardrails_markdown())
+
     w("---")
     w(f"*Phantom Framework v{VERSION} — internal operator report*")
     return "\n".join(out)
@@ -348,6 +543,23 @@ def _build_client_markdown() -> str:
       "Findings are classified by severity and ordered by business impact.")
     w()
 
+    # Coverage: an untested or blocked phase must not read as a clean one.
+    outcomes = _module_outcomes()
+    if outcomes:
+        w("## Assessment Coverage")
+        w()
+        w("Each phase reports what actually happened; a phase that could not "
+          "run is listed as such and is not evidence of a clean result:")
+        w()
+        w("| Phase | Result |")
+        w("|-------|--------|")
+        for mod, outcome, err in outcomes:
+            label = _OUTCOME_LABEL.get(outcome, outcome)
+            if outcome == "error" and err:
+                label = f"{label} ({err})"
+            w(f"| {mod} | {label} |")
+        w()
+
     # Findings by severity
     if ranked:
         w("## Findings")
@@ -366,10 +578,15 @@ def _build_client_markdown() -> str:
                 svc = entry.get("service", {})
                 svc_port = getattr(svc, "port", None) or (svc.get("port") if isinstance(svc, dict) else None)
                 svc_name = getattr(svc, "service", None) or (svc.get("service") if isinstance(svc, dict) else None)
-                w(f"#### {cve.get('id', 'Unknown CVE')} — {svc_name}/{svc_port} "
+                client_cve_id = cve.get('id', 'Unknown CVE')
+                w(f"#### {client_cve_id} — {svc_name}/{svc_port} "
                   f"(score {entry.get('score', 0)}/100)")
                 w()
                 w(f"{cve.get('description', 'No description available')}")
+                w()
+                w(f"_Evidence confidence: "
+                  f"{_confidence_text('vuln', client_cve_id)} (assessment "
+                  "evidence model)._")
                 w()
             w()
 
@@ -452,6 +669,34 @@ def _build_client_markdown() -> str:
                   "verify the affected service is not exposed beyond the trusted network.")
         w()
 
+    # Persistence & cleanup — only when the engagement installed any. A tool
+    # that installs persistence MUST hand the client the way back out: the
+    # old report listed the artifacts as IOCs and told the client to remove
+    # them, with no supported command to do it. The beacon's `unpersist`
+    # deletes exactly what `persist` created (same RunKey value / systemd
+    # unit / autostart file / cron line / on-disk copy).
+    if kb.get("persistence_set") or (kb.get("status") or {}).get("persistence_set"):
+        w("## Persistence & Cleanup")
+        w()
+        w("During the assessment the beacon installed persistence on the "
+          "target. Every artifact below is removed by the beacon's own "
+          "`unpersist` command, which reuses the identical paths `persist` "
+          "installed:")
+        w()
+        w("- Windows: HKCU\\Software\\Microsoft\\Windows\\CurrentVersion"
+          "\\Run value, plus the beacon copy under `%APPDATA%\\Microsoft"
+          "\\Phantom\\`")
+        w("- Linux: `~/.config/systemd/user/<name>.service`, "
+          "`~/.config/autostart/<name>.desktop`, the `crontab` line, and the "
+          "copy in `~/.local/bin/`")
+        w("- macOS: `~/Library/LaunchAgents/com.<name>.plist`")
+        w()
+        w("```")
+        w("unpersist              # same default name used by `persist`")
+        w("unpersist <name>       # the non-default name you installed with")
+        w("```")
+        w()
+
     # Field notes (sanitized — no commands/creds)
     if session.notes:
         w("## Field Notes")
@@ -459,6 +704,8 @@ def _build_client_markdown() -> str:
         for n in session.notes:
             w(f"- **[{n.get('timestamp', '')}]** {n.get('text', '')}")
         w()
+
+    out.extend(_guardrails_markdown())
 
     w("---")
     w(f"*Report generated with Phantom Framework v{VERSION} — Confidential. "
@@ -503,11 +750,15 @@ class ReportModule(BaseModule):
             safe_target = re.sub(r"[^A-Za-z0-9._\-]", "_", session.target or "phantom")
             filename = (f"report_{safe_target}_"
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.{fmt}")
-        elif not filename.endswith(f".{fmt}"):
+        elif fmt == "capabilities" and not filename.endswith(".json"):
+            filename += ".json"
+        elif fmt != "capabilities" and not filename.endswith(f".{fmt}"):
             filename += f".{fmt}"
 
         if fmt == "json":
             self._export_json(filename)
+        elif fmt == "capabilities":
+            self._export_capabilities(filename)
         elif fmt == "html":
             self._export_html(filename)
         elif fmt == "pdf":
@@ -519,13 +770,80 @@ class ReportModule(BaseModule):
         else:
             notifier.error(f"Unsupported format: {fmt}")
 
+    def generate(self, fmt: str = "html") -> dict:
+        """Build the report set for the CURRENT session, non-interactively.
+
+        THE single entry point for callers other than the CLI (the API server):
+        the UI used to run a second generator inline that dropped the guardrail
+        manifest, so a report delivered to a client from the UI could not show
+        which controls were active. One generator, one answer.
+
+        Returns the two artifact paths plus the text previews the UI shows; the
+        chosen format decides the file types, and a PDF request without
+        reportlab degrades to HTML rather than writing text into a `.pdf`.
+        """
+        from phantom.utils.paths import reports_dir
+        fmt = (fmt or "html").lower()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        safe_target = re.sub(r"[^A-Za-z0-9._-]", "_", session.target or "unknown")
+        rdir = _unique_dir(
+            reports_dir(),
+            f"report_{safe_target}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+
+        operator_md = _build_operator_markdown()
+        client_md = _build_client_markdown()
+        note = ""
+
+        if fmt == "json":
+            raw_path = os.path.join(rdir, "raw_audit.json")
+            self._export_json(raw_path)
+            client_path = os.path.join(rdir, "client_report.json")
+            with open(client_path, "w", encoding="utf-8") as f:
+                json.dump({"generated_at": now, "client_report": client_md},
+                          f, indent=2, default=str)
+        elif fmt == "capabilities":
+            raw_path = os.path.join(rdir, "capabilities.json")
+            self._export_capabilities(raw_path)
+            client_path = raw_path
+        elif fmt == "pdf":
+            raw_path = os.path.join(rdir, "raw_audit.md")
+            with open(raw_path, "w", encoding="utf-8") as f:
+                f.write(operator_md)
+            client_path = os.path.join(rdir, "client_report.pdf")
+            if not self._export_pdf(client_path):
+                client_path = os.path.join(rdir, "client_report.html")
+                self._export_html(client_path)
+                note = ("reportlab not installed: the client report was written "
+                        "as HTML instead of PDF")
+        else:
+            fmt = "html"
+            from html import escape as _e
+            raw_path = os.path.join(rdir, "raw_audit.html")
+            with open(raw_path, "w", encoding="utf-8") as f:
+                f.write("<!DOCTYPE html>\n<html><head><meta charset=\"UTF-8\">"
+                        "<title>Phantom Raw Audit</title></head><body><pre>"
+                        f"{_e(operator_md)}</pre></body></html>")
+            client_path = os.path.join(rdir, "client_report.html")
+            self._export_html(client_path)
+
+        out = {
+            "raw": operator_md,
+            "client": client_md,
+            "raw_path": raw_path,
+            "client_path": client_path,
+            "generated_at": now,
+            "format": fmt,
+        }
+        if note:
+            out["note"] = note
+        return out
+
     def _export_full_set(self):
         """Write the complete double-report set to data/reports/<ts>/."""
         from phantom.utils.paths import reports_dir
         import tempfile
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        rdir = os.path.join(reports_dir(), f"engagement_{ts}")
-        os.makedirs(rdir, exist_ok=True)
+        rdir = _unique_dir(reports_dir(), f"engagement_{ts}")
 
         raw_json = os.path.join(rdir, "raw_report.json")
         raw_md = os.path.join(rdir, "raw_report.md")
@@ -604,9 +922,32 @@ class ReportModule(BaseModule):
             "notes": session.notes,
             "history": session.history,
         }
+        # Machine-readable, per-capability evidence + per-module outcomes:
+        # the parts another tool can consume without re-parsing stdout.
+        data["capabilities"] = _capabilities()
+        data["module_outcomes"] = [
+            {"module": m, "outcome": o, "error": e}
+            for m, o, e in _module_outcomes()
+        ]
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, default=str)
         notifier.success(f"JSON audit saved to {filename}")
+
+    def _export_capabilities(self, filename: str):
+        """Standalone machine-readable export, keyed by capability (G18)."""
+        payload = {
+            "target": session.target,
+            "mode": session.mode,
+            "generated_at": datetime.now().isoformat(),
+            "capabilities": _capabilities(),
+            "module_outcomes": [
+                {"module": m, "outcome": o, "error": e}
+                for m, o, e in _module_outcomes()
+            ],
+        }
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, default=str)
+        notifier.success(f"Capability export saved to {filename}")
 
     def _export_operator_md(self, filename: str):
         with open(filename, "w", encoding="utf-8") as f:
@@ -635,8 +976,7 @@ class ReportModule(BaseModule):
 
         target = session.target or "Phantom Engagement"
         date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        summary = _executive_summary().replace("**", "<strong>").replace(
-            "**", "</strong>")
+        summary = _bold_to_html(_executive_summary(), "<strong>", "</strong>")
 
         # P1-12: the target string is operator/target-controlled input →
         # escaped before it lands in the client-facing page
@@ -650,6 +990,15 @@ class ReportModule(BaseModule):
         html = html.replace("{{ notes_section }}", self._build_notes_section())
         # Client-grade: command history is intentionally NOT included.
         html = html.replace("{{ history_section }}", "")
+        # The guardrail manifest is part of the deliverable: the template is
+        # set in stone, so when it has no placeholder the section is injected
+        # before the footer — never dropped.
+        guardrails_html = self._build_guardrails_section()
+        if "{{ guardrails_section }}" in html:
+            html = html.replace("{{ guardrails_section }}", guardrails_html)
+        else:
+            html = html.replace("<footer>",
+                                guardrails_html + "\n\n    <footer>", 1)
         html = html.replace("Phantom v2.5", f"Phantom v{VERSION}")
 
         with open(filename, "w", encoding="utf-8") as f:
@@ -684,6 +1033,7 @@ class ReportModule(BaseModule):
                 <strong>{_e(str(cve.get('id', 'Unknown CVE')))}</strong> - {_e(str(svc_name))}/{_e(str(svc_port))}<br>
                 <small style="color: #666;">{_e(str(cve.get('description', 'No description available'))[:200])}...</small>
                 <div style="margin-top: 10px;">{badges}</div>
+                <small style="color: #888;">Evidence confidence: {_e(_confidence_text('vuln', str(cve.get('id', 'Unknown'))))}</small>
             </div>
             <div class="score" style="color: var(--{level});">{score}/100</div>
         </div>"""
@@ -735,6 +1085,13 @@ class ReportModule(BaseModule):
                       f"{_e(str(note.get('text', '')))}</li>")
         return f"<section><h2>Field Notes</h2><ul>{items}</ul></section>"
 
+    def _build_guardrails_section(self) -> str:
+        """The guardrail manifest, escaped, as a valid HTML section."""
+        from html import escape as _e
+        body = _e("\n".join(_guardrails_markdown()).strip())
+        return ("<section>\n        <h2>Guardrails</h2>\n"
+                f"        <pre>{body}</pre>\n    </section>")
+
     def _export_pdf(self, filename: str):
         try:
             from reportlab.lib.pagesizes import A4
@@ -743,7 +1100,7 @@ class ReportModule(BaseModule):
             from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
         except ImportError:
             notifier.error("reportlab not installed. Install with: pip install reportlab")
-            return
+            return False
 
         doc = SimpleDocTemplate(filename, pagesize=A4)
         styles = getSampleStyleSheet()
@@ -758,7 +1115,7 @@ class ReportModule(BaseModule):
         elements.append(Spacer(1, 20))
 
         elements.append(Paragraph("Executive Summary", heading_style))
-        summary_text = _executive_summary().replace("**", "<b>")
+        summary_text = _bold_to_html(_executive_summary(), "<b>", "</b>")
         elements.append(Paragraph(summary_text, styles['Normal']))
         elements.append(Spacer(1, 15))
 
@@ -802,6 +1159,7 @@ class ReportModule(BaseModule):
 
         doc.build(elements)
         notifier.success(f"Client PDF report saved to {filename}")
+        return True
 
     def do_run(self, arg):
         if "--quiet" in (arg or "").split():

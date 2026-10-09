@@ -833,7 +833,32 @@ class ClientReport:
         lines.append("")
         for r in getattr(self, "_remediations", []):
             lines.append(f"- {r}")
+        # Engagement scope of protection, stated in the deliverable. A client
+        # reading this can see exactly which controls were active and which
+        # the operator overrode - which is the difference between "we stayed
+        # in scope" as a claim and as a fact.
+        lines.extend(self._guardrail_section())
         return "\n".join(lines)
+
+    def _guardrail_section(self) -> List[str]:
+        """The guardrail manifest as a report section.
+
+        Best-effort: a reporting problem must never lose the report, so a
+        failure here degrades to one line saying so rather than raising.
+        """
+        try:
+            from phantom.utils import guardrails as gr
+            scope = None
+            try:
+                from phantom.core.session import session as _sess
+                scope = getattr(_sess, "scope", None)
+            except Exception:
+                scope = None
+            m = gr.build(scope=scope,
+                         targets=[self.target] if self.target else None)
+            return ["", gr.report_block(m)]
+        except Exception as exc:
+            return ["", f"_Guardrail manifest unavailable ({type(exc).__name__})._"]
 
 
 class CampaignReport:
