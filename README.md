@@ -4,7 +4,8 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20Android%20%7C%20macOS-lightgrey.svg)]()
-[![Tests](https://img.shields.io/badge/tests-verified-brightgreen.svg)]()
+[![CI](https://github.com/Terminalkid09/Phantom/actions/workflows/ci.yml/badge.svg)](https://github.com/Terminalkid09/Phantom/actions/workflows/ci.yml)
+[![Electron Release](https://github.com/Terminalkid09/Phantom/actions/workflows/electron-release.yml/badge.svg)](https://github.com/Terminalkid09/Phantom/actions/workflows/electron-release.yml)
 
 **Phantom** is an offensive security framework for red teams that combines a full-featured C2 platform, 12 interactive pentest modules, and an autonomous kill-chain engine — all in one tool. The C2 beacon runs on Windows, Linux, Android, and macOS, using AES-256-GCM + mTLS + per-beacon HMAC authentication.
 
@@ -262,6 +263,49 @@ Full GUI with Command Palette (Ctrl+K), credential vault, campaign timeline, net
 > the state file; the renderer never sees the token, so other local processes or
 > websites cannot read engagement data or revoke identities. Rotate with
 > `config rotate-api-token` in the C2 shell (or the API endpoint).
+
+---
+
+## Development & testing
+
+Requires **Python 3.10+**. The full contributor guide is
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+```bash
+git clone https://github.com/Terminalkid09/Phantom.git
+cd Phantom
+pip install -e .                     # runtime deps come from setup.py
+pip install -r requirements-dev.txt  # pytest + plugins, pyyaml, bandit
+```
+
+Run the tests — the suite is split on purpose:
+
+```bash
+# unit-hermetic: no external binaries, no network (the required CI gate)
+python -m pytest tests -q -m "not integration_tool"
+
+# integration-tool tests need `nmap`; not hermetic, so not a merge gate
+python -m pytest tests -m "integration_tool" -v
+```
+
+Desktop app (Node 20+):
+
+```bash
+cd electron && npm install
+npx tsc --noEmit   # typecheck
+npx vite build     # production build
+```
+
+The beacon and remote payloads are C++20; their build headers are generated,
+never hand-written:
+
+```bash
+python scripts/ci_beacon_prepare.py --dir phantom/payloads/beacon --ci-identity
+python scripts/ci_beacon_prepare.py --dir phantom/payloads/remote --ci-identity
+```
+
+Contributions are welcome — open a Pull Request against `dev`. Please read
+[CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) first.
 
 ---
 

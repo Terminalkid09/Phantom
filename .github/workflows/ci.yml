@@ -357,7 +357,12 @@ jobs:
           # .bandit holds the reviewed, accepted-by-design HIGH checks; any
           # OTHER high-severity finding now FAILS the job (it used to only
           # warn, so a real regression could merge unseen).
-          bandit -r phantom/ -c .bandit -f json -o bandit-results.json || true
+          #
+          # Coverage now includes the helper scripts and the Electron tree:
+          # scripts/ is REAL Python that was previously unscanned, and bandit
+          # skips non-Python files, so `electron/` only ever contributes a
+          # stray .py if one appears. The .bandit baseline covers both.
+          bandit -r phantom/ scripts/ electron/ -c .bandit -f json -o bandit-results.json || true
           python -c "
           import json
           with open('bandit-results.json') as f:
@@ -370,6 +375,35 @@ jobs:
               raise SystemExit(1)
           print('No unbaselined high-severity issues found')
           "
+
+  offline-sims:
+    # The two offline coverage simulators are the project's own answer to
+    # "does the planner have a move for this target?" — and nothing ever ran
+    # them in CI, so a planner/registry rename could silently break the very
+    # diagnostic meant to catch it. Both are fully offline (scripted runner,
+    # no packet leaves the box).
+    #
+    # Honest framing: these are SIMULATIONS, not gates. Both `main()`s return
+    # 0 by design even when the matrix reports a coverage GAP, so a green step
+    # means "the script still runs end-to-end", not "coverage improved". A
+    # crash (import error, planner API break) does fail the step.
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Offline coverage simulations (non-gating — they report, not assert)
+        run: |
+          python scripts/coverage_matrix_sim.py
+          python scripts/hardened_target_sim.py
 
   integration-tools:
     runs-on: ubuntu-latest
@@ -413,10 +447,23 @@ jobs:
       - name: Security invariant tests
         run: |
           set -o pipefail
-          python -m pytest tests/test_security_sweep_round2.py tests/test_p0_phase2.py \
+          # Glob, not a hand-maintained list: a NEW security test file has to
+          # run here without anyone remembering to add it. The hermetic job
+          # had the same bug (P0-12) and was fixed the same way; the old
+          # explicit list here silently skipped every security test added
+          # after it was written.
+          SECURITY_TESTS=$(ls tests/test_security*.py tests/test_p0_*.py \
             tests/test_c2_token_rotation.py tests/test_remote_viewer.py \
-            tests/test_config_secret_perms.py tests/test_security_hardening.py \
+            tests/test_config_secret_perms.py \
             tests/test_electron_allowlist_sync.py tests/test_endpoint_allowlist_drift.py \
+            2>/dev/null | sort -u | tr '\n' ' ')
+          echo "Security sweep files: $SECURITY_TESTS"
+          [ -n "$SECURITY_TESTS" ] || { echo "ERROR: no security tests found"; exit 1; }
+          # `not integration_tool`: these files contain end-to-end execution
+          # asserts that need a real native/WSL2/SSH backend. Without the
+          # filter they fail on a runner that has none and the sweep reads as
+          # a product regression instead of an environment gap.
+          python -m pytest $SECURITY_TESTS -m "not integration_tool" \
             -v --timeout=120 2>&1 | tail -100
 
   docker-test:
