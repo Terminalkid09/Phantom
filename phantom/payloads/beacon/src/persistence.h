@@ -106,6 +106,41 @@ inline std::string establish_windows(const net::C2Config& cfg, const std::string
     return std::string(XOR_DEC(XOR_STR("Error: Failed to open/create Registry key")));
 }
 
+// ── Removal: undo exactly what establish_windows created ───────────────────
+// The report tells the client to clean up the IOC list; this is the supported
+// way to do it. Every path here is the SAME one establish_windows wrote: the
+// RunKey value name, and the %APPDATA%\Microsoft\Phantom copy from the
+// on-disk fallback. No C2 round-trip is involved (nothing to download).
+inline std::string remove_windows(const std::string& name) {
+    std::string results;
+
+    // 1) Run key value — BOTH strategies use the same value name, so a single
+    //    delete removes the no-disk stager AND the on-disk clone.
+    HKEY hKey = NULL;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER,
+            XOR_DEC(XOR_STR("Software\\Microsoft\\Windows\\CurrentVersion\\Run")).c_str(),
+            0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        if (RegDeleteValueA(hKey, name.c_str()) == ERROR_SUCCESS)
+            results += "RunKey value removed: " + name + "\n";
+        RegCloseKey(hKey);
+    }
+
+    // 2) on-disk beacon copy (fallback strategy)
+    char appdata[MAX_PATH];
+    DWORD len = GetEnvironmentVariableA("APPDATA", appdata, sizeof(appdata));
+    if (len > 0 && len < sizeof(appdata)) {
+        std::string dir = std::string(appdata) + "\\Microsoft\\Phantom";
+        std::string exePath = dir + "\\" + name + ".exe";
+        if (DeleteFileA(exePath.c_str()) == TRUE)
+            results += "Removed on-disk copy: " + exePath + "\n";
+        RemoveDirectoryA(dir.c_str());   // only succeeds when it is now empty
+    }
+
+    if (results.empty())
+        return std::string("Unpersist: nothing to remove for '") + name + "'";
+    return std::string("Persistence removed:\n") + results;
+}
+
 // ── Linux persistence (systemd + .desktop + cron) ────────────────────────────
 #elif defined(__linux__)
 
@@ -270,6 +305,77 @@ inline std::string establish_linux(const std::string& name) {
     return XOR_DEC(XOR_STR("Native persistence (cron) established: ")).c_str() + installPath;
 }
 
+#endif
+
+// ── Removal (Linux / macOS): undo exactly what establish_linux created ─────
+#ifndef _WIN32
+inline std::string remove_posix(const std::string& name) {
+    std::string results;
+    std::string home = getenv("HOME") ? getenv("HOME") : "";
+
+    // The installed copy is ~/.local/bin/<exeName> (or /data/local/tmp on the
+    // cron-only fallback): derive the same name establish_linux used.
+    std::string exeName;
+    {
+        char buf[1024];
+        ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (len != -1) {
+            buf[len] = '\0';
+            std::string self(buf);
+            exeName = self.substr(self.find_last_of('/') + 1);
+        }
+    }
+    std::string installPath = home.empty()
+        ? (std::string("/data/local/tmp/") + exeName)
+        : (home + "/.local/bin/" + exeName);
+
+#ifdef __APPLE__
+    // LaunchAgent plist, same path establish_linux wrote on macOS
+    if (home.empty()) return std::string("Error: Could not find HOME directory");
+    std::string plist = home + "/Library/LaunchAgents/com." + name + ".plist";
+    std::string unloadCmd = "launchctl unload " + plist + " 2>/dev/null";
+    FILE* fp = popen(unloadCmd.c_str(), "r");
+    if (fp) pclose(fp);
+    if (remove(plist.c_str()) == 0)
+        results += "[LaunchAgent] removed " + plist + "\n";
+#else
+    if (!home.empty()) {
+        // systemd user service
+        std::string serviceFile = home + "/.config/systemd/user/" + name + ".service";
+        std::string stopCmd = "systemctl --user stop " + name + ".service 2>/dev/null";
+        std::string disableCmd = "systemctl --user disable " + name + ".service 2>/dev/null";
+        FILE* fp = popen(stopCmd.c_str(), "r");
+        if (fp) pclose(fp);
+        fp = popen(disableCmd.c_str(), "r");
+        if (fp) pclose(fp);
+        if (remove(serviceFile.c_str()) == 0)
+            results += "[systemd] removed " + serviceFile + "\n";
+
+        // .desktop autostart
+        std::string desktopFile = home + "/.config/autostart/" + name + ".desktop";
+        if (remove(desktopFile.c_str()) == 0)
+            results += "[autostart] removed " + desktopFile + "\n";
+    }
+#endif
+
+    // cron line: drop the exact installed path, keep every other job, so a
+    // removal never silences the operator's own scheduled work.
+    if (!exeName.empty()) {
+        std::string cronCmd = "crontab -l 2>/dev/null | grep -v -F '" +
+            installPath + "' | crontab - 2>/dev/null";
+        FILE* fp = popen(cronCmd.c_str(), "r");
+        if (fp) pclose(fp);
+        results += "[cron] removed entries for " + installPath + "\n";
+
+        // the beacon copy that persist dropped in ~/.local/bin
+        if (!home.empty() && remove(installPath.c_str()) == 0)
+            results += "[copy] removed " + installPath + "\n";
+    }
+
+    if (results.empty())
+        return std::string("Unpersist: nothing to remove for '") + name + "'";
+    return std::string("Persistence removed:\n") + results;
+}
 #endif
 
 } // namespace persistence
