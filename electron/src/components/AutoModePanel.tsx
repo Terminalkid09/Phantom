@@ -76,7 +76,10 @@ interface ProfilePreview {
 }
 
 export default function AutoModePanel() {
-  const { autoMode, setAutoMode, appendReasoning, updateStep, ensureStep, session } = useStore()
+  const { autoMode, setAutoMode, appendReasoning, updateStep, ensureStep, session, addHandoff,
+    handoffs, setHandoffStatus, beacons, setActiveBeacon, setActiveTab,
+    pushToast
+  } = useStore()
   const { api, pollC2 } = useApi()
   const [newTarget, setNewTarget] = useState('')
   const reasoningRef = useRef<HTMLDivElement>(null)
@@ -86,6 +89,11 @@ export default function AutoModePanel() {
   const [idUser, setIdUser] = useState('')
   const [idPlatform, setIdPlatform] = useState('instagram')
   const [idPreview, setIdPreview] = useState<ProfilePreview | null>(null)
+
+  // Handoffs this run produced and the operator has not acted on yet. The
+  // card is the only thing that consumes them; once accepted or dismissed it
+  // stops showing without any panel having to guess at the state.
+  const pendingHandoffs = handoffs.filter((h) => h.status === 'ready')
   const [idLoading, setIdLoading] = useState(false)
   // mid-run ambiguity decisions (operator eyes on close candidates)
   const [idChecks, setIdChecks] = useState<IdentityCheck[]>([])
@@ -231,6 +239,7 @@ export default function AutoModePanel() {
           done: boolean
           step_updates?: Array<{ step: number; status: string; detail: string; name?: string }>
           current_step?: number
+          handoffs?: Array<{ beacon_id: string; kind: string; target?: string; created_at: number }>
           log?: Array<{
             time: string
             text: string
@@ -268,6 +277,17 @@ export default function AutoModePanel() {
           })
         }
 
+        if (d.handoffs?.length) {
+          d.handoffs.forEach((h) => {
+            addHandoff({
+              source: 'automode',
+              kind: 'beacon_established',
+              beaconId: h.beacon_id,
+              target: h.target || undefined
+            })
+          })
+        }
+
         if (d.done) {
           clearInterval(pollIntervalRef.current!)
           setAutoMode({ running: false, run_state: 'done' })
@@ -295,6 +315,29 @@ export default function AutoModePanel() {
     }
   }
 
+  // Handoff -> C2. Selecting the beacon and switching tab is the whole
+  // action: no task is queued here, because opening a C2 context must never
+  // have a side effect on the target. `interact` is the operator's next,
+  // explicit click.
+  const openBeacon = (beaconId: string | undefined, interact = false) => {
+    if (!beaconId) return
+    setActiveBeacon(beaconId)
+    setActiveTab('c2')
+    const record = handoffs.find((h) => h.beaconId === beaconId)
+    if (record) setHandoffStatus(record.id, 'accepted')
+    appendReasoning(
+      new Date().toLocaleTimeString(),
+      `[→ C2] ${beaconId} selected${interact ? ' — open Interact to send tasks' : ''}`
+    )
+    pushToast({
+      title: interact ? `Beacon ${beaconId} ready` : `Opened C2 on ${beaconId}`,
+      description: interact
+        ? 'Use the Interact panel to send tasks. Nothing was queued.'
+        : 'Beacon selected in the C2 dashboard.',
+      type: 'success'
+    })
+  }
+
   const handleStop = async () => {
     setAutoMode({ run_state: 'stopping' })   // explicit in-flight stop state
     await api('POST', '/api/automode/stop')
@@ -317,16 +360,27 @@ export default function AutoModePanel() {
       current_step: 0
     })
 
+    // The dry run must reflect the SAME posture the run would use: engine,
+    // force_network and the worker count all change what gets planned, so
+    // they are sent here too (the backend delegates to the engine's own
+    // planner). The note the backend returns is shown with the plan so the
+    // operator knows a dry run executes nothing.
     const res = await api('POST', '/api/automode/plan', {
       targets,
       mode: autoMode.mode,
       profile: autoMode.profile,
-      goal: autoMode.goal
+      goal: autoMode.goal,
+      engine: autoMode.engine,
+      force_network: autoMode.forceNetwork,
+      agents: autoMode.agents
     })
 
     if (res.status === 200 && res.data) {
-      const d = res.data as { plan: string[] }
-      setAutoMode({ plan: d.plan, running: false })
+      const d = res.data as { plan: string[]; note?: string }
+      setAutoMode({
+        plan: d.note ? [...d.plan, `- ${d.note}`] : d.plan,
+        running: false
+      })
     } else {
       setAutoMode({ running: false })
     }
@@ -860,6 +914,63 @@ export default function AutoModePanel() {
               )}
             </div>
           </div>
+
+          {/* Handoff: a beacon this run established, waiting to be taken into
+              the C2 by hand. Before this the operator had to notice the beacon
+              in the C2 dashboard on their own — the backend knew, the CLI
+              offered `c2`, and this panel said nothing. */}
+          {pendingHandoffs.length > 0 && (
+            <div className="space-y-2">
+              {pendingHandoffs.map((h) => {
+                const beacon = beacons.find((b) => b.id === h.beaconId)
+                return (
+                  <div key={h.id}
+                    className="rounded-lg border border-phantom-green/40 bg-phantom-green/5 p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-[13px] font-semibold text-phantom-green">
+                          Beacon available — {h.beaconId}
+                        </div>
+                        <div className="text-[11px] text-text-dim mt-0.5">
+                          {h.target && <span className="mr-2">Target: {h.target}</span>}
+                          {beacon?.os && <span className="mr-2">OS: {beacon.os}</span>}
+                          {beacon?.hostname && <span className="mr-2">Host: {beacon.hostname}</span>}
+                          {beacon?.user && <span className="mr-2">User: {beacon.user}</span>}
+                          {beacon?.status && (
+                            <span className={beacon.status === 'LIVE'
+                              ? 'text-phantom-green'
+                              : 'text-text-dim'}>
+                              {beacon.status}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex gap-2 mt-2.5">
+                      <button onClick={() => openBeacon(h.beaconId)}
+                        className="px-2.5 py-1 text-[11px] rounded bg-phantom-cyan/20
+                                   border border-phantom-cyan/40 text-phantom-cyan
+                                   hover:bg-phantom-cyan/30">
+                        Open C2
+                      </button>
+                      <button onClick={() => openBeacon(h.beaconId, true)}
+                        className="px-2.5 py-1 text-[11px] rounded bg-phantom-magenta/20
+                                   border border-phantom-magenta/40 text-phantom-magenta
+                                   hover:bg-phantom-magenta/30">
+                        Interact
+                      </button>
+                      <button onClick={() => setHandoffStatus(h.id, 'dismissed')}
+                        className="px-2.5 py-1 text-[11px] rounded bg-surface
+                                   border border-surface-border text-text-dim
+                                   hover:border-phantom-green/40">
+                        Keep AutoMode open
+                      </button>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
         </div>
       </div>
     </div>

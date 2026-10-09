@@ -16,7 +16,7 @@ interface KeyInfo {
 }
 
 export default function SettingsPanel() {
-  const { settings, setSettings, listener } = useStore()
+  const { settings, setSettings, listener, pushToast } = useStore()
   const { api, pollC2 } = useApi()
   const apiError = useApiError()
   const [apiToken, setApiToken] = useState('')
@@ -34,8 +34,8 @@ export default function SettingsPanel() {
     }
   }
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { loadKeys() }, [])
+// eslint-disable-next-line react-hooks/exhaustive-deps
+useEffect(() => { loadKeys(); loadGuardrails() }, [])
 
   const saveKey = async (name: string) => {
     const value = keyDrafts[name] ?? ''
@@ -64,6 +64,50 @@ export default function SettingsPanel() {
   const handleToggleMtls = async () => {
     const res = await api('POST', '/api/c2/config/mtls-toggle')
     pollC2()
+  }
+
+  // ── guardrails ────────────────────────────────────────────────────────
+  // The manifest is a read; flipping one is a deliberate operator action that
+  // the backend also writes to the audit log. Nothing here is a silent write.
+  type Guardrail = {
+    key: string
+    label: string
+    enabled: boolean
+    overridden: boolean
+    detail: string
+    source: string
+    remedy: string
+  }
+  type GuardrailManifest = {
+    guards: Guardrail[]
+    summary: string
+    digest: string
+    overrides: string[]
+    toggleable: string[]
+  }
+
+  const [guardrails, setGuardrails] = useState<GuardrailManifest | null>(null)
+
+  const loadGuardrails = async () => {
+    const res = await api('GET', '/api/guardrails')
+    if (res.status === 200 && res.data) {
+      setGuardrails(res.data as GuardrailManifest)
+    }
+  }
+
+  const toggleGuardrail = async (key: string, enabled: boolean) => {
+    const res = await api('POST', '/api/guardrails', { key, enabled })
+    if (res.status === 200 && res.data) {
+      const d = res.data as { manifest: GuardrailManifest }
+      setGuardrails(d.manifest)
+    } else if (res.status !== 200) {
+      pushToast({
+        title: 'Guardrail not changed',
+        description: 'That control is not operator-toggleable.',
+        type: 'warning'
+      })
+      loadGuardrails()
+    }
   }
 
   const handleBackendDetect = async () => {
@@ -162,6 +206,96 @@ export default function SettingsPanel() {
             {settings.backend_type === 'wsl2' && (
               <InputGroup label="WSL Distro" value={settings.wsl_distro}
                 onChange={(v) => setSettings({ wsl_distro: v })} placeholder="kali-linux" />
+            )}
+          </div>
+        </div>
+
+        {/* Engagement guardrails: every safety control, its state, and which layer
+            decided it. Overridden controls are called out because an override
+            the operator cannot see is how an engagement runs with less
+            protection than it was sold with — and it is what ends up in the
+            report. */}
+        <div className="bg-surface-card border border-surface-border rounded-lg p-3">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
+              <Shield size={13} /> Engagement guardrails
+            </h2>
+            {guardrails && (
+              <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+                guardrails.overrides.length
+                  ? 'bg-amber-500/20 text-amber-400 border border-amber-500/40'
+                  : 'bg-phantom-green/10 text-phantom-green border border-phantom-green/30'}`}>
+                {guardrails.overrides.length
+                  ? `${guardrails.overrides.length} override${guardrails.overrides.length > 1 ? 's' : ''}`
+                  : 'all on'}
+              </span>
+            )}
+          </div>
+          <button onClick={loadGuardrails}
+            className="text-[10px] text-text-dim hover:text-phantom-cyan mb-2">
+            Refresh
+          </button>
+          <div className="space-y-2">
+            {!guardrails && (
+              <p className="text-[10px] text-text-dim">Loading the manifest…</p>
+            )}
+            {guardrails?.guards.map((g) => {
+              const toggleable = guardrails.toggleable.includes(g.key)
+              const off = !g.enabled
+              const overridden = guardrails.overrides.includes(g.key)
+              // Only the ON/OFF control is a button. Wrapping the whole row in
+              // one would nest a button inside a button: invalid HTML, and the
+              // click fires twice.
+              return (
+                <div key={g.key} className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-text-primary">
+                      {g.label}
+                      {overridden && (
+                        <span className="ml-1.5 text-[9px] px-1 py-0.5 rounded
+                          bg-amber-500/20 text-amber-400 border border-amber-500/40">
+                          operator override
+                        </span>
+                      )}
+                    </p>
+                    <p className="text-[10px] text-text-dim">{g.detail}</p>
+                    <p className="text-[9px] text-text-dim/70 mt-0.5">
+                      set by <span className="font-mono">{g.source}</span>
+                      {g.remedy && <> · restore: {g.remedy}</>}
+                    </p>
+                  </div>
+                  {toggleable ? (
+                    <button
+                      onClick={() => toggleGuardrail(g.key, !g.enabled)}
+                      className={`shrink-0 px-3 py-1 rounded text-xs font-medium transition-colors
+                        ${g.enabled
+                          ? 'bg-phantom-green/20 text-phantom-green hover:bg-phantom-green/30'
+                          : 'bg-surface-border text-text-dim hover:bg-surface-hover'}`}>
+                      {g.enabled ? 'ON' : 'OFF'}
+                    </button>
+                  ) : (
+                    <span className={`shrink-0 px-3 py-1 rounded text-xs font-medium
+                      ${g.enabled
+                        ? 'bg-phantom-green/10 text-phantom-green border border-phantom-green/30'
+                        : 'bg-surface-border text-text-dim'}`}>
+                      {g.enabled ? 'ON' : 'OFF'}
+                    </span>
+                  )}
+                </div>
+              )
+            })}
+            {guardrails && guardrails.overrides.length > 0 && (
+              <p className="text-[10px] text-amber-400/90 pt-1 border-t border-surface-border">
+                This engagement runs with {guardrails.overrides.length} control(s)
+                disabled. The override is recorded in the next report and in the
+                audit log.
+              </p>
+            )}
+            {guardrails && (
+              <p className="text-[9px] text-text-dim/70">
+                manifest digest <span className="font-mono">{guardrails.digest}</span>
+                {' — '}appears in the report as &quot;Guardrails&quot;.
+              </p>
             )}
           </div>
         </div>
