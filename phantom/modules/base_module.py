@@ -142,8 +142,11 @@ class BaseModule(cmd.Cmd):
             notifier.warn("Cancelled.")
             return
         chosen = filter_aggressive_commands(chosen)
-        results = run_commands(chosen, session.target)
-        session.add_result(getattr(self, "module_name", "module"), results)
+        from phantom.core.executor import RunStatus
+        status = RunStatus()
+        results = run_commands(chosen, session.target, status=status)
+        session.add_result(getattr(self, "module_name", "module"), results,
+                           status=status)
 
     def _run_quiet(self, suggestions: dict) -> bool:
         """--quiet path: run the top suggested command directly, print only

@@ -42,7 +42,8 @@ BEACON_VERBS = frozenset({
     "run", "screen-dump", "screen-record", "screen-record-live",
     "screen-stream", "screen-stream-stop", "screenshot", "set-sleep",
     "shell", "sleep", "smb-pipe", "smb-pipe-stop", "socks", "socks-stop",
-    "sysinfo", "upload", "whoami", "wlan-locate", "wlan-scan",
+    "sysinfo", "unpersist", "upload", "whoami", "wlan-locate",
+    "wlan-scan",
 })
 
 # verbs that execute attacker-controlled code on the target — a grant set

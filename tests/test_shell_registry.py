@@ -18,7 +18,7 @@ EXPECTED = {
     "scan_diff", "run_diff",
     "use", "plugins",
     "auto", "agent",
-    "c2", "malleable", "ad", "wordlists", "export",
+    "c2", "malleable", "ad", "wordlists", "export", "guardrails",
     "help", "config", "setup", "coverage", "doctor", "experience",
     "why", "tool",
     "back", "exit", "quit",

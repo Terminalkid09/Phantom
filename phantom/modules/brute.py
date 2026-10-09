@@ -83,7 +83,7 @@ class BruteModule(BaseModule):
         else:
             notifier.info("No default credentials matched. Proceed to wordlist brute.")
 
-    def do_run(self, _):
+    def do_run(self, arg=""):
         """Interactive wizard for network brute force."""
         if not session.target:
             notifier.error("No target set. Use 'set target <ip>' first.")
@@ -120,8 +120,24 @@ class BruteModule(BaseModule):
             return
 
         notifier.status(f"Starting brute force sequence for {session.target}...")
-        results = run_commands(chosen, session.target)
-        session.add_result("brute", results)
+        from phantom.core.executor import RunStatus
+        from phantom.core.manual_checkpoint import ManualCheckpoint
+        status = RunStatus()
+        # G15: a brute force is the longest manual run there is. The
+        # checkpoint survives a lost terminal; --resume continues it
+        # instead of restarting the whole wordlist.
+        ckpt = ManualCheckpoint("brute", session.target)
+        if "--resume" in (arg or "").split():
+            notifier.info(f"Resuming brute force: {ckpt.summary()}")
+        elif ckpt.progress() and not ckpt.is_finished():
+            notifier.warn(
+                f"Unfinished brute checkpoint for {session.target or '?'} "
+                f"({ckpt.summary()}). Starting fresh discards it — use "
+                "`brute run --resume` to continue.")
+            ckpt.clear()
+        results = run_commands(chosen, session.target, status=status,
+                               checkpoint=ckpt)
+        session.add_result("brute", results, status=status)
         self._harvest_creds(results)
 
     def _harvest_creds(self, results: dict):

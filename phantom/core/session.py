@@ -36,6 +36,10 @@ class Session:
     mode: str = ""
     scope: List[str] = field(default_factory=list)
     results: Dict[str, Any] = field(default_factory=dict)
+    # module -> outcome of the last run (see add_result): "outcome",
+    # "error", the refused commands. Kept OUT of `results` so a
+    # consumer that wants the data still gets exactly the data.
+    result_status: Dict[str, Any] = field(default_factory=dict)
     notes: List[Dict[str, str]] = field(default_factory=list)
     history: List[str] = field(default_factory=list)
     active_wordlist: str = ""
@@ -74,8 +78,30 @@ class Session:
         "known_defaults": False,
     })
 
-    def add_result(self, module: str, data: Any) -> None:
+    def add_result(self, module: str, data: Any, *, status: Any = None) -> None:
+        """Store a module result, optionally with its run OUTCOME.
+
+        `status` is a `phantom.core.executor.RunStatus` (or anything with
+        `.as_dict()`) recording why the run produced what it did. Without
+        it, "tool not installed", "target unreachable" and "nothing found"
+        are the same empty dict to every consumer.
+        """
         self.results[module] = data
+        if status is not None:
+            self.result_status[module] = (
+                status.as_dict() if hasattr(status, "as_dict") else status)
+
+    def result_outcome(self, module: str) -> str:
+        """not-run / error / empty / ok for a module, three-state honest.
+
+        Read from the recorded run status; never inferred from the data.
+        """
+        if module not in self.results:
+            return "not-run"
+        st = self.result_status.get(module) or {}
+        if isinstance(st, dict) and st.get("outcome"):
+            return st["outcome"]
+        return "empty" if not self.results.get(module) else "ok"
 
     def get_result(self, module: str) -> Any:
         return self.results.get(module)

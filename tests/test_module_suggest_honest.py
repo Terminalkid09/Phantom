@@ -6,8 +6,11 @@ not silently 403'd at click time. run-group skips them per-command
 instead of aborting the batch.
 """
 import unittest
+from unittest import mock
 
+from phantom.api import server as server_mod
 from phantom.core import session as session_mod
+from phantom.api.backend import QuietResult
 
 
 def _with_target(target="10.0.0.5"):
@@ -98,7 +101,20 @@ class TestRunGroupSkip(unittest.TestCase):
             # everything with a fatal (-1) break before the gate runs
             session_mod.session.scope = ["10.0.0.0/8"]
             try:
-                resp = await module_run_group(_Req())
+                # The runnable command must NOT return a fatal, or the loop
+                # breaks before the gate reaches the two CLI-only ones and
+                # this test silently stops testing the gate. Without a real
+                # backend installed (no nmap/WSL2/SSH) run_pipeline returns
+                # -1 "No native, WSL2, or configured SSH backend detected",
+                # which made this test pass or fail depending on the
+                # workstation. Stub the transport; the gate is the subject.
+                with mock.patch.object(
+                        server_mod.backend_dispatcher, "run_pipeline",
+                        return_value=QuietResult("curl -sI http://127.0.0.1",
+                                                 returncode=0,
+                                                 stdout="HTTP/1.1 200 OK",
+                                                 duration=0.01)):
+                    resp = await module_run_group(_Req())
                 self.assertEqual(resp.status, 200)
                 import json
                 return json.loads(resp.text)
