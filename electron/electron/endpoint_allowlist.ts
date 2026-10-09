@@ -39,6 +39,11 @@ interface Rule {
 
 const RULES: readonly Rule[] = [
   // ── reads (safe to repeat, no side effects) ────────────────────────────
+  // Guardrails: the manifest is a read of current state, and flipping one is
+  // a configuration change the operator makes deliberately - so it is in the
+  // 'mutating' group (confirm-once), never in a silent-write group.
+  { pattern: '/api/guardrails', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/guardrails', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/capabilities', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/session', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/session/history', methods: ['GET'], group: 'readonly' },

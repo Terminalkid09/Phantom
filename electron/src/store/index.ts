@@ -105,6 +105,16 @@ export interface AutoModeState {
   verbose: boolean
 }
 
+export interface Handoff {
+  id: string
+  source: 'automode' | 'manual' | 'c2'
+  kind: 'beacon_established' | 'task_result' | 'remote_ready'
+  beaconId?: string
+  target?: string
+  status: 'ready' | 'accepted' | 'dismissed' | 'expired'
+  createdAt: number
+}
+
 export interface SettingsState {
   backend_type: 'wsl2' | 'native' | 'ssh' | 'none'
   ssh_host: string
@@ -152,6 +162,16 @@ interface PhantomStore {
   ) => void
   updateStep: (index: number, status: string, detail?: string) => void
   ensureStep: (index: number, name: string) => void
+
+  /** Handoffs: AutoMode establishes beacons, the operator moves them into
+   *  the C2 by hand. Every panel used to re-derive "is there something to
+   *  take?" from `beacons` and `autoMode.running`, so none of them could
+   *  agree — the backend knew, the CLI could offer it, and the UI could not.
+   *  One explicit record, one decision, visible everywhere. */
+  handoffs: Handoff[]
+  addHandoff: (h: Omit<Handoff, 'id' | 'createdAt' | 'status'>) => void
+  setHandoffStatus: (id: string, status: Handoff['status']) => void
+  pendingHandoffs: () => Handoff[]
 
   // Settings
   settings: SettingsState
@@ -259,6 +279,29 @@ export const useStore = create<PhantomStore>((set, get) => ({
       steps[index] = { name, status: 'waiting' as const }
       return { autoMode: { ...s.autoMode, steps } }
     }),
+
+  // Handoffs
+  handoffs: [],
+  addHandoff: (h) =>
+    set((s) => {
+      // One record per beacon: a beacon that re-checks-in must not stack up
+      // cards the operator has to dismiss repeatedly.
+      const rest = s.handoffs.filter(
+        (x) => !(x.beaconId && x.beaconId === h.beaconId && x.kind === h.kind)
+      )
+      const record: Handoff = {
+        ...h,
+        id: `${h.kind}:${h.beaconId ?? h.target ?? 'unknown'}`,
+        status: 'ready',
+        createdAt: Date.now()
+      }
+      return { handoffs: [record, ...rest] }
+    }),
+  setHandoffStatus: (id, status) =>
+    set((s) => ({
+      handoffs: s.handoffs.map((h) => (h.id === id ? { ...h, status } : h))
+    })),
+  pendingHandoffs: () => get().handoffs.filter((h) => h.status === 'ready'),
 
   // Settings
   settings: {

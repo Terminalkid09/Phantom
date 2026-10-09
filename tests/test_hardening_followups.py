@@ -104,3 +104,81 @@ def test_beacon_and_remote_crypto_stay_in_sync():
     assert beacon, "crypto.h not found or empty"
     assert beacon == remote, (
         "crypto.h drifted between beacon and remote — update BOTH copies")
+
+
+# ── cross-layer limits: one rule, two spellings, no shared symbol ──────────
+#
+# The recurring damage in this repo is the SAME limit implemented twice in
+# different layers and kept equal by hand. These pin the pairs that would
+# break a run SILENTLY if they drifted apart.
+
+def test_beacon_task_output_cap_fits_the_server_result_cap():
+    """The beacon truncates a task's output at ``kMaxTaskOutput`` (C++); the
+    listener rejects a result larger than ``MAX_RESULT_OUTPUT_BYTES`` (Python)
+    with 413. Two ends of ONE limit with no shared symbol: if the beacon ever
+    emitted more than the server accepts, the result is dropped and the
+    operator sees a task that produced nothing."""
+    from phantom.core.c2_server import MAX_RESULT_OUTPUT_BYTES
+    main = _read("phantom", "payloads", "beacon", "src", "main.cpp")
+    m = re.search(r"kMaxTaskOutput\s*=\s*([0-9][0-9\s\*]*);", main)
+    assert m, "kMaxTaskOutput not found in the beacon"
+    beacon_cap = eval(m.group(1))          # digits, spaces and '*' only
+    assert beacon_cap <= MAX_RESULT_OUTPUT_BYTES, (
+        f"beacon kMaxTaskOutput={beacon_cap} exceeds the server "
+        f"MAX_RESULT_OUTPUT_BYTES={MAX_RESULT_OUTPUT_BYTES}; those results "
+        f"would be rejected 413 and lost")
+
+
+def test_beacon_response_cap_is_one_number_on_every_platform():
+    """``network.h`` caps the C2 response twice: a named constant in the
+    Windows read loop and a bare literal in the POSIX one. Two spellings of one
+    limit — change one and the wire limit silently differs per platform."""
+    network = _read("phantom", "payloads", "beacon", "src", "network.h")
+    code = re.sub(r"//[^\n]*", "", network)
+    caps = sorted(set(re.findall(r"(\d+)\s*\*\s*1024\s*\*\s*1024", code)))
+    assert caps == ["10"], (
+        f"response caps disagree across platforms: found {caps} (MiB) — the "
+        f"Windows and POSIX read paths must bound the same size")
+
+
+# ── silent result pruning ──────────────────────────────────────────────────
+#
+# ``C2State.add_result`` drops the OLDEST results once a beacon has more than
+# ``MAX_RESULTS_PER_BEACON``. Dropping them is fine (memory must be bounded);
+# doing it SILENTLY is not — on a long engagement the operator's first
+# proof-of-access can disappear and nothing in the audit trail says so.
+
+def test_pruning_results_is_reported_not_silent(monkeypatch):
+    from phantom.core import c2_server as S
+    from phantom.utils.audit_log import audit_log
+    import phantom.api.server as api
+
+    monkeypatch.setattr(S, "MAX_RESULTS_PER_BEACON", 3)
+
+    logged = []
+    monkeypatch.setattr(audit_log, "append",
+                        lambda event, **fields: logged.append(
+                            {"event": event, **fields}) or {"event": event})
+
+    pushed = []
+    monkeypatch.setattr(api, "_push_timeline",
+                        lambda source, event_type, detail: pushed.append(
+                            (source, event_type, detail)) or None)
+
+    st = S.C2State()
+    for i in range(6):
+        st.add_result("B1", f"t{i}", f"out{i}")
+
+    # bounded, newest kept, oldest dropped (the cap still works)
+    assert [r["task_id"] for r in st.results["B1"]] == ["t3", "t4", "t5"]
+
+    prune_events = [e for e in logged if e["event"] == "results_pruned"]
+    assert prune_events, "pruning was silent: no audit event was emitted"
+    assert all(e["beacon_id"] == "B1" for e in prune_events)
+    assert sum(e["pruned"] for e in prune_events) == 3, (
+        "the audit trail must count exactly the results that were dropped")
+    assert all(e["kept"] == 3 for e in prune_events)
+
+    assert any(kind == "results_pruned" for _, kind, _ in pushed), (
+        "the UI timeline was never told about the pruning")
+    assert any("B1" in detail for _, _, detail in pushed)
