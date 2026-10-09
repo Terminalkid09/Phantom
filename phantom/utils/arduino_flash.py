@@ -39,6 +39,16 @@ FQBN_BOARDS = {
     "atmega32u4": "arduino:avr:micro",
 }
 
+def fqbn_for(board: str) -> str:
+    """The FQBN a board family needs, or ``""`` when it has no default.
+
+    A Leonardo is not a Micro: the board map knows both, and the flasher is
+    the only place that has to care. "" means "let the caller fall back to
+    ``DEFAULT_FQBN``".
+    """
+    return FQBN_BOARDS.get((board or "").strip().lower(), "")
+
+
 # runner(argv, timeout) -> (returncode, stdout, stderr)
 Runner = Callable[[Sequence[str], float], Tuple[int, str, str]]
 

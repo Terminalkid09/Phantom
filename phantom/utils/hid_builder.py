@@ -48,6 +48,7 @@ Pure text generation: no I/O, no flashing, nothing writes a file here. The
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
@@ -73,6 +74,29 @@ DUCKYSCRIPT_BOARDS = ("flipper", "omg")
 # command is the whole payload, and it points at the C2 the beacon comes
 # from.
 ARDUINO_BOARDS = ("arduino",)
+
+# The operator's board has a NAME (what is written on the thing they plugged
+# in) and a FAMILY (which generator and which toolchain it needs). A Leonardo
+# is an Arduino-IDE ``Keyboard.h`` board like any other; the variant only
+# matters for the FQBN the flasher has to pass (``arduino_flash.fqbn_for``).
+# Without this table the Leonardo was simply "unknown board" even though its
+# FQBN is already in the flasher's map.
+BOARD_ALIASES = {
+    "leonardo": "arduino",
+    "micro": "arduino",
+    "pro-micro": "arduino",
+    "promicro": "arduino",
+    "atmega32u4": "arduino",
+}
+
+# every name the CLI accepts: the families, then the variants
+ALL_BOARD_NAMES = BOARDS + tuple(BOARD_ALIASES)
+
+
+def canonical_board(board: str) -> str:
+    """The board FAMILY behind a name (``leonardo`` -> ``arduino``)."""
+    name = (board or "").strip().lower()
+    return BOARD_ALIASES.get(name, name)
 
 # How to open a place to type the command, per target family. The board is a
 # keyboard: it can only hit the chord that opens a console on EACH family, so
@@ -121,6 +145,75 @@ DEFAULT_DELAY_MS = 1500
 # form; a hand-pasted one-liner may not be, and that is worth saying out
 # loud instead of emitting a 11k-char artefact in silence.
 LONG_COMMAND_CHARS = 1024
+
+# Words that exist on ONE family only. They are matched as WHOLE TOKENS, never
+# as substrings: `apt` inside `adapt` is not a signal, and `-enc` is a flag
+# rather than a word. This is a READ-ONLY heuristic with two consumers — the
+# note printed on the artefact, and the confirmation `payload hid` asks before
+# writing — and it never blocks on its own.
+POSIX_ONLY_TOKENS = frozenset((
+    "sh", "bash", "dash", "zsh", "ksh", "chmod", "chown", "chattr",
+    "setfacl", "sudo", "apt", "apt-get", "apt-key", "dpkg", "yum", "dnf",
+    "pacman", "zypper", "apk", "systemctl", "service", "journalctl",
+    "crontab", "useradd", "adduser", "usermod", "groupadd", "passwd",
+    "pkill", "killall", "iptables", "nft", "ufw", "firewall-cmd", "nohup",
+    "strace", "modprobe", "insmod", "sysctl", "chkconfig", "ldd",
+))
+
+WINDOWS_ONLY_TOKENS = frozenset((
+    "powershell", "pwsh", "cmd", "cmd.exe", "regsvr32", "rundll32",
+    "mshta", "bitsadmin", "certutil", "schtasks", "wevtutil", "vssadmin",
+    "icacls", "takeown", "reg", "wmic", "netsh", "taskkill", "sc.exe",
+    "cscript", "wscript", "nltest", "dsquery", "set-mppreference",
+    "-enc", "-encodedcommand",
+))
+
+# whitespace and every shell separator: the words, not the punctuation
+_TOKEN_SPLIT = re.compile("[\\s;|&()<>\"'`=]+")
+
+
+def command_tokens(command: str) -> Tuple[str, ...]:
+    """The command's words, split on whitespace and shell separators."""
+    return tuple(t for t in _TOKEN_SPLIT.split((command or "").strip().lower())
+                 if t)
+
+
+def command_family(command: str) -> Tuple[str, str]:
+    """``(family, token)`` — which OS family the command's words belong to.
+
+    ``("", "")`` when nothing recognisable appears. Windows wins when a
+    command carries both: a PowerShell one-liner that shells out to ``bash``
+    is still a Windows command, and reporting it as POSIX would be worse than
+    saying nothing.
+    """
+    tokens = set(command_tokens(command))
+    windows = sorted(tokens & WINDOWS_ONLY_TOKENS)
+    if windows:
+        return "windows", windows[0]
+    posix = sorted(tokens & POSIX_ONLY_TOKENS)
+    if posix:
+        return "posix", posix[0]
+    return "", ""
+
+
+def mismatch_hints(command: str, target: str) -> Tuple[str, ...]:
+    """One sentence per sign that the typed command belongs to another OS.
+
+    ``target`` is the OS the board types INTO. A shell command is text, so
+    this is a SUGGESTION the operator may overrule (``--strict`` refuses
+    instead of asking) — never a verdict.
+    """
+    target = (target or "").strip().lower()
+    if not target:
+        return ()
+    family, token = command_family(command)
+    if family == "posix" and target == "windows":
+        return ("the command looks POSIX but the target is Windows "
+                f"({token!r} is a POSIX-only command)",)
+    if family == "windows" and target != "windows":
+        return (f"the command looks Windows but the target is {target} "
+                f"({token!r} is a Windows-only command)",)
+    return ()
 
 
 @dataclass(frozen=True)
@@ -369,10 +462,10 @@ def build_hid_payload(board: str, command: str, *,
     Raises ``ValueError`` on an unknown board, an unknown layout or an empty
     command: a blank HID payload is a bad flash, not a silent no-op.
     """
-    board = (board or "").strip().lower()
+    board = canonical_board(board)
     if board not in BOARDS:
         raise ValueError(f"unknown HID board {board!r}: choose from "
-                         f"{', '.join(BOARDS)}")
+                         f"{', '.join(ALL_BOARD_NAMES)}")
     layout = normalize_layout(layout)
     command = (command or "").strip()
     # the operator quotes the command on the command line; a keystroke
@@ -401,14 +494,7 @@ def build_hid_payload(board: str, command: str, *,
             opener = _OPENERS["windows"]
             notes.append("no target given: assuming a Windows run dialog "
                          "(Win+R); pass --target for the right opener")
-    if (
-        target == "windows"
-        and command.lstrip().lower().startswith(("sh ", "bash ", "curl -sk"))
-    ):
-        notes.append("the command looks POSIX but the target is Windows")
-    if target and target != "windows" and command.lstrip().lower().startswith(
-            ("powershell", "cmd ", "-enc")):
-        notes.append(f"the command looks Windows but the target is {target}")
+    notes.extend(mismatch_hints(command, target))
     if not target:
         notes.append("the typed command must match the TARGET os: nothing "
                      "here detects it (the board types into whatever it is "
@@ -458,7 +544,7 @@ def build_hid_payload(board: str, command: str, *,
 
 def board_notes(board: str) -> Tuple[str, ...]:
     """How each board is flashed — the part that is not in the artefact."""
-    board = (board or "").strip().lower()
+    board = canonical_board(board)
     if board == "pico":
         return ("copy board firmware + lib/adafruit_hid, then write main.py "
                 "to the CIRCUITPY volume",
