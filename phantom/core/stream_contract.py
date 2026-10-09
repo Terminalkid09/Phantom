@@ -342,6 +342,23 @@ def _r_beacon_up(d: dict) -> List[str]:
     return [f"[★] BEACON UP: {_tag(d)}{d.get('beacon_id') or ''}"]
 
 
+def _r_unverified(d: dict) -> List[str]:
+    """A capability ran but its declared postcondition was not observed.
+
+    This is the single most important line in the whole stream: it is the
+    difference between "the tool exited 0" and "the effect was proven". It has
+    to READ as a caveat, not as decoration - an operator who skims the stream
+    must not come away believing an unverified move succeeded.
+    """
+    cap = d.get("capability") or d.get("cap") or ""
+    detail = str(d.get("detail") or "").strip()
+    head = f"[!] Unverified{_tag(d)}"
+    if cap:
+        head += f": {cap}"
+    return [f"{head} - {detail}" if detail else
+            f"{head} - the declared effect was not observed"]
+
+
 def _r_handoff(d: dict) -> List[str]:
     where = f" {_tag(d).strip()}" if _tag(d) else ""
     return [f"[★] Handoff{where}: beacon {d.get('beacon_id') or ''} is "
@@ -585,6 +602,13 @@ EVENTS: Dict[str, EventSpec] = {
     "waiting": EventSpec("info", _r_waiting),
     "beacon_up": EventSpec("success", _r_beacon_up, fields=("beacon_id",)),
     "handoff": EventSpec("info", _r_handoff, fields=("beacon_id",)),
+    # Emitted by agent.py when a capability ran but its declared postcondition
+    # was not observed. It had no renderer, so it fell through to the generic
+    # "[?]" line - which made the most consequential event in the stream the
+    # least legible one, and kept the event-vocabulary gate red so any NEW
+    # kind could ship unclassified.
+    "unverified": EventSpec("warn", _r_unverified,
+                            fields=("capability", "detail")),
     "success": EventSpec("success", _r_success),
     "done": EventSpec("success", _r_done),
     "sandbox": EventSpec("dim", _r_sandbox, verbose_only=True),

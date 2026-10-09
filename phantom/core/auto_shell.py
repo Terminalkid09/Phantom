@@ -34,6 +34,9 @@ _GOALS = ("deep", "deliver", "complete_kill_chain", "footprint", "beacon",
           "creds", "identity", "post_exploit", "ad", "crack", "lateral",
           "cleanup")
 _PROFILES = ("smb", "enterprise", "cloud", "financial", "government", "mobile")
+# goals.engine_for honors "swarm" only for goals that declare a swarm chain;
+# anything else falls back to the agent path with a printed note.
+_ENGINES = ("agent", "swarm")
 
 
 # ── banner / dashboard / status ────────────────────────────────────────────
@@ -129,6 +132,7 @@ def _context_hint(targets: List[str], has_run: bool) -> str:
         hints.append("export <file>.pm")
     hints.append("help")
     hints.append("manual")
+    hints.append("c2")
     hints.append("back")
     return "[dim]▸ " + "   ".join(hints[:5]) + "[/dim]"
 
@@ -147,6 +151,12 @@ class AutoShell(cmd.Cmd):
             "agents": 0, "goal": "deliver", "profile": "enterprise",
             "llm": False, "verbose": False, "experience": False,
             "evolution": False,
+            # Scope-changing controls. `force_network` turns a CIDR into a
+            # full-range engagement and `engine` picks agent vs swarm; both
+            # were reachable only from the CLI, so the REPL could not run
+            # either -- and `_announce_guardrails` read a flag that could
+            # never be set, i.e. a guard that could not fire.
+            "force_network": False, "engine": "agent",
         }
         self.events: Dict[str, List[Dict[str, Any]]] = {}
         self.has_run = False
@@ -319,12 +329,13 @@ class AutoShell(cmd.Cmd):
     # ── flags ─────────────────────────────────────────────────────────────
 
     _BOOL_KEYS = ("aggressive", "stealth", "speed", "llm", "verbose",
-                  "experience", "evolution")
+                  "experience", "evolution", "force_network")
 
     def do_flags(self, arg: str):
         """flags | flags <key> <value> - show/change run flags
-        keys: aggressive|stealth|speed|llm|verbose|experience|evolution
-        (on/off), agents (N), goal (<choices>), profile (<choices>)
+        keys: aggressive|stealth|speed|llm|verbose|experience|evolution|
+        force_network (on/off), agents (N), goal (<choices>),
+        profile (<choices>), engine (agent|swarm)
 
         experience: cross-engagement learning memory. OFF (default) means
         the experience engine learns WITHIN this run only; ON persists the
@@ -378,6 +389,11 @@ class AutoShell(cmd.Cmd):
                 notifier.error(f"profile must be one of: {', '.join(_PROFILES)}")
                 return
             self.flags["profile"] = value
+        elif key == "engine":
+            if value.lower() not in _ENGINES:
+                notifier.error(f"engine must be one of: {', '.join(_ENGINES)}")
+                return
+            self.flags["engine"] = value.lower()
         notifier.success(f"flags {key} = {self.flags[key]}")
 
     # ── plan (dry run) ────────────────────────────────────────────────────
@@ -390,19 +406,9 @@ class AutoShell(cmd.Cmd):
             return
         from phantom.core.automode import run_auto_mode
         console.print(f"[cyan]─ Plan (dry-run) for: {', '.join(targets)} ─[/]")
-        run_auto_mode(
-            targets=targets,
-            plan=True,
-            aggressive=bool(self.flags["aggressive"]),
-            stealth=bool(self.flags["stealth"]),
-            speed=bool(self.flags["speed"]),
-            agents=int(self.flags["agents"]),
-            goal=self.flags["goal"],
-            profile=self.flags["profile"],
-            llm=bool(self.flags["llm"]),
-            verbose=bool(self.flags["verbose"]),
-            experience=bool(self.flags["experience"]),
-        )
+        # One source of truth: the plan used to re-list the flags by hand and
+        # had drifted, so the scope-changing controls never appeared in it.
+        run_auto_mode(targets=targets, plan=True, **self._run_kwargs())
 
     # ── launch / resume ───────────────────────────────────────────────────
 
@@ -418,6 +424,8 @@ class AutoShell(cmd.Cmd):
             verbose=bool(self.flags["verbose"]),
             experience=bool(self.flags["experience"]),
             evolution=bool(self.flags["evolution"]),
+            engine=self.flags["engine"],
+            force_network=bool(self.flags["force_network"]),
         )
 
     def do_review(self, arg: str):
@@ -460,12 +468,29 @@ class AutoShell(cmd.Cmd):
             notifier.error("No targets. Add with: targets add <target>")
             return
         from phantom.core.automode import run_auto_mode
+        # The engagement's protection level is stated BEFORE the run, not
+        # discovered afterwards. If the operator is carrying an override from
+        # a previous session this is the moment they can see it - and, with
+        # strict mode on, the moment the run is refused.
+        if not self._announce_guardrails():
+            return
         self.has_run = True
         console.print(f"[cyan]─ Launching AUTO-MODE on: {', '.join(self.targets)} ─[/]")
         run_auto_mode(targets=self.targets, on_event=self._on_event,
                       handoff_c2=True, **self._run_kwargs())
 
-    do_run = do_launch
+    def do_run(self, arg: str):
+        """run - refused: the whole-chain command here is `launch`
+
+        `run` used to be an alias of `launch`, so one word meant two
+        different things across the two shells: in the MANUAL shell `run`
+        executes ONE module, in AUTO-MODE it silently started the entire kill
+        chain. An operator who typed it by habit started an engagement. It is
+        now an explicit refusal that names the right command instead.
+        """
+        notifier.error("`run` does not launch the kill chain in AUTO-MODE.")
+        notifier.info("Use `launch` for the whole chain, or `manual` then "
+                      "`run <module>` to execute one module.")
 
     def do_resume(self, arg: str):
         """resume <checkpoint.json|session.pm> - continue an interrupted engagement"""
@@ -587,10 +612,241 @@ class AutoShell(cmd.Cmd):
             except Exception:
                 pass
 
+    def _announce_guardrails(self) -> bool:
+        """State the protection level, and put it in the audit log.
+
+        Called at launch so an override that has been lying around since a
+        previous session is visible before anything is attempted against the
+        target, not after. Returns False when strict mode refuses the run.
+
+        Never raises: the reporting layer must not be able to break a launch,
+        so a failure here degrades to "cannot tell" and allows the run.
+        """
+        try:
+            from phantom.utils import guardrails as gr
+            m = gr.build(scope=getattr(session, "scope", None),
+                         targets=list(self.targets),
+                         force_network=bool(self.flags.get("force_network", False)))
+        except Exception as exc:
+            # Never block a run on the reporting layer.
+            console.print(f"[dim]guardrails: unavailable ({exc})[/dim]")
+            return True
+        # render() is DATA, not markup: it contains "[env]", "[config]",
+        # "[run]" - and rich swallows those as (unknown) style tags, which
+        # silently deleted the source attribution from the launch banner.
+        # The source is the whole point of the line, so it has to survive.
+        from rich.markup import escape
+        console.print(f"[dim]{escape(gr.render(m))}[/dim]")
+        overrides = m.overrides
+        if overrides:
+            console.print("[yellow]This engagement runs with "
+                          f"{len(overrides)} safety control(s) disabled by "
+                          "the operator. They will appear in the report.[/]")
+        gr.snapshot_to_audit(m, event="guardrails_at_launch",
+                             targets=list(self.targets))
+        # Strict mode: the refusal happens HERE, before the run, with the
+        # offending controls named. Refusing after the first action would be
+        # theatre.
+        blocking = m.blocking_overrides()
+        if blocking:
+            names = ", ".join(g.label for g in blocking)
+            notifier.error(
+                f"Strict guardrails is ON and {len(blocking)} protection(s) "
+                f"are disabled: {names}.\n"
+                f"Restore them with `guardrails enable <key>`, or turn strict "
+                f"mode off (`guardrails disable strict_guardrails`).")
+            gr.snapshot_to_audit(m, event="guardrails_blocked_launch",
+                                 blocked=[g.key for g in blocking])
+            return False
+        return True
+
+    def do_guardrails(self, arg: str):
+        """guardrails [list|why|enable <k>|disable <k>|record] - safety controls for this engagement
+
+        Every scope/auth/transport control, whether it is on, and which layer
+        decided that. An override an operator cannot see is how an engagement
+        quietly runs with less protection than it was sold with — so the
+        manifest also goes into every report and into the hash-chained audit
+        log, not just to this screen.
+        """
+        from phantom.core.shell.commands.ops import cmd_guardrails
+        cmd_guardrails(self, arg)
+
     def do_back(self, arg: str):
         """back - leave AUTO-MODE"""
         notifier.info("Leaving AUTO-MODE.")
         return True
+
+    @staticmethod
+    def _live_beacons():
+        """The C2's beacon list, or None when the C2 is not running.
+
+        None (never []) is what tells the TTL policy that liveness cannot be
+        checked and only age applies: an empty list would mean "the C2 knows
+        no beacons", which would expire every handoff of the run. The store's
+        values carry no id, so each entry is keyed explicitly for the policy.
+        """
+        try:
+            from phantom.core.c2_server import c2_state, server_instance
+            thread = getattr(server_instance, "thread", None)
+            if thread is None or not thread.is_alive():
+                return None
+            return [{"beacon_id": bid, **info}
+                    for bid, info in c2_state.get_beacons().items()]
+        except Exception:
+            return None
+
+    def _pending_handoffs(self):
+        """Beacons this run established that are STILL offerable, newest first.
+
+        The handoff event is emitted by run_auto_mode whether or not the
+        operator took it, so `handoff` can still offer a C2 context for a
+        beacon the auto-handoff skipped. A handoff older than the TTL - or
+        pointing at a beacon the C2 no longer knows - is not offered, and the
+        operator is told which one was dropped and why: a silently missing
+        handoff is the same bug one layer up.
+        """
+        from phantom.utils import handoff_ttl
+        found = []
+        for events in self.events.values():
+            for ev in events:
+                if ev.get("kind") == "handoff" and ev.get("beacon_id"):
+                    found.append(ev)
+        found.sort(key=lambda ev: ev.get("at", 0.0), reverse=True)
+        offerable, expired = handoff_ttl.partition(
+            found, beacons=self._live_beacons())
+        for record, reason in expired:
+            console.print(
+                f"[dim]handoff {record.get('beacon_id')} not offered: "
+                f"{handoff_ttl.describe(reason)}[/dim]")
+        return [str(r["beacon_id"]) for r in offerable]
+
+    def do_handoff(self, arg: str):
+        """handoff [list|beacon <id>|take [<id>]] - beacons this run handed to the C2
+
+        AutoMode establishes beacons but used to only be able to hand over
+        automatically, inside the run. This surfaces the same information as
+        an explicit command: what is available, and a choice to take it.
+        """
+        parts = arg.split()
+        sub = parts[0].lower() if parts else "list"
+        beacons = self._pending_handoffs()
+
+        if sub in ("list", ""):
+            if not beacons:
+                notifier.info("No beacon handoff from this run yet.")
+                notifier.info("Run `launch` (or `resume`) first — a handoff "
+                              "appears once a beacon has checked in.")
+                return
+            table = Table(title="Handoffs from this run", border_style="cyan")
+            table.add_column("Beacon", style="cyan")
+            table.add_column("Take it")
+            for bid in beacons:
+                table.add_row(bid, f"handoff take {bid}")
+            console.print(table)
+            return
+
+        if sub == "beacon":
+            if len(parts) < 2:
+                notifier.error("Usage: handoff beacon <id>")
+                return
+            self.do_c2(parts[1])
+            return
+
+        if sub == "take":
+            # `handoff take` with no id means "the one you just got", which
+            # is the common case: an operator does not memorise ids.
+            bid = parts[1] if len(parts) > 1 else (beacons[0] if beacons else "")
+            if not bid:
+                notifier.error("Nothing to take: this run produced no beacon "
+                               "handoff. Run `handoff` to check.")
+                return
+            if beacons and bid not in beacons:
+                notifier.warn(f"{bid} is not a handoff from this run — "
+                              "opening the C2 anyway.")
+            self.do_c2(bid)
+            return
+
+        notifier.error(f"Unknown handoff subcommand: {sub}")
+        notifier.info("Usage: handoff [list | beacon <id> | take [<id>]]")
+
+    def do_c2(self, arg: str):
+        """c2 [<beacon-id>] - enter the C2 Control Plane on this engagement
+
+        The C2 used to be reachable only through the MANUAL shell (or by
+        re-launching the process with --c2), which made the operator walk
+        through a surface they did not want just to use a beacon they already
+        had. Passing a beacon id opens the C2 straight into that beacon's
+        context; with no argument the global context is used, and a handoff
+        from this run is offered.
+        """
+        from phantom.core.c2_shell import run_c2
+        bid = (arg or "").strip() or None
+        if bid is None:
+            beacons = self._pending_handoffs()
+            if beacons:
+                bid = beacons[0]
+                console.print(f"[dim]Using beacon from this run: {bid}[/]")
+            else:
+                notifier.info("No beacon handoff from this run — opening the "
+                              "global C2 context.")
+        console.print("[dim]Entering the C2 Control Plane — `exit` to return "
+                      "to AUTO-MODE.[/]")
+        try:
+            run_c2(preferred_beacon=bid)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Returning to AUTO-MODE.[/]")
+
+    def do_context(self, arg: str):
+        """context - show the current engagement context in one place
+
+        Target, scope, run flags, whether a run happened, and which beacons
+        are waiting. This is the answer to "what does Phantom think is going
+        on right now", asked without reading three different commands.
+        """
+        table = Table(title="Engagement context", border_style="cyan")
+        table.add_column("Field", style="cyan")
+        table.add_column("Value")
+        table.add_row("mode", "AUTO-MODE")
+        table.add_row("session target", session.target or "-")
+        table.add_row("targets",
+                      ", ".join(self.targets) if self.targets else "-")
+        scope = getattr(session, "scope", None)
+        table.add_row("scope", str(scope) if scope else "[dim]none[/dim]")
+        table.add_row("goal", str(self.flags.get("goal", "-")))
+        table.add_row("profile", str(self.flags.get("profile", "-")))
+        table.add_row("agents", str(self.flags.get("agents", 0)))
+        table.add_row("engine", str(self.flags.get("engine", "-")))
+        table.add_row("mode flags",
+                      ", ".join(k for k in ("aggressive", "stealth", "speed",
+                                            "llm", "experience", "evolution",
+                                            "force_network")
+                                if self.flags.get(k)) or "-")
+        table.add_row("last run", "yes" if self.has_run else "no")
+        beacons = self._pending_handoffs()
+        table.add_row("beacon handoff",
+                      ", ".join(beacons) if beacons else "[dim]none[/dim]")
+        console.print(table)
+
+    def do_workspace(self, arg: str):
+        """workspace - list the surfaces of this engagement and how to reach them
+
+        One place that answers "what can I do from here": the autonomous
+        orchestrator, the manual modules, and the C2 control plane are three
+        views of the SAME engagement, not three separate programs.
+        """
+        table = Table(title="Engagement workspaces", border_style="cyan")
+        table.add_column("Surface", style="cyan")
+        table.add_column("Enter with", style="green")
+        table.add_column("For")
+        table.add_row("AUTO-MODE", "(current)", "Planning, agents, launch")
+        table.add_row("MANUAL", "manual", "Modules, AD graph, OSINT, report")
+        table.add_row("C2 Control Plane", "c2 [<beacon>]",
+                      "Listener, beacons, tasks, remote session")
+        table.add_row("Timeline / evidence", "status", "Per-target run events")
+        table.add_row("Scope", "scope", "CIDR list for this engagement")
+        table.add_row("Session", "export <file>.pm", "Save/restore the engagement")
+        console.print(table)
 
     def do_exit(self, arg: str):
         """exit - leave AUTO-MODE"""
@@ -608,14 +864,20 @@ class AutoShell(cmd.Cmd):
         rows = [
             ("targets", "List targets | add <t[,t...]> | rm <t>"),
             ("scope", "List scope | add <cidr> | rm <cidr>"),
-            ("flags", "Show/change run flags (aggressive, stealth, speed, agents, goal, profile, llm, experience)"),
+            ("flags", "Show/change run flags (aggressive, stealth, speed, agents, goal, profile, llm, experience, force_network, engine)"),
             ("plan", "Dry-run the planned kill chain (executes nothing)"),
+            ("review", "Show the self-improvement status: authored patterns, budgets, learned capabilities, beta PRs"),
             ("launch", "Run the autonomous kill chain on the current targets"),
             ("resume", "Continue from a checkpoint.json or an imported .pm"),
             ("status", "Per-target event summary of the last run"),
             ("export", "Export the engagement to a portable <file>.pm"),
             ("import", "Restore an engagement from a <file>.pm"),
             ("manual", "Enter the MANUAL module shell on this engagement"),
+            ("c2 [<beacon>]", "Enter the C2 Control Plane (optionally straight into a beacon)"),
+            ("handoff", "Show the beacons this run handed over | take [<id>] to open one"),
+            ("guardrails", "Show the safety controls for this engagement | enable/disable <key>"),
+            ("context", "Show target, scope, flags, run state and pending beacons"),
+            ("workspace", "List the surfaces of this engagement and how to reach them"),
             ("back", "Leave AUTO-MODE"),
         ]
         for c, d in rows:
