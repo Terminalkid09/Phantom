@@ -4,9 +4,7 @@ Completa kill chain autonoma: enumeration → exploit → post-exploitation.
 """
 
 import os
-import re
 import time
-import ipaddress
 import threading
 from typing import Callable, Optional, List
 
@@ -18,6 +16,43 @@ from phantom.utils.notifier import notifier
 from phantom.utils.network import get_lhost
 
 console = Console()
+
+# --- extracted policy / rendering / reporting (thin re-exports) ----------
+# The bodies live in automode_policy / automode_render / automode_report:
+# run_auto_mode is the orchestrator, not the policy. The underscore names
+# stay importable HERE because the CLI, the API and the tests reach
+# automode for them (and monkeypatch them through this namespace).
+from phantom.core.automode_policy import (  # noqa: E402
+    apply_range_policy as _apply_range_policy,
+    expand_targets as _expand_targets,
+    extract_networks as _extract_networks,
+    triage_targets as _triage_targets,
+    warn_missing_scope as _warn_missing_scope,
+)
+from phantom.core.automode_render import (  # noqa: E402
+    emit_rendered as _emit_rendered,
+    make_agent_stream as _make_agent_stream,
+    stream_agent_event as _stream_agent_event,
+    stream_swarm_event as _stream_swarm_event,
+)
+from phantom.core.automode_report import (  # noqa: E402
+    fmt_elapsed as _fmt_elapsed,
+    print_agent_single_tail as _print_agent_single_tail,
+    print_campaign_tail as _print_campaign_tail,
+    print_report_paths as _print_report_paths,
+    print_swarm_tail as _print_swarm_tail,
+    report_out_dir as _report_out_dir,
+    safe_target_dir as _safe_target_dir,
+    write_agent_reports as _write_agent_reports,
+    write_swarm_summary as _write_swarm_summary,
+)
+
+
+def _callback_preflight(targets, goal: str) -> None:
+    """Callback-plausibility policy (automode_policy), announced through
+    THIS module's notifier: the orchestrator owns the announcer."""
+    from phantom.core.automode_policy import callback_preflight
+    return callback_preflight(targets, goal, notifier=notifier)
 
 
 def _experience_enabled(explicit: Optional[bool] = None) -> bool:
@@ -43,132 +78,9 @@ def _experience_enabled(explicit: Optional[bool] = None) -> bool:
 # Agent routing (auto -> planner agent -> swarm tasks)
 # -----------------------------------------------------------------------------
 
-_MAX_CIDR_HOSTS = 256
-
-
-def _extract_networks(raw_targets: List[str]) -> List[str]:
-    """CIDR/subnet tokens in the raw target list (e.g. 10.0.0.0/24)."""
-    nets = []
-    for raw in raw_targets or []:
-        for token in raw.split(","):
-            token = token.strip()
-            if "/" in token:
-                try:
-                    ipaddress.ip_network(token, strict=False)
-                    nets.append(token)
-                except ValueError:
-                    continue
-    return nets
-
-
-def _expand_targets(raw_targets: List[str],
-                    scope_list: Optional[List[str]] = None) -> List[str]:
-    """Expand CIDR ranges and comma lists into a deduped target list,
-    filtered by the engagement scope when provided."""
-    from phantom.core.scope import is_in_scope
-    out: List[str] = []
-    seen = set()
-
-    def _add(t: str) -> None:
-        if not t or t in seen:
-            return
-        if scope_list:
-            # identity targets (email/username/phone) are the engagement
-            # SUBJECT and are always in scope — the scope list gates the
-            # machines (ip/domain/url), not the person being assessed
-            from phantom.automation.guidance.targets import (
-                classify_target,
-                is_identity_target,
-            )
-            ttype = classify_target(t)
-            if not is_identity_target(ttype) and not is_in_scope(t, scope_list):
-                notifier.warn(f"{t} fuori scope, ignorato")
-                return
-        seen.add(t)
-        out.append(t)
-
-    for raw in raw_targets:
-        for token in raw.split(","):
-            token = token.strip()
-            if not token:
-                continue
-            if "/" in token:
-                try:
-                    net = ipaddress.ip_network(token, strict=False)
-                except ValueError:
-                    _add(token)  # e.g. a URL path, not a CIDR
-                    continue
-                # Bound the iteration BEFORE materializing: a /8 input would
-                # otherwise allocate 16M strings in RAM just to truncate
-                # them to the first 256. Never build the full host list.
-                hosts = []
-                for i, h in enumerate(net.hosts()):
-                    if i >= _MAX_CIDR_HOSTS:
-                        break
-                    hosts.append(str(h))
-                if not hosts:
-                    hosts = [str(net.network_address)]
-                if net.num_addresses > _MAX_CIDR_HOSTS:
-                    notifier.warn(
-                        f"{token}: {net.num_addresses} host, espansione "
-                        f"limitata a {_MAX_CIDR_HOSTS}")
-                for h in hosts:
-                    _add(str(h))
-            else:
-                _add(token)
-    return out
-
-
-def _emit_rendered(rendered) -> None:
-    """Print one rendered event on the CLI (level -> notifier channel).
-
-    The wording belongs to the shared contract; the CLI only picks the
-    colour, so the CLI, the swarm stream and the API/UI cannot drift into
-    three different explanations of the same event again.
-    """
-    for line in rendered.lines:
-        if rendered.level == "success":
-            notifier.success(line)
-        elif rendered.level == "warn":
-            notifier.warn(line)
-        elif rendered.level == "error":
-            notifier.error(line)
-        else:
-            notifier.info(line)
-
-
-def _stream_agent_event(kind: str, data: dict, verbose: bool = False) -> None:
-    """Render an agent event through the shared contract.
-
-    This function used to BE the renderer and knew 12 of the ~40 kinds the
-    engine emits: the stall diagnosis ("stuck because X, change angle to
-    Y") and every error/recover/gate/llm/shared event were emitted and then
-    dropped here, which made a reasoning engagement look like it had gone
-    quiet. The vocabulary now lives in phantom.core.stream_contract.
-    """
-    from phantom.core.stream_contract import render_event
-    rendered = render_event(kind, data, verbose=verbose)
-    if rendered is None:
-        return
-    _emit_rendered(rendered)
-
-
-def _make_agent_stream(verbose: bool = False,
-                       on_event: Optional[Callable[[str, dict], None]] = None):
-    """Factory for the shared agent event stream.
-
-    The CLI renderer remains the default consumer. Electron and other local
-    frontends can subscribe to the same events without duplicating the agent.
-    """
-    def _stream(kind: str, data: dict) -> None:
-        if on_event is not None:
-            try:
-                on_event(kind, data)
-            except Exception:
-                # A frontend must never interrupt the engagement engine.
-                pass
-        _stream_agent_event(kind, data, verbose=verbose)
-    return _stream
+# Target expansion / range policy live in automode_policy;
+# event rendering lives in automode_render (both re-exported
+# above under their legacy underscore names).
 
 
 def _dry_run_plan(target: str, goal: str, profile: str,
@@ -328,15 +240,6 @@ def _handoff_c2(beacon_id: str) -> None:
     run_c2(preferred_beacon=beacon_id or None)
 
 
-def _report_out_dir() -> str:
-    from phantom.utils.paths import sessions_dir
-    return os.path.join(sessions_dir(), f"auto_{int(time.time())}")
-
-
-def _safe_target_dir(target: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]", "_", target)
-
-
 def _merge_results_to_session(agent, target: str) -> dict:
     """Bridge an auto-mode agent's findings into the manual session. Never
     raises: a bridge failure must not abort a finished engagement."""
@@ -355,67 +258,65 @@ def _merge_results_to_session(agent, target: str) -> dict:
         return {}
 
 
-def _write_agent_reports(agent, profile: str, out_root: str, target: str):
-    from datetime import datetime as _dt
-    from phantom.automation.reporting import RawReport, ClientReport, ReportWriter
-    raw = RawReport.from_agent(agent)
-    raw.ended = _dt.now().isoformat(timespec="seconds")
-    tdir = os.path.join(out_root, _safe_target_dir(target))
-    return tdir, ReportWriter(tdir).write(
-        raw, ClientReport.from_agent(agent, profile))
-
-
-def _print_report_paths(paths: dict) -> None:
-    for k, p in paths.items():
-        console.print(f"  [cyan]{k}[/]: {p}")
-
-
-def _fmt_elapsed(seconds: float) -> str:
-    """Human-readable duration: "3m 12s", "45s", "1h 2m 3s"."""
-    seconds = int(seconds)
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    if h:
-        return f"{h}h {m}m {s}s"
-    if m:
-        return f"{m}m {s}s"
-    return f"{s}s"
-
-
 # goal -> swarm chain template, from the single goal registry
 # (phantom/automation/goals.py). Goals without a swarm chain (cleanup…)
 # fall back to the single-agent path with a notice (honest, not silent).
-from phantom.automation.goals import SWARM_CHAIN as _GOAL_CHAIN  # noqa: E402
+from phantom.automation.goals import (  # noqa: E402
+    SWARM_CHAIN as _GOAL_CHAIN,
+    engine_for as _engine_for,
+)
 
 
-def _stream_swarm_event(kind: str, data: dict, verbose: bool = False,
-                        on_event=None) -> None:
-    """Swarm events onto the operator stream, through the SAME contract as
-    the agent path.
+def _run_swarm_branch(resolved, goal, profile, aggressive, speed, agents,
+                      verbose, on_event, llm, out_root, started_wall,
+                      handoff_c2, resilient_stager, resume, experience,
+                      evolution) -> None:
+    """The swarm-engine branch of run_auto_mode, single AND campaign: run
+    the operation, persist the summary, merge into the manual session and
+    print the shared tail. One copy, so the engine policy is fixed once.
 
-    This renderer knew two kinds, so `--verbose` was a no-op on the swarm
-    path: a swarm run showed task outcomes and nothing about what each task
-    reasoned or executed.
-    """
-    from phantom.core.stream_contract import render_event
-    rendered = render_event(kind, data, verbose=verbose)
-    if rendered is not None:
-        _emit_rendered(rendered)
-    if on_event is not None:
-        try:
-            on_event(kind, data)
-        except Exception:
-            pass
+    `merged` is {target: counts} (session_bridge.merge_board_into_session):
+    it is printed per target — the old single-target branch flattened it
+    and showed `10.0.0.5={'service': 3}` instead of the counts."""
+    notifier.success("=" * 25 + " PHANTOM AUTO-MODE (swarm) " + "=" * 25)
+    result, summary, merged = _run_swarm_operation(
+        resolved, goal, profile, aggressive, speed, agents,
+        verbose, on_event, llm, resilient_stager=resilient_stager,
+        resume=resume, experience=experience, evolution=evolution)
+    _write_swarm_summary(
+        summary, out_root,
+        resolved[0] if len(resolved) == 1 else ",".join(resolved))
+    if merged:
+        for t, counts in merged.items():
+            if counts:
+                notifier.info(
+                    f"Core sync [{t}]: " + ", ".join(
+                        f"{k}={v}" for k, v in sorted(counts.items())))
+    _print_swarm_tail(result, summary, out_root, started_wall,
+                      goal, on_event, handoff_c2)
 
 
 def _run_swarm_operation(targets, goal, profile, aggressive, speed,
                          agents, verbose=False, on_event=None,
                          llm: bool = False, budget: int = 10,
-                         resilient_stager: bool = True):
+                         resilient_stager: bool = True,
+                         resume: str = "", experience: bool = False,
+                         evolution: bool = False):
     """Swarm engine for run_auto_mode: fact-driven tasks over a shared
     board, then merge into the manual session. Returns
     (result, summary, merged) where result speaks the legacy keys the
-    reporting tail below already understands."""
+    reporting tail already understands.
+
+    The agent-path-only flags are announced HERE, once, instead of once per
+    caller: --resume/--experience/--evolution are checkpoint/evolution
+    features of the agent path and are ignored on the swarm path."""
+    for _flag, _name in ((resume, "--resume"),
+                         (experience, "--experience"),
+                         (evolution, "--evolution")):
+        if _flag:
+            notifier.warn(
+                f"{_name} ignorato sullo swarm path "
+                f"(checkpoint/evolution sono del path agent)")
     from phantom.automation.swarm import run_swarm
     from phantom.automation.swarm.llm import LLMApproval
     from phantom.core.session_bridge import merge_board_into_session
@@ -481,63 +382,6 @@ def _run_swarm_operation(targets, goal, profile, aggressive, speed,
                    "lateral": n_lateral > 0},
     }
     return result, summary, merged
-
-
-def _write_swarm_summary(summary: dict, out_root: str, target: str) -> dict:
-    """Persist the swarm operation summary (board_ref excluded: live
-    objects, not JSON). Returns {"summary": path} like the report writer."""
-    import json as _json
-    clean = {k: v for k, v in (summary or {}).items() if k != "board_ref"}
-    os.makedirs(out_root, exist_ok=True)
-    path = os.path.join(out_root, "swarm_summary.json")
-    try:
-        with open(path, "w", encoding="utf-8") as fh:
-            _json.dump(clean, fh, indent=2, default=str)
-    except OSError as exc:
-        notifier.warn(f"Swarm summary non salvato: {exc}")
-        return {}
-    return {"summary": path}
-
-
-def _print_swarm_tail(result: dict, summary: dict, out_root: str,
-                      started_wall: float, goal: str, on_event,
-                      handoff_c2: bool) -> None:
-    """Shared reporting tail for swarm runs (single + campaign): stage
-    ladder, totals, merge note. No checkpoint file exists for swarm —
-    re-running merges the committed session seed, so downstream tasks
-    release at once instead of rediscovering."""
-    elapsed = _fmt_elapsed(time.time() - started_wall)
-    tasks = summary.get("tasks", []) if summary else []
-    done = sum(1 for t in tasks if t.get("status") == "done")
-    if goal == "deep":
-        st = result.get("stages") or {}
-        ladder = " ".join(
-            f"{k}={'✔' if st.get(k) else '—'}" for k in
-            ("deliver", "post_exploit", "ad", "crack", "lateral"))
-        notifier.success(
-            f"Swarm deep completato (⏱ {elapsed}): "
-            f"{done}/{len(tasks)} task, beacon={result.get('beacon_established')}, "
-            f"persistenza={result.get('persistence_installed')}, "
-            f"system/root={result.get('system_privilege')}, "
-            f"AD creds={result.get('ad_creds')}, "
-            f"cracked={result.get('cracked_hashes')}, "
-            f"lateral={result.get('lateral_movements')}, "
-            f"azioni={result.get('actions_taken')}")
-        notifier.info(f"Stage ladder: {ladder}")
-    else:
-        notifier.success(
-            f"Swarm {goal} completo (⏱ {elapsed}): {done}/{len(tasks)} task, "
-            f"beacon={result.get('beacon_established')}, "
-            f"persistenza={result.get('persistence_installed')}, "
-            f"creds={result.get('creds_found')}, "
-            f"azioni={result.get('actions_taken')}")
-    notifier.info(f"⏱ Tempo totale engagement: {elapsed}.")
-    if result.get("beacon_established"):
-        notifier.info("Nessun handoff automatico dallo swarm: apri 'c2' -> "
-                      "'beacons' per prendere in carico i callback.")
-    else:
-        notifier.warn("Nessun beacon stabilito: niente handoff. "
-                      "Usa 'c2' -> 'beacons' per monitorare callback")
 
 
 def _probe_bind(host: str, port: int) -> bool:
@@ -608,46 +452,6 @@ def _ensure_c2_listener(server=None) -> bool:
     except Exception as exc:
         notifier.warn(f"Auto-start listener C2 fallito: {exc}")
         return False
-
-
-def _callback_preflight(targets, goal: str) -> None:
-    """Say it BEFORE the run when a beacon-bound goal cannot call back.
-
-    The beacon's endpoint is compiled from `c2.host`. When the target
-    cannot dial it (unset host, 0.0.0.0, loopback, or a private endpoint
-    against an external target) the deploy SUCCEEDS and the beacon never
-    checks in — the operator then reads a late "nessun beacon stabilito"
-    with no cause. This is the most common real-deploy failure, so it is
-    named up front (warn when some targets are affected, error when none
-    can work). Never blocks the run: a tunnel may exist that we cannot
-    see from here.
-    """
-    if goal not in ("beacon", "deliver", "complete_kill_chain",
-                    "post_exploit", "deep"):
-        return
-    try:
-        from phantom.utils import config as cfg
-        from phantom.utils.network import callback_plausibility, get_c2_endpoint
-        advertised = cfg.get_str("c2.host", "") or get_c2_endpoint()[0]
-    except Exception:
-        return
-    bad = []
-    for t in targets:
-        try:
-            ok, reason = callback_plausibility(t, advertised)
-        except Exception:
-            continue
-        if not ok:
-            bad.append((t, reason))
-    for t, reason in bad:
-        notifier.warn(f"Callback implausibile per {t}: {reason}")
-    if bad and len(bad) == len(list(targets)):
-        notifier.error(
-            "Nessun target può chiamare il C2: i beacon si deployerebbero "
-            "ma non rientrerebbero MAI.",
-            hint="imposta c2.host all'indirizzo operatore raggiungibile dal "
-                 "target (o fai port-forward) — `doctor --net` verifica il "
-                 "listener")
 
 
 def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
@@ -723,70 +527,22 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
         notifier.error("Nessun target specificato. Usa: auto <target> [target2, ...]")
         return
 
-    # senior network triage: a CIDR/subnet input gets host discovery +
-    # surface ranking BEFORE the assault, so the agent pool works the
-    # richest hosts first instead of spraying full chains on random IPs
-    # from the address range. Discovery only runs when a network token
-    # was actually given; identity targets are never triaged.
+    # senior network triage: a CIDR/subnet input gets host
+    # discovery + surface ranking BEFORE the assault, so the
+    # agent pool works the richest hosts first (see
+    # automode_policy.triage_targets for the policy).
     networks = _extract_networks(raw)
-    if networks:
-        # ONE engine: discovery + enrichment + exposure ranking all live
-        # in netmap (the same code the `map` command and Electron use), so
-        # the assault pool and the network map always see the same truth.
-        from phantom.core.netmap import triage_networks
-        notifier.info(
-            f"Network triage: host discovery su {', '.join(networks)}...")
-        tri = triage_networks(networks)
-        ranked = [r["ip"] for r in tri.get("ranked", [])]
-        if ranked:
-            alive_n = len(tri.get("hosts", []))
-            notifier.success(
-                f"Host discovery: {alive_n} vivi, ordinati per "
-                f"superficie d'attacco (top: {', '.join(ranked[:5])})")
-            # senior semantics: the CIDR expansion is REPLACED by the
-            # discovered + ranked hosts. Only the operator's explicit
-            # per-host tokens survive the swap (operator intent first,
-            # then discovered hosts ranked by attack surface). This avoids
-            # the trap where the 256-host expansion already contains the
-            # discovered IPs, which would silently keep the whole range.
-            explicit = [
-                t.strip()
-                for tok in raw for t in tok.split(",")
-                if t.strip() and "/" not in t
-                and t.strip() not in networks
-            ]
-            seen = set(explicit)
-            ranked = [h for h in ranked
-                      if not (h in seen or seen.add(h))]
-            resolved = explicit + ranked
-        else:
-            notifier.warn(
-                "Nessun host esposto rilevato o nmap assente: espansione "
-                "CIDR classica (host a caso nella rete)")
+    resolved = _triage_targets(raw, networks, resolved)
 
-    # RANGE POLICY: a CIDR/range token authorizes discovery (-sn +
-    # ranking, already done above), never an assault. Engaging N hosts
-    # with full chains needs explicit operator intent per host, or the
-    # force flag with its disclaimer. A range is not intent. Dry-run
+    # RANGE POLICY: a CIDR/range token authorizes discovery
+    # (-sn + ranking, done by triage_targets), never an
+    # assault. Engaging N hosts with full chains needs
+    # explicit operator intent per host, or the force flag
+    # with its disclaimer. A range is not intent. Dry-run
     # (--plan) always passes: it executes nothing.
-    if networks and not force_network and not plan:
-        if len(resolved) > 1 or any("/" in t for t in raw):
-            notifier.info("Network scope: discovery-only di default "
-                          "(host vivi + ranking, nessun engagement).")
-            for t in resolved[:20]:
-                console.print(f"  [cyan]{t}[/]")
-            if len(resolved) > 20:
-                console.print(f"  [dim]... +{len(resolved) - 20} altri "
-                              f"(vedi network map)[/]")
-            notifier.info("Per ingaggiare: riesegui con host espliciti "
-                          "oppure --force-network (full engagement, loud).")
-            return
-    if networks and force_network:
-        notifier.warn(
-            f"FORCE-NETWORK attivo: engagement completo su {len(resolved)} "
-            f"host ({', '.join(resolved[:5])}"
-            f"{', ...' if len(resolved) > 5 else ''}). Scansioni, exploit "
-            f"e brute force gireranno su tutta la rete.")
+    if not _apply_range_policy(networks, resolved, raw,
+                               force_network, plan):
+        return
 
     notifier.success("=" * 25 + " PHANTOM AUTO-MODE (agent) " + "=" * 25)
     # profile <-> target coherence: the profile is the ENVIRONMENT, the
@@ -817,23 +573,10 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
     # make: name an implausible endpoint BEFORE burning the engagement
     _callback_preflight(resolved, goal)
     if not scope_list:
-        try:
-            from phantom.automation.guidance.targets import (
-                classify_target, is_identity_target)
-            net_targets = [t for t in resolved
-                           if not is_identity_target(classify_target(t))]
-        except Exception:
-            net_targets = list(resolved)
-        if net_targets:
-            # A-6: auto-mode now FAILS CLOSED without a scope (the agent gate
-            # refuses unless the operator explicitly opted out), so this is
-            # no longer a silent warn-and-continue.
-            notifier.warn(
-                "NESSUNO SCOPE impostato su target di rete: l'auto-mode "
-                "rifiuterà i target finché non imposti 'set scope "
-                "<cidr,...>' (o scope_list). Per un lab dichiara "
-                "l'eccezione con PHANTOM_ALLOW_UNSCOPED=1 — un typo nel "
-                "target o un CIDR largo colpiscono davvero.")
+        # A-6: auto-mode FAILS CLOSED without a scope (the
+        # agent gate refuses unless the operator explicitly
+        # opted out) — the notice explains why up front.
+        _warn_missing_scope(resolved)
 
     if plan:
         for t in resolved:
@@ -893,30 +636,21 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
         except Exception as _exc:
             notifier.warn(f"[beta] load fallito: {_exc}")
 
+    # ONE goal table decides the engine (goals.GOALS: facts + chain +
+    # engine): --engine swarm is honored for goals that DECLARE a
+    # swarm chain, anything else falls back to the agent path with a
+    # note (honest, not silent).
+    engine, engine_note = _engine_for(goal, engine)
+    if engine_note:
+        notifier.warn(engine_note)
+
     if len(resolved) == 1:
-        if engine == "swarm" and goal in _GOAL_CHAIN:
-            for _flag, _name in ((resume, "--resume"),
-                                 (experience, "--experience"),
-                                 (evolution, "--evolution")):
-                if _flag:
-                    notifier.warn(
-                        f"{_name} ignorato sullo swarm path "
-                        f"(checkpoint/evolution sono del path agent)")
-            notifier.success("=" * 25 + " PHANTOM AUTO-MODE (swarm) " + "=" * 25)
-            result, summary, _merged = _run_swarm_operation(
-                resolved, goal, profile, aggressive, speed, agents,
-                verbose, on_event, llm, resilient_stager=resilient_stager)
-            paths = _write_swarm_summary(summary, out_root, resolved[0])
-            if _merged:
-                notifier.info(
-                    "Core sync: " + ", ".join(
-                        f"{k}={v}" for k, v in sorted(_merged.items())) +
-                    " (visibili ora anche nel core manuale)")
-            _print_swarm_tail(result, summary, out_root, started_wall,
-                              goal, on_event, handoff_c2)
-            return
         if engine == "swarm":
-            notifier.warn(f"Swarm has no chain for goal '{goal}': agent path")
+            _run_swarm_branch(
+                resolved, goal, profile, aggressive, speed, agents,
+                verbose, on_event, llm, out_root, started_wall, handoff_c2,
+                resilient_stager, resume, experience, evolution)
+            return
         state_path = resume or os.path.join(out_root, "checkpoint.json")
         result, agent = _run_agent_single(
             resolved[0], goal, profile, aggressive, stealth, speed,
@@ -937,45 +671,8 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                 "Core sync: " + ", ".join(
                     f"{k}={v}" for k, v in sorted(_merged.items())) +
                 " (visibili ora anche nel core manuale)")
-        elapsed = _fmt_elapsed(time.time() - started_wall)
-        if goal == "deep":
-            st = result.get("stages") or {}
-            ladder = " ".join(
-                f"{k}={'✔' if st.get(k) else '—'}" for k in
-                ("deliver", "post_exploit", "ad", "crack", "lateral"))
-            notifier.success(
-                f"Deep engagement completato (⏱ {elapsed}): "
-                f"beacon={result.get('beacon_established')}, "
-                f"persistenza={result.get('persistence_installed')}, "
-                f"system/root={result.get('system_privilege')}, "
-                f"AD creds={result.get('ad_creds')}, "
-                f"cracked={result.get('cracked_hashes')}, "
-                f"lateral={result.get('lateral_movements')}, "
-                f"azioni={result.get('actions_taken')}")
-            notifier.info(f"Stage ladder: {ladder}")
-        else:
-            notifier.success(
-                f"Deliver completo (⏱ {elapsed}): beacon={result.get('beacon_established')}, "
-                f"persistenza={result.get('persistence_installed')}, "
-                f"creds={result.get('creds_found')}, "
-                f"victim_ips={result.get('victim_ips')}, "
-                f"ipotesi={result.get('hypotheses')} "
-                f"({result.get('hypotheses_confirmed')} confermate), "
-                f"azioni={result.get('actions_taken')}")
-        notifier.info("Report (raw operatore + client sanificato):")
-        _print_report_paths(paths)
-        # end-of-run LEARNING receipt: what this run recorded and what the
-        # next one will do differently (the visible half of the loop)
-        try:
-            from phantom.automation.agent import experience_receipt
-            notifier.info(experience_receipt(agent.experience))
-        except Exception:
-            pass
-        notifier.info(f"⏱ Tempo totale engagement: {elapsed}.")
-        notifier.info(
-            f"Checkpoint: {os.path.join(out_root, 'checkpoint.json')} — "
-            "riprendi con `auto <target> --resume <file>` o condividi "
-            "con `export-session` (.pm)")
+        _print_agent_single_tail(result, paths, agent, goal,
+                                 started_wall, out_root)
         if result.get("beacon_established"):
             beacon_id = result.get("beacon_id") or ""
             if handoff_c2:
@@ -987,30 +684,12 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                           "Usa 'c2' -> 'beacons' per monitorare callback")
         return
 
-    if engine == "swarm" and goal in _GOAL_CHAIN:
-        for _flag, _name in ((resume, "--resume"),
-                             (experience, "--experience"),
-                             (evolution, "--evolution")):
-            if _flag:
-                notifier.warn(
-                    f"{_name} ignorato sullo swarm path "
-                    f"(checkpoint/evolution sono del path agent)")
-        notifier.success("=" * 25 + " PHANTOM AUTO-MODE (swarm) " + "=" * 25)
-        result, summary, merged = _run_swarm_operation(
-            resolved, goal, profile, aggressive, speed, agents,
-            verbose, on_event, llm, resilient_stager=resilient_stager)
-        _write_swarm_summary(summary, out_root, ",".join(resolved))
-        if merged:
-            for t, counts in merged.items():
-                if counts:
-                    notifier.info(
-                        f"Core sync [{t}]: " + ", ".join(
-                            f"{k}={v}" for k, v in sorted(counts.items())))
-        _print_swarm_tail(result, summary, out_root, started_wall,
-                          goal, on_event, handoff_c2)
-        return
     if engine == "swarm":
-        notifier.warn(f"Swarm has no chain for goal '{goal}': agent path")
+        _run_swarm_branch(
+            resolved, goal, profile, aggressive, speed, agents,
+            verbose, on_event, llm, out_root, started_wall, handoff_c2,
+            resilient_stager, resume, experience, evolution)
+        return
     campaign = _run_agent_campaign(
         resolved, goal, profile, aggressive, stealth, speed,
         scope_list, agents, verbose, on_event, llm,
@@ -1028,14 +707,7 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
     from phantom.automation.reporting import CampaignReport, ReportWriter
     cpaths = ReportWriter(out_root).write_campaign(
         CampaignReport(campaign, profile, per_target))
-    notifier.success(
-        f"Campaign completata (⏱ {elapsed}): {campaign.get('beacons')} beacon, "
-        f"{campaign.get('persistent')} persistenti, "
-        f"{campaign.get('compromised_creds')} creds.")
-    notifier.info(f"⏱ Tempo totale campagna: {elapsed}.")
-    notifier.info("Report (per-target + campaign):")
-    for k, p in {**per_target, **cpaths}.items():
-        console.print(f"  [cyan]{k}[/]: {p}")
+    _print_campaign_tail(campaign, per_target, cpaths, elapsed)
     first_beacon = ""
     for r in campaign.get("results", {}).values():
         if r.get("beacon_established") and not first_beacon:
