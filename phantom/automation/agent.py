@@ -24,7 +24,7 @@ import random
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from phantom.automation.belief import WorldModel, Finding
 from phantom.automation.guidance.commands import Registry, make_registry
@@ -746,7 +746,8 @@ class AutonomousAgent:
                                "expect the provider to block direct access"))
         return True
 
-    def _execute_origin_capability(self, cap, slots: Dict[str, Any]) -> bool:
+    def _execute_origin_capability(self, cap, slots: Dict[str, Any],
+                             step: PlanStep = None) -> bool:
         """The `origin_discovery` capability when the planner asks for it:
         the same pass, reported as the capability's own run."""
         return self._run_origin_discovery()
@@ -823,9 +824,104 @@ class AutonomousAgent:
                                    reasons=[f"broker unavailable: {exc}"],
                                    command="")
 
+    # --- channel registry (per kill-chain phase) -------------------------
+    # _execute_capability used to be a monolithic dispatcher: shared gates,
+    # an if-chain over category/id, and the whole shell-command path in one
+    # 350-line method. The routing is now THIS ordered table (registry, not
+    # if-chain): (phase, matcher, handler). First match wins, so row order
+    # is part of the contract — e.g. an in-process ENGINE in the osint/
+    # social lane must resolve before the social channel (phone_osint is an
+    # offline lookup, not a side-effecting social move), and the generic
+    # engine lane comes after the id-specific engines.
+    #
+    # `phase` is the owning kill-chain phase (phantom.automation.phases);
+    # "any" marks a cross-phase channel, "learned" the machine-authored
+    # lane (capabilities with no phase of their own). Handler names are
+    # resolved on the agent at dispatch time.
+    _CHANNEL_ROUTES: Tuple[Tuple[str, Callable[[Any], bool], str], ...] = (
+        # post-exploitation capabilities execute through the beacon channel
+        ("post",     lambda cap: cap.category == "post",
+         "_execute_post_capability"),
+        # AD capabilities are DUAL-channel: through the beacon session when
+        # one exists, DIRECTLY from the operator box when it does not — a
+        # domain controller can be enumerated/kerberoasted with just
+        # network access + credentials, no beacon foothold required.
+        ("post",     lambda cap: cap.category == "ad",
+         "_execute_ad_capability"),
+        # in-process ENGINE capabilities in the identity lane (phone_osint:
+        # offline metadata lookup) run through the ENGINE channel, exactly
+        # like the recon engines — the social channel owns SIDE EFFECTS
+        # (sherlock, breach APIs, phish delivery), not an offline net-less
+        # lookup, so a social-category engine must not be routed to it.
+        ("osint",    lambda cap: cap.category in ("osint", "social")
+                                and getattr(cap, "exec_class", "") == "in_process_engine"
+                                and getattr(cap, "engine", None) is not None,
+         "_execute_engine_capability"),
+        # social/osint capabilities execute through the SocialEngine channel
+        # (OSINT discovery, breach lookup, persona, phish, IP-grabber polling)
+        ("osint",    lambda cap: cap.category in ("osint", "social"),
+         "_execute_social_capability"),
+        # behavioural hunting executes through the anomaly engine channel
+        # (baseline + statistical scoring + mutation escalation, in-process)
+        ("exploit",  lambda cap: cap.category == "hunt",
+         "_execute_hunt_capability"),
+        # IDOR detection executes through the differential engine channel
+        # (baseline + reference walk + distinct-object oracle, in-process)
+        ("exploit",  lambda cap: cap.id == "idor_scan",
+         "_execute_idor_capability"),
+        # ORIGIN discovery executes through the edge engine (public data
+        # only: header evidence + CT-log hostnames + DNS resolution)
+        ("recon",    lambda cap: cap.id == "origin_discovery",
+         "_execute_origin_capability"),
+        # web credential extraction is an in-process engine (SSRF/SQLi
+        # probes against the discovered web services) — the adapter returns
+        # WEBCREDS: markers, never a shell command
+        ("foothold", lambda cap: cap.id == "web_creds",
+         "_execute_web_creds_capability"),
+        # in-process ENGINE capabilities run HERE, not in make_command:
+        # building a command must stay pure (the chain preview builds every
+        # candidate's command, and a live socket probe there is a bug), and
+        # `run_engine` gives the engine a timeout and a short TTL cache.
+        ("any",      lambda cap: getattr(cap, "exec_class", "") == "in_process_engine"
+                                and getattr(cap, "engine", None) is not None,
+         "_execute_engine_capability"),
+        # A-2: a LEARNED capability carries NO in-process adapter/interpreter
+        # (the loader reads only an out-of-process descriptor). Its whole
+        # contribution — preconditions, adapter and interpreter — runs in the
+        # task worker, and findings come back as JSON data. This must be
+        # handled BEFORE make_command(), which by design has no adapter here.
+        ("learned",  lambda cap: cap.id.startswith("learned.")
+                                and bool(getattr(cap, "source_module", "")),
+         "_execute_learned_capability"),
+        # everything else is a shell command (the only place commands exist)
+        ("any",      lambda cap: True,
+         "_execute_command_capability"),
+    )
+
     def _execute_capability(self, step: PlanStep) -> bool:
+        """Execute one planned step: the shared gates first (scope, stealth,
+        edge, preconditions, toolchain, slot safety), then the channel
+        registry routes the capability to its executor."""
         cap = step.capability
-        slots = dict(step.slot_values)
+        slots = self._gate_capability(cap, dict(step.slot_values))
+        if slots is None:
+            return False
+        return self._dispatch_capability(cap, slots, step)
+
+    def _dispatch_capability(self, cap, slots: Dict[str, Any],
+                             step: PlanStep = None) -> bool:
+        """Registry dispatch — first matching row wins (row order is part of
+        the contract, see _CHANNEL_ROUTES)."""
+        for _phase, match, handler in self._CHANNEL_ROUTES:
+            if match(cap):
+                return getattr(self, handler)(cap, slots, step)
+        raise AssertionError("channel registry must end with the default route")
+
+    def _gate_capability(self, cap, slots: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Shared pre-dispatch gates. Returns None when the capability is
+        refused (every refusal is announced and recorded first), else the
+        AUTOFILLED slots the channel executes with."""
+        slots = dict(slots)
         # scope discipline: never act on a target that is out of authorized scope
         if not self._scope_ok():
             self._mark_failed(cap.id)
@@ -834,7 +930,7 @@ class AutonomousAgent:
             self.wm.record_failure(cap.id, f"out of scope: {self.target}")
             _audit_decision("scope_decision", target=self.target, decision="deny",
                             reason=f"{cap.id}: target out of scope")
-            return False
+            return None
         # R2 stealth veto: once the engagement has spent its noise budget the
         # stealth lens refuses LOUD moves outright. It is narrow on purpose
         # (aggressive/forceful/high-detection only) so it stops the run from
@@ -848,7 +944,7 @@ class AutonomousAgent:
             self.wm.record_failure(cap.id, f"stealth veto: {veto}")
             _audit_decision("policy_decision", subject=cap.id, decision="deny",
                             policy="stealth_veto", reason=str(veto))
-            return False
+            return None
         # EDGE gate: an address behind Cloudflare/Akamai/Fastly/… is the
         # PROVIDER's reverse proxy, not the target. Packet-level work against
         # it footprints the CDN and touches a third party, so it is refused
@@ -858,7 +954,7 @@ class AutonomousAgent:
         if edge_block:
             self._emit("blocked", capability=cap.id, reason=edge_block)
             self.wm.record_failure(cap.id, edge_block)
-            return False
+            return None
         # the world is the judge: a capability whose preconditions are not
         # met NOW is deferred, not executed (e.g. network tooling on an
         # identity target before the victim_ip was harvested). Deferral is
@@ -872,7 +968,7 @@ class AutonomousAgent:
                     if not pre(self.wm):
                         self._emit("deferred", capability=cap.id,
                                    reason="precondition not met")
-                        return False
+                        return None
                 except Exception as exc:
                     # A precondition that RAISES must never be read as
                     # "satisfied": that turns a bug (or a hostile fact) into
@@ -882,7 +978,7 @@ class AutonomousAgent:
                                reason=f"precondition error: {exc}")
                     self.wm.record_failure(
                         cap.id, f"precondition raised: {exc}")
-                    return False
+                    return None
         # toolchain: a capability whose tools are missing fails cleanly
         # (checked BEFORE autofill so no side effects are recorded)
         if cap.tools and self.toolchain.resolve(cap.tools) is None:
@@ -894,7 +990,7 @@ class AutonomousAgent:
             self._mark_failed(cap.id)
             self._emit("tool_missing", capability=cap.id, tools=missing)
             self.wm.record_failure(cap.id, f"tool unavailable: {', '.join(missing)}")
-            return False
+            return None
         # TOOL CHOICE: stamp the target-aware pick BEFORE autofill/adapter,
         # so the command is built for THIS target's surface.
         try:
@@ -907,7 +1003,7 @@ class AutonomousAgent:
         except Exception as e:
             self._mark_failed(cap.id)
             self._emit("error", capability=cap.id, detail=f"autofill: {e}")
-            return False
+            return None
         # execution robustness: a slot value interpolated RAW into a command
         # string must be a plain token. One carrying a space becomes extra
         # argv (argument injection) and one carrying `;`/`&` becomes shell
@@ -923,60 +1019,15 @@ class AutonomousAgent:
             self._emit("blocked", capability=cap.id,
                        reason=f"unsafe slot value ({detail})")
             self.wm.record_failure(cap.id, f"unsafe slot value ({detail})")
-            return False
-        # post-exploitation capabilities execute through the beacon channel
-        if cap.category == "post":
-            return self._execute_post_capability(cap, slots)
-        # AD capabilities are DUAL-channel: through the beacon session when
-        # one exists, DIRECTLY from the operator box when it does not — a
-        # domain controller can be enumerated/kerberoasted with just
-        # network access + credentials, no beacon foothold required.
-        if cap.category == "ad":
-            return self._execute_ad_capability(cap, slots)
-        # in-process ENGINE capabilities in the identity lane (phone_osint:
-        # offline metadata lookup) run through the ENGINE channel, exactly
-        # like the recon engines — the social channel owns SIDE EFFECTS
-        # (sherlock, breach APIs, phish delivery), not an offline net-less
-        # lookup, so a social-category engine must not be routed to it.
-        if cap.category in ("osint", "social") \
-                and getattr(cap, "exec_class", "") == "in_process_engine" \
-                and getattr(cap, "engine", None) is not None:
-            return self._execute_engine_capability(cap, slots)
-        # social/osint capabilities execute through the SocialEngine channel
-        # (OSINT discovery, breach lookup, persona, phish, IP-grabber polling)
-        if cap.category in ("osint", "social"):
-            return self._execute_social_capability(cap, slots)
-        # behavioural hunting executes through the anomaly engine channel
-        # (baseline + statistical scoring + mutation escalation, in-process)
-        if cap.category == "hunt":
-            return self._execute_hunt_capability(cap, slots)
-        # IDOR detection executes through the differential engine channel
-        # (baseline + reference walk + distinct-object oracle, in-process)
-        if cap.id == "idor_scan":
-            return self._execute_idor_capability(cap, slots)
-        # ORIGIN discovery executes through the edge engine (public data
-        # only: header evidence + CT-log hostnames + DNS resolution)
-        if cap.id == "origin_discovery":
-            return self._execute_origin_capability(cap, slots)
-        # web credential extraction is an in-process engine (SSRF/SQLi
-        # probes against the discovered web services) — the adapter returns
-        # WEBCREDS: markers, never a shell command
-        if cap.id == "web_creds":
-            return self._execute_web_creds_capability(cap, slots)
-        # in-process ENGINE capabilities run HERE, not in make_command:
-        # building a command must stay pure (the chain preview builds every
-        # candidate's command, and a live socket probe there is a bug), and
-        # `run_engine` gives the engine a timeout and a short TTL cache.
-        if getattr(cap, "exec_class", "") == "in_process_engine" \
-                and getattr(cap, "engine", None) is not None:
-            return self._execute_engine_capability(cap, slots)
-        # A-2: a LEARNED capability carries NO in-process adapter/interpreter
-        # (the loader reads only an out-of-process descriptor). Its whole
-        # contribution — preconditions, adapter and interpreter — runs in the
-        # task worker, and findings come back as JSON data. This must be
-        # handled BEFORE make_command(), which by design has no adapter here.
-        if cap.id.startswith("learned.") and getattr(cap, "source_module", ""):
-            return self._execute_learned_capability(cap, slots)
+            return None
+
+        return slots
+
+    def _execute_command_capability(self, cap, slots: Dict[str, Any],
+                             step: PlanStep = None) -> bool:
+        """The shell-command channel: command synthesis -> dynamic shaping ->
+        the capability's own gates (beacon foothold, bind shell, online
+        brute) -> brokered execution -> perception -> postconditions."""
         # synthesize the command — the ONLY place commands exist
         try:
             cmd = cap.make_command(self.wm, slots)
@@ -1215,7 +1266,8 @@ class AutonomousAgent:
                 "target_type": getattr(self.wm, "target_type", "ip"),
                 "findings": findings}
 
-    def _execute_learned_capability(self, cap, slots: Dict[str, Any]) -> bool:
+    def _execute_learned_capability(self, cap, slots: Dict[str, Any],
+                             step: PlanStep = None) -> bool:
         """A-2: run a machine-authored capability entirely out of process.
 
         The worker re-checks the module's own preconditions, runs the
@@ -1975,7 +2027,8 @@ class AutonomousAgent:
             return False
         return True
 
-    def _execute_hunt_capability(self, cap, slots: Dict[str, Any]) -> bool:
+    def _execute_hunt_capability(self, cap, slots: Dict[str, Any],
+                             step: PlanStep = None) -> bool:
         """Behavioural hunting runs through the anomaly engine channel:
         endpoint discovery (robots/sitemap/crawl), baseline probes +
         statistical scoring + validation pass (confirmed/severity) +
@@ -2134,7 +2187,8 @@ class AutonomousAgent:
                        families=sorted({f.verdict.family_hint
                                         for f in findings}))
 
-    def _execute_idor_capability(self, cap, slots: Dict[str, Any]) -> bool:
+    def _execute_idor_capability(self, cap, slots: Dict[str, Any],
+                             step: PlanStep = None) -> bool:
         """IDOR detection runs through the differential engine channel:
         baseline + reference walk on web endpoints, distinct-object oracle
         (identity markers / size delta / status delta), bounded GETs. The
@@ -2171,7 +2225,8 @@ class AutonomousAgent:
             return False
         return True
 
-    def _execute_engine_capability(self, cap, slots: Dict[str, Any]) -> bool:
+    def _execute_engine_capability(self, cap, slots: Dict[str, Any],
+                             step: PlanStep = None) -> bool:
         """Run an in-process engine capability.
 
         The engine opens sockets/does the I/O at EXECUTION time only, under
@@ -2202,7 +2257,8 @@ class AutonomousAgent:
             return False
         return True
 
-    def _execute_web_creds_capability(self, cap, slots: Dict[str, Any]) -> bool:
+    def _execute_web_creds_capability(self, cap, slots: Dict[str, Any],
+                             step: PlanStep = None) -> bool:
         """Web credential extraction runs in-process (like the anomaly
         engine): deterministic SSRF/SQLi probes against the discovered web
         services, bounded and non-destructive. Emits WEBCREDS: markers that
@@ -2237,7 +2293,8 @@ class AutonomousAgent:
             return False
         return True
 
-    def _execute_post_capability(self, cap, slots: Dict[str, Any]) -> bool:
+    def _execute_post_capability(self, cap, slots: Dict[str, Any],
+                             step: PlanStep = None) -> bool:
         """Post-exploitation runs THROUGH the beacon channel (C2 task).
 
         The command is queued to the established beacon session; the result
@@ -2334,7 +2391,8 @@ class AutonomousAgent:
             return False
         return True
 
-    def _execute_ad_capability(self, cap, slots: Dict[str, Any]) -> bool:
+    def _execute_ad_capability(self, cap, slots: Dict[str, Any],
+                             step: PlanStep = None) -> bool:
         """AD/domain capabilities are DUAL-channel.
 
         With a beacon session the command is queued through the C2 (the
@@ -2414,7 +2472,8 @@ class AutonomousAgent:
             return False
         return True
 
-    def _execute_social_capability(self, cap, slots: Dict[str, Any]) -> bool:
+    def _execute_social_capability(self, cap, slots: Dict[str, Any],
+                             step: PlanStep = None) -> bool:
         """OSINT/social-engineering capabilities execute through the
         SocialEngine (sherlock/theHarvester, breach lookup, persona mailbox,
         phish delivery, IP-grabber polling) instead of the OS shell.
