@@ -676,6 +676,12 @@ class AutoJob:
         self.stream: list[dict] = []
         self.current_step = -1
         self.done = False
+        # Beacons THIS RUN established. The stream flattens events into log
+        # lines and drops the event kind, so the UI had no way to tell "this
+        # run produced a beacon" from "a beacon was already registered" — it
+        # could only diff the whole beacon list and guess. Recorded here, at
+        # the one place that knows, and served alongside the stream.
+        self.handoffs: list[dict] = []
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.started_at = time.time()
@@ -694,6 +700,24 @@ class AutoJob:
     def callback(self, kind: str, data: dict) -> None:
         with _auto_lock:
             self.stream.append({"kind": kind, "data": data})
+            if kind == "handoff":
+                beacon_id = str((data or {}).get("beacon_id") or "").strip()
+                if beacon_id and not any(
+                        h.get("beacon_id") == beacon_id for h in self.handoffs):
+                    self.handoffs.append({
+                        "beacon_id": beacon_id,
+                        "kind": "beacon_established",
+                        "target": str((data or {}).get("target")
+                                       or (self.targets[0] if self.targets else "")
+                                       or ""),
+                        "created_at": time.time(),
+                    })
+
+    def handoff_records(self) -> list[dict]:
+        """Handoffs so far, oldest first. A snapshot, so a UI poll cannot
+        mutate the job's state by iterating it."""
+        with _auto_lock:
+            return [dict(h) for h in self.handoffs]
 
     def drain(self) -> list[dict]:
         with _auto_lock:
@@ -879,6 +903,32 @@ def _preapprove_llm(job, llm: bool) -> None:
         job.llm_approval.approve_session()
 
 
+def _record_automode_guardrails(targets: List[str], force_network: bool
+                                ) -> Optional[Dict[str, Any]]:
+    """Announce-and-record the protection level for an API-triggered run.
+
+    The CLI states the engagement's protection level BEFORE a launch and
+    appends it to the audit log. The API used to not do either, so
+    ``force_network`` sent from the desktop panel (it has a checkbox for it)
+    widened an engagement with no guardrail manifest and no audit record
+    anywhere -- an override that left no trace, which is the one thing this
+    project must never allow.
+
+    Best-effort by design: a reporting failure must not stop a run. Returns
+    the manifest dict for the response, or None when unavailable.
+    """
+    try:
+        from phantom.utils import guardrails as gr
+        scope = getattr(session, "scope", None)
+        manifest = gr.build(scope=scope, targets=list(targets),
+                            force_network=bool(force_network))
+        gr.snapshot_to_audit(manifest, event="guardrails_at_launch",
+                             targets=list(targets), source="api")
+        return manifest.to_dict()
+    except Exception:
+        return None
+
+
 @routes.post("/api/automode/run")
 async def automode_run(request: web.Request) -> web.Response:
     """Start the auto-mode engine as a managed job."""
@@ -905,6 +955,10 @@ async def automode_run(request: web.Request) -> web.Response:
 
     if not targets:
         return _error("No targets specified")
+
+    # F2: record the protection level before anything runs, exactly as the
+    # CLI does at launch. `force_network` here is a scope-widening override.
+    guardrails = _record_automode_guardrails(targets, force_network)
 
     job = auto_jobs.create(targets, mode, profile, goal, verbose=verbose)
     # M3: the job owns its targets — never hijack the operator's global
@@ -949,7 +1003,8 @@ async def automode_run(request: web.Request) -> web.Response:
     job.thread = threading.Thread(target=_run, args=(job,), daemon=True)
     job.thread.start()
     return _json({"status": "started", "job_id": job.id,
-                  "targets": targets, "mode": mode, "engine": engine})
+                  "targets": targets, "mode": mode, "engine": engine,
+                  "guardrails": guardrails})
 
 
 @routes.get("/api/automode/stream")
@@ -958,7 +1013,7 @@ async def automode_stream(_request: web.Request) -> web.Response:
     job = auto_jobs.active()
     if job is None:
         return _json({"done": True, "step_updates": [], "current_step": -1,
-                      "log": []})
+                      "log": [], "handoffs": []})
     step_updates, logs = _automode_log_entries(job, job.drain())
 
     return _json({
@@ -966,7 +1021,67 @@ async def automode_stream(_request: web.Request) -> web.Response:
         "step_updates": step_updates,
         "current_step": job.current_step,
         "log": logs,
+        # What THIS run handed over, so the UI can offer the C2 handoff
+        # instead of asking the operator to go and notice a beacon by hand.
+        "handoffs": job.handoff_records(),
     })
+
+
+@routes.get("/api/guardrails")
+async def guardrails_get(_request: web.Request) -> web.Response:
+    """The engagement's safety manifest: every control, its state, and which
+    layer decided that (default / config / env / run flag).
+
+    Read-only by construction - this endpoint observes, it never flips a
+    control. Overrides are reported because an override an operator cannot see
+    is how an engagement runs outside the scope it was sold with.
+    """
+    from phantom.utils import guardrails as gr
+    try:
+        from phantom.core.session import session as _session
+        scope = getattr(_session, "scope", None)
+        target = getattr(_session, "target", None)
+    except Exception:
+        scope, target = None, None
+    m = gr.build(scope=scope, targets=[target] if target else None)
+    payload = m.to_dict()
+    # The UI needs to know which rows are switches and which are read-only, or
+    # it renders a dead button (or hides a control that is genuinely settable).
+    payload["toggleable"] = [t["key"] for t in gr.toggleable()]
+    return _json(payload)
+
+
+@routes.post("/api/guardrails")
+async def guardrails_post(request: web.Request) -> web.Response:
+    """Flip one toggleable guardrail: {"key": "...", "enabled": true|false}.
+
+    Refuses keys that are not operator-toggleable rather than pretending: a
+    switch that appears to work but writes nowhere is worse than an error.
+    """
+    from phantom.utils import guardrails as gr
+    body = await request.json() or {}
+    key = str(body.get("key") or "").strip().lower()
+    if not key:
+        return _error("key is required")
+    if "enabled" not in body:
+        return _error("enabled (bool) is required")
+    ok, msg = gr.set_guardrail(key, bool(body.get("enabled")))
+    if not ok:
+        return _error(msg)
+    # The new manifest goes to the audit log too: a guardrail change is
+    # exactly the kind of event a post-engagement review needs to see.
+    try:
+        from phantom.core.session import session as _session
+        scope = getattr(_session, "scope", None)
+        target = getattr(_session, "target", None)
+    except Exception:
+        scope, target = None, None
+    m = gr.build(scope=scope, targets=[target] if target else None)
+    gr.snapshot_to_audit(m, event="guardrails_changed", changed=key,
+                         now_enabled=bool(body.get("enabled")))
+    manifest_payload = m.to_dict()
+    manifest_payload["toggleable"] = [t["key"] for t in gr.toggleable()]
+    return _json({"ok": True, "message": msg, "manifest": manifest_payload})
 
 
 @routes.get("/api/automode/status")
@@ -1085,46 +1200,108 @@ async def identity_confirm(request: web.Request) -> web.Response:
 
 @routes.post("/api/automode/plan")
 async def automode_plan(request: web.Request) -> web.Response:
-    """Dry-run: return the planned kill chain without executing."""
+    """Dry-run: the REAL plan the engine would follow, without executing.
+
+    This used to rebuild the chain by hand from `mode` and the shape of the
+    target string, ignoring `engine`, `force_network` and `agents`. The dry
+    run was therefore a SECOND, drift-prone planner: the operator read a
+    chain the engine would not follow (the same class of drift E2 closed in
+    the shell). It now delegates to `automode._dry_run_plan` -- the exact
+    function the CLI's `--plan` uses -- so preview and run are one planner.
+    """
     body = await request.json() or {}
-    targets = body.get("targets", [])
-    mode = body.get("mode", "default")
-    profile = body.get("profile", "enterprise")
-    goal = body.get("goal", "deliver")
+    targets = [str(t).strip() for t in body.get("targets", []) if str(t).strip()]
+    mode = str(body.get("mode", "default"))
+    profile = str(body.get("profile", "enterprise"))
+    goal = str(body.get("goal", "deliver"))
+    engine = str(body.get("engine", "agent") or "agent").strip().lower()
+    force_network = bool(body.get("force_network", False))
+    try:
+        agents = int(body.get("agents", 0) or 0)
+    except (TypeError, ValueError):
+        agents = 0
 
     if not targets:
         return _error("No targets specified")
+    if engine not in ("agent", "swarm"):
+        return _error("engine must be 'agent' or 'swarm'")
 
-    # Build a plan based on target type
+    # Same mode -> posture mapping the run endpoint uses, so the preview is
+    # produced under the posture the run would actually use.
+    aggressive = mode == "aggressive"
+    paranoid = mode == "stealth"
+    speed = mode == "speed"
+
+    # Resolve the target set EXACTLY as run_auto_mode does before planning:
+    # scope-bounded expansion, CIDR triage, then the range policy. Without
+    # this a CIDR previewed as a single identity target -- a chain the run
+    # would never follow.
+    from phantom.core.automode import (
+        _apply_range_policy, _dry_run_plan, _expand_targets,
+        _extract_networks, _triage_targets)
+    raw = list(targets)
+    resolved = _expand_targets(
+        raw, scope_list=list(getattr(session, "scope", None) or []))
+    networks = _extract_networks(raw)
+    try:
+        resolved = _triage_targets(raw, networks, resolved) or resolved
+    except Exception:
+        pass
+    if not resolved:
+        return _error("no plannable target after scope/range expansion")
+    # plan=True: a dry run is allowed to preview a range (the run itself
+    # would need force_network, and says so).
+    if not _apply_range_policy(networks, resolved, raw,
+                               force_network, True):
+        return _error("range policy refused this target set "
+                      "(a CIDR needs force_network to plan an assault)")
+
     plan = []
-    for t in targets:
-        t = t.strip()
-        if "@" in t or t.startswith("+"):
-            plan.append(f"[{t}] Classify → IDENTITY (email/phone)")
-            plan.append(f"[{t}] OSINT → breach lookup → persona → victim IP")
-            plan.append(f"[{t}] After victim IP: SCAN → EXPLOIT → BEACON → PERSIST")
-        elif t.startswith(("http://", "https://")):
-            plan.append(f"[{t}] Classify → URL")
-            plan.append(f"[{t}] WEB RECON → CVE CORRELATE → EXPLOIT → BEACON")
-        elif "/" in t:
-            plan.append(f"[{t}] Classify → CIDR range")
-            plan.append(f"[{t}] PING SWEEP → per-host SCAN → EXPLOIT → BEACON")
-        else:
-            plan.append(f"[{t}] Classify → IP/DOMAIN")
-            plan.append(f"[{t}] SCAN ({'stealth' if mode == 'stealth' else 'full'}) → OS DETECT")
-            plan.append(f"[{t}] CVE CORRELATE → {'STEALTH EXPLOIT' if mode == 'stealth' else 'EXPLOIT'} → CREDS")
-            plan.append(f"[{t}] BEACON ({'minimal' if mode == 'stealth' else 'standard'} dropper)")
-            plan.append(f"[{t}] PERSIST (auto-detect OS)")
-            plan.append(f"[{t}] Handoff to C2 terminal")
+    steps = []
+    for t in resolved:
+        try:
+            p, tt, chain, goal_facts = _dry_run_plan(
+                t, goal, profile, aggressive, paranoid, speed)
+        except Exception as exc:
+            plan.append(f"[{t}] plan failed: {type(exc).__name__}: {exc}")
+            continue
+        plan.append(f"[{t}] Classify -> {tt} ({chain} chain)")
+        if not p.steps:
+            plan.append(f"[{t}]   (goal already satisfied or no path available)")
+        for i, s in enumerate(p.steps, 1):
+            cap = s.capability
+            plan.append(f"[{t}]   {i}. {cap.id} "
+                        f"(cost {cap.opsec_cost}, {cap.stealth_level}) "
+                        f"-- {s.reason}")
+            steps.append({
+                "target": t, "target_type": tt, "chain": chain,
+                "step": i, "capability": cap.id,
+                "opsec_cost": cap.opsec_cost,
+                "stealth_level": cap.stealth_level,
+                "reason": s.reason,
+                "goal_facts": list(goal_facts),
+            })
 
-    plan.append("═══ GENERATE DUAL REPORT (raw audit + sanitized client) ═══")
+    if force_network:
+        plan.append("!! force_network=on: the run may engage the FULL range "
+                    "(scope-widening override; recorded at launch)")
+    plan.append("-- GENERATE DUAL REPORT (raw audit + sanitized client) --")
 
-    if mode == "aggressive":
-        plan.insert(2, f"[{targets[0]}] AGGRESSIVE: online brute force, vuln scan, loud tools")
-    if mode == "speed":
-        plan.append("   SPEED: exploit first viable opening, skip remaining targets")
+    return _json({
+        "plan": plan,
+        "steps": steps,
+        "engine": engine,
+        "mode": mode,
+        "profile": profile,
+        "goal": goal,
+        "force_network": force_network,
+        "agents": agents,
+        "workers_per_target": agents if agents > 0 else "auto",
+        "note": ("dry run: nothing is executed. The chain above is the "
+                 "engine's own plan; a 'swarm' engine runs the per-target "
+                 "chains in parallel over a shared blackboard."),
+    })
 
-    return _json({"plan": plan})
 
 
 # ── Manual modules ─────────────────────────────────────────────────────────
@@ -1144,15 +1321,6 @@ _MODULES = {
 }
 
 
-def _api_target_type() -> str:
-    """Target-type tag (IP/EMAIL/USERNAME/DOMAIN/...) for reports/UI."""
-    if not session.target:
-        return "UNKNOWN"
-    try:
-        from phantom.automation.guidance.targets import classify_target
-        return classify_target(session.target).upper()
-    except Exception:
-        return "UNKNOWN"
 
 
 def _module_instance(name: str):
@@ -1407,8 +1575,6 @@ def _validate_backend_command(module: Optional[str],
         if err:
             return err
     return None
-
-
 @routes.get("/api/modules")
 async def modules_list(request: web.Request) -> web.Response:
     """Return module metadata and live state-aware commands.
@@ -1543,129 +1709,25 @@ async def module_run_group(request: web.Request) -> web.Response:
 
 @routes.post("/api/reports/generate")
 async def reports_generate(request: web.Request) -> web.Response:
-    """Generate a report from session data."""
+    """Generate a report from session data.
+
+    Delegates to ReportModule — the SAME generator the CLI uses. The inline
+    generator that used to live here drifted from it and silently dropped the
+    guardrail manifest, so a report produced from the UI could not show which
+    protection controls the engagement actually ran with.
+    """
     body = await request.json() or {}
-    fmt = body.get("format", "html")
-
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    target = session.target or "unknown"
-    mode = _api_target_type()
-    scope = ", ".join(session.scope) if session.scope else "—"
-
-    # Build the raw report
-    raw = f"""╔══════════════════════════════════════════════════════════╗
-║  PHANTOM — RAW AUDIT REPORT                              ║
-╚══════════════════════════════════════════════════════════╝
-
-GENERATED:  {now}
-TARGET:     {target}
-TYPE:       {mode.upper()}
-SCOPE:      {scope}
-
-──────────────────────────────────────────────────────────
-ENGAGEMENT SUMMARY
-──────────────────────────────────────────────────────────
-
-Results: {json.dumps(session.results, indent=2)}
-
-Notes:
-{chr(10).join(f"  • {n}" for n in session.notes) if session.notes else '  (none)'}
-
-Command History:
-{chr(10).join(f"  {i+1}. {c}" for i, c in enumerate(session.history[-50:])) if session.history else '  (none)'}
-
-══════════════════════════════════════════════════════════
-END OF RAW REPORT
-"""
-
-    # Build the client report (sanitized)
-    client = f"""╔══════════════════════════════════════════════════════════╗
-║  PHANTOM — SECURITY ASSESSMENT REPORT (CLIENT)           ║
-╚══════════════════════════════════════════════════════════╝
-
-Assessment Date:  {now}
-Target Scope:     {scope}
-
-──────────────────────────────────────────────────────────
-EXECUTIVE SUMMARY
-──────────────────────────────────────────────────────────
-
-Phantom performed a {mode.upper()} security assessment of the
-target system(s). The engagement followed industry-standard
-methodology and identified potential security weaknesses.
-
-──────────────────────────────────────────────────────────
-FINDINGS
-──────────────────────────────────────────────────────────
-
-{_client_findings(session.results)}
-
-══════════════════════════════════════════════════════════
-This report contains sanitized findings for the client.
-Technical details are available in the raw audit report.
-END OF CLIENT REPORT
-"""
-
-    # the target may contain path-hostile characters (<script>, :/\ ...):
-    # sanitize it before it becomes part of a filesystem path
-    target_safe = re.sub(r"[^A-Za-z0-9._-]", "_", target)
-    report_dir = os.path.join(
-        sessions_dir(), f"report_{target_safe}_{int(time.time())}")
-    os.makedirs(report_dir, exist_ok=True)
-
-    if fmt == "json":
-        raw_path = os.path.join(report_dir, "raw_audit.json")
-        client_path = os.path.join(report_dir, "client_report.json")
-        with open(raw_path, "w") as f:
-            json.dump({"report": raw, "generated_at": now}, f, indent=2)
-        with open(client_path, "w") as f:
-            json.dump({"report": client, "generated_at": now}, f, indent=2)
-    else:
-        ext = "html" if fmt == "html" else "txt"
-        raw_path = os.path.join(report_dir, f"raw_audit.{ext}")
-        client_path = os.path.join(report_dir, f"client_report.{ext}")
-        with open(raw_path, "w", encoding="utf-8") as f:
-            if fmt == "html":
-                # escape the report body: raw findings/history can contain
-                # angle brackets from target data (HTML injection)
-                f.write(f"<html><body><pre>{html.escape(raw)}</pre></body></html>")
-            else:
-                f.write(raw)
-        with open(client_path, "w", encoding="utf-8") as f:
-            if fmt == "html":
-                f.write(f"<html><body><pre>{html.escape(client)}</pre></body></html>")
-            else:
-                f.write(client)
-
+    fmt = str(body.get("format", "html") or "html").lower()
+    from phantom.modules.report import ReportModule
+    out = ReportModule().generate(fmt)
     return _json({
-        "raw": raw[:5000],
-        "client": client[:5000],
-        "raw_path": raw_path,
-        "client_path": client_path,
-        "generated_at": now,
-        "format": fmt,
+        "raw": out["raw"][:5000],
+        "client": out["client"][:5000],
+        "raw_path": out["raw_path"],
+        "client_path": out["client_path"],
+        "generated_at": out["generated_at"],
+        "format": out["format"],
     })
-
-
-def _client_findings(results: dict) -> str:
-    """Generate sanitized client-facing findings."""
-    lines = []
-    # Group hints from results into readable text
-    if results.get("scan"):
-        lines.append("• Network scanning identified open ports and services")
-    if results.get("osint"):
-        lines.append("• OSINT collection identified publicly exposed information")
-    if results.get("exploit"):
-        lines.append("• Vulnerability assessment identified exploitable CVEs")
-    if results.get("creds"):
-        lines.append("• Credential testing revealed weak authentication patterns")
-    if results.get("web"):
-        lines.append("• Web application testing identified configuration issues")
-    if not lines:
-        lines.append("• No critical findings during this assessment cycle")
-    lines.append("")
-    lines.append("RECOMMENDATION: Review the detailed audit report and prioritize remediation.")
-    return "\n".join(lines)
 
 
 @routes.post("/api/reports/export")
@@ -2393,102 +2455,18 @@ async def pm_import(request: web.Request) -> web.Response:
 
 @routes.post("/api/reports/export-all")
 async def reports_export_all(request: web.Request) -> web.Response:
-    """Generate AND export both raw + client reports in one step."""
+    """Generate AND write both raw + client reports through ReportModule."""
     body = await request.json() or {}
-    fmt = body.get("format", "html")
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    target = session.target or "unknown"
-    mode = _api_target_type()
-    scope = ", ".join(session.scope) if session.scope else "—"
-
-    # Build both reports
-    raw = _build_raw_report(target, mode, scope, now)
-    client = _build_client_report(target, mode, scope, now)
-
-    # the target may contain path-hostile characters (<script>, :/\ ...):
-    # sanitize it before it becomes part of a filesystem path
-    target_safe = re.sub(r"[^A-Za-z0-9._-]", "_", target)
-    report_dir = os.path.join(
-        sessions_dir(), f"report_{target_safe}_{int(time.time())}")
-    os.makedirs(report_dir, exist_ok=True)
-
-    if fmt == "json":
-        raw_path = os.path.join(report_dir, "raw_audit.json")
-        client_path = os.path.join(report_dir, "client_report.json")
-        with open(raw_path, "w") as f:
-            json.dump({"report": raw, "generated_at": now}, f, indent=2)
-        with open(client_path, "w") as f:
-            json.dump({"report": client, "generated_at": now}, f, indent=2)
-    else:
-        ext = "html" if fmt == "html" else "pdf"
-        raw_path = os.path.join(report_dir, f"raw_audit.{ext}")
-        client_path = os.path.join(report_dir, f"client_report.{ext}")
-        with open(raw_path, "w") as f:
-            if fmt == "html":
-                f.write(f"<html><head><title>Phantom Raw Audit</title></head><body><pre>{raw}</pre></body></html>")
-            else:
-                f.write(raw)
-        with open(client_path, "w") as f:
-            if fmt == "html":
-                f.write(f"<html><head><title>Phantom Client Report</title></head><body><pre>{client}</pre></body></html>")
-            else:
-                f.write(client)
-
+    fmt = str(body.get("format", "html") or "html").lower()
+    from phantom.modules.report import ReportModule
+    out = ReportModule().generate(fmt)
     return _json({
         "status": "exported",
-        "format": fmt,
-        "raw_path": raw_path,
-        "client_path": client_path,
-        "generated_at": now,
+        "format": out["format"],
+        "raw_path": out["raw_path"],
+        "client_path": out["client_path"],
+        "generated_at": out["generated_at"],
     })
-
-
-def _build_raw_report(target: str, mode: str, scope: str, now: str) -> str:
-    """Build the raw audit report."""
-    lines = ["PHANTOM — RAW AUDIT REPORT", "=" * 60, "",
-             f"Generated:  {now}", f"Target:     {target}",
-             f"Type:       {mode.upper()}", f"Scope:      {scope}", "",
-             "─" * 40, "ENGAGEMENT SUMMARY", "─" * 40, ""]
-    for key, val in (session.results or {}).items():
-        lines.append(f"[{key.upper()}] {val}"[:200])
-    if not session.results:
-        lines.append("(no module results yet)")
-    lines += ["", "Notes:"]
-    if session.notes:
-        lines += [f"  • {n}" for n in session.notes]
-    else:
-        lines.append("  (none)")
-    lines += ["", "Command History:"]
-    if session.history:
-        lines += [f"  {i+1}. {c}" for i, c in enumerate(session.history[-50:])]
-    lines += ["", "END OF RAW REPORT"]
-    return "\n".join(lines)
-
-
-def _build_client_report(target: str, mode: str, scope: str, now: str) -> str:
-    """Build the sanitized client report."""
-    findings = _client_findings(session.results)
-    return f"""PHANTOM — SECURITY ASSESSMENT REPORT (CLIENT)
-{'=' * 60}
-
-Assessment Date:  {now}
-Target Scope:     {scope}
-
-{'─' * 40}
-EXECUTIVE SUMMARY
-{'─' * 40}
-
-Phantom performed a {mode.upper()} security assessment of the
-target system(s) following industry-standard methodology.
-
-{'─' * 40}
-FINDINGS
-{'─' * 40}
-
-{findings}
-
-END OF CLIENT REPORT
-"""
 
 
 # ── State Config ────────────────────────────────────────────────────────────
@@ -3178,11 +3156,11 @@ async def export_campaign(_request: web.Request) -> web.Response:
         except Exception:
             pass
 
-        # Generate raw + client reports
-        raw = _build_raw_report(target, _api_target_type(), ", ".join(session.scope or []), now)
-        client = _build_client_report(target, _api_target_type(), ", ".join(session.scope or []), now)
-        zf.writestr("raw_audit.txt", raw)
-        zf.writestr("client_report.txt", client)
+        # Generate raw + client reports through the ONE generator
+        from phantom.modules.report import (
+            _build_operator_markdown, _build_client_markdown)
+        zf.writestr("raw_audit.txt", _build_operator_markdown())
+        zf.writestr("client_report.txt", _build_client_markdown())
 
     export_path = os.path.join(sessions_dir(), f"campaign_{target}_{now}.zip")
     with open(export_path, "wb") as f:
