@@ -133,11 +133,17 @@ class TestTheLoopKeepsWorking:
         assert "std::min(60000, cfg.sleep_ms * 2)" in loop_body
 
     def test_undelivered_results_are_retried_before_new_work(self, loop_body):
-        retry = loop_body.index("for (auto it = pending_results.begin()")
+        # The drain is `task::drain_pending_results` now: the old inline loop
+        # `break`-ed on the FIRST failed upload, so one undeliverable result
+        # stalled every result queued behind it. The policy itself (and its
+        # tests) live in tests/test_beacon_task_lifecycle.py.
+        retry = loop_body.index("task::drain_pending_results(")
         parse = loop_body.index("json_mini::parse_tasks(response)")
         assert retry < parse, \
             "results must be retried BEFORE new tasks are parsed"
         assert "pending_results.emplace_back" in loop_body
+        assert "for (auto it = pending_results.begin()" not in loop_body, \
+            "the loop that break-ed on the first failed upload is back"
 
     def test_the_sleep_is_masked_and_jittered(self, loop_body):
         assert "cfg.get_sleep_ms()" in loop_body
