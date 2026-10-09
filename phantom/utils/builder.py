@@ -341,7 +341,6 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                 "src/pic_bootstrap.asm",
                 "src/peb_walker.asm",
                 "src/api_resolver.asm",
-                "src/stack_spoofer.asm",
             ]
 
             # Helper to find a tool by any of its possible names

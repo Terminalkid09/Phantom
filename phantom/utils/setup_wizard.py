@@ -141,6 +141,16 @@ NOT_INSTALLED = "not_installed"
 NO_DISTRO = "no_distro"
 READY = "ready"
 
+#: Timeout for a STATE PROBE (is WSL there? which distros?) as opposed to an
+#: installer. `_run` defaults to 600s because apt/dnf installs legitimately
+#: take minutes - but `wsl -l -q` is a query, and on a machine where the WSL
+#: service is wedged (or still booting, or stopped after a reboot) it hangs
+#: until the caller's timeout fires. That put a 10-minute stall in front of
+#: `phantom setup`, `doctor` and any state check, and it blocked the test suite
+#: outright on this box. A probe that takes 30s is not a slow probe, it is a
+#: broken one; fail fast and let the caller report WSL as unavailable.
+PROBE_TIMEOUT_S = 30
+
 
 def wsl_state_check() -> Optional[Tuple[str, str]]:
     """(state, human detail). None when not on Windows."""
@@ -150,7 +160,14 @@ def wsl_state_check() -> Optional[Tuple[str, str]]:
         return (NOT_INSTALLED,
                 "WSL not installed — `wsl --install` requires ADMIN and "
                 "one REBOOT")
-    ok, out = _run(["wsl", "-l", "-q"])
+    ok, out = _run(["wsl", "-l", "-q"], timeout=PROBE_TIMEOUT_S)
+    if not ok and "timed out" in (out or "").lower():
+        # Say WHY rather than reporting "no distro": the operator needs to
+        # know the service is wedged, not that they have an empty WSL.
+        return (NO_DISTRO,
+                f"WSL present but `wsl -l -q` did not answer within "
+                f"{PROBE_TIMEOUT_S}s (the WSL service looks stuck - try "
+                f"`wsl --shutdown`, then `wsl -l -v`)")
     distros = [d.strip() for d in (out or "").replace("\x00", "").splitlines()
                if d.strip() and "no installed distributions"
                not in d.lower()]
