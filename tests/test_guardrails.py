@@ -32,14 +32,28 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
 def _isolated():
-    """Point config + state at a temp dir and drop ambient PHANTOM_* vars."""
+    """Point config + state at a temp dir and drop ambient PHANTOM_* vars.
+
+    The environment is restored EXHAUSTIVELY on exit — cleared, then the
+    original mapping put back — instead of merely merged. Merging only
+    re-adds the vars that were dropped here, so a test that SETS one (a
+    strict-mode test setting ``PHANTOM_STRICT_GUARDRAILS`` and not popping
+    it) leaked strict mode into every later test in the same process: that
+    is how ``tests/test_autoshell_scope_flags.py`` failed when it ran after
+    this file and passed when it ran before it.
+    """
     stack = contextlib.ExitStack()
+
+    original_env = dict(os.environ)
+
+    def _restore_env():
+        os.environ.clear()
+        os.environ.update(original_env)
 
     tmp = tempfile.TemporaryDirectory()
     stack.callback(tmp.cleanup)
     os.environ["PHANTOM_STATE_FILE"] = os.path.join(tmp.name,
                                                     "phantom_state.json")
-    stack.callback(lambda: os.environ.pop("PHANTOM_STATE_FILE", None))
 
     import phantom.utils.config as cfg
     stack.enter_context(mock.patch.object(
@@ -49,11 +63,10 @@ def _isolated():
     cfg._loaded = None
     stack.callback(lambda: setattr(cfg, "_loaded", None))
 
-    leaked = {k: v for k, v in os.environ.items() if k.startswith("PHANTOM_")}
-    for key in leaked:
+    for key in [k for k in os.environ if k.startswith("PHANTOM_")]:
         if key != "PHANTOM_STATE_FILE":
             os.environ.pop(key, None)
-    stack.callback(lambda: os.environ.update(leaked))
+    stack.callback(_restore_env)
     return stack
 
 
