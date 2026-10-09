@@ -112,8 +112,10 @@ class ScanModule(BaseModule):
         chosen_commands = filter_aggressive_commands(chosen_commands)
 
         notifier.status(f"Starting scan sequence for {session.target}...")
-        results = run_commands(chosen_commands, session.target)
-        session.add_result("scan", results)
+        from phantom.core.executor import RunStatus
+        status = RunStatus()
+        results = run_commands(chosen_commands, session.target, status=status)
+        session.add_result("scan", results, status=status)
         
         # Trigger Smart Intelligence: CVE Analysis
         self._analyze_vulnerabilities(results)

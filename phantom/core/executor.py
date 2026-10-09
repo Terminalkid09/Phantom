@@ -275,6 +275,7 @@ _PHANTOM_COMMANDS = frozenset({
     "beacon-auth", "beacon-help", "autopersist", "interact", "results",
     "back", "payloads", "console", "migrate", "run", "use", "set",
     "fire", "execute", "screenshot", "keylog", "persist",
+    "unpersist",
     # module names — `use <module>` / `run <module>` verbs, never packages
     "scan", "osint", "wifi", "web", "brute", "exploit", "payload",
     "handler", "pivot", "analyzer", "report", "wordlist", "telegram",
@@ -470,7 +471,62 @@ def _safe_input(prompt: str, default: str = "y") -> str:
         return "k"
 
 
-def run_command(cmd: str, target_ip: str = "") -> str:
+class RunStatus:
+    """Outcome accumulator for a command batch (G16).
+
+    `run_command` returns "" for a missing tool, for an out-of-scope target
+    and for a command that genuinely printed nothing -- three different facts
+    that modules then stored as their whole module result. Nothing downstream
+    could tell a BROKEN run from a CLEAN one: "nmap is not installed" and
+    "nmap found nothing" and "the target is unreachable" all arrived as an
+    empty value. This accumulator carries the reason next to the output.
+    """
+
+    __slots__ = ("errors", "refused", "commands", "output_chars", "with_output")
+
+    def __init__(self):
+        self.errors: list = []
+        self.refused: list = []
+        self.commands: int = 0
+        self.output_chars: int = 0
+        self.with_output: list = []
+
+    def refused_command(self, cmd: str, reason: str) -> None:
+        self.errors.append(reason)
+        self.refused.append(cmd)
+
+    def ran(self, cmd: str, output: str) -> None:
+        self.commands += 1
+        self.output_chars += len(output or "")
+        if output and output.strip():
+            self.with_output.append(cmd)
+
+    @property
+    def error(self):
+        return self.errors[0] if self.errors else None
+
+    @property
+    def outcome(self) -> str:
+        """error / empty / ok -- never inferred from the output text."""
+        if self.errors and not self.output_chars:
+            return "error"
+        if not self.commands:
+            return "empty"
+        return "ok" if self.output_chars else "empty"
+
+    def as_dict(self) -> dict:
+        return {
+            "outcome": self.outcome,
+            "error": self.error,
+            "errors": list(self.errors),
+            "refused": list(self.refused),
+            "commands": self.commands,
+            "output_chars": self.output_chars,
+            "with_output": list(self.with_output),
+        }
+
+
+def run_command(cmd: str, target_ip: str = "", status=None) -> str:
     """
     Run a shell command with interactive timeout.
 
@@ -486,16 +542,22 @@ def run_command(cmd: str, target_ip: str = "") -> str:
     """
     if target_ip and session.scope and not is_in_scope(target_ip, session.scope):
         console.print(f"[red][!] Command blocked: {target_ip} is out of scope.[/]")
+        if status is not None:
+            status.refused_command(cmd, f"out of scope: {target_ip}")
         return ""
 
     if target_ip and not _is_safe_target(target_ip):
         console.print(f"[red][!] Blocked: target '{target_ip}' contains dangerous characters.[/]")
+        if status is not None:
+            status.refused_command(cmd, f"unsafe target: {target_ip}")
         return ""
 
     if not _is_tool_installed(cmd):
         tool = cmd.split()[0] if cmd.split() else "Unknown"
         console.print(f"[yellow][!] Tool '{tool}' not installed. Skipping.[/]")
         console.print(f"    [dim]Install with: sudo apt install {tool}[/]")
+        if status is not None:
+            status.refused_command(cmd, f"tool '{tool}' not installed")
         return ""
 
     console.print(f"\n  [dim]$ {cmd}[/]")
@@ -577,6 +639,8 @@ def run_command(cmd: str, target_ip: str = "") -> str:
                         "buffer": background_buffer,
                         "process": process,
                     })
+                    if status is not None:
+                        status.ran(cmd, "".join(output_lines))
                     return "".join(output_lines)
 
                 elif choice == "k":
@@ -608,6 +672,8 @@ def run_command(cmd: str, target_ip: str = "") -> str:
         # Always restore terminal — fixes invisible input after sudo commands
         _restore_terminal(terminal_settings)
 
+    if status is not None:
+        status.ran(cmd, "".join(output_lines))
     return "".join(output_lines)
 
 
@@ -869,17 +935,44 @@ class BackgroundProcess:
             pass
 
 
-def run_commands(commands: list, target_ip: str = "") -> dict:
+def run_commands(commands: list, target_ip: str = "", status=None,
+                 checkpoint=None) -> dict:
     """
     Run a list of commands sequentially.
     After all commands complete, shows buffered output
     from any commands sent to background with 'n'.
     Returns dict {command: output}.
+
+    `status`, when given a `RunStatus`, accumulates WHY each command did
+    or did not produce output (missing tool / out of scope / genuinely
+    empty), so the caller can store that next to the raw output instead
+    of collapsing every case into an empty dict.
+
+    `checkpoint`, when given a `ManualCheckpoint`, makes the batch
+    RESUMABLE: a command already recorded as completed is not run again,
+    and each result is persisted as soon as it is produced — so a run
+    interrupted at minute 39 of 40 resumes instead of starting over.
     """
     results = {}
+    done = checkpoint.completed() if checkpoint is not None else {}
     for cmd in commands:
         clean_cmd = cmd.replace(" AGGRESSIVE", "").strip()
-        results[clean_cmd] = run_command(clean_cmd, target_ip)
+        if checkpoint is not None and clean_cmd in done:
+            results[clean_cmd] = done[clean_cmd]
+            console.print(f"  [dim]resume: skipping completed "
+                          f"'{clean_cmd[:60]}'[/]")
+            if status is not None:
+                status.ran(clean_cmd, done[clean_cmd])
+            continue
+        # The call SHAPE is unchanged when no status is requested: wrappers
+        # and test doubles that predate the outcome channel keep working
+        # (they only need to accept the extra kwarg when they ask for one).
+        if status is None:
+            results[clean_cmd] = run_command(clean_cmd, target_ip)
+        else:
+            results[clean_cmd] = run_command(clean_cmd, target_ip, status=status)
+        if checkpoint is not None:
+            checkpoint.mark(clean_cmd, results[clean_cmd])
 
     # Show background command output at the end
     bg_keys = [k for k in session.results.keys() if k.startswith("_bg_")]
@@ -923,4 +1016,6 @@ def run_commands(commands: list, target_ip: str = "") -> dict:
             # Remove from session after showing
             del session.results[key]
 
+    if checkpoint is not None:
+        checkpoint.finish()
     return results

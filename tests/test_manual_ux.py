@@ -147,7 +147,15 @@ class TestQuietMode:
         mod.quiet = True
         fake = type("R", (), {"stdout": "22 open ssh\n", "stderr": "",
                               "returncode": 0, "ok": True})()
-        with patch("phantom.core.executor.execute_quiet", return_value=fake) as eq:
+        # Quiet mode refuses the run outright when the top suggestion's tools
+        # are absent (base_module._gate_tools), so on a box without nmap this
+        # test never reached the executor it is about. The subject here is the
+        # quiet-mode plumbing, not tool availability - stub the gate, keep the
+        # executor assertion real.
+        with patch("phantom.core.executor.module_missing_tools",
+                   return_value=[]), \
+             patch("phantom.core.executor.execute_quiet",
+                   return_value=fake) as eq:
             buf = io.StringIO()
             with patch("sys.stdout", buf):
                 mod.do_run("--quiet")

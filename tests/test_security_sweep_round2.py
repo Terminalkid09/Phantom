@@ -86,10 +86,24 @@ def test_backend_run_pipeline_refuses_substitution():
     assert r.returncode == -1 and "refused" in (r.error or "")
 
 
+@pytest.mark.integration_tool
 def test_backend_run_pipeline_executes_argv():
+    """The NATIVE backend really runs an argv command with no shell.
+
+    Marked integration_tool on purpose: this asserts an end-to-end execution
+    through whichever backend the host provides (native / WSL2 / SSH), so it
+    cannot pass on a box without one - it was returning "No native, WSL2, or
+    configured SSH backend detected" and reading as a product failure. It is
+    the execution claim, not the gate, so it must NOT be mocked: mocking it
+    would make it assert nothing. The unit-level argv/shell contract is
+    covered hermetically by the safe_exec tests above.
+    """
     from phantom.api.backend import backend_dispatcher
     r = backend_dispatcher.run_pipeline("echo hello-argv", "", timeout=10)
-    assert r.returncode == 0 and r.stdout.strip() == "hello-argv"
+    assert r.returncode == 0, (
+        f"no usable execution backend on this host (rc={r.returncode}, "
+        f"error={r.error!r}) - this is an integration_tool test")
+    assert r.stdout.strip() == "hello-argv"
 
 
 def test_module_spawns_avoid_the_shell():
@@ -225,11 +239,40 @@ def test_worker_strips_phantom_env(tmp_path):
 # ── A-3: CORS ───────────────────────────────────────────────────────────────
 
 def test_cors_is_not_a_wildcard():
-    import inspect
+    """The CORS middleware grants only the local renderer origins.
+
+    Behaviour, not source text: the old version inspected the function with
+    ``inspect.getsource``, which reads through ``linecache`` — editing the
+    file while the suite ran made it assert a stale body (a real flake).
+    Here we drive the middleware itself and read the response it produces.
+    """
+    import asyncio
+
+    from aiohttp import web
+
     from phantom.api import server as S
-    src = inspect.getsource(S.cors_middleware)
-    assert 'Allow-Origin"] = "*"' not in src
-    assert "_LOCAL_ORIGINS" in src
+
+    async def _handler(request):
+        return web.Response(text="ok")
+
+    class _Req:
+        def __init__(self, origin):
+            self.headers = {"Origin": origin} if origin else {}
+
+    def _call(origin):
+        return asyncio.run(S.cors_middleware(_Req(origin), _handler))
+
+    # An allowed renderer origin is echoed verbatim — never `*`.
+    allowed = _call("http://localhost:5173")
+    assert allowed.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
+    assert "*" not in allowed.headers["Access-Control-Allow-Origin"]
+
+    # A foreign origin receives NO CORS grant (the wildcard regression).
+    foreign = _call("https://evil.example")
+    assert "Access-Control-Allow-Origin" not in foreign.headers
+    # ...but the response still varies on Origin (shared-cache safety, B-6).
+    assert foreign.headers["Vary"] == "Origin"
+
     assert "http://localhost:5173" in S._LOCAL_ORIGINS
 
 

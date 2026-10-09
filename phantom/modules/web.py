@@ -276,8 +276,10 @@ class WebModule(BaseModule):
             return
         chosen_commands = filter_aggressive_commands(chosen_commands)
         notifier.status(f"Starting Web enumeration for {session.target}...")
-        results = run_commands(chosen_commands, session.target)
-        session.add_result("web", results)
+        from phantom.core.executor import RunStatus
+        status = RunStatus()
+        results = run_commands(chosen_commands, session.target, status=status)
+        session.add_result("web", results, status=status)
         self._analyze_web_results(results)
         notifier.info("Tip: 'hunt' runs the behavioural anomaly engine on "
                       "the web services (confirmed candidates -> reasoning).")

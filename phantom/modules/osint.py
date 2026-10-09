@@ -294,8 +294,10 @@ class OsintModule(BaseModule):
             return
 
         notifier.status(f"Starting OSINT sequence for {session.target}...")
-        results = run_commands(chosen_commands, session.target)
-        session.add_result("osint", results)
+        from phantom.core.executor import RunStatus
+        status = RunStatus()
+        results = run_commands(chosen_commands, session.target, status=status)
+        session.add_result("osint", results, status=status)
 
         # Esegue l'estrazione automatica via API solo se NON siamo in un contesto puramente social
         if not ("_" in session.target or "@" in session.target):
