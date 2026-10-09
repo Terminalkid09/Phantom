@@ -155,10 +155,85 @@ def cmd_export(shell, arg: str):
     rm.export(fmt, filename)
 
 
+def cmd_guardrails(shell, arg: str):
+    """guardrails [list|enable <key>|disable <key>|why|record] — safety controls
+
+    Shows every safety control, whether it is on, and WHICH LAYER decided
+    that (default / config / env / run flag). Controls an operator turned off
+    are marked, because an override nobody can see is how an engagement ends
+    up running outside the scope it was sold with.
+
+    Subcommands:
+      list             the manifest (default)
+      why              what each control does and how to restore it
+      enable <key>     turn a control back on
+      disable <key>    turn one off (recorded in the next report)
+      record           append the manifest to the hash-chained audit log
+    """
+    from phantom.utils import guardrails as gr
+
+    parts = arg.strip().split()
+    sub = parts[0].lower() if parts else "list"
+
+    if sub in ("list", ""):
+        from rich.console import Console
+        console = Console()
+        m = gr.build(scope=getattr(session, "scope", None),
+                     targets=[session.target] if session.target else None)
+        console.print(gr.render(m))
+        return
+
+    if sub == "why":
+        from rich.table import Table
+        from rich.console import Console
+        console = Console()
+        table = Table(title="Guardrails: what they do and how to restore them",
+                      border_style="cyan")
+        table.add_column("Control", style="cyan")
+        table.add_column("Protects", style="white")
+        table.add_column("Restore with", style="yellow")
+        m = gr.build(scope=getattr(session, "scope", None))
+        for g in m.guards:
+            table.add_row(f"{g.label}\n[{g.source}]", g.detail,
+                          g.remedy or "not operator-toggleable")
+        console.print(table)
+        return
+
+    if sub in ("enable", "disable"):
+        if len(parts) < 2:
+            notifier.error(f"Usage: guardrails {sub} <key>")
+            return
+        ok, msg = gr.set_guardrail(parts[1].lower(), sub == "enable")
+        if ok:
+            notifier.success(msg)
+            notifier.warn("The change is recorded in the next report — an "
+                          "override is never silent.")
+        else:
+            notifier.error(msg)
+        return
+
+    if sub == "record":
+        m = gr.build(scope=getattr(session, "scope", None),
+                     targets=[session.target] if session.target else None)
+        entry = gr.snapshot_to_audit(m, event="guardrails_snapshot")
+        if entry is None:
+            notifier.error("Could not append to the audit log (unwritable "
+                           "store?). The manifest is still in the report.")
+            return
+        notifier.success(f"Guardrails appended to the audit log "
+                         f"(digest {m.digest()})")
+        return
+
+    notifier.error(f"Unknown guardrails subcommand: {sub}")
+    notifier.info("Usage: guardrails [list | why | enable <key> | "
+                  "disable <key> | record]")
+
+
 COMMANDS = {
     "c2": cmd_c2,
     "malleable": cmd_malleable,
     "ad": cmd_ad,
     "wordlists": cmd_wordlists,
     "export": cmd_export,
+    "guardrails": cmd_guardrails,
 }
