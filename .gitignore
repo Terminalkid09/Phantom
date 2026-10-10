@@ -37,6 +37,8 @@ data/network_hosts.json
 data/c2_replay.json
 data/c2_store.json
 data/c2_audit.jsonl
+# the LLM proposal/reasoning journal (diagnostic, per-machine)
+data/llm_journal.jsonl
 # BloodHound/AD graph built from a live engagement (target topology)
 data/ad_graph.json
 # Social-engineering runtime: persona + conversation state, and the capture
