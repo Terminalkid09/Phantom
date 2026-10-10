@@ -262,7 +262,15 @@ jobs:
         shell: bash
         run: |
           if [ -f /tmp/beacon.out ]; then
-            tail -30 /tmp/beacon.out | while IFS= read -r line; do
+            # the ERROR line first: the Checks API caps annotations per step,
+            # so a bare tail can spend the budget on progress chatter (that is
+            # how the Android failure arrived without its cause)
+            grep -nEi "error|fatal|undefined|not declared|cannot find|No such file" /tmp/beacon.out \
+              | head -8 | while IFS= read -r line; do
+              echo "::error title=beacon-syntax::${line}"
+            done
+            echo "::error title=beacon-syntax::--- last 8 lines ---"
+            tail -8 /tmp/beacon.out | while IFS= read -r line; do
               echo "::error title=beacon-syntax::${line}"
             done
           else
@@ -312,7 +320,12 @@ jobs:
         if: failure()
         run: |
           if [ -f /tmp/beacon.out ]; then
-            tail -25 /tmp/beacon.out | while IFS= read -r line; do
+            grep -nEi "error|fatal|undefined|not declared|cannot find|No such file" /tmp/beacon.out \
+              | head -8 | while IFS= read -r line; do
+              echo "::error title=beacon-smoke::${line}"
+            done
+            echo "::error title=beacon-smoke::--- last 8 lines ---"
+            tail -8 /tmp/beacon.out | while IFS= read -r line; do
               echo "::error title=beacon-smoke::${line}"
             done
           else
@@ -360,7 +373,12 @@ jobs:
         shell: bash
         run: |
           if [ -f /tmp/beacon.out ]; then
-            tail -25 /tmp/beacon.out | while IFS= read -r line; do
+            grep -nEi "error|fatal|undefined|not declared|cannot find|No such file" /tmp/beacon.out \
+              | head -8 | while IFS= read -r line; do
+              echo "::error title=beacon-smoke-windows::${line}"
+            done
+            echo "::error title=beacon-smoke-windows::--- last 8 lines ---"
+            tail -8 /tmp/beacon.out | while IFS= read -r line; do
               echo "::error title=beacon-smoke-windows::${line}"
             done
           else
@@ -397,7 +415,12 @@ jobs:
         shell: bash
         run: |
           if [ -f /tmp/beacon.out ]; then
-            tail -25 /tmp/beacon.out | while IFS= read -r line; do
+            grep -nEi "error|fatal|undefined|not declared|cannot find|No such file" /tmp/beacon.out \
+              | head -8 | while IFS= read -r line; do
+              echo "::error title=beacon-smoke-macos::${line}"
+            done
+            echo "::error title=beacon-smoke-macos::--- last 8 lines ---"
+            tail -8 /tmp/beacon.out | while IFS= read -r line; do
               echo "::error title=beacon-smoke-macos::${line}"
             done
           else
@@ -440,7 +463,12 @@ jobs:
         shell: bash
         run: |
           if [ -f /tmp/beacon.out ]; then
-            tail -25 /tmp/beacon.out | while IFS= read -r line; do
+            grep -nEi "error|fatal|undefined|not declared|cannot find|No such file" /tmp/beacon.out \
+              | head -8 | while IFS= read -r line; do
+              echo "::error title=beacon-smoke-android::${line}"
+            done
+            echo "::error title=beacon-smoke-android::--- last 8 lines ---"
+            tail -8 /tmp/beacon.out | while IFS= read -r line; do
               echo "::error title=beacon-smoke-android::${line}"
             done
           else
