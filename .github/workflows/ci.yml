@@ -195,6 +195,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     needs: lint-and-test
     strategy:
+      # fail-fast off for the same reason as the unit-test matrix: with three
+      # operating systems, a macOS failure CANCELED the Windows leg, so a red
+      # run said nothing about whether the break was platform-specific.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
@@ -229,6 +233,7 @@ jobs:
       - name: Compile beacon AND remote translation units (warnings are errors)
         shell: bash
         run: |
+          set -o pipefail
           # -Werror on a CURATED set: the WinAPI noise (`#pragma comment`,
           # partial Win32 struct init, FARPROC casts) is suppressed, every
           # other warning fails the job. Linux and Windows were verified
@@ -245,8 +250,24 @@ jobs:
           fi
           # The remote module carries its OWN copy of crypto.h and the
           # transport: exactly the kind of duplication that drifts silently.
-          $CXX -std=c++20 -fsyntax-only $WARNS $CPPFLAGS -Iphantom/payloads/beacon/src phantom/payloads/beacon/src/main.cpp
-          $CXX -std=c++20 -fsyntax-only $WARNS $CPPFLAGS -Iphantom/payloads/remote/src phantom/payloads/remote/src/main.cpp
+          {
+            $CXX -std=c++20 -fsyntax-only $WARNS $CPPFLAGS -Iphantom/payloads/beacon/src phantom/payloads/beacon/src/main.cpp
+            $CXX -std=c++20 -fsyntax-only $WARNS $CPPFLAGS -Iphantom/payloads/remote/src phantom/payloads/remote/src/main.cpp
+          } 2>&1 | tee /tmp/beacon.out
+
+      - name: Surface the compiler error as an annotation
+        # Diagnostic only (see the unit-test step): the job log needs admin,
+        # annotations are public, and this job compiles on three platforms.
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f /tmp/beacon.out ]; then
+            tail -30 /tmp/beacon.out | while IFS= read -r line; do
+              echo "::error title=beacon-syntax::${line}"
+            done
+          else
+            echo "::error title=beacon-syntax::no compiler output captured"
+          fi
 
   beacon-smoke:
     runs-on: ubuntu-latest
@@ -259,19 +280,45 @@ jobs:
           python-version: "3.11"
       - name: Install deps and C++ toolchain
         run: |
+          set -o pipefail
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
           pip install -r requirements.txt
-          sudo apt-get update && sudo apt-get install -y \
-            g++ libssl-dev zlib1g-dev libzstd-dev
+          # The packages the BUILDER refuses to build without, taken from the
+          # static-dependency map `check_build_env` checks — not a hand-kept
+          # list. That list had half of them, and this job failed on the
+          # missing third-party static archives (libcurl/brotli/nghttp2) with
+          # "Build environment not ready for linux (x64)" before compiling a
+          # single line: on a runner there is no container auto-install to
+          # fill the gap.
+          PKGS=$(python -c "from phantom.utils.build_helper import _LINUX_STATIC_DEPS as m; print(' '.join(sorted(set(m.values()))))")
+          echo "builder-required packages: $PKGS"
+          sudo apt-get update && sudo apt-get install -y g++ $PKGS
       - name: Compile the beacon through the RELEASE path
+        # tee'd so the failure can be annotated (see the step below).
         # the real build function the release uses, not a hand-rolled
         # command: a break in the generated headers, the flags or the link
         # fails here instead of at an engagement. The canary token is set so
         # the NEXT step can prove it never reaches the binary.
         env:
           PHANTOM_PAYLOAD_TOKEN: phantom-canary-deployment-token
-        run: python scripts/ci_beacon_smoke.py --platform linux --require
+        run: |
+          set -o pipefail
+          python scripts/ci_beacon_smoke.py --platform linux --require 2>&1 \
+            | tee /tmp/beacon.out
+
+      - name: Surface the build failure as an annotation
+        # Diagnostic only: the job log needs admin rights, annotations do not.
+        if: failure()
+        run: |
+          if [ -f /tmp/beacon.out ]; then
+            tail -25 /tmp/beacon.out | while IFS= read -r line; do
+              echo "::error title=beacon-smoke::${line}"
+            done
+          else
+            echo "::error title=beacon-smoke::no build output captured"
+          fi
+
       - name: The built binary carries no deployment payload token
         # An enrolled build derives its own download token at runtime; if the
         # deployment-wide token ever leaks in, one captured beacon unlocks
@@ -303,7 +350,22 @@ jobs:
           pip install -r requirements.txt
       - name: Compile the beacon for Windows (release path)
         shell: bash
-        run: python scripts/ci_beacon_smoke.py --platform windows --require
+        run: |
+          set -o pipefail
+          python scripts/ci_beacon_smoke.py --platform windows --require 2>&1 \
+            | tee /tmp/beacon.out
+
+      - name: Surface the build failure as an annotation
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f /tmp/beacon.out ]; then
+            tail -25 /tmp/beacon.out | while IFS= read -r line; do
+              echo "::error title=beacon-smoke-windows::${line}"
+            done
+          else
+            echo "::error title=beacon-smoke-windows::no build output captured"
+          fi
 
   beacon-smoke-macos:
     # Native clang++ on a real Mac: osxcross only exists to cross-compile FROM
@@ -325,7 +387,22 @@ jobs:
           pip install -r requirements.txt
       - name: Compile the beacon for macOS (release path)
         shell: bash
-        run: python scripts/ci_beacon_smoke.py --platform macos --require
+        run: |
+          set -o pipefail
+          python scripts/ci_beacon_smoke.py --platform macos --require 2>&1 \
+            | tee /tmp/beacon.out
+
+      - name: Surface the build failure as an annotation
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f /tmp/beacon.out ]; then
+            tail -25 /tmp/beacon.out | while IFS= read -r line; do
+              echo "::error title=beacon-smoke-macos::${line}"
+            done
+          else
+            echo "::error title=beacon-smoke-macos::no build output captured"
+          fi
 
   beacon-smoke-android:
     # The NDK does not ship OpenSSL; the build helper cross-compiles it into
@@ -352,9 +429,23 @@ jobs:
         run: |
           # The runner image ships an NDK under ANDROID_NDK_LATEST_HOME; the
           # other names are honoured too, exactly like the builder does.
+          set -o pipefail
           export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-/opt/android-ndk}}"
           echo "NDK: $ANDROID_NDK_HOME"
-          python scripts/ci_beacon_smoke.py --platform android --require
+          python scripts/ci_beacon_smoke.py --platform android --require 2>&1 \
+            | tee /tmp/beacon.out
+
+      - name: Surface the build failure as an annotation
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f /tmp/beacon.out ]; then
+            tail -25 /tmp/beacon.out | while IFS= read -r line; do
+              echo "::error title=beacon-smoke-android::${line}"
+            done
+          else
+            echo "::error title=beacon-smoke-android::no build output captured"
+          fi
 
   c2d-test:
     # The Go data plane is a SECOND implementation of the wire protocol. It is
