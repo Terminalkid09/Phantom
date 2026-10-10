@@ -262,6 +262,97 @@ def cmd_deps(shell, arg: str):
     notifier.info("Usage: deps [report | install <tool> ...]")
 
 
+def cmd_llm(shell, arg: str):
+    """llm [journal [refusals] | propose [n] | proposals | accept <id> | reject <id> [reason] | clear]
+
+    The model reasons freely but may not execute. `propose` asks it for
+    concrete commands; each lands PENDING here. `accept <id>` is the only path
+    that runs one, and it runs through the same gate as any operator command
+    (scope, hostnames named inside the command, tool availability). `journal`
+    shows what the model wanted and why the algorithm refused it.
+    """
+    from phantom.automation import llm_journal, llm_proposals
+    from rich.console import Console
+
+    parts = arg.strip().split()
+    sub = parts[0].lower() if parts else "proposals"
+
+    if sub in ("journal", "log"):
+        refused = len(parts) > 1 and parts[1].lower() in ("refusals", "refused",
+                                                          "dropped")
+        Console().print(llm_journal.journal.render(limit=25,
+                                                  refused_only=refused))
+        return
+
+    if sub in ("proposals", "queue", "list"):
+        Console().print(llm_proposals.render())
+        return
+
+    if sub == "propose":
+        limit = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 5
+        from phantom.automation.llm_advisor import LLMAdvisor
+        from phantom.core.knowledge import session_wm
+        advisor = LLMAdvisor(enabled=True)
+        if not advisor.available():
+            notifier.error("LLM advisor unavailable: "
+                           + str(advisor._error or "no model configured"))
+            notifier.info("See: llm journal (reasoning) | config (backend)")
+            return
+        props = advisor.propose_commands(session_wm(), limit=limit,
+                                         agent="cli")
+        if not props:
+            notifier.info("the model proposed no usable command "
+                          "(see: llm journal)")
+            return
+        Console().print(llm_proposals.render())
+        notifier.info("Nothing has run: accept one with 'llm accept <id>'")
+        return
+
+    if sub in ("accept", "reject"):
+        if len(parts) < 2 or not parts[1].isdigit():
+            notifier.error(f"Usage: llm {sub} <id>" + (" [reason]" if sub == "reject" else ""))
+            return
+        pid = int(parts[1])
+        if sub == "reject":
+            reason = " ".join(parts[2:])
+            ok, msg = llm_proposals.queue.refuse(pid, reason)
+            (notifier.success if ok else notifier.error)(msg)
+            return
+        ok, msg = llm_proposals.queue.accept(pid)
+        if not ok:
+            notifier.error(msg)
+            return
+        notifier.success(msg)
+        prop = llm_proposals.queue.get(pid)
+        if not session.target:
+            notifier.error("No target set: an accepted proposal is executed in "
+                           "the engagement scope. Use: set target <ip|host>")
+            llm_proposals.queue.record_result(pid, ok=False,
+                                              excerpt="no session target")
+            return
+        bad = llm_proposals.out_of_scope_hosts(prop.command, session.scope)
+        if bad:
+            notifier.error("Refused by the scope gate: " + ", ".join(bad)
+                           + " is/are out of scope")
+            llm_proposals.queue.record_result(
+                pid, ok=False, excerpt="out of scope: " + ", ".join(bad))
+            return
+        out = llm_proposals.execute(prop, target=session.target,
+                                    scope=session.scope)
+        llm_proposals.queue.record_result(pid, ok=bool(out),
+                                          excerpt=(out or "").strip())
+        return
+
+    if sub == "clear":
+        n = llm_proposals.queue.clear()
+        notifier.info(f"cleared {n} proposal(s)")
+        return
+
+    notifier.error("Unknown llm subcommand: " + sub)
+    notifier.info("Usage: llm [journal [refusals] | propose [n] | proposals | "
+                  "accept <id> | reject <id> [reason] | clear]")
+
+
 def _ask_to_install(tool: str, cmd) -> bool:
     """Ask the operator, in the shell, before running a package manager.
 
@@ -285,4 +376,5 @@ COMMANDS = {
     "export": cmd_export,
     "guardrails": cmd_guardrails,
     "deps": cmd_deps,
+    "llm": cmd_llm,
 }

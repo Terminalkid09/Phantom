@@ -179,10 +179,14 @@ class Journal:
                 verdict = prop.get("verdict", "?")
                 why = prop.get("reason", "")
                 drop = prop.get("drop_reason", "")
-                mark = "ACCEPTED" if verdict == "accepted" else "DROPPED"
+                cmd = prop.get("command", "")
+                mark = {"accepted": "ACCEPTED", "pending": "PENDING ",
+                        "dropped": "DROPPED "}.get(verdict, verdict.upper())
                 lines.append(f"      [{mark}] {cid}"
                              + (f" - {drop}" if drop else "")
                              + (f" | model said: {why}" if why else ""))
+                if cmd:
+                    lines.append(f"          $ {str(cmd)[:300]}")
         return "\n".join(lines)
 
 
