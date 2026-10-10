@@ -69,13 +69,17 @@ python scripts/ci_beacon_prepare.py --dir phantom/payloads/beacon --ci-identity
 python scripts/ci_beacon_prepare.py --dir phantom/payloads/remote --ci-identity
 ```
 
-A fast syntax check (the same shape CI runs) is enough for most changes:
+A fast check (the same shape CI runs) is enough for most changes. Note `-c`
+rather than `-fsyntax-only`: g++ only reports an unused static function when it
+really compiles, so a parse-only check quietly accepts a helper that clang —
+the macOS leg of `beacon-syntax` — rejects.
 
 ```bash
-x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only \
+x86_64-w64-mingw32-g++ -std=c++20 -c \
   -Wall -Wextra -Werror -Wno-unknown-pragmas \
   -Wno-missing-field-initializers -Wno-cast-function-type \
-  -Iphantom/payloads/beacon/src phantom/payloads/beacon/src/main.cpp
+  -Iphantom/payloads/beacon/src phantom/payloads/beacon/src/main.cpp \
+  -o /dev/null
 ```
 
 ## Running the tests
