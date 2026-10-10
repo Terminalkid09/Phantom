@@ -16,6 +16,8 @@ Supports **Windows**, **Linux**, **macOS**, and **Android** from a single codeba
 
 ## Building
 
+**C++20 is required.** `CMakeLists.txt` sets it, CI compiles with it and the one-liners below pass `-std=c++20`. A `-std=c++17` build fails outright: `evasion.h` obfuscates strings with a lambda in an unevaluated context (`XOR_DEC(XOR_STR(...))`), which C++17 rejects.
+
 ### Windows (MSVC)
 ```bat
 mkdir build && cd build
@@ -25,25 +27,25 @@ cmake --build . --config Release
 
 ### Windows (MinGW-w64 from Linux)
 ```bash
-x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -o beacon.exe src/main.cpp \
+x86_64-w64-mingw32-g++ -std=c++20 -O2 -s -o beacon.exe src/main.cpp \
     -lwinhttp -lbcrypt -lws2_32 -static
 ```
 
 ### Linux
 ```bash
-g++ -std=c++17 -O2 -s -o beacon_linux src/main.cpp \
+g++ -std=c++20 -O2 -s -o beacon_linux src/main.cpp \
     -lcurl -lssl -lcrypto -lpthread
 ```
 
 ### macOS
 ```bash
-clang++ -std=c++17 -O2 -o beacon_macos src/main.cpp \
+clang++ -std=c++20 -O2 -o beacon_macos src/main.cpp \
     -lcurl -lssl -lcrypto -lpthread -framework CoreGraphics
 ```
 
 ### Android (NDK)
 ```bash
-$NDK_CC -std=c++17 -O2 -s -o beacon_android src/main.cpp -static
+$NDK_CC -std=c++20 -O2 -s -o beacon_android src/main.cpp -static
 ```
 
 ## Usage
