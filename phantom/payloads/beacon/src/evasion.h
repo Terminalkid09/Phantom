@@ -900,7 +900,16 @@ inline void report(EdrReport& rep) {
                         if (strstr(lower, probe.name)) {
                             rep.known_edr++;
                             strncat(rep.drivers, lower, sizeof(rep.drivers) - strlen(rep.drivers) - 2);
-                            strncat(rep.drivers, "\n", 1);
+                            // Append the newline by hand: GCC rejects
+                            // strncat(dst, "\n", 1) outright ("specified bound 1
+                            // equals source length" is -Wstringop-overflow), and
+                            // the first strncat above already reserved the two
+                            // bytes this and the terminator need.
+                            size_t used = strlen(rep.drivers);
+                            if (used + 1 < sizeof(rep.drivers)) {
+                                rep.drivers[used]     = '\n';
+                                rep.drivers[used + 1] = '\0';
+                            }
                             break;
                         }
                     }

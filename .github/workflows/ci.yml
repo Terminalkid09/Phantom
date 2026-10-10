@@ -207,9 +207,35 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y g++ libssl-dev
       - name: Install MinGW
+        # The image already ships MinGW, and reinstalling it on every run is a
+        # network round-trip that has failed before (choco exit != 0). When it
+        # failed, the compile step below was SKIPPED, so a red job said nothing
+        # about the code. Probe the known locations first and only fall back to
+        # choco when none of them has a compiler.
         if: runner.os == 'Windows'
-        shell: powershell
-        run: choco install mingw -y --no-progress
+        shell: bash
+        run: |
+          set -eu
+          if command -v g++ >/dev/null 2>&1; then
+            echo "using the MinGW already on PATH: $(command -v g++)"
+            g++ --version | head -1
+            exit 0
+          fi
+          for d in \
+            "/c/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/bin" \
+            "/c/mingw64/bin" \
+            "/c/msys64/mingw64/bin" \
+            "/c/Strawberry/c/bin"; do
+            if [ -x "$d/g++.exe" ]; then
+              echo "$(cygpath -w "$d")" >> "$GITHUB_PATH"
+              echo "using the preinstalled MinGW in $d"
+              "$d/g++.exe" --version | head -1
+              exit 0
+            fi
+          done
+          echo "no preinstalled MinGW found; installing via chocolatey"
+          choco install mingw -y --no-progress
+          echo 'C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin' >> "$GITHUB_PATH"
       - name: Install OpenSSL headers on macOS
         if: runner.os == 'macOS'
         run: brew install openssl@3
@@ -239,6 +265,13 @@ jobs:
           # other warning fails the job. Linux and Windows were verified
           # warning-free with exactly these flags; macOS also tolerates an
           # unknown warning option so a clang version skew cannot break it.
+          #
+          # -c -o /dev/null, NOT -fsyntax-only: g++ only runs its
+          # unused-function pass when it actually compiles, so -fsyntax-only
+          # let a static helper that is dead on this platform (but live on
+          # another) sail past the Linux and Windows legs while the macOS leg —
+          # clang diagnoses it during semantic analysis — failed. Codegen costs
+          # a few seconds and makes all three legs able to catch it.
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             CXX=clang++
             CPPFLAGS="-I$(brew --prefix openssl@3)/include"
@@ -251,8 +284,8 @@ jobs:
           # The remote module carries its OWN copy of crypto.h and the
           # transport: exactly the kind of duplication that drifts silently.
           {
-            $CXX -std=c++20 -fsyntax-only $WARNS $CPPFLAGS -Iphantom/payloads/beacon/src phantom/payloads/beacon/src/main.cpp
-            $CXX -std=c++20 -fsyntax-only $WARNS $CPPFLAGS -Iphantom/payloads/remote/src phantom/payloads/remote/src/main.cpp
+            $CXX -std=c++20 -c $WARNS $CPPFLAGS -Iphantom/payloads/beacon/src phantom/payloads/beacon/src/main.cpp -o /dev/null
+            $CXX -std=c++20 -c $WARNS $CPPFLAGS -Iphantom/payloads/remote/src phantom/payloads/remote/src/main.cpp -o /dev/null
           } 2>&1 | tee /tmp/beacon.out
 
       - name: Surface the compiler error as an annotation
@@ -274,7 +307,10 @@ jobs:
               echo "::error title=beacon-syntax::${line}"
             done
           else
-            echo "::error title=beacon-syntax::no compiler output captured"
+            # An earlier step (toolchain install, header generation) failed and
+            # skipped the compile, so there is no output to quote. Say that
+            # instead of leaving a bare red X with no cause.
+            echo "::error title=beacon-syntax::the compile step never ran — an earlier step (toolchain install / header generation) failed; open that step's annotation, not this one"
           fi
 
   beacon-smoke:
@@ -329,7 +365,7 @@ jobs:
               echo "::error title=beacon-smoke::${line}"
             done
           else
-            echo "::error title=beacon-smoke::no build output captured"
+            echo "::error title=beacon-smoke::the build step never ran — an earlier step (toolchain install / header generation) failed; open that step's annotation, not this one"
           fi
 
       - name: The built binary carries no deployment payload token
@@ -382,7 +418,7 @@ jobs:
               echo "::error title=beacon-smoke-windows::${line}"
             done
           else
-            echo "::error title=beacon-smoke-windows::no build output captured"
+            echo "::error title=beacon-smoke-windows::the build step never ran — an earlier step (toolchain install / header generation) failed; open that step's annotation, not this one"
           fi
 
   beacon-smoke-macos:
@@ -424,7 +460,7 @@ jobs:
               echo "::error title=beacon-smoke-macos::${line}"
             done
           else
-            echo "::error title=beacon-smoke-macos::no build output captured"
+            echo "::error title=beacon-smoke-macos::the build step never ran — an earlier step (toolchain install / header generation) failed; open that step's annotation, not this one"
           fi
 
   beacon-smoke-android:
@@ -472,7 +508,7 @@ jobs:
               echo "::error title=beacon-smoke-android::${line}"
             done
           else
-            echo "::error title=beacon-smoke-android::no build output captured"
+            echo "::error title=beacon-smoke-android::the build step never ran — an earlier step (toolchain install / header generation) failed; open that step's annotation, not this one"
           fi
 
   c2d-test:
