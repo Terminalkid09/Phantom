@@ -218,15 +218,40 @@ class TestNetmap(unittest.TestCase):
         self.assertEqual(_guess_os([1900, 53]), "Router/IoT firmware")
 
     def test_quick_probe_enriches_hosts(self):
-        """_quick_probe_hosts attaches ports/services/os to enriched hosts."""
+        """_quick_probe_hosts attaches ports/services/os to enriched hosts.
+
+        The claim is the ENRICHMENT SHAPE, so the test provides the one thing
+        the probe can see: a real listener on loopback. It used to assume
+        "the dev environment runs the API server on some port", which made it
+        a statement about the machine it ran on — green on the author's box,
+        `'ports' not found` on every runner and inside a container.
+        """
+        import socket
         import phantom.core.netmap as nm
-        hosts = [{"ip": "127.0.0.1", "hostname": "loopback"}]
-        nm._quick_probe_hosts(hosts, timeout=8)
-        h = hosts[0]
-        # loopback in the dev environment runs the API server on some port;
-        # whatever it finds, the shape of the enrichment must hold
-        self.assertIn("ports", h)
-        self.assertIn("services", h)
+
+        # one of the ports `_quick_probe_hosts` actually probes, bound for
+        # real: the first free candidate wins, so a busy port is not a flake
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        bound = None
+        try:
+            for port in (8443, 8080, 8009, 3306, 6379, 5555, 5900):
+                try:
+                    srv.bind(("127.0.0.1", port))
+                    srv.listen(1)
+                    bound = port
+                    break
+                except OSError:
+                    continue
+            self.assertIsNotNone(bound, "no probed loopback port was free")
+            hosts = [{"ip": "127.0.0.1", "hostname": "loopback"}]
+            nm._quick_probe_hosts(hosts, timeout=8)
+            h = hosts[0]
+            self.assertIn("ports", h)
+            self.assertIn("services", h)
+            self.assertIn(bound, h["ports"])
+        finally:
+            srv.close()
 
 
 class TestInstallTool(unittest.TestCase):

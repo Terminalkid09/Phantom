@@ -173,8 +173,41 @@ def test_execute_quiet_reports_nonzero_exit():
     assert r.returncode == 3 and not r.ok
 
 
+def _pid_alive(pid: int) -> bool:
+    """True when `pid` is still a RUNNING process (Windows and POSIX).
+
+    The check used to be an unguarded `tasklist`, which exists only on
+    Windows: on Linux/macOS the test died with FileNotFoundError('tasklist')
+    and read as a tree-kill regression rather than as a missing Windows
+    binary. Each platform is asked in the way it can answer.
+    """
+    import os
+    if os.name == "nt":
+        import subprocess
+        try:
+            chk = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+                                 capture_output=True, text=True)
+        except OSError:
+            return False          # no tasklist: cannot claim it is alive
+        return str(pid) in (chk.stdout or "")
+    try:
+        os.kill(pid, 0)             # signal 0: existence probe, no signal
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                 # exists, owned by somebody else
+    # A zombie is a killed-but-not-yet-reaped process: it runs nothing, which
+    # is exactly what the tree kill promises, so read the state instead of
+    # counting `kill(0)` succeeding as alive.
+    try:
+        with open(f"/proc/{pid}/stat", "r") as fh:
+            state = fh.read().split(") ", 1)[1].split(" ", 1)[0]
+        return state != "Z"
+    except (OSError, IndexError, ValueError):
+        return True                  # no /proc (macOS): trust kill(0)
+
+
 def test_execute_quiet_timeout_kills_tree():
-    import subprocess
     from phantom.core.executor import execute_quiet
     inner = "import time; time.sleep(60)"
     spawner = (
@@ -186,8 +219,6 @@ def test_execute_quiet_timeout_kills_tree():
     assert r.timed_out
     import re as _re
     m = _re.search(r"(\d{4,})", r.stdout or "")
-    if m and hasattr(subprocess, "run"):
+    if m:
         time.sleep(1)
-        chk = subprocess.run(["tasklist", "/FI", f"PID eq {m.group(1)}"],
-                             capture_output=True, text=True)
-        assert m.group(1) not in chk.stdout   # grandchild is dead
+        assert not _pid_alive(int(m.group(1)))   # grandchild is dead
