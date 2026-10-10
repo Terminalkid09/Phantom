@@ -660,6 +660,17 @@ class AutoShell(cmd.Cmd):
             return False
         return True
 
+    def do_deps(self, arg: str):
+        """deps [report|install <tool>...] - external tools Phantom needs
+
+        Shows what is missing on this machine (Kali/WSL, other Linux, macOS,
+        Windows) and how Phantom would install it. `install <tool>` asks first
+        and never installs on a no. The Electron surface offers the same helper
+        through /api/toolchain.
+        """
+        from phantom.core.shell.commands import ops
+        ops.cmd_deps(self, arg)
+
     def do_guardrails(self, arg: str):
         """guardrails [list|why|enable <k>|disable <k>|record] - safety controls for this engagement
 

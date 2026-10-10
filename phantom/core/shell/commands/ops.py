@@ -229,6 +229,54 @@ def cmd_guardrails(shell, arg: str):
                   "disable <key> | record]")
 
 
+def cmd_deps(shell, arg: str):
+    """deps [report|install <tool>...] -- the external tools Phantom shells out to
+
+    A missing binary used to look exactly like a clean run: the command
+    produced nothing and the module stored an empty result. `report` names what
+    is absent and the exact command that would install it on THIS machine
+    (Kali/WSL, other Linux, macOS, Windows); `install <tool>` asks the operator
+    before it runs a package manager, and refuses when the answer is no.
+    """
+    from phantom.utils import toolchain as tc
+
+    parts = arg.strip().split()
+    sub = parts[0].lower() if parts else "report"
+
+    if sub in ("report", "list", ""):
+        from rich.console import Console
+        Console().print(tc.report())
+        return
+
+    if sub == "install":
+        wanted = parts[1:]
+        if not wanted:
+            notifier.error("Usage: deps install <tool> [<tool> ...]")
+            return
+        for tool in wanted:
+            ok, msg = tc.install(tool, confirm=_ask_to_install)
+            (notifier.success if ok else notifier.error)(msg)
+        return
+
+    notifier.error("Unknown deps subcommand: " + sub)
+    notifier.info("Usage: deps [report | install <tool> ...]")
+
+
+def _ask_to_install(tool: str, cmd) -> bool:
+    """Ask the operator, in the shell, before running a package manager.
+
+    Defaults to NO on anything other than an explicit yes, and treats a
+    non-interactive shell as a no: an automated run must never install software
+    on the operator's machine just because a scan wanted a tool.
+    """
+    from rich.prompt import Confirm
+    try:
+        return bool(Confirm.ask(
+            "Install " + tool + "?  ($ " + " ".join(cmd) + ")", default=False))
+    except Exception:
+        return False
+
+
 COMMANDS = {
     "c2": cmd_c2,
     "malleable": cmd_malleable,
@@ -236,4 +284,5 @@ COMMANDS = {
     "wordlists": cmd_wordlists,
     "export": cmd_export,
     "guardrails": cmd_guardrails,
+    "deps": cmd_deps,
 }
