@@ -180,7 +180,16 @@ htmlcov/
 # Untracked directories
 .antigravitycli/
 /payloads/
-phantom/data/
+# phantom/data holds two DIFFERENT things: runtime state (threat-intel cache,
+# generated artifacts) that must not be committed, and PRODUCT ASSETS (the
+# report templates the renderer loads BY NAME) that must be. Ignoring the
+# whole directory looked harmless and was not: the template existed on the
+# developer's disk and in no clone, so every report test passed locally and
+# the unit-test step failed on CI for months with "Template not found".
+# `phantom/data/*` + a negation keeps the state ignored and the assets tracked.
+phantom/data/*
+!phantom/data/templates/
+!phantom/data/templates/**
 
 # OS artifacts
 Thumbs.db
