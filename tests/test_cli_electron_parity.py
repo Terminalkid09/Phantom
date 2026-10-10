@@ -78,6 +78,11 @@ CLI_ONLY = {
            "POST accept/reject) and a pending proposal can only be accepted "
            "by a human, but no panel consumes it yet: AutoModePanel is where "
            "the proposal card and its reasoning belong.",
+    "social": "the backend is shared (`/api/social/graph` returns nodes/edges/"
+              "stats, `/api/social/emails` the gated enumeration) and the "
+              "GRAPH is the one surface Electron should do better than the "
+              "CLI — GAP: no panel renders it yet, the CLI renders text and "
+              "exports GraphML.",
 }
 
 

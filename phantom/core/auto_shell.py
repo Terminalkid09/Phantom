@@ -671,6 +671,18 @@ class AutoShell(cmd.Cmd):
         from phantom.core.shell.commands import ops
         ops.cmd_deps(self, arg)
 
+    def do_social(self, arg: str):
+        """social [graph [--json|--graphml FILE] [--run]|emails <addr> [--reset-only]] - identity graph + account existence
+
+        `graph` shows the circle of the target and which handles are PROVEN to
+        be one person (offline, from the engagement's own findings); `--run`
+        refreshes it with a live recon pass; `--graphml` exports for Gephi.
+        `emails` asks services whether an address is registered and asks the
+        operator first — verdicts are exists/absent/unknown, never a guess.
+        """
+        from phantom.core.shell.commands import ops
+        ops.cmd_social(self, arg)
+
     def do_llm(self, arg: str):
         """llm [journal [refusals]|propose [n]|proposals|accept <id>|reject <id> [reason]|clear] - what the model wanted
 

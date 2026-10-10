@@ -113,6 +113,8 @@ class ReconResult:
     avatar_dhash: str = ""       # perceptual hash: survives re-encoding
     emails: List[str] = field(default_factory=list)   # visible in bio/page
     leads: List[Lead] = field(default_factory=list)
+    posts: List[Any] = field(default_factory=list)    # mine_posts() output
+    topics: List[str] = field(default_factory=list)  # top interests
 
     def markers(self) -> List[str]:
         """Stable marker lines for the social interpreter."""
@@ -329,6 +331,32 @@ def _state_vote(username: str, platform: str, jar=None) -> Tuple[str, float, str
 
 
 # ── layer 2: graph mining ────────────────────────────────────────────────────
+
+def _mine_all(username: str, platform: str, html: str,
+              result: ReconResult, jar=None) -> None:
+    """`_mine_graph` plus the per-post layer (never fetches anything extra).
+
+    Post mining is pure: it reads the JSON already in hand, so the topics,
+    mentions, places and links of what the target actually posts about cost
+    nothing on the network budget and are the best pretext material there is.
+    """
+    _mine_graph(username, platform, html, result, jar)
+    try:
+        from phantom.automation.social import social_graph as _sg
+        result.posts = _sg.mine_posts(html, author=username)
+        counts: dict = {}
+        for post in result.posts:
+            for tag in list(post.hashtags) + [_norm_place(p) for p in post.places]:
+                counts[tag] = counts.get(tag, 0) + 1
+        result.topics = [t for t, _c in sorted(counts.items(),
+                                              key=lambda kv: (-kv[1], kv[0]))[:8]]
+    except Exception:
+        result.posts = []
+
+
+def _norm_place(value: str) -> str:
+    return (value or "").strip().lower()
+
 
 def _mine_graph(username: str, platform: str, html: str,
                 result: ReconResult, jar=None) -> None:
@@ -707,7 +735,7 @@ def present_candidate(result: "ReconResult") -> str:
 def deep_recon(username: str, platform: str = "",
                variants: bool = True, wayback: bool = True,
                search: bool = True, second_hop: bool = True,
-               ask=None, jar=None) -> Tuple[bool, List[str]]:
+               ask=None, jar=None, graph=None) -> Tuple[bool, List[str]]:
     """Full reverse-engineering pass. Returns marker lines for the social
     interpreter. Bounded: <= 20 network calls total, never raises.
 
@@ -720,6 +748,11 @@ def deep_recon(username: str, platform: str = "",
     stealer chain. Attached ONLY to platform profile views (never to
     archives/search), so an authed-visible bio/counts resolves on
     private accounts. Which hosts used it is emitted as SESSION_USED.
+
+    `graph`: optional `SocialGraph` to fill in (in/out), so the CLI/API can
+    render or export the identity graph without re-deriving it. The markers
+    are emitted either way, so auto-mode gets the graph through the social
+    interpreter whether or not a caller passed one.
     """
     try:
         lines: List[str] = []
@@ -738,7 +771,7 @@ def deep_recon(username: str, platform: str = "",
         if html:
             primary.bio = _extract_bio(html)
             primary.link = _extract_link(primary.bio)
-            _mine_graph(username, platform, html, primary, jar)
+            _mine_all(username, platform, html, primary, jar)
         results.append(primary)
 
         # same handle on OTHER platforms (single quick fetch each)
@@ -753,7 +786,7 @@ def deep_recon(username: str, platform: str = "",
             if h2:
                 r.bio = _extract_bio(h2)
                 r.link = _extract_link(r.bio)
-                _mine_graph(username, p, h2, r, jar)
+                _mine_all(username, p, h2, r, jar)
                 if r.state == "public" and r.bio:
                     # a PUBLIC account of the same handle on another platform
                     primary.leads.append(Lead(
@@ -769,7 +802,7 @@ def deep_recon(username: str, platform: str = "",
                                      state=st, state_confidence=cf)
                     if h2:
                         rv.bio = _extract_bio(h2)
-                        _mine_graph(v, platform, h2, rv, jar)
+                        _mine_all(v, platform, h2, rv, jar)
                     results.append(rv)
                     primary.leads.append(Lead(
                         "account_link", v, platform, "variant_probe", 0.55))
@@ -916,6 +949,49 @@ def deep_recon(username: str, platform: str = "",
                              f"evidence={lead.evidence}" if lead.platform else
                              f"SEARCH_HIT: url={lead.value} "
                              f"evidence={lead.evidence}")
+
+        # ── the identity GRAPH ──────────────────────────────────────────
+        # Every fact above was emitted as a flat marker line, so nothing could
+        # reason over it: not who is in the circle, not which two handles are
+        # the SAME person, not what the target posts about. The graph makes it
+        # walkable, and the markers below carry the summary to auto-mode.
+        try:
+            from phantom.automation.social import social_graph as _sg
+            built = _sg.graph_from_recon(results)
+            for r in results:
+                if getattr(r, "posts", None):
+                    _sg.graph_from_posts(r.posts, author=r.username,
+                                         platform=r.platform, graph=built,
+                                         source="post-mining")
+            if graph is not None:
+                graph.merge(built)
+                view = graph
+            else:
+                view = built
+            stats = view.stats()
+            lines.append("SOCIAL_GRAPH: nodes=%d edges=%d clusters=%d "
+                         "same_person=%d"
+                         % (stats["nodes"], stats["edges"], stats["clusters"],
+                            len(stats["same_person_groups"])))
+            for group in stats["same_person_groups"]:
+                lines.append("SAME_PERSON: handles=%s evidence=confirming"
+                             % ",".join(h.split(":", 1)[-1]
+                                        for h in group))
+            primary_key = _sg.node_key("handle", username)
+            for node in view.pivot_leads(("handle", "email"),
+                                         min_confidence=0.5)[:10]:
+                if node.key == primary_key:
+                    continue
+                lines.append("GRAPH_PIVOT: kind=%s value=%s conf=%.2f proofs=%d"
+                             % (node.kind, node.label, node.confidence,
+                                len(view.proofs(node.key))))
+            topics = view.interests(primary_key, limit=8)
+            if topics:
+                lines.append("POST_TOPIC: username=%s topics=%s"
+                             % (username,
+                                ",".join("%s:%d" % (t, c) for t, c in topics)))
+        except Exception:
+            pass
         return True, lines
     except Exception as e:
         return False, [f"ERROR: deep recon failed: {e}"]

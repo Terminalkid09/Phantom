@@ -353,6 +353,116 @@ def cmd_llm(shell, arg: str):
                   "accept <id> | reject <id> [reason] | clear]")
 
 
+def cmd_social(shell, arg: str):
+    """social [graph [--json|--graphml FILE] [--run] | emails <address> [--reset-only]]
+
+    The identity graph: who is in the target's circle, which handles are
+    PROVEN to be the same person, and (from `emails`) which services
+    recognise an address. `graph` renders what the engagement already knows
+    (no network); `--run` does a live recon pass and fills the same graph.
+
+    `emails` asks third-party services for account existence and asks YOU
+    first: it prints the plan, needs an explicit yes, and every verdict is
+    exists/absent/unknown — a failed guess degrades to `unknown`, it never
+    becomes a false confirmation.
+    """
+    from rich.console import Console
+
+    parts = arg.strip().split()
+    sub = parts[0].lower() if parts else "graph"
+
+    if sub == "graph":
+        from phantom.automation.social import social_graph as sg
+        from phantom.core.knowledge import session_wm
+        graph = sg.SocialGraph()
+        if "--run" in parts:
+            from phantom.automation.social.recon import deep_recon, session_jar
+            handle = session.target
+            if not handle:
+                notifier.error("No target set. Use: set target <handle|email>")
+                return
+            try:
+                jar = session_jar(session_wm())
+            except Exception:
+                jar = {}
+            notifier.status(f"Deep recon on {handle} (this makes network calls)")
+            ok, lines = deep_recon(handle, jar=jar or None, graph=graph)
+            for line in lines:
+                if line.startswith(("SOCIAL_GRAPH:", "SAME_PERSON:",
+                                    "GRAPH_PIVOT:", "POST_TOPIC:")):
+                    Console().print("  " + line)
+            if not ok:
+                notifier.error("deep recon failed (see the lines above)")
+        else:
+            graph = sg.graph_from_wm(session_wm())
+        if "--json" in parts:
+            Console().print(sg.to_json(graph))
+            return
+        for index, token in enumerate(parts):
+            if token == "--graphml" and index + 1 < len(parts):
+                path = parts[index + 1]
+                try:
+                    with open(path, "w", encoding="utf-8") as handle_out:
+                        handle_out.write(graph.to_graphml())
+                    notifier.success(f"graph written to {path} (open it in Gephi)")
+                except OSError as exc:
+                    notifier.error(f"could not write {path}: {exc}")
+                break
+        Console().print(graph.render())
+        return
+
+    if sub in ("emails", "email"):
+        from phantom.automation.social import email_enum as ee
+        address = next((p for p in parts[1:] if "@" in p), "")
+        if not address:
+            notifier.error("Usage: social emails <address> [--reset-only]")
+            return
+        reset_only = "--reset-only" in parts
+        rows = ee.plan(address, include_reset=True)
+        Console().print(f"Plan for {ee.mask_email(address)}: "
+                        f"{len(rows)} service(s)")
+        for row in rows:
+            Console().print(f"  {row['service']:<12} {row['url']}")
+        if not _ask_to_enum(address, [r["service"] for r in rows]):
+            notifier.info("Nothing sent. The services above were NOT asked.")
+            return
+        if reset_only:
+            verdicts = ee.reset_oracle(address, confirm=_ask_per_service)
+            report = ee.EmailEnumReport(masked=ee.mask_email(address),
+                                        verdicts=verdicts)
+        else:
+            report = ee.enumerate_email(address, confirm=_ask_per_service)
+        Console().print(report.render())
+        if report.confirmed:
+            notifier.success("Reset-oracle confirmed on: "
+                             + ", ".join(v.service for v in report.confirmed))
+        return
+
+    notifier.error("Unknown social subcommand: " + sub)
+    notifier.info("Usage: social [graph [--json|--graphml FILE] [--run] | "
+                  "emails <address> [--reset-only]]")
+
+
+def _ask_to_enum(address: str, services) -> bool:
+    """One explicit yes for the whole run, defaulting to NO."""
+    from rich.prompt import Confirm
+    try:
+        return bool(Confirm.ask(
+            "Ask " + str(len(services)) + " service(s) whether "
+            + address + " is registered?", default=False))
+    except Exception:
+        return False
+
+
+def _ask_per_service(service: str, url: str) -> bool:
+    """Per-service confirmation (used by the reset oracle). Default NO."""
+    from rich.prompt import Confirm
+    try:
+        return bool(Confirm.ask(f"  ask {service}?  ({url})", default=False))
+    except Exception:
+        return False
+
+
 def _ask_to_install(tool: str, cmd) -> bool:
     """Ask the operator, in the shell, before running a package manager.
 
@@ -377,4 +487,5 @@ COMMANDS = {
     "guardrails": cmd_guardrails,
     "deps": cmd_deps,
     "llm": cmd_llm,
+    "social": cmd_social,
 }
