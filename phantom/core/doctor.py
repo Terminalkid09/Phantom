@@ -621,6 +621,40 @@ def _drivers_check() -> Check:
     return Check("drivers", "pass", detail)
 
 
+def _settings_check() -> Check:
+    """The settings nucleus: every declared setting, and where it resolves from.
+
+    `phantom/utils/settings.py` existed with a full test suite and NO caller,
+    so the precedence rules it implements (param > cli > state > env > config >
+    default) were documented but unobservable. This check is its read path: it
+    lists what is declared, so `describe()` finally reports to a human.
+    """
+    from phantom.utils import settings as S
+    rows = S.describe()
+    secrets = [r["name"] for r in rows if r["kind"] == "secret"]
+    if not rows:
+        return Check("settings", "warn", "no settings declared")
+    return Check("settings", "pass",
+                 f"{len(rows)} declared ({len(secrets)} secret, values never "
+                 "reported)")
+
+
+def _quiet_check() -> Check:
+    """Failures Phantom swallowed on purpose — visible, at last.
+
+    A bare `except: pass` used to leave no trace at all, so "the audit log was
+    degraded all run" looked exactly like "everything worked".
+    """
+    from phantom.utils import quiet
+    total = quiet.registry.total()
+    if not total:
+        return Check("quiet-failures", "pass", "none swallowed this session")
+    worst = ", ".join(f"{s.where} x{s.count}" for s in quiet.registry.sites()[:4])
+    return Check("quiet-failures", "warn",
+                 f"{total} swallowed at {len(quiet.registry.sites())} site(s)",
+                 hint=f"optional layers degraded, not fatal: {worst}")
+
+
 # ── runner ───────────────────────────────────────────────────────────────
 
 def run_doctor(net: bool = False) -> DoctorReport:
@@ -632,6 +666,7 @@ def run_doctor(net: bool = False) -> DoctorReport:
         _c2_operator_auth_check, _c2_front_check,
         _c2_backend_check, _c2d_capabilities_check, _secrets_at_rest_check,
         _experience_check, _llm_check, _scopes_check, _data_usage_check,
+        _settings_check, _quiet_check,
     ]
     if net:
         fns += [_c2_reachable_check, _msf_check, _dead_drop_net_check]

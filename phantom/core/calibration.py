@@ -59,16 +59,37 @@ class CalibrationEngine:
         self._load_state()
 
     def _load_state(self) -> None:
+        """Load the learned weights, treating a broken file as ABSENT.
+
+        The previous behaviour warned on every import for any unparsable file
+        (a 5-byte placeholder warned forever), and — worse — a file that parsed
+        to something that was not a `{weights, observations}` mapping was
+        assigned anyway, so calibration silently ran on the wrong shape. A file
+        that does not match the schema is not state: ignore it (recording the
+        swallow) and keep the built-in weights.
+        """
         if not os.path.exists(self.weights_file):
             return
         try:
             with open(self.weights_file, "r") as f:
                 data = json.load(f)
-            self.weights = data.get("weights", self.weights)
-            self.observations = data.get("observations", {})
-            notifier.info(f"Loaded {len(self.weights)} calibrated weights")
-        except Exception as e:
-            notifier.warn(f"Failed to load calibration state: {e}")
+        except Exception as exc:
+            from phantom.utils import quiet
+            quiet.swallow("calibration.load_weights", exc,
+                          f"unreadable: {os.path.basename(self.weights_file)}")
+            return
+        if not isinstance(data, dict) or not isinstance(data.get("weights"), dict):
+            from phantom.utils import quiet
+            quiet.swallow("calibration.load_weights", None,
+                          "state file has no weights mapping "
+                          f"({os.path.basename(self.weights_file)})")
+            return
+        weights = data.get("weights") or {}
+        observations = data.get("observations")
+        self.weights = {**self.weights, **{k: v for k, v in weights.items()
+                                           if isinstance(v, (int, float))}}
+        if isinstance(observations, dict):
+            self.observations = observations
 
     def _save_state(self) -> None:
         data = {
