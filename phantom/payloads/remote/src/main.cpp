@@ -65,19 +65,6 @@ static unsigned long g_frame_seq = 0;
 static long long g_session_deadline = 0;
 static bool g_session_revoked = false;
 
-static std::string _now_str() {
-    char buf[32];
-    time_t t = time(nullptr);
-    struct tm tmv{};
-#ifdef _WIN32
-    localtime_s(&tmv, &t);
-#else
-    localtime_r(&t, &tmv);
-#endif
-    strftime(buf, sizeof(buf), "%H:%M:%S", &tmv);
-    return buf;
-}
-
 static std::string _handle_command(const std::string& command,
                                    remote_net::RemoteConfig& cfg) {
     std::istringstream iss(command);

@@ -78,10 +78,6 @@ static std::string _b64(const std::vector<unsigned char>& d) {
     std::vector<BYTE> b(d.begin(), d.end());
     return crypto::base64_encode(b);
 }
-static std::vector<unsigned char> _unb64(const std::string& s) {
-    auto b = crypto::base64_decode(s);
-    return std::vector<unsigned char>(b.begin(), b.end());
-}
 
 // JSON string escaping for result payloads.
 static std::string json_escape(const std::string& s) {
@@ -117,13 +113,14 @@ static std::string json_escape(const std::string& s) {
     #define REMOTE_PIN_ENFORCED 0
 #endif
 
-// SHA-256 over arbitrary bytes, lowercase hex (BCrypt on Windows, EVP on
-// OpenSSL). Empty on failure so a failed hash can never be read as "match".
-// Only compiled when a pin is enforced (an unused static function would trip
-// -Werror on a build without a certificate).
-#if REMOTE_PIN_ENFORCED
+// SHA-256 over DER, lowercase hex (BCrypt); empty on failure so a failed hash
+// can never be read as "match".
+//
+// Windows AND pin only — both bounds matter. The OpenSSL transport pins the
+// peer with X509_digest instead of calling this, so on a non-Windows build the
+// helper has no caller, and clang rejects an unused static function.
+#if REMOTE_PIN_ENFORCED && defined(_WIN32)
 static std::string _sha256_hex(const unsigned char* data, size_t len) {
-#ifdef _WIN32
     BCRYPT_ALG_HANDLE hAlg = nullptr;
     BCRYPT_HASH_HANDLE hHash = nullptr;
     std::string out;
@@ -146,15 +143,8 @@ static std::string _sha256_hex(const unsigned char* data, size_t len) {
     if (hHash) BCryptDestroyHash(hHash);
     if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
     return out;
-#else
-    unsigned char digest[EVP_MAX_MD_SIZE];
-    unsigned int n = 0;
-    if (EVP_Digest(data, len, digest, &n, EVP_sha256(), nullptr) != 1)
-        return std::string();
-    return crypto::hex_encode(digest, n);
-#endif
 }
-#endif  // REMOTE_PIN_ENFORCED
+#endif  // REMOTE_PIN_ENFORCED && _WIN32
 
 #ifdef _WIN32
 static bool _cert_pin_ok(HINTERNET hRequest) {
