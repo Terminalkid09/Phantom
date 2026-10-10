@@ -131,7 +131,7 @@ inline bool run_shellcode(const std::vector<unsigned char>& shellcode, std::stri
     }
     return true;
 }
-#else
+#elif defined(__linux__)
 // Execute ELF Binary on Linux via memfd_create with fallback to /dev/shm
 inline bool run_binary(const std::vector<unsigned char>& binary, const std::string& args = "") {
     (void)args;   // the argv override is honoured by the Windows path only
@@ -175,6 +175,15 @@ inline bool run_binary(const std::vector<unsigned char>& binary, const std::stri
     }
 
     close(fd);
+    return false;
+}
+
+#else
+// macOS and other POSIX without memfd_create()/procfs: SAME signature, an
+// honest refusal instead of a build failure. `run_binary` needs an anonymous
+// executable file plus /proc/self/fd to exec it, and neither exists there
+// (memory.h:143 `MFD_CLOEXEC`/`memfd_create` are Linux/glibc spelling).
+inline bool run_binary(const std::vector<unsigned char>&, const std::string& = "") {
     return false;
 }
 #endif

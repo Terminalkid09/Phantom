@@ -154,7 +154,10 @@ private:
             SOCKET clientSock = accept(listenSock, nullptr, nullptr);
             if (clientSock == INVALID_SOCKET) { Sleep(100); continue; }
 
-            std::thread([this, clientSock, stop_flag = this->stop_flag]() {
+            // `this` is deliberately not captured: the thread copies what it
+            // needs (the socket and the stop flag). Capturing it made clang
+            // fail the macOS build with -Werror,-Wunused-lambda-capture.
+            std::thread([clientSock, stop_flag = this->stop_flag]() {
                 std::string targetHost;
                 int targetPort = 0;
                 if (!socks5_handshake(clientSock, targetHost, targetPort)) {
