@@ -3410,6 +3410,64 @@ async def llm_proposals_post(request: web.Request) -> web.Response:
                   "proposal": llm_proposals.queue.get(pid).to_dict()})
 
 
+# -- Identity graph + account existence (the Electron social surface) --------
+
+@routes.get("/api/social/graph")
+async def social_graph_get(request: web.Request) -> web.Response:
+    """The identity graph of what the engagement already knows (no network)."""
+    from phantom.automation.social import social_graph as sg
+    from phantom.core.knowledge import session_wm
+    graph = sg.graph_from_wm(session_wm())
+    return _json({
+        "graph": graph.to_dict(),
+        "text": graph.render(),
+        "graphml": graph.to_graphml(),
+        "pivots": [n.to_dict() for n in graph.pivot_leads()[:20]],
+        "topics": {n.key: [list(t) for t in graph.interests(n.key)]
+                   for n in graph.pivot_leads(("handle",))[:5]},
+    })
+
+
+@routes.get("/api/social/emails/plan")
+async def social_emails_plan(request: web.Request) -> web.Response:
+    """What an enumeration WOULD ask, so the panel can show it before asking."""
+    from phantom.automation.social import email_enum as ee
+    address = str(request.query.get("email", "")).strip()
+    if not ee.is_email(address):
+        return _json({"ok": False, "message": "email is required"}, 400)
+    return _json({"ok": True, "masked": ee.mask_email(address),
+                  "plan": ee.plan(address, include_reset=True)})
+
+
+@routes.post("/api/social/emails")
+async def social_emails_post(request: web.Request) -> web.Response:
+    """Enumerate account existence -- only with confirm=true, like /api/toolchain.
+
+    The body carries the decision so opening a page can never ask third-party
+    services anything. Verdicts are exists/absent/unknown per service, and the
+    reset oracle is opt-in (`reset=true`) because it is the strongest claim
+    this surface makes.
+    """
+    from phantom.automation.social import email_enum as ee
+    body = await request.json() or {}
+    address = str(body.get("email", "")).strip()
+    if not ee.is_email(address):
+        return _json({"ok": False, "message": "email is required"}, 400)
+    if not body.get("confirm"):
+        return _json({"ok": False,
+                      "message": f"refused: enumerating {ee.mask_email(address)} "
+                                 "needs confirm=true",
+                      "plan": ee.plan(address, include_reset=True)})
+    if body.get("reset"):
+        verdicts = ee.reset_oracle(address, confirm=lambda _s, _u: True)
+        report = ee.EmailEnumReport(masked=ee.mask_email(address),
+                                    verdicts=verdicts)
+    else:
+        report = ee.enumerate_email(address, confirm=lambda _s, _u: True)
+    return _json({"ok": not report.error, "report": report.to_dict(),
+                  "text": report.render(), "message": report.error})
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Phantom API Server")
     parser.add_argument("--port", type=int, default=9876, help="Port to listen on")
