@@ -3307,6 +3307,109 @@ async def toolchain_post(request: web.Request) -> web.Response:
     ok, message = tc.install(tool, env, confirm=lambda t, c: True)
     return _json({"ok": ok, "message": message, "tool": tool})
 
+def _int_param(raw: Any, default: int) -> int:
+    """Query/body int with a fallback (a bad parameter must not 500)."""
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+# -- LLM reasoning journal + command proposals (Electron surface) -------------
+# Reading the reasoning is free. EXECUTING is not: a proposal runs only after an
+# explicit accept, and only through the gated executor.
+
+@routes.get("/api/llm/journal")
+async def llm_journal_get(request: web.Request) -> web.Response:
+    """What the model proposed and what the deterministic layer did with it."""
+    from phantom.automation import llm_journal
+    refused_only = request.query.get("refusals", "") not in ("", "0", "false")
+    limit = _int_param(request.query.get("limit"), 25)
+    entries = (llm_journal.journal.refusals(limit) if refused_only
+               else llm_journal.journal.entries(limit=limit))
+    return _json({
+        "stats": llm_journal.journal.stats(),
+        "refusals_only": refused_only,
+        "text": llm_journal.journal.render(limit=limit,
+                                          refused_only=refused_only),
+        "entries": [e.to_dict() for e in entries],
+    })
+
+
+@routes.get("/api/llm/proposals")
+async def llm_proposals_get(request: web.Request) -> web.Response:
+    """The operator queue: what the model wants to run, and its state."""
+    from phantom.automation import llm_proposals
+    limit = _int_param(request.query.get("limit"), 50)
+    return _json({
+        "stats": llm_proposals.queue.stats(),
+        "proposals": [p.to_dict()
+                      for p in (llm_proposals.queue.all()[-limit:] if limit
+                                else llm_proposals.queue.all())],
+        "text": llm_proposals.render(limit=limit),
+    })
+
+
+@routes.post("/api/llm/proposals")
+async def llm_proposals_post(request: web.Request) -> web.Response:
+    """propose | accept | reject. Acceptance is the ONLY path to execution.
+
+    `accept` runs the command exactly like the CLI does: session target for the
+    scope gate, the hosts named inside the command checked too, and the shared
+    executor (tool availability, streaming) doing the work.
+    """
+    from phantom.automation import llm_proposals
+    body = await request.json() or {}
+    action = str(body.get("action", "")).strip().lower()
+
+    if action == "propose":
+        from phantom.automation.llm_advisor import LLMAdvisor
+        from phantom.core.knowledge import session_wm
+        limit = int(body.get("limit") or 5)
+        advisor = LLMAdvisor(enabled=True)
+        if not advisor.available():
+            return _json({"ok": False,
+                          "message": str(advisor._error or "no model configured")})
+        props = advisor.propose_commands(session_wm(), limit=limit,
+                                         agent="api")
+        return _json({"ok": True, "queued": [p.to_dict() for p in props],
+                      "message": "nothing runs until an operator accepts"})
+
+    if action not in ("accept", "reject"):
+        return _json({"ok": False,
+                      "message": "action must be propose|accept|reject"}, 400)
+
+    try:
+        pid = int(body.get("id"))
+    except (TypeError, ValueError):
+        return _json({"ok": False, "message": "id is required"}, 400)
+
+    if action == "reject":
+        ok, message = llm_proposals.queue.refuse(pid,
+                                                 str(body.get("reason") or ""))
+        return _json({"ok": ok, "message": message})
+
+    ok, message = llm_proposals.queue.accept(pid)
+    if not ok:
+        return _json({"ok": False, "message": message})
+    prop = llm_proposals.queue.get(pid)
+    if not session.target:
+        llm_proposals.queue.record_result(pid, ok=False,
+                                          excerpt="no session target")
+        return _json({"ok": False, "message": "no target set: set one before "
+                                                "executing a proposal"})
+    bad = llm_proposals.out_of_scope_hosts(prop.command, session.scope)
+    if bad:
+        note = "out of scope: " + ", ".join(bad)
+        llm_proposals.queue.record_result(pid, ok=False, excerpt=note)
+        return _json({"ok": False, "message": note})
+    out = llm_proposals.execute(prop, target=session.target, scope=session.scope)
+    llm_proposals.queue.record_result(pid, ok=bool(out),
+                                      excerpt=(out or "").strip())
+    return _json({"ok": True, "message": message, "output": out or "",
+                  "proposal": llm_proposals.queue.get(pid).to_dict()})
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Phantom API Server")
     parser.add_argument("--port", type=int, default=9876, help="Port to listen on")

@@ -671,6 +671,17 @@ class AutoShell(cmd.Cmd):
         from phantom.core.shell.commands import ops
         ops.cmd_deps(self, arg)
 
+    def do_llm(self, arg: str):
+        """llm [journal [refusals]|propose [n]|proposals|accept <id>|reject <id> [reason]|clear] - what the model wanted
+
+        The model reasons autonomously but never executes: `propose` queues
+        concrete commands as PENDING, `accept <id>` runs one through the normal
+        scope gate, and `journal` shows every proposal with the reason the
+        deterministic layer accepted or refused it.
+        """
+        from phantom.core.shell.commands import ops
+        ops.cmd_llm(self, arg)
+
     def do_guardrails(self, arg: str):
         """guardrails [list|why|enable <k>|disable <k>|record] - safety controls for this engagement
 

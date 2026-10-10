@@ -74,6 +74,10 @@ CLI_ONLY = {
             "installs ONLY on an explicit confirm) but no panel consumes it "
             "yet: SettingsPanel is where the missing-tool list and the "
             "install button belong.",
+    "llm": "the backend is shared (`/api/llm/journal`, `/api/llm/proposals`, "
+           "POST accept/reject) and a pending proposal can only be accepted "
+           "by a human, but no panel consumes it yet: AutoModePanel is where "
+           "the proposal card and its reasoning belong.",
 }
 
 
