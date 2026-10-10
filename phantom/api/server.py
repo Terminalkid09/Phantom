@@ -3263,6 +3263,50 @@ def main(port: int = 9876):
     web.run_app(app, host="127.0.0.1", port=port, print=lambda *args: None)
 
 
+
+# -- External toolchain state (the Electron surface of `deps`) ---------------
+
+@routes.get("/api/toolchain")
+async def toolchain_get(_request: web.Request) -> web.Response:
+    """What this machine is missing, and the install command for each."""
+    from phantom.utils import toolchain as tc
+    env = tc.detect_env()
+    gone = tc.missing()
+    return _json({
+        "environment": env.label(),
+        "os": env.os, "distro": env.distro, "manager": env.manager,
+        "wsl": env.wsl, "needs_sudo": env.needs_sudo,
+        "missing": [
+            {"tool": name, "why": tc.TOOLS[name].why,
+             "command": tc.install_command(name, env) or []}
+            for name in gone],
+        "report": tc.report(env),
+    })
+
+
+@routes.post("/api/toolchain")
+async def toolchain_post(request: web.Request) -> web.Response:
+    """Install ONE missing tool -- only with an explicit confirm=true.
+
+    The body carries the decision, so the UI cannot install anything as a side
+    effect of opening a page: without `confirm` the answer is a plain refusal
+    that still reports the command which WOULD have run.
+    """
+    from phantom.utils import toolchain as tc
+    body = await request.json() or {}
+    tool = str(body.get("tool", "")).strip()
+    if not tool:
+        return _json({"ok": False, "message": "tool is required"}, 400)
+    env = tc.detect_env()
+    if not body.get("confirm"):
+        return _json({
+            "ok": False,
+            "message": "refused: installing " + tool + " needs confirm=true",
+            "command": tc.install_command(tool, env) or [],
+        })
+    ok, message = tc.install(tool, env, confirm=lambda t, c: True)
+    return _json({"ok": ok, "message": message, "tool": tool})
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Phantom API Server")
     parser.add_argument("--port", type=int, default=9876, help="Port to listen on")

@@ -70,6 +70,10 @@ CLI_ONLY = {
     "workspace": "GAP: same omission — the surfaces of the engagement and how "
                  "to reach them; the Sidebar IS that list, so a badge/legend "
                  "would cover it",
+    "deps": "the backend is shared (`/api/toolchain` reports the machine and "
+            "installs ONLY on an explicit confirm) but no panel consumes it "
+            "yet: SettingsPanel is where the missing-tool list and the "
+            "install button belong.",
 }
 
 

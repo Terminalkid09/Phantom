@@ -19,6 +19,7 @@ EXPECTED = {
     "use", "plugins",
     "auto", "agent",
     "c2", "malleable", "ad", "wordlists", "export", "guardrails",
+    "deps",
     "help", "config", "setup", "coverage", "doctor", "experience",
     "why", "tool",
     "back", "exit", "quit",
