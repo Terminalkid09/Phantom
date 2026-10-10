@@ -214,6 +214,18 @@ def _r_stall(d: dict) -> List[str]:
             + (f" | policy: {d.get('policy')}" if d.get("policy") else "")]
 
 
+def _r_llm_command(d: dict) -> List[str]:
+    decided = d.get("decided_by") or "auto-policy"
+    why = d.get("reason") or ""
+    return [f"[LLM] {decided} ran: $ {_clip(d.get('command'), 160)}"
+            + (f" — {_clip(why, 100)}" if why else "")]
+
+
+def _r_llm_refused(d: dict) -> List[str]:
+    lines = [line for line in str(d.get("lines") or "").splitlines() if line]
+    return lines or ["[LLM] the auto-gate refused the proposals"]
+
+
 def _r_blocked(d: dict) -> List[str]:
     return [f"[!] Blocked {_tag(d)}{d.get('capability')}: "
             f"{_clip(d.get('reason'), 140)}"]
@@ -640,6 +652,14 @@ EVENTS: Dict[str, EventSpec] = {
     "llm": EventSpec("dim", _r_llm, verbose_only=True),
     "llm_request": EventSpec("warn", _r_llm_request),
     "llm_consult": EventSpec("dim", _r_llm_consult, verbose_only=True),
+    # the model's CONCRETE commands, decided by the deterministic auto-gate:
+    # the operator must be able to see afterwards what the run executed on its
+    # own, and what it refused to execute and why (`fields` keeps both).
+    "llm_command": EventSpec("success", _r_llm_command,
+                             fields=("command", "reason", "decided_by")),
+    "llm_command_empty": EventSpec("warn", _r_llm_command,
+                                  fields=("command", "reason")),
+    "llm_refused": EventSpec("warn", _r_llm_refused, fields=("lines",)),
 
     # structure / cells
     "roster": EventSpec("dim", _r_roster, verbose_only=True),

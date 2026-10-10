@@ -199,6 +199,8 @@ class AutonomousAgent:
                  experience: bool = False,
                  evolution: bool = False,
                  llm: bool = False,
+                 auto_llm_commands: bool = True,
+                 auto_llm_budget: int = 3,
                  stop_event=None,
                  reason_profile: str = "",
                  cell_loop: bool = False,
@@ -228,6 +230,14 @@ class AutonomousAgent:
         # is explicit (`--no-resilient`), never a side effect of max-OPSEC.
         self.resilient_stager = resilient_stager
         self.scope_list = scope_list or []
+        # AUTO-MODE LLM GATE: with no operator watching, the deterministic
+        # policy (`llm_autogate`) is the decider. Bounded per run so a
+        # chatty model cannot turn a campaign into a shell session, and
+        # every decision is journalled with its reason either way.
+        self.llm_auto_commands = bool(auto_llm_commands)
+        self.llm_auto_budget = max(int(auto_llm_budget), 0)
+        self.llm_auto_used = 0
+        self._llm_auto_asked = 0
         # target ledger: the single source of truth for the ACTIVE target
         # set (initial + mid-run pivots), their classification, and the
         # scope/provenance authorization of every discovered pivot.
@@ -3550,6 +3560,17 @@ class AutonomousAgent:
                 for cid in llm_prefs:
                     if cid not in prefs:
                         prefs.append(cid)
+            # AUTO-MODE, no operator: the model's CONCRETE commands are decided
+            # by the deterministic policy in `llm_autogate` (bounded per run,
+            # every verdict journalled). Asking costs a model call, so it is
+            # capped: at most `1 + budget` asks in a whole run.
+            if (self.llm_auto_commands and self.llm_auto_used < self.llm_auto_budget
+                    and self._llm_auto_asked <= self.llm_auto_budget):
+                self._llm_auto_asked += 1
+                try:
+                    self._llm_auto_commands()
+                except Exception as exc:
+                    self._degrade("llm_auto", exc)
             # buco 2: the QUIET cells reason in PARALLEL over their own
             # scoped candidates and their own world views; the consensus
             # joins the planner preferences (a preference, exactly like the
@@ -4030,6 +4051,109 @@ class AutonomousAgent:
             return self._execute_capability(step)
         finally:
             cells.release(cell)
+
+    # ------------------------------------------------- llm auto-mode gate
+
+    def _llm_auto_commands(self) -> int:
+        """Let the model propose commands and ACCEPT them without an operator.
+
+        The user-facing contract is "the model reasons, the algorithm decides":
+        auto-mode has nobody to ask, so the deterministic policy accepts or
+        refuses each proposal and the accepted ones run through the same
+        gated executor as any capability. Bounded per run, silent when the
+        advisor is off, and never fatal: a broken model or a broken gate
+        degrades the run to its normal behaviour.
+
+        Returns the number of commands actually executed.
+        """
+        if not (self.llm_auto_commands and self.llm_auto_budget > self.llm_auto_used):
+            return 0
+        try:
+            if not self.llm_advisor.available():
+                return 0
+        except Exception:
+            return 0
+        try:
+            from phantom.automation import llm_autogate, llm_proposals
+            remaining = self.llm_auto_budget - self.llm_auto_used
+            proposals = self.llm_advisor.propose_commands(
+                self.wm, limit=remaining, agent=f"auto:{self.target}")
+            if not proposals:
+                return 0
+            accepted, refused = llm_autogate.apply_decisions(
+                proposals,
+                scope=list(self.scope_list or []),
+                paranoid=bool(self.paranoid),
+                strict=self._auto_gate_strict(),
+                extra_allowed=self._llm_auto_extra_programs(),
+            )
+            if refused:
+                self._emit("llm_refused",
+                           lines=llm_autogate.render([], refused))
+            ran = 0
+            for proposal in accepted:
+                if self.llm_auto_used >= self.llm_auto_budget:
+                    break
+                self.llm_auto_used += 1
+                output = self._run_llm_command(proposal)
+                ran += 1 if output else 0
+            return ran
+        except Exception as exc:
+            self._degrade("llm_auto_commands", exc)
+            return 0
+
+    def _auto_gate_strict(self) -> bool:
+        """Strict/paranoid conditions the auto-gate must respect.
+
+        The cell roster turns on its own strict mode (see `_cell_strict_here`),
+        and the operator can run with strict guardrails: either way the auto
+        gate narrows to bare allowlisted commands.
+        """
+        try:
+            if self._cell_strict_here():
+                return True
+        except Exception:
+            pass
+        for attr in ("strict_guardrails", "strict"):
+            if bool(getattr(self, attr, False)):
+                return True
+        return bool(self.paranoid)
+
+    def _llm_auto_extra_programs(self) -> List[str]:
+        """Programs the run has already cleared as its own tools.
+
+        The toolbelt is the engagement's approved tool set: a driver the
+        operator added is exactly as trustworthy as a built-in, so it may join
+        the auto-gate allowlist. Empty when nothing was declared.
+        """
+        try:
+            return sorted({os.path.basename(str(name)).lower()
+                           for name in self.toolchain.installed_tools()})
+        except Exception:
+            return []
+
+    def _run_llm_command(self, proposal) -> str:
+        """Run ONE auto-accepted proposal through the shared gated executor.
+
+        Nothing here is a private execution path: `run_command` enforces the
+        engagement scope, the safe-target rules and tool availability, exactly
+        as it would for a command the operator typed.
+        """
+        from phantom.automation import llm_proposals
+        try:
+            output = llm_proposals.execute(
+                proposal, target=self.target,
+                scope=list(self.scope_list or []) or None)
+        except Exception as exc:
+            output = ""
+            self._degrade("llm_command", exc)
+        llm_proposals.queue.record_result(
+            proposal.id, ok=bool(output), excerpt=(output or "").strip())
+        self._emit("llm_command" if output else "llm_command_empty",
+                   command=proposal.command, reason=proposal.why,
+                   decided_by=proposal.decided_by,
+                   bytes=len(output or ""))
+        return output
 
     def _parallel_reasoning(self, goal: str, prefs: list) -> Optional[str]:
         """Buco 2 — the contact-free cells reason CONCURRENTLY.

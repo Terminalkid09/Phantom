@@ -16,7 +16,60 @@ operator action, not new world knowledge.
 from __future__ import annotations
 
 import shutil
+import time
 from typing import Callable, Dict, List, Optional, Set, Tuple
+
+# A WSL probe spawns `wsl.exe`, which on a Windows box with no usable distro
+# can BLOCK instead of failing: observed hanging until the timeout, once per
+# tool, which turned the first toolbelt scan into ~4 minutes of dead time
+# (and made a single misconfigured machine look like a broken build). So
+# availability is checked ONCE per process with its own short deadline, and a
+# process-wide budget caps the total time the WSL path may ever spend. Failing
+# closed costs a "tool missing" on a machine where the probe would have hung
+# anyway — the honest degradation this module is for.
+_WSL_AVAIL_TIMEOUT = 5.0
+_WSL_BUDGET_SECONDS = 20.0
+
+
+def _wsl_probe(cmd: List[str], timeout: float):
+    """Run ONE wsl.exe command and return the CompletedProcess or None.
+
+    Separated out so the budget/availability logic can be verified without a
+    real WSL on the box (the whole point of the fix).
+    """
+    import subprocess
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout)
+    except Exception:
+        return None
+
+
+def _wsl_state() -> Dict[str, float]:
+    return _wsl_which.__dict__.setdefault(
+        "_state", {"checked": 0.0, "ok": 0.0, "spent": 0.0, "disabled": 0.0})
+
+
+def _reset_wsl_state() -> None:
+    """Forget the memoised WSL facts (tests, and after installing a distro)."""
+    _wsl_which.__dict__.pop("_state", None)
+    _wsl_which.__dict__.pop("_cache", None)
+
+
+def wsl_available() -> bool:
+    """Is there a USABLE wsl.exe? Checked once per process, bounded."""
+    state = _wsl_state()
+    if not state["checked"]:
+        state["checked"] = 1.0
+        started = time.time()
+        proc = _wsl_probe(["wsl", "-l", "-q"], _WSL_AVAIL_TIMEOUT)
+        state["spent"] += time.time() - started
+        state["ok"] = 1.0 if proc is not None else 0.0
+    return bool(state["ok"]) and not state["disabled"]
+
+
+def _wsl_budget_left() -> float:
+    return _WSL_BUDGET_SECONDS - _wsl_state()["spent"]
 
 
 def _wsl_which(name: str) -> Optional[str]:
@@ -30,38 +83,50 @@ def _wsl_which(name: str) -> Optional[str]:
 
     Distros are probed in order (running ones first): the default distro
     via `wsl -e`, then every registered distro via `wsl -d <name>`.
-    Results are cached process-wide (WSL probes cost ~1s each).
+    Results are cached process-wide, and the whole WSL path is bounded: no
+    availability, or a spent budget, turns it off for the rest of the
+    process instead of paying another hang per tool.
     """
-    import subprocess
     cache = _wsl_which.__dict__.setdefault("_cache", {})
     if name in cache:
         return cache[name]
+    if not wsl_available() or _wsl_budget_left() <= 0:
+        cache[name] = None
+        return None
     result: Optional[str] = None
     # 1. default distro
-    try:
-        r = subprocess.run(
-            ["wsl", "-e", "sh", "-c", f"command -v {name} 2>/dev/null"],
-            capture_output=True, text=True, timeout=15)
+    started = time.time()
+    r = _wsl_probe(["wsl", "-e", "sh", "-c", f"command -v {name} 2>/dev/null"],
+                   max(min(15.0, _wsl_budget_left()), 1.0))
+    _wsl_state()["spent"] += time.time() - started
+    if r is not None:
         out = (r.stdout or "").strip().splitlines()
         if r.returncode == 0 and out and out[0].strip().startswith("/"):
             result = f"wsl -e {name}"
-    except Exception:
-        pass
     # 2. named distros (wsl --list output is UTF-16 on some builds)
-    if result is None:
-        distros = _wsl_distro_list()
+    if result is None and _wsl_budget_left() > 0:
+        try:
+            distros = _wsl_distro_list()
+        except Exception:
+            distros = []
         for d in distros:
-            try:
-                r = subprocess.run(
-                    ["wsl", "-d", d, "-e", "sh", "-c",
-                     f"command -v {name} 2>/dev/null"],
-                    capture_output=True, text=True, timeout=20)
+            if _wsl_budget_left() <= 0:
+                break
+            started = time.time()
+            r = _wsl_probe(
+                ["wsl", "-d", d, "-e", "sh", "-c",
+                 f"command -v {name} 2>/dev/null"],
+                max(min(20.0, _wsl_budget_left()), 1.0))
+            _wsl_state()["spent"] += time.time() - started
+            if r is not None:
                 out = (r.stdout or "").strip().splitlines()
-                if r.returncode == 0 and out and out[0].strip().startswith("/"):
+                if (r.returncode == 0 and out
+                        and out[0].strip().startswith("/")):
                     result = f"wsl -d {d} {name}"
                     break
-            except Exception:
-                continue
+    if result is None and _wsl_budget_left() <= 0:
+        # the budget is gone: stop paying for probes this run
+        _wsl_state()["disabled"] = 1.0
     cache[name] = result
     return result
 

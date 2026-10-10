@@ -10,6 +10,11 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
     strategy:
+      # fail-fast off: with three interpreters, a failure on one used to CANCEL
+      # the other two, so a red run told you nothing about whether the problem
+      # was version-specific. Three verdicts cost runner minutes and save
+      # whole debugging sessions.
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
     steps:
@@ -57,7 +62,28 @@ jobs:
           # HERMETIC gate: tool-dependent tests are deselected and run in the
           # separate `integration-tools` job below, so a missing binary never
           # masquerades as a product regression here.
-          python -m pytest $TEST_FILES -m "not integration_tool" -v --timeout=120 --maxfail=25 2>&1 | tail -200
+          python -m pytest $TEST_FILES -m "not integration_tool" -v --timeout=120 --maxfail=25 2>&1 \
+            | tee /tmp/pytest.out | tail -200
+
+      - name: Surface the failing tests as annotations
+        # A red run used to be diagnosable only by whoever could open the job
+        # logs. The failing test IDs are emitted as ANNOTATIONS instead, which
+        # the Checks UI shows and the public API returns without a login — so
+        # "CI is red" carries the test that broke with it. Diagnostic only:
+        # this step never changes the verdict of the run (it is `if: failure()`
+        # and its own commands cannot fail the job).
+        if: failure()
+        run: |
+          echo "::warning title=pytest::the unit-test step failed - see the annotations below for the failing tests"
+          if [ -f /tmp/pytest.out ]; then
+            grep -E '^(FAILED|ERROR) ' /tmp/pytest.out | head -10 | while read -r line; do
+              echo "::error title=pytest::${line}"
+            done
+            echo "--- short summary ---"
+            sed -n '/short test summary info/,$p' /tmp/pytest.out | head -30
+          else
+            echo "::error title=pytest::no pytest output captured (the step failed before running the suite)"
+          fi
 
       - name: Verify core module imports
         run: |
