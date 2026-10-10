@@ -318,6 +318,17 @@ struct Rc4Context {
 
 // Stack bounds of the calling thread (low = stackaddr, high = stackaddr+size).
 inline bool thread_stack_bounds(uint8_t** low, uint8_t** high) {
+#if defined(__APPLE__)
+    // Darwin has no pthread_getattr_np (that is a glibc API): the stack base
+    // and size come from the two _np accessors instead, and there the returned
+    // address is the HIGH end of the stack, not the low one.
+    void* base = pthread_get_stackaddr_np(pthread_self());
+    size_t size = pthread_get_stacksize_np(pthread_self());
+    if (!base || size == 0) return false;
+    *high = static_cast<uint8_t*>(base);
+    *low = *high - size;
+    return true;
+#else
     pthread_attr_t attr;
     if (pthread_getattr_np(pthread_self(), &attr) != 0) return false;
     void* addr = nullptr;
@@ -328,6 +339,7 @@ inline bool thread_stack_bounds(uint8_t** low, uint8_t** high) {
     *low = static_cast<uint8_t*>(addr);
     *high = *low + size;
     return true;
+#endif
 }
 
 }  // namespace sleepmask
