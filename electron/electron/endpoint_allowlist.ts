@@ -85,6 +85,13 @@ const RULES: readonly Rule[] = [
   { pattern: '/api/vault', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/launcher', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/config/keys', methods: ['GET'], group: 'readonly' },
+  // Identity graph (SocialGraphPanel). The graph read is pure: it rebuilds the
+  // view from findings already in the session and never touches the network.
+  { pattern: '/api/social/graph', methods: ['GET'], group: 'readonly' },
+  // The email PLAN is a read of the rules table (which services, which URLs).
+  // It is safe to repeat and it is what the panel shows BEFORE asking for
+  // confirmation, so it can inform the decision without making the request.
+  { pattern: '/api/social/emails/plan', methods: ['GET'], group: 'readonly' },
 
   // ── mutating (each one changes backend state — still operator-driven) ──
   { pattern: '/api/session/run', methods: ['POST'], group: 'mutating' },
@@ -119,6 +126,12 @@ const RULES: readonly Rule[] = [
   { pattern: '/api/identity/checks', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/identity/confirm', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/craft', methods: ['POST'], group: 'mutating' },
+  // Asking third-party services whether an address is registered is an
+  // OUTBOUND action (like /api/osint/preview), so it is mutating. No
+  // main-process confirm dialog: the panel already gates it behind the plan
+  // and an explicit checkbox, and it is not destructive — nothing on the
+  // target or the operator's machine changes.
+  { pattern: '/api/social/emails', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/backend/detect', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/backend/install-tool', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/backend/config', methods: ['POST'], group: 'mutating' },

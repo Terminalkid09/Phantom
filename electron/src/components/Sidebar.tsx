@@ -4,7 +4,7 @@ import {
   Radio, Target, Bot, FileText, Settings, Terminal,
   Globe, Wifi, Search, Shield, AlertTriangle,
   Wrench, Monitor, Key, Layers, MapPin, Clock, ScrollText,
-  Radar, BookOpen, PieChart, Film, Package, Brain, Network
+  Radar, BookOpen, PieChart, Film, Package, Brain, Network, Share2
 } from 'lucide-react'
 
 const SECTIONS = [
@@ -15,6 +15,7 @@ const SECTIONS = [
       { id: 'session', icon: Target, label: 'Session' },
       { id: 'automode', icon: Bot, label: 'Auto-Mode' },
       { id: 'adgraph', icon: Network, label: 'AD Graph' },
+      { id: 'social', icon: Share2, label: 'Identity Graph' },
     ],
   },
   {

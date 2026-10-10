@@ -18,6 +18,7 @@ import RecordingsPanel from '@/components/RecordingsPanel'
 import BundlesPanel from '@/components/BundlesPanel'
 import LearningPanel from '@/components/LearningPanel'
 import AdGraphPanel from '@/components/AdGraphPanel'
+import SocialGraphPanel from '@/components/SocialGraphPanel'
 import { ToastContainer } from '@/components/Toast'
 
 export default function App() {
@@ -107,6 +108,7 @@ export default function App() {
     { id: 'bundles', node: <BundlesPanel /> },
     { id: 'learning', node: <LearningPanel /> },
     { id: 'adgraph', node: <AdGraphPanel /> },
+    { id: 'social', node: <SocialGraphPanel /> },
   ]
   for (const m of MODULE_TABS) panels.push({ id: m, node: <ModulePanel moduleId={m} /> })
   // Feature-gating: drop the panels whose component this build does not expose

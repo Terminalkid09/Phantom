@@ -50,6 +50,10 @@ ELECTRON_SURFACES = {
     "guardrails": "SettingsPanel: guardrails section (GET/POST /api/guardrails)",
     "review": "LearningPanel: evolution summary (partial: the panel shows "
               "learned patterns, not the PR/gate budgets)",
+    "social": "SocialGraphPanel: GET /api/social/graph (clusters, proofs, same-"
+              "person groups, pivots, GraphML download) + the two-step email "
+              "flow (GET plan, then POST confirm=true) — the panel that makes "
+              "the graph readable, which is what the CLI cannot do",
     "help": "CommandPalette: search across modules and commands",
     "back": "navigation: the tab switch itself",
     "exit": "navigation: closing the window",
@@ -78,11 +82,6 @@ CLI_ONLY = {
            "POST accept/reject) and a pending proposal can only be accepted "
            "by a human, but no panel consumes it yet: AutoModePanel is where "
            "the proposal card and its reasoning belong.",
-    "social": "the backend is shared (`/api/social/graph` returns nodes/edges/"
-              "stats, `/api/social/emails` the gated enumeration) and the "
-              "GRAPH is the one surface Electron should do better than the "
-              "CLI — GAP: no panel renders it yet, the CLI renders text and "
-              "exports GraphML.",
 }
 
 
