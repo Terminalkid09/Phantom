@@ -417,28 +417,52 @@ class LLMAdvisor:
         """
         if not self.available():
             return []
+        # Every proposal and its fate is recorded (llm_journal): the advisor
+        # is non-gating, so WITHOUT this the operator can never tell a
+        # hallucinated id from a good move the deterministic layer refused.
+        from phantom.automation import llm_journal
+        decisions: List[Dict[str, Any]] = []
+        request_digest = ""
         try:
+            request_digest = str(wm.target or "")
             raw = self._generate(wm)
             parsed = self._parse(raw)
         except Exception as e:
             self._error = str(e)
+            self._journal(llm_journal, "suggest", request_digest, "", [],
+                          error=str(e))
             return []
         out: List[str] = []
         for item in parsed:
             cid = str(item.get("capability_id", "")).strip()
+            reason = str(item.get("reason", ""))[:200]
             if not cid or cid in out:
                 continue
+            verdict, drop = "accepted", ""
             if cid not in self.whitelist:
-                continue  # not on the whitelist -> dropped
-            if registry is not None:
-                cap = registry.get(cid)
-                if cap is None:
-                    continue  # does not exist -> dropped
-                if self.paranoid and getattr(cap, "stealth_level", "") == "aggressive":
-                    continue  # paranoid mode: never prefer loud moves
-            out.append(cid)
+                verdict, drop = "dropped", "not-whitelisted"
+            elif registry is not None and registry.get(cid) is None:
+                verdict, drop = "dropped", "unknown-capability"
+            elif (registry is not None and self.paranoid
+                  and getattr(registry.get(cid), "stealth_level", "") == "aggressive"):
+                verdict, drop = "dropped", "paranoid-aggressive"
+            decisions.append({"capability_id": cid, "reason": reason,
+                               "verdict": verdict, "drop_reason": drop})
+            if verdict == "accepted":
+                out.append(cid)
         self.accepted += len(out)
+        self._journal(llm_journal, "suggest", request_digest, raw, decisions)
         return out[: self.max_suggestions]
+
+    @staticmethod
+    def _journal(mod, kind: str, request: str, raw: str,
+                 proposals: List[Dict[str, Any]], error: str = "") -> None:
+        """Record one call; a broken journal must never break the advisor."""
+        try:
+            mod.journal.record(kind, request=request, raw=raw,
+                               proposals=proposals, error=error)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------- dossier
 
