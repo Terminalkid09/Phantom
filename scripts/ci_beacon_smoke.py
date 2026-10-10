@@ -109,8 +109,18 @@ def main(argv=None) -> int:
         print(f"SMOKE SKIP ({args.platform}): {reason}")
         return 1 if args.require else 2
 
+    import phantom
     from phantom.utils.builder import compile_beacon
-    path = compile_beacon(args.platform, ROOT, force_rebuild=True,
+    # compile_beacon() takes the PACKAGE root — the directory that CONTAINS
+    # `payloads/` — exactly as the CLI, the API and the payload generator pass
+    # it (`os.path.dirname(phantom.__file__)`). Handing it the REPO root made
+    # every smoke build look in `<repo>/payloads/beacon`: a path that only
+    # exists if an earlier run created it (it is gitignored), so the assembler
+    # died with "can't open .../src/syscalls.asm" on Windows and the generated
+    # headers were written outside the package elsewhere. Every beacon-smoke
+    # job was red for this reason alone.
+    pkg_root = os.path.dirname(os.path.abspath(phantom.__file__))
+    path = compile_beacon(args.platform, pkg_root, force_rebuild=True,
                           host="127.0.0.1", port=8443, use_ssl=True)
     if not path:
         print(f"SMOKE FAIL: compile_beacon({args.platform}) returned no "
