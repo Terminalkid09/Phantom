@@ -79,13 +79,40 @@ if __name__ == "__main__":
 _BOOT_NAME = "_descriptor_boot.py"
 
 
+def with_framework_path(env: Dict[str, str]) -> Dict[str, str]:
+    """Put the `phantom` import root on a child's PYTHONPATH.
+
+    The children spawned here are FRESH interpreters: the parent's
+    ``sys.path`` is not inherited (pytest's rootdir insert, a virtualenv
+    ``.pth``, an editable-install hook are all invisible to them), only the
+    environment is. A learned module whose body says ``import phantom...``
+    then dies with ModuleNotFoundError, ``describe()`` returns None and every
+    learned capability silently degrades to "still loading" — which is
+    exactly how it read on a CI runner that installs ``requirements.txt`` but
+    never the package itself, while the same test passed on any machine with
+    ``pip install -e .``.
+
+    Derived from the package location, not the CWD: the child runs wherever
+    the operator happened to be.
+    """
+    import phantom
+
+    root = str(Path(phantom.__file__).resolve().parent.parent)
+    parts = [p for p in (env.get("PYTHONPATH") or "").split(os.pathsep) if p]
+    if root not in parts:
+        parts.insert(0, root)
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    return env
+
+
 def _worker_env() -> Dict[str, str]:
-    """Environment for the descriptor worker: PHANTOM_* secrets removed."""
+    """Environment for the descriptor worker: PHANTOM_* secrets removed,
+    the framework itself still importable."""
     env = dict(os.environ)
     for key in list(env):
         if key.upper().startswith("PHANTOM_"):
             env.pop(key, None)
-    return env
+    return with_framework_path(env)
 
 
 def describe(module_path: str, timeout: float = 20.0) -> Optional[Dict[str, Any]]:
