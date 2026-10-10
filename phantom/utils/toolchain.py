@@ -90,14 +90,25 @@ def _manager_for_ids(ids: Iterable[str]) -> Optional[str]:
     return None
 
 
-def detect_env(os_release: str = "", *, platform_name: str = "",
+def detect_env(os_release: Optional[str] = None, *, platform_name: str = "",
                wsl_marker: bool = False) -> Env:
-    """Decide the environment. All inputs are injectable so this is pure.
+    """Decide the environment. Every input is injectable, so it is testable.
 
-    `platform_name` defaults to `sys.platform`; `os_release` to the content of
-    /etc/os-release when it exists, which is the only reliable way to tell Kali
-    from Debian (they share the apt family but Kali ships the recon tools).
+    `platform_name` defaults to `sys.platform`; `os_release=None` (the
+    default) reads /etc/os-release from the host, which is the only reliable
+    way to tell Kali from Debian (they share the apt family but Kali ships the
+    recon tools). Pass `""` to say "there is no os-release here" — what the
+    injected tests do.
+
+    The bare `detect_env()` must agree with the CLI it feeds. It used to
+    answer `distro="unknown", manager="none"` on every Linux host, because the
+    file was read by the CALLERS (`report()`, `missing_tools()`) and not here:
+    the shell printed `apt-get install -y nmap` while the API — and therefore
+    the Electron toolchain panel, which calls this function directly — offered
+    no install command for Linux at all.
     """
+    if os_release is None:
+        os_release = _os_release_text()
     name = (platform_name or _platform.system()).lower()
     # WSL is worth naming: a Kali-on-Windows operator gets apt (the whole recon
     # stack) while a Windows-native run only has winget/choco. `WSL_DISTRO_NAME`
