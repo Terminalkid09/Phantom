@@ -204,12 +204,23 @@ class TestBruteSshMultiTool(unittest.TestCase):
         self.assertTrue(cmd2.startswith("medusa"))
 
     def test_os_adapter_consumes_chosen_tool(self):
-        """os_detect routes on the stamp too (not a silent nmap default)."""
+        """os_detect routes on the stamp too (not a silent nmap default).
+
+        `_raw_socket_ok` is PINNED here. It is what picks between `-O` and
+        the banner-only `-sV`, and it describes the HOST (root on POSIX,
+        Npcap on Windows) rather than the code under test — leaving it free
+        made this a test of the runner's privileges: green on a root/Npcap
+        box, red on the unprivileged CI runner. Both privilege branches keep
+        their own coverage in test_real_target_fixes.py.
+        """
+        from unittest import mock
+        from phantom.automation.guidance import kit
         from phantom.automation.guidance.kit import _os_adapter
         from phantom.automation.belief import WorldModel
         wm = WorldModel("10.0.0.9")
         wm.chosen_tool = {"capability": "os_detect", "tool": "nmap"}
-        self.assertTrue(_os_adapter(wm, {}).startswith("nmap -Pn -O"))
+        with mock.patch.object(kit, "_raw_socket_ok", lambda: True):
+            self.assertTrue(_os_adapter(wm, {}).startswith("nmap -Pn -O"))
 
     def test_interpreter_hydra_and_medusa(self):
         from phantom.automation.guidance.kit import _brute_ssh_interp

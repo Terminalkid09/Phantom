@@ -1,5 +1,6 @@
 """Tests for non-interactive execution (execute_quiet / BackgroundProcess)."""
 import os
+import shlex
 import sys
 import time
 import unittest
@@ -15,8 +16,15 @@ from phantom.core.executor import (
 class TestExecuteQuiet(unittest.TestCase):
 
     def _py(self, code: str) -> str:
-        q = '"' if os.name == "nt" else "'"
-        return f'{sys.executable} -c {q}{code}{q}'
+        # POSIX: shlex.quote, NOT a hand-rolled pair of quotes. The code
+        # samples below contain single quotes of their own (`(l or '')`), so
+        # wrapping them in `'...'` let the shell strip the inner quotes and
+        # changed the program ("NameError: name 'A' is not defined"). On
+        # Windows cmd.exe has no equivalent of shlex.quote, so double quotes
+        # (which Python re-quotes for argv) stay.
+        if os.name == "nt":
+            return f'{sys.executable} -c "{code}"'
+        return f"{sys.executable} -c {shlex.quote(code)}"
 
     def test_success_result(self):
         r = execute_quiet(self._py("print(1+1)"))
@@ -57,8 +65,11 @@ class TestExecuteQuiet(unittest.TestCase):
 class TestBackgroundProcess(unittest.TestCase):
 
     def _py(self, code: str) -> str:
-        q = '"' if os.name == "nt" else "'"
-        return f'{sys.executable} -u -c {q}{code}{q}'
+        # see TestExecuteQuiet._py: shlex.quote on POSIX, double quotes on
+        # Windows (cmd.exe has no shell-quoting helper).
+        if os.name == "nt":
+            return f'{sys.executable} -u -c "{code}"'
+        return f"{sys.executable} -u -c {shlex.quote(code)}"
 
     def test_read_output(self):
         p = execute_quiet_bg(self._py("import time; print('A'); time.sleep(0.3); print('B')"))
