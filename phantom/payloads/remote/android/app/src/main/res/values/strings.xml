@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">System Update Service</string>
+    <string name="accessibility_label">System Update Service</string>
+    <string name="service_channel">System Update</string>
+</resources>
