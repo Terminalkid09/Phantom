@@ -25,6 +25,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from phantom.automation.guidance.learned.descriptor import with_framework_path
+
 # The worker boots the module, builds a read-only world snapshot, honours
 # the module's own preconditions, runs the adapter, then serialises the
 # findings as DATA. Nothing but JSON crosses back.
@@ -168,12 +170,19 @@ _BOOT_NAME = "_worker_boot.py"
 
 
 def _worker_env() -> Dict[str, str]:
-    """PHANTOM_* secrets are stripped: the worker needs none of them."""
+    """PHANTOM_* secrets are stripped: the worker needs none of them.
+
+    The framework import root is ADDED (see
+    ``descriptor.with_framework_path``): the worker is a fresh interpreter
+    and does not inherit this process's ``sys.path``, so the learned module's
+    own ``import phantom...`` would otherwise fail on any host where the
+    package is not installed (exactly the case on a CI runner).
+    """
     env = dict(os.environ)
     for key in list(env):
         if key.upper().startswith("PHANTOM_"):
             env.pop(key, None)
-    return env
+    return with_framework_path(env)
 
 
 def _boot_script(module_path: Path) -> Path:

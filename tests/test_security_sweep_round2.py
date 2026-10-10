@@ -236,6 +236,39 @@ def test_worker_strips_phantom_env(tmp_path):
     assert "PHANTOM_" in src and "pop" in src
 
 
+def test_learned_child_can_import_the_framework(monkeypatch):
+    """A fresh interpreter + the worker env must be able to import `phantom`.
+
+    The children are spawned as `[sys.executable, boot, module_path]`, so
+    their sys.path[0] is the MODULE's directory: the parent's sys.path
+    (pytest's rootdir insert, an editable-install hook) is not inherited,
+    only the environment is. A learned module whose body says
+    `import phantom...` therefore raised ModuleNotFoundError on a runner that
+    installs requirements.txt but never the package, `describe()` returned
+    None and three A-2 tests failed there while passing on any box with
+    `pip install -e .`. `-S` is the proof: with site-packages switched off,
+    the ONLY way `import phantom` can succeed is PYTHONPATH.
+    """
+    import subprocess
+    import tempfile
+    from phantom.automation.guidance.learned import descriptor, worker
+
+    monkeypatch.setenv("PHANTOM_LEAK_CANARY", "must-not-cross")
+    for env_fn in (descriptor._worker_env, worker._worker_env):
+        env = env_fn()
+        parts = [p for p in (env.get("PYTHONPATH") or "").split(os.pathsep) if p]
+        assert any((Path(p) / "phantom" / "__init__.py").is_file()
+                   for p in parts), f"no framework root on PYTHONPATH: {parts}"
+        assert "PHANTOM_LEAK_CANARY" not in env
+        r = subprocess.run(
+            [sys.executable, "-S", "-c", "import phantom; print(phantom.__file__)"],
+            capture_output=True, text=True, env=env,
+            cwd=tempfile.mkdtemp(), timeout=60)
+        assert r.returncode == 0, (
+            "the out-of-process child cannot import the framework it belongs "
+            f"to: {r.stderr.strip()[-300:]}")
+
+
 # ── A-3: CORS ───────────────────────────────────────────────────────────────
 
 def test_cors_is_not_a_wildcard():
