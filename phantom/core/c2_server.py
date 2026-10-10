@@ -1169,18 +1169,34 @@ async def handle_result(request: web.Request, pre_body: Optional[str] = None) ->
         if len(output.encode("utf-8", errors="replace")) > MAX_RESULT_OUTPUT_BYTES:
             return web.Response(status=413, text="Result too large")
 
-        c2_state.add_result(beacon_id, task_id, output)
-        try:
-            from phantom.utils.audit_log import audit_log
-            audit_log.append("task_result", beacon_id=beacon_id,
-                             task_id=task_id, output_len=len(output))
-        except Exception:
-            pass
+        _record_task_result_with_audit(beacon_id, task_id, output)
 
         return web.Response(text="OK")
     except Exception as e:
         logger.error(f"Result error: {e}")
         return web.Response(status=500)
+
+
+def _record_task_result_with_audit(beacon_id: str, task_id: str,
+                                   output: str) -> None:
+    """Store a beacon result and write its audit entry.
+
+    The two are not equally important: the RESULT must land so the operator
+    sees it, and the AUDIT entry must never silently vanish — that is the whole
+    point of a chain of custody. A failed append is counted in `quiet` and
+    logged; the beacon still gets its OK, because retrying a result we already
+    hold would duplicate work, but the operator can now see that this run ran
+    with a degraded audit log.
+    """
+    c2_state.add_result(beacon_id, task_id, output)
+    try:
+        from phantom.utils.audit_log import audit_log
+        audit_log.append("task_result", beacon_id=beacon_id, task_id=task_id,
+                         output_len=len(output))
+    except Exception as exc:
+        from phantom.utils import quiet
+        quiet.swallow("c2_server.task_result.audit_append", exc)
+        logger.warning(f"Audit append failed for task {task_id}: {exc}")
 
 
 # Filename a browser saves the artifact under. Without a
