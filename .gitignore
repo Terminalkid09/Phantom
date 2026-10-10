@@ -206,6 +206,15 @@ Thumbs.db
 *.pdf
 *.xml
 
+# ...but the Android module's XML files are SOURCE, not documents. The
+# manifest, the accessibility-service config and res/values are as much a
+# part of the payload as the .java files beside them: `*.xml` above hid them
+# from every clone, so the module existed on the developer's disk and nowhere
+# else and the Android tree tests failed on CI (the same failure mode as the
+# report template: see `phantom/data/templates` above).
+!phantom/payloads/remote/android/app/src/main/AndroidManifest.xml
+!phantom/payloads/remote/android/app/src/main/res/**/*.xml
+
 # System & temp files
 *.log
 shell.elf

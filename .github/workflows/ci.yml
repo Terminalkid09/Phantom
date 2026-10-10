@@ -76,14 +76,45 @@ jobs:
         run: |
           echo "::warning title=pytest::the unit-test step failed - see the annotations below for the failing tests"
           if [ -f /tmp/pytest.out ]; then
-            grep -E '^(FAILED|ERROR) ' /tmp/pytest.out | head -10 | while read -r line; do
+            # EVERY failure, not the first ten: a run with `--maxfail=25` was
+            # emitting ten annotations and hiding the rest, so fixing what you
+            # could see revealed another batch. The annotations are the only
+            # channel that survives without admin rights on the job log.
+            total=$(grep -cE '^(FAILED|ERROR) ' /tmp/pytest.out || true)
+            echo "::error title=pytest::${total} failing test(s) - all of them are annotated below"
+            grep -E '^(FAILED|ERROR) ' /tmp/pytest.out | head -50 | while read -r line; do
               echo "::error title=pytest::${line}"
             done
             echo "--- short summary ---"
-            sed -n '/short test summary info/,$p' /tmp/pytest.out | head -30
+            sed -n '/short test summary info/,$p' /tmp/pytest.out | head -60
           else
             echo "::error title=pytest::no pytest output captured (the step failed before running the suite)"
           fi
+
+      - name: Verify the product assets are TRACKED, not just present
+        # The failure this step exists for: `phantom/data/` used to be ignored
+        # as a whole, so the report template existed on every developer's disk
+        # and in no clone. The report tests passed locally, the unit-test step
+        # failed on CI for months, and fourteen other jobs were skipped behind
+        # it. A fresh clone is the only place that difference is visible.
+        run: |
+          tracked=$(git ls-files phantom/data/templates)
+          [ -n "$tracked" ] || {
+            echo "::error title=assets::report templates are NOT tracked in git"
+            exit 1
+          }
+          echo "tracked assets: $tracked"
+          # Same bug class, second instance: the `*.xml` document rule hid the
+          # Android module's manifest, accessibility config and res/values, so
+          # only the .java files survived a clone and the Android tree tests
+          # failed there with FileNotFoundError.
+          android_xml=$(git ls-files phantom/payloads/remote/android/app/src/main \
+            | grep '\.xml$' || true)
+          [ -n "$android_xml" ] || {
+            echo "::error title=assets::the Android module's XML (manifest / accessibility config) is NOT tracked"
+            exit 1
+          }
+          echo "tracked android xml: $android_xml"
 
       - name: Verify core module imports
         run: |
