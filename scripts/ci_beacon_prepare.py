@@ -13,6 +13,7 @@ exercises the per-beacon token path rather than the legacy one.
 """
 import argparse
 import os
+import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -21,10 +22,37 @@ sys.path.insert(0, ROOT)
 from dotenv import load_dotenv
 load_dotenv(os.path.join(ROOT, ".env"))
 
+from phantom.utils.builder import write_build_id, write_config_encrypted
 from phantom.utils.c2_crypto import (
     write_beacon_c2_config,
     write_beacon_crypto_config,
 )
+from phantom.utils.malleable import write_malleable_config
+
+# Generated headers that carry NO endpoint data and NO secret. A clean
+# checkout has none of them, and this script is what the syntax job compiles
+# against — so "the sources include it and nothing writes it" fails at an
+# `#include` far from the cause. That is exactly what build_id.h and
+# config_encrypted.h did: the beacon could not be compiled from a fresh clone
+# at all (the smoke job failed on `config_encrypted.h: No such file`).
+NON_SECRET_HEADERS = {
+    "build_id.h": write_build_id,
+    "config_encrypted.h": write_config_encrypted,
+    "malleable_config.h": write_malleable_config,
+}
+
+
+def local_includes(payload_dir: str) -> set:
+    """Every `#include "x.h"` name the module's own sources ask for."""
+    src = os.path.join(payload_dir, "src")
+    names = set()
+    for entry in sorted(os.listdir(src)):
+        if not entry.endswith((".h", ".cpp", ".c")):
+            continue
+        with open(os.path.join(src, entry), "r", encoding="utf-8",
+                  errors="replace") as handle:
+            names.update(re.findall(r'#include\s+"([^"]+)"', handle.read()))
+    return names
 
 _STUB_IDENTITY = """#pragma once
 // CI-only throwaway identity. NOT a secret: the all-zero secret makes the
@@ -68,6 +96,13 @@ def main() -> int:
     # The C2 endpoint header too: a fresh checkout has neither, the compile
     # step includes it, and they are build artefacts wherever they exist.
     print(f"Wrote {write_beacon_c2_config(payload_dir, host=args.host, port=args.port, use_ssl=False)}")
+
+    # Every generated header THIS module's sources include, not a fixed list:
+    # the remote module needs neither of the two below, the beacon needs both.
+    needed = local_includes(payload_dir)
+    for header, writer in sorted(NON_SECRET_HEADERS.items()):
+        if header in needed:
+            print(f"Wrote {writer(payload_dir)}")
 
     if args.ci_identity:
         path = os.path.join(payload_dir, "src", "beacon_auth.h")

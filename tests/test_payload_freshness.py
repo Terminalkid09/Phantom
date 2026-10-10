@@ -36,15 +36,17 @@ def _seed_of(path) -> str:
 
 @pytest.fixture()
 def beacon_dir(tmp_path):
-    """A beacon source tree carrying the real config header."""
-    src = tmp_path / "src"
-    src.mkdir()
-    real = os.path.normpath(os.path.join(
-        os.path.dirname(B.__file__), os.pardir, "payloads", "beacon", "src",
-        "config_encrypted.h"))
-    header = src / "config_encrypted.h"
-    with open(real, encoding="utf-8") as handle:
-        header.write_text(handle.read(), encoding="utf-8")
+    """A beacon source tree carrying the REAL config header.
+
+    The header is GENERATED from the tracked template, the way a build does
+    it: it is deliberately not tracked (.gitignore, and ci_beacon_lint fails
+    if it is ever committed), so the old fixture — which copied the working
+    tree's copy — only worked where a build had already run. A clean checkout
+    got three FileNotFoundError ERRORs, and a clean checkout is the whole
+    point of CI.
+    """
+    (tmp_path / "src").mkdir()
+    B.write_config_encrypted(str(tmp_path))
     return tmp_path
 
 

