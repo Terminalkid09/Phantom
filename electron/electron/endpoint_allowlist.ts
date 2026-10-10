@@ -85,6 +85,14 @@ const RULES: readonly Rule[] = [
   { pattern: '/api/vault', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/launcher', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/config/keys', methods: ['GET'], group: 'readonly' },
+  // External tools (ExternalTools, the Settings card for `deps`): the report
+  // only READS what this machine is missing and the command that would fix it.
+  { pattern: '/api/toolchain', methods: ['GET'], group: 'readonly' },
+  // The model's proposals and reasoning journal (LlmProposals, Auto-Mode).
+  // Reading them is free: nothing runs, the queue is inert until an operator
+  // accepts, and the journal is diagnostic data about refused proposals.
+  { pattern: '/api/llm/proposals', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/llm/journal', methods: ['GET'], group: 'readonly' },
   // Identity graph (SocialGraphPanel). The graph read is pure: it rebuilds the
   // view from findings already in the session and never touches the network.
   { pattern: '/api/social/graph', methods: ['GET'], group: 'readonly' },
@@ -132,6 +140,17 @@ const RULES: readonly Rule[] = [
   // and an explicit checkbox, and it is not destructive — nothing on the
   // target or the operator's machine changes.
   { pattern: '/api/social/emails', methods: ['POST'], group: 'mutating' },
+  // Installing one external tool runs a package manager on the operator's
+  // machine: mutating AND confirm-gated, on top of the confirm=true the
+  // backend already requires. Two locks on the one door worth locking twice.
+  { pattern: '/api/toolchain', methods: ['POST'], group: 'mutating', confirm: true },
+  // accept|reject for a model proposal. `accept` EXECUTES the command (through
+  // the same gated executor as any operator command), so the route is
+  // confirm-gated in the main process as well — a second, native dialog on the
+  // action that actually runs something. `reject` shares the path and therefore
+  // shows it too: sharing the confirmation is the safe direction, since the
+  // alternative is a route that executes with no main-process dialog at all.
+  { pattern: '/api/llm/proposals', methods: ['POST'], group: 'mutating', confirm: true },
   { pattern: '/api/backend/detect', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/backend/install-tool', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/backend/config', methods: ['POST'], group: 'mutating' },
