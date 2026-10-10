@@ -274,8 +274,9 @@ static int remote_main(int argc, char** argv) {
 
 #ifdef _WIN32
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
-    int argc = 0;
-    char** argv = nullptr;
+    // No argc/argv here: the arguments are rebuilt from lpCmdLine below (a
+    // WinMain has no argv). Declaring them unused failed the CI beacon-syntax
+    // job on the Windows leg, where -Werror makes -Wunused-variable fatal.
     std::vector<std::string> args;
     args.push_back("remote.exe");
     if (lpCmdLine && strlen(lpCmdLine) > 0) {
