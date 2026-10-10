@@ -54,6 +54,12 @@ ELECTRON_SURFACES = {
               "person groups, pivots, GraphML download) + the two-step email "
               "flow (GET plan, then POST confirm=true) — the panel that makes "
               "the graph readable, which is what the CLI cannot do",
+    "deps": "SettingsPanel: the ExternalTools card lists what this machine is "
+            "missing and POSTs confirm=true for ONE tool, so the desktop has "
+            "the same provision path as `deps install`",
+    "llm": "AutoModePanel: the LlmProposals card shows the queue and the "
+           "reasoning journal (which proposal was refused, and why) and "
+           "accepts/rejects one proposal at a time through the gated route",
     "help": "CommandPalette: search across modules and commands",
     "back": "navigation: the tab switch itself",
     "exit": "navigation: closing the window",
@@ -74,14 +80,6 @@ CLI_ONLY = {
     "workspace": "GAP: same omission — the surfaces of the engagement and how "
                  "to reach them; the Sidebar IS that list, so a badge/legend "
                  "would cover it",
-    "deps": "the backend is shared (`/api/toolchain` reports the machine and "
-            "installs ONLY on an explicit confirm) but no panel consumes it "
-            "yet: SettingsPanel is where the missing-tool list and the "
-            "install button belong.",
-    "llm": "the backend is shared (`/api/llm/journal`, `/api/llm/proposals`, "
-           "POST accept/reject) and a pending proposal can only be accepted "
-           "by a human, but no panel consumes it yet: AutoModePanel is where "
-           "the proposal card and its reasoning belong.",
 }
 
 

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '@/store'
 import { useApi, useApiError } from '@/hooks/useApi'
+import ExternalTools from '@/components/ExternalTools'
 import {
   Settings, Cpu, Server, Shield, Key, Eye, EyeOff,
   RotateCw, CheckCircle2, AlertTriangle, Film, Globe
@@ -299,6 +300,11 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
             )}
           </div>
         </div>
+
+        {/* External tools: what this machine is missing and the install command
+            for THIS platform. The Electron half of `deps` — the backend asks the
+            package manager only when the request carries confirm=true. */}
+        <ExternalTools />
 
         {/* Security */}
         <div className="bg-surface-card border border-surface-border rounded-lg p-3">

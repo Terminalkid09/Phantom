@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { useStore } from '@/store'
 import { apiError, useApi } from '@/hooks/useApi'
+import LlmProposals from '@/components/LlmProposals'
 import { useSerialPoll } from '@/hooks/useSerialPoll'
 import {
   Bot, Play, Square, FileText, Plus, X, Zap,
@@ -396,6 +397,10 @@ export default function AutoModePanel() {
         </h1>
         <p className="text-xs text-text-dim mt-0.5">Autonomous kill chain — from scan to beacon injection</p>
       </div>
+
+      {/* The model's own plan, and the reason a proposal was refused: the
+          advisor never executes, so its commands wait here for a human. */}
+      <LlmProposals />
 
       <div className="flex gap-4 flex-1 min-h-0">
         {/* Left: Configuration */}
