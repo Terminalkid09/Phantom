@@ -12,7 +12,6 @@ not act on a superseded finding.
 | [`ROADMAP.md`](ROADMAP.md) | Consolidated work roadmap. Where it disagrees with an older review, the roadmap (and `master_review.md`) is authoritative. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Notable changes per release. |
 | [`beacon_platform_matrix.md`](beacon_platform_matrix.md) | Which beacon features actually build/run per platform. |
-| [`THIRD_PARTY_REPOS.md`](THIRD_PARTY_REPOS.md) | Licence policy: which upstream repositories may be linked, which only re-implemented, and why. Enforced by `tests/test_third_party_repo_policy.py`. |
 | [`CROSS_PLATFORM_BUILD_STATUS.md`](CROSS_PLATFORM_BUILD_STATUS.md) | Current cross-platform build status of the C++ beacon. |
 
 ## Audits & reviews (historical, dated)

@@ -1,36 +1,31 @@
-"""The four upstream repositories from the last review are NOT dependencies.
+"""No third-party repository "we took an idea from" may become a dependency.
 
 Phantom is MIT (see `LICENSE`). Linking a GPL-2.0 (stegseek), a GPL-3.0
 (Osintgram) or an UNLICENSED (WhatsApp-OSINT) body of code into it would
 relicense the project, and a line in `requirements.txt` is a link in every
 sense that matters: the code ships inside the operator's working copy and in
-every build produced from it. Only Apache-2.0 (Caldera) is absorbable at all,
-and even that one is re-implemented rather than vendored.
+every build produced from it, under Phantom's name.
 
-So the rule this file enforces is a LICENCE rule, not a style rule. It is also
-why `docs/THIRD_PARTY_REPOS.md` exists: a future change that wants one of these
-in-process has to edit this list AND that document in the same PR, which is
-precisely the moment a reviewer should be looking at it.
+What Phantom takes from upstream projects is IDEAS, re-implemented here in our
+own code: the camouflage that keeps automated traffic from looking automated,
+the social-engineering technique, the delivery trick. None of that needs the
+upstream source, and none of it may drag the upstream licence in. The rule
+below is therefore a LICENCE rule, not a style rule, and it is enforced rather
+than documented: if a future change wants one of these in-process, it has to
+change this list on purpose, in a commit a reviewer can see.
 """
 import pathlib
 import re
-from dataclasses import dataclass
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MANIFESTS = ("requirements.txt", "requirements-dev.txt", "setup.py")
-POLICY_DOC = ROOT / "docs" / "THIRD_PARTY_REPOS.md"
-DOCS_INDEX = ROOT / "docs" / "README.md"
 
 
-@dataclass(frozen=True)
 class Repo:
-    slug: str
-    license: str
-    verdict: str
-
-    @property
-    def owner(self) -> str:
-        return self.slug.split("/")[0]
+    def __init__(self, slug: str, license: str, note: str) -> None:
+        self.slug = slug
+        self.license = license
+        self.note = note
 
     @property
     def name(self) -> str:
@@ -43,10 +38,15 @@ class Repo:
 
 
 REPOS = (
-    Repo("apache/caldera", "Apache-2.0", "absorbable-technique-only"),
-    Repo("RickdeJager/stegseek", "GPL-2.0", "external-process-only"),
-    Repo("Datalux/Osintgram", "GPL-3.0", "external-process-only"),
-    Repo("kinghacker0/WhatsApp-OSINT", "no LICENSE file", "rejected"),
+    Repo("apache/caldera", "Apache-2.0",
+         "absorbable in licence terms only — the ideas are re-implemented, "
+         "nothing is vendored"),
+    Repo("RickdeJager/stegseek", "GPL-2.0",
+         "an external process at most, never linked"),
+    Repo("Datalux/Osintgram", "GPL-3.0",
+         "the technique is re-implemented on our own client, the code is not"),
+    Repo("kinghacker0/WhatsApp-OSINT", "no LICENSE file",
+         "unlicensed code has no terms we can accept"),
 )
 
 # Every spelling a manifest or an import could carry. Note the deliberate
@@ -74,9 +74,9 @@ def test_no_dependency_manifest_names_one_of_them():
             for token in _TOKENS[repo.slug]:
                 assert token not in text, (
                     f"{manifest} names {token!r}, but {repo.slug} is "
-                    f"{repo.license} ({repo.verdict}) and cannot become a "
-                    f"dependency of an MIT project — see "
-                    f"docs/THIRD_PARTY_REPOS.md")
+                    f"{repo.license} ({repo.note}) and cannot become a "
+                    f"dependency of an MIT project — re-implement the idea "
+                    f"instead of linking the code")
 
 
 def test_phantom_never_imports_them():
@@ -112,13 +112,3 @@ def test_no_vendored_copy_lives_in_the_tree():
     for repo in REPOS:
         assert not (ROOT / "phantom" / "vendor" / repo.name.lower()).exists()
         assert not (ROOT / "vendor" / repo.name.lower()).exists()
-
-
-def test_the_decision_is_recorded_where_a_reviewer_looks():
-    assert POLICY_DOC.is_file(), POLICY_DOC
-    text = POLICY_DOC.read_text(encoding="utf-8")
-    for repo in REPOS:
-        assert repo.slug in text, repo.slug
-        assert repo.verdict in text, repo.verdict
-    assert POLICY_DOC.name in DOCS_INDEX.read_text(encoding="utf-8"), (
-        "docs/README.md requires a new top-level doc to be listed there")
