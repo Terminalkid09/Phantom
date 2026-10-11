@@ -190,21 +190,32 @@ class TestHidCommand:
         content, _ = self._run("pico 'whoami' --target linux", tmp_path)
         assert "usb_hid" in content and "layout.write('whoami')" in content
 
-    def test_the_stager_flag_builds_the_real_dropper(self, tmp_path):
+    def test_the_stager_flag_types_a_short_fetcher_by_default(self, tmp_path):
         content, notifier = self._run(
             "flipper --stager linux --target linux", tmp_path)
-        assert "STRING echo " in content
-        # the resilient POSIX stager is what gets typed, and it carries the
-        # C2 endpoint inside its own retry script (option C, 8.1)
+        assert "STRING " in content
+        # HID default is DOWNLOAD: the board types a ~300-char fetcher and the
+        # C2 serves the beacon. The 11.4k inline one-liner is opt-in — the
+        # LENGTH is the cost on this channel, and only on this channel.
+        assert "/api/v1/payload_linux" in content
+        assert "base64 -d | sh" not in content
+
+    def test_the_inline_stager_is_still_available(self, tmp_path):
+        content, notifier = self._run(
+            "flipper --stager linux --target linux --stager-mode inline",
+            tmp_path)
+        # the resilient POSIX stager, carrying the C2 endpoint inside its own
+        # retry script (option C, 8.1) — what `--stager` used to do for HID
         assert "base64 -d | sh" in content
 
-    def test_the_arduino_stager_is_resilient_and_fits_the_board(self,
-                                                                tmp_path):
+    def test_the_arduino_download_stager_is_resilient_and_fits_the_board(
+            self, tmp_path):
         content, _ = self._run(
             "arduino --stager linux --target linux", tmp_path)
-        # the short resilient POSIX stager, typed by the board: it retries on
-        # its own if the C2 is down when the board is plugged in
-        assert "base64 -d | sh" in content
+        # the download stager retries CLIENT-side (a curl loop), so a C2 that
+        # is cold when the board is plugged in is not a lost payload — and
+        # nothing was scheduled on the host to achieve it
+        assert "while ! curl" in content
         assert '#include <Keyboard.h>' in content
 
     def test_a_stager_target_mismatch_is_refused_before_writing(self,

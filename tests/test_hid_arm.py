@@ -102,3 +102,45 @@ class TestArmingIsArduinoSpecific:
         assert "--arm" in joined
         assert "--arm-pin" in joined
         assert "GND" in joined
+
+
+class TestTheArmFlagsOnTheCommandLine:
+    """The CLI half of the same control: `--arm` and `--arm-pin` have to
+    reach the sketch, and a bad pin must be refused rather than guessed."""
+
+    def _sketch(self, arg, tmp_path):
+        import os
+        from unittest import mock
+
+        from phantom.modules.payload import PayloadModule
+        out = os.path.join(str(tmp_path), "arm", "arm.ino")
+        with mock.patch("phantom.modules.payload.notifier") as note:
+            PayloadModule().do_hid(f"{arg} --out {out}")
+        if not os.path.isfile(out):
+            return None, note
+        with open(out, encoding="utf-8") as handle:
+            return handle.read(), note
+
+    @staticmethod
+    def _errors(note):
+        return " ".join(str(c) for c in note.error.call_args_list)
+
+    def test_arm_reaches_the_sketch(self, tmp_path):
+        body, _ = self._sketch("arduino whoami --arm", tmp_path)
+        assert body is not None
+        assert body.count("waitPress();") == 2
+
+    def test_arm_pin_reaches_the_sketch(self, tmp_path):
+        body, _ = self._sketch("arduino whoami --arm --arm-pin 3", tmp_path)
+        assert body is not None
+        assert "static const uint8_t ARM_PIN = 3;" in body
+
+    def test_a_non_numeric_pin_is_refused(self, tmp_path):
+        body, note = self._sketch("arduino whoami --arm --arm-pin", tmp_path)
+        assert "--arm-pin wants a pin number" in self._errors(note)
+
+    def test_the_help_documents_the_safety_meaning(self, tmp_path):
+        from phantom.modules.payload import PayloadModule
+        doc = PayloadModule().do_hid.__doc__
+        assert "--arm-pin" in doc and "--arm " in doc
+        assert "before the board types" in doc

