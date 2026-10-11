@@ -33,6 +33,42 @@ Android-specific details:
 
 Anti-analysis is compiled in unless `DISABLE_ANTI` is defined at build time.
 
+## Advanced arsenal (collection / action)
+
+The table above is anti-analysis. The collection and action capabilities have
+their own per-OS paths, and — contrary to a common misreading of the
+``#ifdef _WIN32`` at the top of each header (that is only the **include**
+block, not a whole-file guard) — **none of them is Windows-only**. Every one
+keeps a real non-Windows branch, and `tests/test_beacon_arsenal_parity.py` pins
+that so this contract cannot silently regress.
+
+| Capability (command) | Windows | Linux | Android | macOS |
+|---|---|---|---|---|
+| Screenshot (`screenshot`) | GDI `BitBlt` → BMP | Wayland-first: `grim` / `gnome-screenshot` / `spectacle` → `scrot` / `import` / `xwd` (X11) → `screencap` | `screencap -p` | POSIX branch (Linux tools — degrades) |
+| Screen record (`screen-record*`) | GDI frames; ffmpeg `gdigrab` | ffmpeg `x11grab` (X11) | `screenrecord` (passive fallback) | POSIX branch (ffmpeg) |
+| Camera (`camera`) | Media Foundation; WIA via PowerShell | `fswebcam` / ffmpeg `v4l2` | `am … IMAGE_CAPTURE`; `v4l2-ctl` | POSIX branch (degrades) |
+| Audio (`audio`) | WASAPI (raw COM) | `arecord` / `ffmpeg` alsa / `rec` | `termux-microphone-recorder` / `arecord` | POSIX branch (Linux tools) |
+| GPS (`gps`) | WinRT Geolocator | gpsd `gpspipe`, `/dev/gps0`, `nmcli` | `dumpsys location` | POSIX branch (degrades) |
+| netstat (`netstat`) | iphlpapi `GetExtendedTcpTable` | `/proc/net/tcp` (+ `/proc/*/fd`) | `/proc/net/tcp` | no `/proc` → empty |
+| Cookies (`cookies`) | DPAPI + browser profile files | OpenSSL `EVP` over Chromium/Firefox profiles | not covered | not covered |
+| WLAN (`wlan-scan` / `wlan-locate`) | Native WLAN API | `nmcli` (NetworkManager; no root) → `iw` / `iwlist` (root or CAP_NET_ADMIN) | `iw`/`iwlist` when present | same POSIX path |
+| Bluetooth (`bt-scan`) | native | `hcitool` / `bluetoothctl` | when present | same POSIX path |
+| Browser pivot (`browser-pivot`) | Toolhelp32 PID + TCP relay | `find_browser_pid()` over `/proc/*/comm` + relay | same | `/proc` absent → pass a PID |
+| CDP (`cdp-*`) | `CreateProcess(chrome.exe)` + websocket | `google-chrome --remote-debugging-port` + BSD sockets | same POSIX path | same POSIX path |
+| SOCKS5 (`socks`) / forward (`portfwd`) | WinSock | BSD sockets | BSD sockets | BSD sockets (built under macOS `-Werror`) |
+
+Real caveats (not cosmetic):
+
+- The POSIX branches are **Linux-first**. Several shell out to X11 tools
+  (`import`, `xwd`, `x11grab`) or Linux-only sources (`/proc`, `iw`). macOS runs
+  the same POSIX path and therefore **degrades** on the media/netstat
+  capabilities — macOS has no dedicated branch, which is the accepted posture.
+- Android is Linux without the desktop tools: the media paths try the Android
+  binaries (`screencap`, `screenrecord`, `dumpsys`, `am`, `v4l2-ctl`) first,
+  and cookies/CDP have no dedicated Android path.
+- `smb.h` (SMB named-pipe lateral movement) is Windows-only on purpose and is
+  in the accepted list below, not here.
+
 ## Deliberately Windows-only (accepted, no POSIX analogue)
 
 These are NT-specific mechanisms and are **accepted as Windows-only**: on POSIX

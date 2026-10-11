@@ -8,6 +8,8 @@ into creds findings.
 from __future__ import annotations
 
 from phantom.automation.guidance.kit import (  # noqa: F401
+    _brute_rdp_interp as parse_brute_rdp,
+    _brute_smb_interp as parse_brute_smb,
     _brute_ssh_interp as parse_brute,
     _web_creds_interp as parse_web_creds,
 )

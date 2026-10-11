@@ -78,6 +78,16 @@ DEFAULT_CREDENTIALS: Dict[str, List[Tuple[str, str]]] = {
         ("user",          "user"),
         ("vagrant",       "vagrant"),
     ],
+    # RDP accounts are Windows accounts: the same shape as the SMB set, kept
+    # separate so a future RDP-only wordlist does not silently change SMB.
+    "rdp": [
+        ("Administrator", "Administrator"),
+        ("Administrator", "password"),
+        ("Administrator", ""),
+        ("admin",         "admin"),
+        ("user",          "user"),
+        ("vagrant",       "vagrant"),
+    ],
     "ftp": [
         ("anonymous", "anonymous"),
         ("ftp",       "ftp"),

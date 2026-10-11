@@ -36,8 +36,9 @@ class ScanModule(BaseModule):
     def build_commands(self) -> dict:
         """Return the command groups for network scanning (static + state)."""
         from phantom.utils.paths import scan_xml_path, sessions_dir
+        from phantom.modules.suggest import target_host
 
-        t = session.target
+        t = target_host()
         if not t:
             return {}
 

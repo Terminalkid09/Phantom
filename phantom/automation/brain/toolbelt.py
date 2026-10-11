@@ -133,6 +133,17 @@ _TOOL_CATALOG: Dict[str, List[ToolOption]] = {
         ToolOption("hydra", rank=30, requires_service=("ssh",)),
         ToolOption("medusa", rank=60, requires_service=("ssh",)),
     ],
+    "brute_smb": [
+        ToolOption("hydra", rank=30,
+                   requires_service=("microsoft-ds", "netbios-ssn", "smb")),
+        ToolOption("medusa", rank=60,
+                   requires_service=("microsoft-ds", "netbios-ssn", "smb")),
+    ],
+    "brute_rdp": [
+        ToolOption("hydra", rank=30, requires_service=("ms-wbt-server", "rdp")),
+        ToolOption("medusa", rank=60,
+                   requires_service=("ms-wbt-server", "rdp")),
+    ],
 }
 
 # capabilities whose options must be re-resolved per run profile

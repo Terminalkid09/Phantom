@@ -11,8 +11,7 @@ not act on a superseded finding.
 | [`Phantom.md`](Phantom.md) | Project specification / reference model. |
 | [`ROADMAP.md`](ROADMAP.md) | Consolidated work roadmap. Where it disagrees with an older review, the roadmap (and `master_review.md`) is authoritative. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Notable changes per release. |
-| [`beacon_platform_matrix.md`](beacon_platform_matrix.md) | Which beacon features actually build/run per platform. |
-| [`CROSS_PLATFORM_BUILD_STATUS.md`](CROSS_PLATFORM_BUILD_STATUS.md) | Current cross-platform build status of the C++ beacon. |
+| [`beacon_platform_matrix.md`](beacon_platform_matrix.md) | Which beacon features actually build/run per platform (the live contract). |
 
 ## Audits & reviews (historical, dated)
 
@@ -26,6 +25,10 @@ roadmap or the code before treating a finding as still open.
 | [`master_review.md`](master_review.md) | Master review handoff (authoritative where reviews disagree). | — |
 | [`REVIEW.md`](REVIEW.md) | Code review & analysis. | 2026-05-05 |
 | [`manus.md`](manus.md) | Deep technical analysis + AutoMode redesign. | — |
+| [`ManusReview.md`](ManusReview.md) | Independent review: architecture, C2, AutoMode, gaps. | — |
+| [`ManusOpenCode.md`](ManusOpenCode.md) | AutoMode/handoff redesign proposal. | — |
+| [`AutoModeBrief.md`](AutoModeBrief.md) | AutoMode + tool-discovery brief. Its P0/P1 items are now IMPLEMENTED in `phantom/automation/` — read it as the design intent, and check the code/roadmap for current status, not as an open-work list. | 2026-10-05 |
+| [`CROSS_PLATFORM_BUILD_STATUS.md`](CROSS_PLATFORM_BUILD_STATUS.md) | Early cross-platform beacon build snapshot ("166 tests"); superseded by `beacon_platform_matrix.md` and the CI beacon jobs. | — |
 
 ## Verification / test reports (historical)
 

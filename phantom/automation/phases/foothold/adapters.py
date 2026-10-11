@@ -8,6 +8,8 @@ as the recon facade).
 from __future__ import annotations
 
 from phantom.automation.guidance.kit import (  # noqa: F401
+    _brute_rdp_adapter as brute_rdp,
+    _brute_smb_adapter as brute_smb,
     _brute_ssh_adapter as brute_ssh,
     _ssh_login_adapter as ssh_login,
     _web_creds_adapter as web_creds,

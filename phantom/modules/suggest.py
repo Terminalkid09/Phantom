@@ -8,8 +8,30 @@ session (target, open services, fingerprints, prior module results) so the
 """
 
 import re
+from urllib.parse import urlsplit
 
 from phantom.core.session import session
+
+
+def target_host() -> str:
+    """The HOST to build commands against, out of ``session.target``.
+
+    ``session.target`` may be a bare IP, a domain, or a full URL
+    (``https://host:port/path``). The command templates below interpolate it
+    as a HOST, so a URL used to yield
+    ``curl -sI http://https://host:port/path:port`` and ``amass enum -d https:``
+    — commands that cannot run, shown to the operator as if they could. Strip
+    the scheme/path/port to the host HERE, once, for every generator.
+    """
+    t = (session.target or "").strip()
+    if "://" not in t and "/" not in t:
+        return t
+    probe = t if "://" in t else "//" + t
+    try:
+        parts = urlsplit(probe)
+    except ValueError:
+        return t.split("/")[0]
+    return parts.hostname or t.split("/")[0]
 
 _OPEN_PORT_RE = re.compile(
     r"(\d+)/(tcp|udp)[ \t]+open[ \t]+([\w\-\./]+)[ \t]*(.*)")
@@ -155,7 +177,7 @@ def session_services() -> list:
 def service_suggestion_group(services=None) -> dict:
     """Targeted enumeration commands for the services already known open."""
     services = session_services() if services is None else services
-    t = session.target
+    t = target_host()
     if not t or not services:
         return {}
     groups = {}
@@ -200,7 +222,7 @@ def probe_suggestion_group(services=None) -> dict:
     known is wasted noise).
     """
     services = session_services() if services is None else services
-    t = session.target
+    t = target_host()
     if not t:
         return {}
     from phantom.automation.exploit.modules import module_registry
@@ -369,7 +391,7 @@ def first_steps_suggestion_group() -> dict:
     when services are already known, the follow-up group deepens the
     fingerprint (OS, UDP top ports, service scripts on the open ports).
     """
-    t = session.target
+    t = target_host()
     if not t:
         return {}
     services = session_services()
@@ -454,7 +476,7 @@ def osint_suggestion_group() -> dict:
                 f"breach-check {' '.join(str(e) for e in emails[:5])}",
             ]
     elif tt in ("domain", "url"):
-        d = t.split("/")[0] if "://" in t else t
+        d = target_host()
         groups["SUGGESTED (Domain)"] = [
             f"curl -s 'https://crt.sh/?q=%25.{d}&output=json' | jq '.[].name_value' | sort -u",
             f"amass enum -d {d} -passive",

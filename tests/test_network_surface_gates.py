@@ -139,11 +139,17 @@ class TestBruteSshIsPlannable(unittest.TestCase):
     the brute is exactly the intended move.
     """
 
-    def test_brute_ssh_is_the_last_creds_source(self):
+    def test_the_brute_group_is_the_floor_of_the_creds_sources(self):
         from phantom.automation.planner import _FACT_SOURCES
-        self.assertIn("brute_ssh", _FACT_SOURCES["creds"])
-        # quiet/derived sources rank first; the loud brute is the floor
-        self.assertEqual(_FACT_SOURCES["creds"][-1], "brute_ssh")
+        creds = _FACT_SOURCES["creds"]
+        # quiet/derived sources rank first; the LOUD brutes are the floor.
+        # SMB/RDP joined brute_ssh so a Windows box whose only surface is
+        # SMB/RDP (no web, no ssh) is plannable at all — it used to have NO
+        # creds source and the planner produced no plan.
+        brutes = [c for c in creds if c.startswith("brute_")]
+        self.assertEqual(brutes, ["brute_ssh", "brute_smb", "brute_rdp"])
+        self.assertEqual(creds[len(creds) - len(brutes):], brutes)
+        self.assertLess(creds.index("web_creds"), creds.index("brute_ssh"))
 
     def test_brute_ssh_viable_only_with_ssh_service(self):
         cap = make_registry().get("brute_ssh")
@@ -153,6 +159,22 @@ class TestBruteSshIsPlannable(unittest.TestCase):
         _add_service(no_ssh_wm, 445, "microsoft-ds")
         self.assertTrue(Planner._precondition_viable(cap, ssh_wm))
         self.assertFalse(Planner._precondition_viable(cap, no_ssh_wm))
+
+    def test_brute_smb_and_rdp_viable_only_with_their_service(self):
+        # SMB answers as microsoft-ds (445) or netbios-ssn (139); RDP as
+        # ms-wbt-server (3389). Each gate must be satisfied by its OWN
+        # surface and refused on a host that does not expose it.
+        cases = {"brute_smb": (445, "microsoft-ds"),
+                 "brute_rdp": (3389, "ms-wbt-server")}
+        for cap_id, (port, svc) in cases.items():
+            cap = make_registry().get(cap_id)
+            self.assertIsNotNone(cap, cap_id)
+            yes = WorldModel(target="10.0.0.1", target_type="ip")
+            _add_service(yes, port, svc)
+            no = WorldModel(target="10.0.0.2", target_type="ip")
+            _add_service(no, 22, "ssh")
+            self.assertTrue(Planner._precondition_viable(cap, yes), cap_id)
+            self.assertFalse(Planner._precondition_viable(cap, no), cap_id)
 
 
 if __name__ == "__main__":

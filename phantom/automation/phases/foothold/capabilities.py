@@ -10,6 +10,8 @@ from typing import List
 
 FOOTHOLD_CAPABILITY_IDS = (
     "brute_ssh",
+    "brute_smb",
+    "brute_rdp",
     "cred_spray",
     "ssh_login",
     "web_creds",

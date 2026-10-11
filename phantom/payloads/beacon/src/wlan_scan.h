@@ -341,7 +341,53 @@ inline std::vector<AccessPoint> scan_access_points() {
 
 #else // Linux / macOS
 
+// NetworkManager path: present on virtually every desktop distro, needs no
+// interface name and no root for a cached scan, and — unlike iw/iwlist, which
+// are increasingly NOT installed — is the modern default. Terse mode escapes a
+// ':' inside a field as '\:' and a backslash as '\\', so the split below must
+// honour the escape instead of naively splitting on every ':'.
+inline std::vector<AccessPoint> scan_access_points_nmcli() {
+    std::vector<AccessPoint> results;
+    FILE* fp = popen("nmcli -t -f BSSID,SSID,CHAN,SIGNAL dev wifi list 2>/dev/null", "r");
+    if (!fp) return results;
+
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        std::string l(line);
+        while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+        if (l.empty()) continue;
+
+        // split on UNESCAPED ':' into BSSID, SSID, CHAN, SIGNAL
+        std::vector<std::string> fields;
+        std::string cur;
+        bool esc = false;
+        for (char c : l) {
+            if (esc) { cur.push_back(c); esc = false; continue; }
+            if (c == '\\') { esc = true; continue; }
+            if (c == ':') { fields.push_back(cur); cur.clear(); continue; }
+            cur.push_back(c);
+        }
+        fields.push_back(cur);
+        if (fields.size() < 4 || fields[0].empty()) continue;
+
+        AccessPoint ap;
+        ap.bssid = fields[0];
+        ap.ssid = fields[1];
+        ap.channel = atoi(fields[2].c_str());
+        int signal = atoi(fields[3].c_str());   // nmcli reports 0..100 %
+        ap.rssi = (signal / 2) - 100;            // dBm approximation
+        results.push_back(ap);
+    }
+    pclose(fp);
+    return results;
+}
+
 inline std::vector<AccessPoint> scan_access_points() {
+    // NetworkManager first: it is the path most likely to exist AND to answer
+    // without CAP_NET_ADMIN, so the old iw/iwlist route is now the fallback.
+    std::vector<AccessPoint> via_nm = scan_access_points_nmcli();
+    if (!via_nm.empty()) return via_nm;
+
     std::vector<AccessPoint> results;
 
     // Try iw first (modern), then iwlist (legacy)

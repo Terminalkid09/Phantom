@@ -56,6 +56,24 @@ def _has_service_kind(kind_service: str, service_name: str):
     return _requires_service
 
 
+def _has_any_service(labels, requires: str):
+    """Like `_has_service_kind`, but the footprint may label the SAME service
+    in more than one way: nmap calls SMB ``microsoft-ds`` (445) or
+    ``netbios-ssn`` (139), and RDP ``ms-wbt-server``. One gate must cover all
+    of them, with the same planner-visible ``_phantom_requires_service``.
+    """
+    wanted = {str(l).lower() for l in labels}
+
+    def _requires_service(wm: WorldModel) -> bool:
+        for finding in wm.find("service"):
+            value = finding.value if isinstance(finding.value, dict) else {}
+            if str(value.get("service", "")).lower() in wanted:
+                return True
+        return False
+    _requires_service._phantom_requires_service = requires
+    return _requires_service
+
+
 _WEB_PORTS = {80, 443, 8080, 8081, 8443, 8000, 8888, 3000, 5000, 9090}
 
 
@@ -1295,6 +1313,20 @@ def _service_port(wm, service: str, default: int = 22) -> int:
     return default
 
 
+def _service_port_any(wm, names, default: int) -> int:
+    """`_service_port` for a service the scanner may label in several ways
+    (SMB ``microsoft-ds``/``netbios-ssn``, RDP ``ms-wbt-server``)."""
+    wanted = {str(n).lower() for n in names}
+    for finding in wm.find("service"):
+        value = finding.value if isinstance(finding.value, dict) else {}
+        if str(value.get("service", "")).lower() in wanted:
+            try:
+                return int(value.get("port"))
+            except (TypeError, ValueError):
+                pass
+    return default
+
+
 def _version_adapter(wm, slots):
     port = slots.get("port")
     tool = _chosen_tool(wm, "version_detect", "nmap")
@@ -1598,63 +1630,95 @@ def _web_creds_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> Lis
     return findings
 
 
-def _brute_ssh_adapter(wm, slots):
-    """Adapter: online SSH brute force with the toolbelt's chosen cracker
-    (hydra > medusa). Wordlists = default credential set + operator
-    custom lists; -f/-f stop-on-first-hit keeps the noise bounded."""
+def _brute_words(service: str) -> tuple:
+    """(users, passwords) for an online brute: the built-in default set for
+    the service plus any operator wordlists, de-duplicated in order."""
     from phantom.utils.rce_deployer import DEFAULT_CREDENTIALS
-    import tempfile
-    tool = _chosen_tool(wm, "brute_ssh", "hydra")
-    host = _effective_target(wm)
-    port = _service_port(wm, "ssh")
     users: List[str] = []
     passwords: List[str] = []
-    for u, p in DEFAULT_CREDENTIALS.get("ssh", []):
+    for u, p in DEFAULT_CREDENTIALS.get(service, []):
         if u not in users:
             users.append(u)
         if p and p not in passwords:
             passwords.append(p)
     try:
         from phantom.automation.exploit.vectors import load_custom_wordlists
-        extra_u, extra_p = load_custom_wordlists("ssh")
+        extra_u, extra_p = load_custom_wordlists(service)
         users.extend(u for u in extra_u if u not in users)
         passwords.extend(p for p in extra_p if p not in passwords)
     except Exception:
         pass
-    if not users or not passwords:
-        return "# brute_ssh: empty wordlists (no defaults, no custom lists)"
-    tmp = tempfile.mkdtemp(prefix="phantom_brute_")
+    return users, passwords
+
+
+def _brute_wordlist_files(users: List[str], passwords: List[str],
+                          tag: str) -> tuple:
+    """Write the user/pass files a cracker reads and return (users, pass)."""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix=f"phantom_brute_{tag}_")
     uf = os.path.join(tmp, "users.txt")
     pf = os.path.join(tmp, "pass.txt")
     with open(uf, "w", encoding="utf-8") as fh:
         fh.write("\n".join(users) + "\n")
     with open(pf, "w", encoding="utf-8") as fh:
         fh.write("\n".join(passwords) + "\n")
+    return uf, pf
+
+
+def _brute_adapter(wm, capability: str, service: str, medusa_module: str,
+                   hydra_url: str, port: int):
+    """One online brute adapter for every protocol.
+
+    Windows boxes answer on SMB/RDP and nothing else — no ssh, no web — so
+    `brute_ssh` alone left those hosts with NO creds source and the planner
+    with no plan at all. Same bounded shape for all of them: default
+    credential set + operator wordlists, `-f` stop-on-first-hit.
+    """
+    tool = _chosen_tool(wm, capability, "hydra")
+    host = _effective_target(wm)
+    users, passwords = _brute_words(service)
+    if not users or not passwords:
+        return f"# {capability}: empty wordlists (no defaults, no custom lists)"
+    uf, pf = _brute_wordlist_files(users, passwords, capability)
     if tool == "medusa":
-        return f"medusa -h {host} -n {port} -M ssh -U {uf} -P {pf} -t 4 -f"
-    return f"hydra -L {uf} -P {pf} -t 4 -W 3 -f -s {port} ssh://{host}:{port}"
+        return f"medusa -h {host} -n {port} -M {medusa_module} -U {uf} -P {pf} -t 4 -f"
+    return f"hydra -L {uf} -P {pf} -t 4 -W 3 -f -s {port} {hydra_url.format(host=host, port=port)}"
 
 
-def _brute_ssh_interp(output: str, wm: WorldModel,
-                      slots: Dict[str, Any]) -> List[Finding]:
-    """Interpreter: parse hydra ('login: x password: y') and medusa
-    ('[SUCCESS] ... User: x, Password: y') success lines into creds."""
+def _brute_ssh_adapter(wm, slots):
+    """Adapter: online SSH brute force with the toolbelt's chosen cracker
+    (hydra > medusa). Bounded via `-f` stop-on-first-hit."""
+    return _brute_adapter(wm, "brute_ssh", "ssh", "ssh",
+                          "ssh://{host}:{port}", _service_port(wm, "ssh"))
+
+
+def _brute_smb_adapter(wm, slots):
+    """Adapter: online SMB brute force (hydra > medusa)."""
+    port = _service_port_any(wm, ("microsoft-ds", "netbios-ssn", "smb"), 445)
+    return _brute_adapter(wm, "brute_smb", "smb", "smbnt",
+                          "smb://{host}", port)
+
+
+def _brute_rdp_adapter(wm, slots):
+    """Adapter: online RDP brute force (hydra > medusa)."""
+    port = _service_port_any(wm, ("ms-wbt-server", "rdp"), 3389)
+    return _brute_adapter(wm, "brute_rdp", "rdp", "rdp",
+                          "rdp://{host}", port)
+
+
+def _parse_brute_creds(output: str, wm: WorldModel, *, service: str,
+                       key_prefix: str, source: str, port: int) -> List[Finding]:
+    """Parse hydra ('login: x password: y') and medusa ('[SUCCESS] ...
+    User: x, Password: y') success lines into creds findings."""
     findings: List[Finding] = []
-    port = _service_port(wm, "ssh")
     for line in output.splitlines():
+        user = pw = ""
         if "login:" in line and "password:" in line:
             try:
                 user = line.split("login:")[1].split()[0].strip()
                 pw = line.split("password:")[1].split()[0].strip()
             except (IndexError, ValueError):
                 continue
-            if user and pw:
-                findings.append(Finding(
-                    kind="creds", key=f"ssh:{user}",
-                    value={"username": user, "password": pw,
-                           "service": "ssh", "valid": True,
-                           "method": "online_brute", "port": port},
-                    confidence=0.85, source="brute_ssh", target=wm.target))
         elif "[SUCCESS]" in line and "User:" in line and "Password:" in line:
             try:
                 mu = re.search(r"User:\s*([^\s,()]+)", line)
@@ -1663,14 +1727,35 @@ def _brute_ssh_interp(output: str, wm: WorldModel,
                 pw = mp.group(1).strip() if mp else ""
             except (IndexError, ValueError):
                 continue
-            if user and pw:
-                findings.append(Finding(
-                    kind="creds", key=f"ssh:{user}",
-                    value={"username": user, "password": pw,
-                           "service": "ssh", "valid": True,
-                           "method": "online_brute", "port": port},
-                    confidence=0.85, source="brute_ssh", target=wm.target))
+        if not user or not pw:
+            continue
+        findings.append(Finding(
+            kind="creds", key=f"{key_prefix}:{user}",
+            value={"username": user, "password": pw, "service": service,
+                   "valid": True, "method": "online_brute", "port": port},
+            confidence=0.85, source=source, target=wm.target))
     return findings
+
+
+def _brute_ssh_interp(output: str, wm: WorldModel,
+                      slots: Dict[str, Any]) -> List[Finding]:
+    return _parse_brute_creds(output, wm, service="ssh", key_prefix="ssh",
+                              source="brute_ssh",
+                              port=_service_port(wm, "ssh"))
+
+
+def _brute_smb_interp(output: str, wm: WorldModel,
+                      slots: Dict[str, Any]) -> List[Finding]:
+    return _parse_brute_creds(
+        output, wm, service="smb", key_prefix="smb", source="brute_smb",
+        port=_service_port_any(wm, ("microsoft-ds", "netbios-ssn", "smb"), 445))
+
+
+def _brute_rdp_interp(output: str, wm: WorldModel,
+                      slots: Dict[str, Any]) -> List[Finding]:
+    return _parse_brute_creds(
+        output, wm, service="rdp", key_prefix="rdp", source="brute_rdp",
+        port=_service_port_any(wm, ("ms-wbt-server", "rdp"), 3389))
 
 
 def _cred_spray_adapter(wm, slots):
@@ -3805,6 +3890,31 @@ CAPABILITIES = [
         timeout=300, forceful=True,
         preconditions=[_has_service_kind("service", "ssh"), _has_network_host()],
         banner="ssh brute", tools=["hydra", "medusa"]),
+
+    _mk("brute_smb", "brute",
+        "Online SMB brute force with the toolbelt's cracker (hydra > medusa): "
+        "default-credential set + operator wordlists, stop-on-first-hit. The "
+        "creds source a Windows box whose ONLY surface is SMB (no web, no "
+        "ssh) needs. Hard-gated behind --aggressive (noisy)",
+        [], ["creds"], _brute_smb_adapter, _brute_smb_interp,
+        opsec_cost=2.2, detection_risk=0.7, stealth_level="aggressive",
+        timeout=300, forceful=True,
+        preconditions=[_has_any_service(("microsoft-ds", "netbios-ssn", "smb"),
+                                        "smb"),
+                       _has_network_host()],
+        banner="smb brute", tools=["hydra", "medusa"]),
+
+    _mk("brute_rdp", "brute",
+        "Online RDP brute force with the toolbelt's cracker (hydra > medusa): "
+        "default-credential set + operator wordlists, stop-on-first-hit. RDP "
+        "is a Windows surface with no other creds source. Hard-gated behind "
+        "--aggressive (noisy)",
+        [], ["creds"], _brute_rdp_adapter, _brute_rdp_interp,
+        opsec_cost=2.4, detection_risk=0.75, stealth_level="aggressive",
+        timeout=300, forceful=True,
+        preconditions=[_has_any_service(("ms-wbt-server", "rdp"), "rdp"),
+                       _has_network_host()],
+        banner="rdp brute", tools=["hydra", "medusa"]),
 
     _mk("ssh_login", "creds", "Single credential pair check over SSH",
         [_mk_slot("username", "username", True, "account"), _mk_slot("password", "password", True, "password")],

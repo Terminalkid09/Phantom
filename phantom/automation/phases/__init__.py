@@ -83,6 +83,8 @@ _CAPABILITY_PHASE: Dict[str, str] = {
     "idor_scan": "exploit",
     # foothold (ACCESS: creds + shell)
     "brute_ssh": "foothold",
+    "brute_smb": "foothold",
+    "brute_rdp": "foothold",
     "cred_spray": "foothold",
     "ssh_login": "foothold",
     "web_creds": "foothold",
