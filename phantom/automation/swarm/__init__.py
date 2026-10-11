@@ -14,15 +14,20 @@ Vocabulary (deliberately distinct from the C2 ``TypedTask`` in
   hardcoded chain: the DAG emerges from the facts.
 * :class:`Board` — the blackboard: committed WorldModels per target.
   Workers NEVER write it live; they run on a snapshot and return staged
-  findings the orchestrator commits under lock (first-writer-wins per
-  finding key). Shared reads, private scratch, mediated commit — the
-  prerequisite for two agents reasoning differently on the same task.
+  findings the orchestrator commits under lock and merges by EVIDENCE (a
+  stronger observation supersedes a weaker one; an identical repeat is
+  idempotent). This is NOT first-writer-wins: scheduling order must never
+  decide which fact is the truth (AutoModeBrief §9). Shared reads, private
+  scratch, mediated commit — the prerequisite for two agents reasoning
+  differently on the same task.
 * :func:`run_swarm` — build board + tasks, drain through one
   :class:`phantom.automation.orchestrator.Orchestrator` pool PER TARGET
   (a shared semaphore caps total workers operation-wide) with
   ready-gates, return the summary.
 """
 from __future__ import annotations
+
+from typing import List
 
 from .board import Board
 from .llm import LLMApproval, consult

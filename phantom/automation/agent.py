@@ -1310,7 +1310,6 @@ class AutonomousAgent:
             self._emit("error", capability=cap.id,
                        detail=str(res.get("reason", "worker failed"))[-200:])
             return False
-        from phantom.automation.belief import Finding
         found = []
         for item in res.get("findings", []) or []:
             try:

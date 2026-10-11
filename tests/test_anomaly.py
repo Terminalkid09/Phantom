@@ -302,10 +302,10 @@ class TestProfessionalBugClasses(unittest.TestCase):
         self.assertTrue(any(a.cls == "exposure" for a in anomalies))
 
     def test_verb_options_allow_header(self):
-        runner = _header_runner({
-            # any OPTIONS probe path
-        })
-        # custom runner that returns Allow only for OPTIONS method
+        # custom runner that returns Allow only for OPTIONS method. (The
+        # `runner` bound here IS this function: a `_header_runner({})`
+        # assignment used to sit above it and was dead on arrival — the def
+        # shadowed it before any call, which is what ruff's F811 flagged.)
         def runner(method, url, body="", timeout=8.0):
             if method == "OPTIONS":
                 return ProbeResult(200, 0, 0.05, "",
@@ -573,7 +573,7 @@ class TestAnomalyDedupe(unittest.TestCase):
         self.assertEqual(len(keys), len(set(keys)))
 
     def test_auth_bypass_landed_on_signal(self):
-        from phantom.automation.exploit.anomaly import HuntEngine, Probe
+        from phantom.automation.exploit.anomaly import HuntEngine
         eng = HuntEngine(runner=lambda *a, **k: ProbeResult())
         # successful bypass: 302 to a member page (Location read when the
         # probe does not follow redirects)
@@ -588,7 +588,7 @@ class TestAnomalyDedupe(unittest.TestCase):
         self.assertTrue(any(s.startswith("landed-on:/bank") for s in signals))
 
     def test_auth_bypass_failed_login_not_signaled(self):
-        from phantom.automation.exploit.anomaly import HuntEngine, Probe
+        from phantom.automation.exploit.anomaly import HuntEngine
         eng = HuntEngine(runner=lambda *a, **k: ProbeResult())
         probe = Probe("sqli", "post-quote", "POST", "/doLogin",
                       body="uid=x&passw=y", follow=False)

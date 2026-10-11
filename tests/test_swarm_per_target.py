@@ -85,8 +85,6 @@ class TestPerTargetPools(unittest.TestCase):
             return True
 
         def factory(sem, width):
-            from phantom.automation.orchestrator import Orchestrator
-            from phantom.automation.belief import WorldModel
             return Orchestrator(wm=WorldModel(target="swarm"), stealth=None,
                                 worker=worker, max_agents=width,
                                 global_slot=sem)

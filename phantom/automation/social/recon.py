@@ -34,7 +34,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # ── bounded constants ────────────────────────────────────────────────────────
 
@@ -875,7 +875,7 @@ def deep_recon(username: str, platform: str = "",
         for r in results[1:]:
             if r.platform == primary.platform:
                 continue
-            lead_obj = _score(primary_platform, primary_dict, {
+            lead_obj = _score(primary.platform, primary_dict, {
                 "username": r.username, "bio": r.bio,
                 "avatar_hash": r.avatar_hash,
                 "avatar_dhash": r.avatar_dhash, "link": r.link,

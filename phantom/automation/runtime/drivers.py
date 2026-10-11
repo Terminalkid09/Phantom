@@ -48,9 +48,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+
 import shlex
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:  # annotation-only: the interpreters below import Finding
+    # lazily so a driver manifest can be loaded without the belief module.
+    from phantom.automation.belief import Finding
 
 # Capability categories the agent knows how to dispatch. A driver outside
 # this set would register but never execute, so it is rejected up front.
@@ -359,7 +364,7 @@ def _parse_marker(line: str, prefix: str) -> Dict[str, str]:
 
 
 def _driver_interp(drv: ToolDriver):
-    def _interp(output: str, wm, slots) -> List[Finding]:
+    def _interp(output: str, wm, slots) -> List["Finding"]:
         from phantom.automation.belief import Finding
         findings: List[Finding] = []
         for line in (output or "").splitlines():

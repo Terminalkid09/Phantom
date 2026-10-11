@@ -8,7 +8,12 @@ report builders themselves: raw (operator) and client (sanitized).
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict
+
+if TYPE_CHECKING:  # annotation-only: the builders are still imported per
+    # function so importing this phase's adapters never pulls the reporting
+    # stack (markdown/PDF deps) into the phase-contract import graph.
+    from phantom.automation.reporting import ClientReport, RawReport
 
 
 def raw_report(agent: Any) -> "RawReport":
@@ -21,6 +26,9 @@ def client_report(agent: Any, profile: str = "enterprise") -> "ClientReport":
     return ClientReport.from_agent(agent, profile)
 
 
-def write_reports(raw, client) -> Dict[str, str]:
+def write_reports(raw: "RawReport", client: "ClientReport",
+                  out_dir: str) -> Dict[str, str]:
+    # `out_dir` is required: ReportWriter() with no directory raises
+    # TypeError, so this facade could never have written a document.
     from phantom.automation.reporting import ReportWriter
-    return ReportWriter().write(raw, client)
+    return ReportWriter(out_dir).write(raw, client)

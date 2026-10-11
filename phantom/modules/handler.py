@@ -137,7 +137,10 @@ class HandlerModule(BaseModule):
             notifier.success(f"Background ncat started on port {port_num} (PID {proc.pid})")
         else:
             notifier.warn("ncat runs in foreground. Ctrl+C to stop.")
-            run_command(cmd)
+            # same command line the background branch spawns: `cmd` here was
+            # a NameError (there is no such local), so a foreground ncat
+            # listener always crashed the module.
+            run_command(" ".join(shlex.quote(a) for a in argv))
 
     def do_list(self, _):
         """list — show active background listeners."""

@@ -17,7 +17,9 @@ class DummyResponse:
         self.headers = headers or {}
         self.text = text
 
-    def json(self):
+    def json(self):  # noqa: F811 - the fake response's API is `json()`,
+        # exactly what the providers call; it shadows the stdlib module name
+        # only inside this class body, which is deliberate, not a slip.
         if self._data is None:
             raise ValueError("not json")
         return self._data

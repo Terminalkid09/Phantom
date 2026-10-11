@@ -74,7 +74,6 @@ SERVICE_TO_TECHNIQUES: Dict[str, List[str]] = {
     "995": ["T1557.001"],  # POP3S
 
     # Infrastructure
-    "53": ["T1557.001"],  # DNS
     "123": ["T1557.001"],  # NTP
     "161": ["T1557.001"],  # SNMP
     "162": ["T1557.001"],  # SNMPTRAP

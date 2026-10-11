@@ -83,8 +83,8 @@ class BaseModule(cmd.Cmd):
             return
         for group, cmds in groups.items():
             console.print(f"  [bold green]-- {group}[/]")
-            for cmd in cmds:
-                console.print(f"    [green]▶ {cmd}[/]")
+            for command in cmds:
+                console.print(f"    [green]▶ {command}[/]")
 
     def _with_suggestions(self, groups: dict, suggestions: dict) -> dict:
         """Merge suggestions ahead of the static groups (SUGGESTED first)."""

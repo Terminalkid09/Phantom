@@ -94,7 +94,6 @@ class TestModuleIntegration:
     def test_aggressive_flag_consistency(self):
         """Test that AGGRESSIVE flag is handled consistently across modules."""
         from phantom.core.executor import run_commands
-        from unittest.mock import patch
 
         # Create commands with AGGRESSIVE marker
         commands = [

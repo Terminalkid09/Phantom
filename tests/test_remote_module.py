@@ -121,7 +121,6 @@ class RemoteC2RouteTests(unittest.TestCase):
     def test_payload_serves_remote_binary_with_token(self, _tok):
         """With the right token and a compiled binary, the handler serves it."""
         from phantom.core import c2_server
-        import os
 
         class FakeRequest:
             path = "/api/v1/remote_payload_linux"
@@ -149,7 +148,6 @@ class RemoteC2RouteTests(unittest.TestCase):
     def test_remote_binary_path_uses_remote_dir(self):
         """The payload handler must look in payloads/remote/ for remote binaries."""
         from phantom.core import c2_server
-        import os
         base = os.path.dirname(os.path.dirname(os.path.abspath(c2_server.__file__)))
         for filename in ("remote.exe", "remote_linux", "remote_macos", "remote.apk"):
             p = os.path.join(base, "payloads", "remote", filename)

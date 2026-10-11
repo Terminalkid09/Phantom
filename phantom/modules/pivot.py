@@ -242,7 +242,6 @@ class PivotModule(BaseModule):
                  f"-W %h:%p {user}@{foothold}'")
         probe = (f"sshpass -p {pw} ssh -p 22 {opts} {proxy} "
                  f"{user}@{peer} 'id' 2>/dev/null")
-        from phantom.core.executor import run_command
         out = run_command(probe)
         if "uid=" in out:
             notifier.success(

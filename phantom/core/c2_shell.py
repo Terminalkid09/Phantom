@@ -9,7 +9,6 @@ from typing import Optional
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from datetime import datetime
 
 from phantom.core.c2_server import server_instance, c2_state
 from phantom.core.session import session

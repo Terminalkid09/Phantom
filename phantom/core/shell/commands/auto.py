@@ -489,6 +489,16 @@ def cmd_agent(shell, arg: str):
     if not _check.ok:
         notifier.warn(_check.reason)
     profile = _check.effective
+    # resolve the terminal goal FIRST: it used to be computed further down,
+    # so this announce (and the run) read a local that was not bound yet —
+    # `agent <target>` died with UnboundLocalError before it planned a move.
+    goal = "cleanup" if args.cleanup else args.goal
+    if args.deliver:
+        goal = "deliver"
+        notifier.info("Deliver mode: stop after beacon injection + persistence.")
+    if args.cleanup:
+        notifier.info("Cleanup mode: persistence removal + beacon exit "
+                      "on every target.")
     _announce_profile_coverage(profile, goal)
 
     # scope enforcement: the session scope is mandatory for the agent
@@ -519,14 +529,6 @@ def cmd_agent(shell, arg: str):
 
     out_root = os.path.join(sessions_dir(), f"agent_{int(time.time())}")
     writer = ReportWriter(out_root)
-
-    goal = "cleanup" if args.cleanup else args.goal
-    if args.deliver:
-        goal = "deliver"
-        notifier.info("Deliver mode: stop after beacon injection + persistence.")
-    if args.cleanup:
-        notifier.info("Cleanup mode: persistence removal + beacon exit "
-                      "on every target.")
 
     if len(targets) == 1:
         if args.state and os.path.exists(args.state):

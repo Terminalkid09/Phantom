@@ -1,0 +1,42 @@
+# ruff — the repository lint gate (see .github/workflows/ci.yml, job
+# `static-analysis`). Run it locally with:
+#
+#     pip install -r requirements-dev.txt
+#     python -m ruff check .
+#
+# SCOPE IS A RATCHET. The tree carries pre-existing debt that a first lint
+# gate cannot pay down in one commit without a 500-file diff. Rather than turn
+# the gate off, the rules with mass pre-existing hits are DISABLED here with
+# their measured count, so the rules that ARE enforced are green at adoption
+# and a regression fails CI instead of drowning in old noise. Burn-down =
+# delete a line from `ignore` once its count reaches zero; never add one to
+# hide a new violation.
+#
+# Counts measured when the gate was added (ruff 0.6.8, 810 indexed files):
+#   F401 unused-import ................ 434  (`ruff check --fix` is safe here)
+#   E402 module-import-not-at-top .....  82  (deliberate late/facade imports)
+#   E741 ambiguous-variable-name ......  75  (single-letter recon/math names)
+#   F541 f-string-missing-placeholders   65
+#   F841 unused-variable ..............  51
+#   E701/E702/E731/E401/E713 ..........  49
+#
+# ENFORCED (green today): E9 (syntax), and the pyflakes rules that catch a
+# NameError before an operator does — F821 undefined-name, F811 redefinition,
+# F402 import-shadowed-by-loop-var, F601 repeated dict key.
+target-version = "py310"
+line-length = 100
+
+[lint]
+select = ["E9", "F"]
+ignore = [
+    "F401",  # 434 pre-existing unused imports
+    "F541",  # 65
+    "F841",  # 51
+    "E402",  # 82 — optional deps / phase facades import late on purpose
+    "E741",  # 75
+    "E701",  # 21
+    "E731",  # 12
+    "E401",  # 10
+    "E702",  # 5
+    "E713",  # 1
+]

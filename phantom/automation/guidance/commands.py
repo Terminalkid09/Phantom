@@ -128,7 +128,6 @@ def run_engine(cap: "Capability", wm: WorldModel,
     command synthesis. A timeout returns a comment line the interpreter
     ignores, so a hung probe cannot stall the run loop.
     """
-    import time
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TO
 
     key = (cap.id, str(getattr(wm, "target", "")),
