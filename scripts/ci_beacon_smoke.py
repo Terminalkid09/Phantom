@@ -15,6 +15,8 @@ Which targets a runner can actually build:
   android  the NDK alone is NOT enough: the beacon links OpenSSL, which the
            NDK does not ship. Needs OPENSSL_ANDROID_ROOT (a built OpenSSL for
            the same ABI) and a prebuilt llvm toolchain path (ANDROID_NDK_HOME).
+           The artefact is verified as an aarch64 ELF (e_machine 0xB7), not
+           merely as "an ELF": the NDK target triple is the requirement.
 
 Exit codes: 0 = built and verified, 1 = broken, 2 = SKIPPED because the
 toolchain for that target is not present on this runner. ``--require`` turns a
@@ -47,6 +49,41 @@ MAGIC = {
 FALLBACK_ARTEFACT = {
     "windows": ["beacon.pe"],
 }
+
+# (e_machine, name) each target MUST carry. The magic byte says "an ELF";
+# it does not say WHICH architecture, and the Android job's whole point is
+# that an aarch64 payload was actually produced. A wrong NDK triple, or a
+# linker that quietly fell back to the host, still starts with \x7fELF — so
+# the machine field is checked too, not just the first four bytes.
+_ARCH = {
+    "linux": (0x3E, "x86-64"),
+    "android": (0xB7, "AArch64"),
+}
+
+ELF_HEADER_BYTES = 20
+
+
+def _arch_mismatch(head: bytes, platform: str) -> str:
+    """Why this ELF is not what ``platform`` must produce, or "" if it is.
+
+    "" for a platform with no expected architecture (macOS ships Mach-O, not
+    ELF) and for anything that is not an ELF at all — the magic check already
+    owns that verdict, and saying it twice would only half-fail twice.
+    """
+    expected = _ARCH.get(platform)
+    if not expected or len(head) < ELF_HEADER_BYTES or head[:4] != b"\x7fELF":
+        return ""
+    ei_class, ei_data = head[4], head[5]
+    machine = int.from_bytes(head[18:20], "little" if ei_data == 1 else "big")
+    want, name = expected
+    if ei_class != 2:
+        return f"not 64-bit (EI_CLASS={ei_class})"
+    if ei_data != 1:
+        return f"not little-endian (EI_DATA={ei_data})"
+    if machine != want:
+        return f"e_machine=0x{machine:02x}, expected 0x{want:02x} ({name})"
+    return ""
+
 
 def _candidates(path: str, platform: str) -> list:
     out = [path]
@@ -133,9 +170,14 @@ def main(argv=None) -> int:
             checked.append(f"{os.path.basename(candidate)}={size}B (too small)")
             continue
         with open(candidate, "rb") as handle:
-            head = handle.read(8)
+            head = handle.read(ELF_HEADER_BYTES)
         for magic, label in MAGIC[args.platform]:
             if head.startswith(magic):
+                wrong = _arch_mismatch(head, args.platform)
+                if wrong:
+                    checked.append(f"{os.path.basename(candidate)}={size}B "
+                                   f"(ELF, but {wrong})")
+                    break
                 print(f"SMOKE OK ({args.platform}): "
                       f"{os.path.basename(candidate)} ({size} bytes, {label})")
                 return 0
