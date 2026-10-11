@@ -59,13 +59,16 @@ _FACT_SOURCES = {
     "web_app": ["http_probe"],
     "smb_share": ["smb_enum"],
     "redis": ["redis_info"],
-    # creds sources, quiet-first. `brute_ssh` is deliberately LAST: it is
-    # forceful/aggressive, so `_stealth_ok`/the R2 veto drop it outside an
-    # explicit --aggressive run — but on a host whose ONLY access surface is
-    # ssh (no web, no breach material) it is the one move that can still
-    # produce creds, so it must be plannable at all rather than absent.
+    # creds sources, quiet-first. The `brute_*` entries are deliberately LAST:
+    # they are forceful/aggressive, so `_stealth_ok`/the R2 veto drop them
+    # outside an explicit --aggressive run — but on a host whose ONLY access
+    # surface is ssh (brute_ssh) or SMB/RDP with no web (brute_smb/brute_rdp)
+    # they are the one move that can still produce creds, so they must be
+    # plannable at all rather than absent. Without brute_smb/brute_rdp a bare
+    # Windows box produced NO plan at all (see scripts/coverage_matrix_sim.py).
     "creds": ["web_creds", "ssh_login", "breach_check", "harvest_campaign",
-              "cred_spray", "loot_triage", "brute_ssh"],
+              "cred_spray", "loot_triage", "brute_ssh", "brute_smb",
+              "brute_rdp"],
     "identity": ["osint_identity", "persona_create", "deep_recon"],
     # I2 identity-field primitives: passive composition/verification before
     # the breach lookup, and the breach correlation for a confirmed address.
@@ -780,8 +783,26 @@ class Planner:
         return plan
 
     def suggest_next(self, wm: WorldModel, goal: str = "complete_kill_chain") -> Optional[PlanStep]:
-        """Cheap next-step suggestion: pick the cheapest usable capability
-        that makes progress toward the goal facts."""
+        """The move to run NEXT toward the goal (the "guided core" hint).
+
+        FAST PATH: a capability whose EFFECTS already satisfy a goal fact and
+        whose preconditions are met right now. Among those the cheapest wins —
+        this helper is deliberately cost-greedy; `plan()` keeps the
+        scan-first ORDER, the hint only names ONE allowed move.
+
+        No direct source is the NORMAL case for the network goals: their
+        terminal fact (`beacon`) has two sources (beacon_deploy /
+        beacon_via_rce) and neither is usable before creds or an rce_foothold
+        exist. The hint was therefore EMPTY on every kill-chain target, while
+        an identity goal (whose fact is produced by the precondition-free
+        osint_identity) always got a move — the guided core looked broken on
+        exactly the goals it exists for. It now falls back to the goal plan's
+        FIRST READY step, i.e. the same backward chain `plan()` walks, so a
+        network target is told to scan instead of being told nothing.
+
+        Both paths only ever report a move the planner would itself make
+        (registry-usable + stealth-allowed, `plan()` for the fallback), so the
+        hint can never invent work the agent could not run."""
         goal_facts = GOAL_FACTS.get(goal, GOAL_FACTS["complete_kill_chain"])
         best = None
         for cap in self.registry.usable(wm):
@@ -789,8 +810,14 @@ class Planner:
                 if best is None or cap.opsec_cost < best.opsec_cost:
                     if self._stealth_ok(cap):
                         best = cap
-        if best is None:
+        if best is not None:
+            return PlanStep(capability=best, slot_values={},
+                            reason="cheapest usable step toward goal")
+        # no DIRECT source of a goal fact: descend the goal's backward chain
+        # (the real plan) and offer its first executable step.
+        plan = self.plan(wm, goal=goal)
+        step = plan.first_ready(self.registry, wm)
+        if step is None:
             return None
-        slots = {}
-        return PlanStep(capability=best, slot_values=slots,
-                        reason="cheapest usable step toward goal")
+        return PlanStep(capability=step.capability, slot_values={},
+                        reason=f"first ready step of the {goal} plan")

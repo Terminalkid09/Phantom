@@ -570,7 +570,8 @@ def analyze(scn: Scenario, registry: Registry) -> Dict[str, Any]:
     guided = 0
     step = planner.suggest_next(wm, goal=scn.goal)
     if step is None:
-        print("      <no suggestion — the goal fact has no ready source>")
+        print("      <no suggestion — no usable move toward this goal, "
+              "neither a direct source nor the goal plan's first step>")
     else:
         guided = 1
         print(f"      {step.capability.id} ({step.capability.exec_class})")

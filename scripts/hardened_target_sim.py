@@ -172,19 +172,27 @@ def main() -> int:
     print("GUIDED MANUAL CORE (planner.suggest_next, one move at a time)")
     print("-" * 74)
     manual_wm = auto_wm
+    guided_hint = None
     for i in range(10):
         step = planner.suggest_next(manual_wm, goal="complete_kill_chain")
         if step is None:
             print(f"  {i + 1}. <no further suggestion>")
             break
         cap = step.capability
+        guided_hint = cap.id
         if cap.exec_class == "shell_command":
             _, c, n = run_shell_cap(registry, manual_wm, cap.id, {},
                                     runner, log)
             print(f"  {i + 1}. {cap.id:24} ran -> {n} finding(s)")
         else:
+            # This harness can only EXECUTE shell_command moves. An
+            # engine-class move (web_creds, external_recon, ...) is run
+            # in-process by the agent, so the world model never advances here
+            # and the same hint would repeat every iteration: stop with the
+            # reason instead of printing one line ten times.
             print(f"  {i + 1}. {cap.id:24} ({cap.exec_class}) "
-                  "not executable by the guided shell loop")
+                  "not executable by the guided shell loop (STOP)")
+            break
         if manual_wm.find("beacon"):
             break
 
@@ -221,16 +229,25 @@ def main() -> int:
         "AUTO web fingerprint reaching :8443": WEB_PORT in auto_cmd,
         "AUTO/guided hidden-path RCE discovery": HIDDEN_PATH in rce_cmd,
         "AUTO beacon established": bool(auto_wm.find("beacon")),
+        "guided core hint on a network goal": guided_hint is not None,
     }
     for k, v in reached.items():
         print(f"  [{'OK ' if v else 'GAP'}] {k}")
     print()
-    print("  Manual core: the guided planner hint is EMPTY on this target")
-    print("  (suggest_next only offers the GOAL fact -> beacon, whose sources")
-    print("  need creds or a confirmed rce_foothold). The hand-driven module")
-    print("  surface, however, exposes unrestricted fuzzing + free-form run,")
-    print("  so a skilled operator CAN reach the hidden path the automaton")
-    print("  has no move for.")
+    if guided_hint is None:
+        print("  Manual core: the guided planner hint offered NO move on this")
+        print("  target.")
+    else:
+        print("  Manual core: the guided planner hint is NOT empty any more —")
+        print(f"  suggest_next offers '{guided_hint}', the first ready step of")
+        print("  the goal plan. Before the fix it was EMPTY on every network")
+        print("  goal (it only looked for a DIRECT source of the terminal")
+        print("  `beacon` fact, and both of those need creds or a confirmed")
+        print("  rce_foothold). The hint is an engine-class move on this target,")
+        print("  which this shell-only harness cannot execute; the hand-driven")
+        print("  module surface additionally exposes unrestricted fuzzing +")
+        print("  free-form run, so a skilled operator CAN reach the hidden path")
+        print("  the automaton has no move for.")
     return 0
 
 

@@ -85,6 +85,35 @@ class TestPlanner(unittest.TestCase):
         self.assertIn(step.capability.id, ("ssh_banner", "http_probe",
                                            "scan_tcp", "external_recon"))
 
+    def test_suggest_next_offers_a_move_on_a_network_goal(self):
+        # Regression (guided core): the hint was EMPTY for every NETWORK goal.
+        # `complete_kill_chain`'s terminal fact is `beacon`, and its only
+        # sources (beacon_deploy / beacon_via_rce) are unusable until creds or
+        # an rce_foothold exist — so the "cheapest source of a goal fact" scan
+        # found nothing and returned None on exactly the goals the guided core
+        # exists for, while an identity goal (fact produced by the
+        # precondition-free osint_identity) always got a move.
+        wm = WorldModel(target="10.0.0.5", target_type="ip")
+        planner = Planner(self.registry, StealthEngine(wm, StealthConfig()))
+        step = planner.suggest_next(wm, goal="complete_kill_chain")
+        self.assertIsNotNone(step, "network kill-chain goal must hint a move")
+        self.assertEqual(step.capability.id, "scan_tcp")
+
+    def test_suggest_next_hint_is_the_plans_first_ready_step(self):
+        # The hint is not invented: with no DIRECT source of a goal fact it
+        # reports the goal plan's own first executable step, so "what does
+        # suggest_next say" and "what will the agent run first" can never
+        # disagree (they diverged before: plan() had scan_tcp, hint had None).
+        for goal in ("complete_kill_chain", "beacon", "creds", "ad",
+                     "lateral", "web"):
+            wm = WorldModel(target="10.0.0.5", target_type="ip")
+            planner = Planner(self.registry, StealthEngine(wm, StealthConfig()))
+            step = planner.suggest_next(wm, goal=goal)
+            ready = planner.plan(wm, goal=goal).first_ready(self.registry, wm)
+            self.assertIsNotNone(step, goal)
+            self.assertIsNotNone(ready, goal)
+            self.assertEqual(step.capability.id, ready.capability.id, goal)
+
     def test_identity_goal_on_network_target_degrades_to_footprint(self):
         # "identity" on an IP/domain used to produce an empty plan -> the
         # agent halted instantly without doing anything. It must instead
