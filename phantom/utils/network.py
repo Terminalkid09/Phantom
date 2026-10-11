@@ -313,6 +313,108 @@ def get_c2_front() -> Optional[tuple]:
     return host, port, cfg.get_bool("c2.ssl", True, env="PHANTOM_C2_SSL")
 
 
+class C2Endpoint:
+    """Where an artefact built RIGHT NOW calls back, and what is listening.
+
+    Two facts that were never compared, and their disagreement is silent: a
+    dropper is generated for `session.lport` while the listener serves
+    `server_instance.port`, so the artefact is printed, registered, delivered
+    — and never connects. Neither the port nor the scheme was checked against
+    the live listener; the only warning was "no listener at all".
+    """
+
+    def __init__(self, host: str, port: int, use_ssl: bool,
+                 listener_alive: bool, listener_port: int,
+                 listener_ssl: bool) -> None:
+        self.host = host
+        self.port = int(port)
+        self.use_ssl = bool(use_ssl)
+        self.listener_alive = bool(listener_alive)
+        self.listener_port = int(listener_port or 0)
+        self.listener_ssl = bool(listener_ssl)
+
+    @property
+    def url(self) -> str:
+        """The callback URL an artefact built now would embed."""
+        return f"{'https' if self.use_ssl else 'http'}://{self.host}:{self.port}"
+
+    @property
+    def listener_url(self) -> str:
+        if not self.listener_alive:
+            return ""
+        return (f"{'https' if self.listener_ssl else 'http'}://"
+                f"{self.host}:{self.listener_port}")
+
+    def warnings(self) -> list:
+        """Every way this artefact and this listener disagree. Empty = they match.
+
+        Phrased as ACTIONS where a fix exists, because the operator reading
+        this is holding a board or a pasted one-liner, not a debugger.
+        """
+        if not self.listener_alive:
+            return [f"no listener is running: this artefact calls back to "
+                    f"{self.url} and nothing will answer there. Start it "
+                    f"with `listeners start {self.port}`, or it will never "
+                    f"check in."]
+        if not self.listener_port or self.listener_port == self.port:
+            # NOTHING to say about the SCHEME, and that is the point: it is
+            # read from this same live listener, so an artefact cannot
+            # disagree with a listener that exists. The mismatch used to be a
+            # literal `use_ssl=True`; the derivation is the fix, and a warning
+            # here would be a branch no input can reach.
+            return []
+        return [f"MISMATCH: the artefact calls back to :{self.port} but the "
+                f"listener is on :{self.listener_port} — the beacon will "
+                f"never connect. Fix the artefact (`set lport "
+                f"{self.listener_port}` and regenerate) or restart the "
+                f"listener on {self.port}."]
+
+
+def c2_endpoint_status(host: str = "") -> C2Endpoint:
+    """The callback endpoint the NEXT artefact gets, versus the live listener.
+
+    One source of truth for a question FOUR call sites used to answer
+    separately (`generate`, the interactive payload wizard, `deploy`, the HID
+    stager): the port half came from `session.lport` and the listener half
+    from `server_instance`, and nothing compared them, so "the artefact you
+    just generated points somewhere else" was a discovery made later, with a
+    target in hand and no beacon checking in.
+    """
+    from phantom.utils import config as cfg
+
+    listener_alive, listener_port, listener_ssl = False, 0, True
+    try:
+        from phantom.core.c2_server import server_instance
+        thread = getattr(server_instance, "thread", None)
+        listener_alive = bool(thread is not None and thread.is_alive())
+        listener_port = int(getattr(server_instance, "port", 0) or 0)
+        listener_ssl = bool(getattr(server_instance, "use_ssl", False))
+    except Exception:
+        pass
+
+    use_ssl = (listener_ssl if listener_alive
+               else cfg.get_bool("c2.ssl", True, env="PHANTOM_C2_SSL"))
+
+    lhost = host
+    lport = 0
+    try:
+        from phantom.core.session import session
+        lhost = lhost or str(getattr(session, "lhost", "") or "")
+        lport = int(getattr(session, "lport", 0) or 0)
+    except Exception:
+        pass
+    if not lhost:
+        try:
+            lhost = get_lhost()
+        except Exception:
+            lhost = "127.0.0.1"
+    if not lport:
+        lport = (listener_port if listener_alive
+                 else cfg.get_int("c2.port", 8080, env="PHANTOM_C2_PORT"))
+    return C2Endpoint(lhost, lport, use_ssl, listener_alive, listener_port,
+                      listener_ssl)
+
+
 def c2_use_ssl() -> bool:
     """Does the C2 the next dropper is built for speak TLS?
 
@@ -327,18 +429,7 @@ def c2_use_ssl() -> bool:
     port that was never going to answer. `ssl` is configuration, not a
     constant.
     """
-    try:
-        from phantom.core.c2_server import server_instance
-        thread = getattr(server_instance, "thread", None)
-        if thread is not None and thread.is_alive():
-            return bool(server_instance.use_ssl)
-    except Exception:
-        pass
-    try:
-        from phantom.utils import config as cfg
-        return cfg.get_bool("c2.ssl", True, env="PHANTOM_C2_SSL")
-    except Exception:
-        return True
+    return c2_endpoint_status().use_ssl
 
 
 def get_c2_front_cert() -> str:

