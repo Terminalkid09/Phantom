@@ -147,11 +147,12 @@ def build_short_stager(platform: str, url: str, *,
                          f"{', '.join(_PLATFORMS)}")
 
     # The URL travels inside a quoted wrapper on every platform (`iwr '…'` on
-    # Windows, `"…"` inside the single-quoted `sh -c` on POSIX). A quote, `$`
-    # or backtick in it would end that wrapper early and hand the target a
-    # TRUNCATED command — which is worse than a long one, because it looks
-    # right on screen and then fails with nothing to read. Refusing here is
-    # cheap; finding it on a board mid-engagement is not.
+    # Windows, `"…"` inside the single-quoted `sh -c` on POSIX). A quote in it
+    # would END that wrapper early and hand the target a truncated command —
+    # worse than a long one, because it looks right on screen and then fails
+    # with nothing to read — and `$`/backtick would be EXPANDED by the shell
+    # instead of fetched literally. Refusing here is cheap; finding it on a
+    # board mid-engagement is not.
     for bad in ("'", '"', "$", "`"):
         if bad in url:
             raise ValueError(
