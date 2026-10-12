@@ -127,6 +127,94 @@ class SwarmTask:
         return any(all(board.has(t, f) for f in self.provides)
                    for t in targets)
 
+    # ------------------------------------------------- serialization
+
+    @staticmethod
+    def _pack_tried_key(key) -> str:
+        """JSON-safe sink key: a (task_id, target) TUPLE becomes 'a\x1fb'.
+
+        ``sink['tried']`` is keyed by tuples in the dispatcher, and a tuple
+        key silently becomes a string through JSON — losing which target a
+        capability was burned on, which is exactly the evidence the next
+        wave uses to avoid re-spending it.
+        """
+        if isinstance(key, (tuple, list)) and len(key) == 2:
+            return f"{key[0]}\x1f{key[1]}"
+        return str(key)
+
+    @staticmethod
+    def _unpack_tried_key(key):
+        parts = str(key).split("\x1f")
+        return tuple(parts) if len(parts) == 2 else str(key)
+
+    def to_dict(self) -> dict:
+        """Serialize the task's DAG state for a checkpoint resume.
+
+        Everything ``build_tasks`` derives is included, so the resumed DAG
+        is the SAME DAG (same needs/provides/seed/profile) rather than a
+        rebuilt one that might order its waves differently, PLUS the state a
+        fresh build cannot know: status, attempts, done_targets, the avoid /
+        banned sets and what a helper already tried.
+        """
+        return {
+            "id": self.id,
+            "goal": self.goal,
+            "targets": list(self.targets),
+            "needs": sorted(self.needs),
+            "provides": sorted(self.provides),
+            "contact": self.contact,
+            "max_agents": int(self.max_agents),
+            "budget": int(self.budget),
+            "seed": int(self.seed),
+            "profile": self.profile,
+            "avoid_caps": sorted(self.avoid_caps),
+            "banned_categories": sorted(self.banned_categories),
+            "target_source": self.target_source,
+            "status": self.status,
+            "attempts": int(self.attempts),
+            "failure_kind": self.failure_kind,
+            "note": self.note,
+            # ORDER IS EVIDENCE: the capability list is the order they were
+            # burned in, and the stall helper reads it that way. Dedupe keeps
+            # the FIRST occurrence; sorting it would rewrite history (and
+            # made a resumed run's avoid-set differ from the live one).
+            "tried": {self._pack_tried_key(k): _ordered_unique(v)
+                      for k, v in (self.tried or {}).items()},
+            "helper_used": bool(self.helper_used),
+            "done_targets": sorted(self.done_targets),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SwarmTask":
+        """Rebuild a task from ``to_dict`` (swarm resume)."""
+        data = data or {}
+        task = cls(
+            id=data.get("id", ""),
+            goal=data.get("goal", ""),
+            targets=list(data.get("targets") or []),
+            needs=frozenset(data.get("needs") or ()),
+            provides=frozenset(data.get("provides") or ()),
+            contact=data.get("contact", CONTACT_RECON),
+            max_agents=int(data.get("max_agents") or 1),
+            budget=int(data.get("budget") or 10),
+            seed=int(data.get("seed") or 0),
+            profile=data.get("profile", "") or "",
+            avoid_caps=frozenset(data.get("avoid_caps") or ()),
+            banned_categories=frozenset(data.get("banned_categories") or ()),
+            target_source=data.get("target_source", "") or "",
+        )
+        task.status = data.get("status", STATUS_QUEUED)
+        task.attempts = int(data.get("attempts") or 0)
+        task.failure_kind = data.get("failure_kind", "") or ""
+        task.note = data.get("note", "") or ""
+        # keys go back to (task_id, target) tuples: the dispatcher looks
+        # them up that way, so a plain string would silently never match.
+        task.tried = {cls._unpack_tried_key(k): list(v or [])
+                      for k, v in (data.get("tried") or {}).items()}
+        task.helper_used = bool(data.get("helper_used", False))
+        task.done_targets = set(data.get("done_targets") or ())
+        return task
+
 
 # chain -> ordered task specs. Order sets scheduling priority only; the
 # FACTS set the actual release (a task never runs before its needs).
@@ -193,6 +281,16 @@ _CHAINS: Dict[str, List[dict]] = {
     ],
 }
 CHAIN_TEMPLATES = tuple(_CHAINS.keys())
+
+
+def _ordered_unique(items) -> List[str]:
+    """Capability ids in first-seen order, deduped (never sorted)."""
+    out: List[str] = []
+    for c in items or ():
+        token = str(c)
+        if token not in out:
+            out.append(token)
+    return out
 
 
 def build_tasks(chain: str, targets: List[str], seed: int = 0,

@@ -53,6 +53,7 @@ from .profile_policy import (
     reason_hint_for,
     thin_surface_for,
 )
+from .profiles import rotate as rotate_profile
 from .worker import TaskResult, run_swarm_task
 
 __all__ = [
@@ -90,7 +91,8 @@ def run_swarm(targets, chain="", runner=None, profile="enterprise",
               advisor_factory=None, seed_facts=None, scope_list=None,
               reason_profile="", toolchain=None,
               resilient_stager: bool = True, budgets=None, cancel=None,
-              idempotency=None):
+              idempotency=None, resume: str = "",
+              checkpoint_path: str = ""):
     """Run one swarm operation: tasks by chain template, one
     orchestrator+pool PER TARGET (shared semaphore caps total workers),
     commit to the board. Deterministic given a deterministic runner +
@@ -127,6 +129,17 @@ def run_swarm(targets, chain="", runner=None, profile="enterprise",
     ``toolchain`` (a `ToolRegistry`) is the operator's REAL tools; the
     CLI and the auto-mode engine inject one. Omit it (tests, bare
     environments) and workers plan against the offline default.
+
+    ``resume`` (a path written by ``save_swarm_checkpoint``) RESTORES the
+    board and the DAG state instead of building them, so an operation
+    interrupted overnight continues where it stopped: a task whose provides
+    are already committed is marked DONE and never re-runs (re-running it
+    would re-spend budget to rediscover a fact the board holds). A file from
+    another schema raises ``CheckpointSchemaError`` here — before any thread
+    exists. ``checkpoint_path`` makes the run WRITE that file after every
+    committed ``(task, target)``, which is what gives ``resume`` something
+    to load; both default to "" and then this function is byte-for-byte
+    today's behaviour.
     """
     from phantom.automation.belief import WorldModel
     from phantom.automation.guidance.commands import make_registry
@@ -134,7 +147,20 @@ def run_swarm(targets, chain="", runner=None, profile="enterprise",
 
     from .llm import LLMApproval
     from .scheduler import schedule
+
+    resumed = None
+    if resume:
+        # MULTI-DAY RESUME: the checkpoint is authoritative for the BOARD and
+        # for the DAG state. A file from another schema raises here, before
+        # any thread exists, instead of being interpreted.
+        from .checkpoint import load_swarm_checkpoint
+        resumed = load_swarm_checkpoint(resume)
+
     targets = [t for t in (targets or []) if t]
+    if resumed is not None and not targets:
+        # a resumed operation knows its own targets (the caller may pass
+        # none); the checkpoint is the record of the engagement.
+        targets = list(resumed["board"].targets())
     if not targets:
         return {"ok": False, "reason": "no targets", "tasks": []}
     refused = _refuse_out_of_scope(targets, scope_list or [])
@@ -148,34 +174,82 @@ def run_swarm(targets, chain="", runner=None, profile="enterprise",
         # (mobile opens with the scan, not a direct web chain; cloud is
         # identity-led). An explicit --chain always wins.
         chain = chain_for_profile(profile)
-    board = Board(targets)
     # Per-TARGET budget: separate from the run-wide budget above. Derived
     # from config when not injected, and UNLIMITED unless a limit was set.
     from phantom.automation.budget import ledger_from_config
     from .cancellation import NullToken
     from .idempotency import IdempotencyRegistry
-    board.budgets = budgets if budgets is not None else ledger_from_config()
+    if resumed is not None:
+        board = resumed["board"]
+        tasks = resumed["tasks"]
+        sink = resumed["sink"]
+        if budgets is not None:
+            # an explicit ledger from the caller outranks the checkpoint's
+            # (same rule as --chain: an explicit choice always wins)
+            board.budgets = budgets
+        if idempotency is None:
+            idempotency = resumed.get("idempotency") or IdempotencyRegistry()
+        for task in tasks:
+            # already delivered on the board -> DONE, never re-dispatched
+            try:
+                if task.status != "done" and task.satisfied(board):
+                    task.status = "done"
+                    task.note = ((task.note + " | ") if task.note else "") + \
+                        "resumed: already satisfied on the board"
+                    continue
+                if task.status == "failed":
+                    # MULTI-DAY RESUME: a process killed mid-flight leaves
+                    # tasks FAILED, not satisfied — and a resumed run that
+                    # keeps them failed would make no progress at all (the
+                    # scheduler only dispatches QUEUED tasks). The new run
+                    # gets a fresh wave, exactly like the scheduler's own
+                    # requeue after a failed wave, so the next source is
+                    # tried instead of the engagement ending where the
+                    # crash happened.
+                    task.status = "queued"
+                    task.profile = rotate_profile(task.profile)
+                    task.note = ((task.note + " | ") if task.note else "") + \
+                        "resumed: retrying a previously failed task"
+            except Exception:
+                continue
+        if seed_facts:
+            # idempotent by evidence merge, so re-seeding is harmless, but a
+            # resumed board already holds it: only genuinely new targets go in
+            for target, staged in (seed_facts or {}).items():
+                if target in board.targets():
+                    board.commit("seed", target, list(staged or []))
+    else:
+        board = Board(targets)
+        board.budgets = (budgets if budgets is not None
+                         else ledger_from_config())
+        idempotency = (idempotency if idempotency is not None
+                       else IdempotencyRegistry())
+        tasks = build_tasks(chain, targets, seed=seed, budget=budget,
+                            aggressive=aggressive)
+        if reason_profile:
+            # an explicit --reason on the CLI outranks the priors picker
+            for task in tasks:
+                if not task.profile:
+                    task.profile = reason_profile
+        if seed_facts:
+            # operator-known truth lands before the first gate check, so
+            # downstream tasks release immediately (no rediscovery)
+            for target, staged in (seed_facts or {}).items():
+                if target in board.targets():
+                    board.commit("seed", target, list(staged or []))
+        sink = {"failures": [], "cases": [], "actions": 0}
     # Cancellation tree + one-run-per-key registry (shared by every worker).
     cancel = cancel if cancel is not None else NullToken()
-    idempotency = (idempotency if idempotency is not None
-                   else IdempotencyRegistry())
-    tasks = build_tasks(chain, targets, seed=seed, budget=budget,
-                        aggressive=aggressive)
-    if reason_profile:
-        # an explicit --reason on the CLI outranks the priors picker
-        for task in tasks:
-            if not task.profile:
-                task.profile = reason_profile
-    if seed_facts:
-        # operator-known truth lands before the first gate check, so
-        # downstream tasks release immediately (no rediscovery)
-        for target, staged in (seed_facts or {}).items():
-            if target in board.targets():
-                board.commit("seed", target, list(staged or []))
     registry = make_registry()
-    sink: dict = {"failures": [], "cases": [], "actions": 0}
     approval = llm_approval if llm_approval is not None else LLMApproval()
     width = max(1, min(int(max_agents or 1), MAX_AGENTS_CEILING))
+    if checkpoint_path:
+        # the dispatcher rewrites this file after every committed (task,
+        # target); the scheduler owns the waves and is not editable from
+        # here, so the commit is where a resume point really is.
+        sink["checkpoint_path"] = checkpoint_path
+        sink["_tasks"] = tasks
+        _checkpoint(board, sink, idempotency, on_event)
 
     def _make_worker():
         return lambda action, ctx: _dispatch(
@@ -199,6 +273,12 @@ def run_swarm(targets, chain="", runner=None, profile="enterprise",
                        priors=priors, registry=registry, sink=sink,
                        grouped=True, orch_factory=_orch_factory,
                        ceiling=MAX_AGENTS_CEILING, max_agents=width)
+    if checkpoint_path and sink.get("checkpoint_path"):
+        # a cleanly finished run leaves a loadable final state too: the
+        # per-commit writes stop at the last task, not at the last wave
+        _checkpoint(board, sink, idempotency, on_event)
+        sink.pop("_tasks", None)
+        sink.pop("checkpoint_path", None)
     summary["ok"] = all(t["status"] == "done" for t in summary["tasks"])
     summary["board_ref"] = board  # live board: merge/report downstream
     summary["budgets"] = board.budgets.snapshot()
@@ -417,9 +497,37 @@ def _dispatch(action, board, runner=None, profile="enterprise",
             else:
                 idempotency.fail(idem_key)
             ok_all = ok_all and result.ok
+            # a committed (task, target) IS the resume point: write it now,
+            # best-effort, so an interruption loses at most one unit
+            _checkpoint(board, sink, idempotency, _events)
         finally:
             board.leases.release(task.id, target, lease_owner)
     return ok_all
+
+
+def _checkpoint(board, sink, idempotency, emit=None) -> None:
+    """Best-effort swarm checkpoint after one committed (task, target).
+
+    Never raises into a worker: a failed write is reported as an event and
+    the next commit retries (the atomic write in ``checkpoint.py`` makes a
+    partial file impossible). No-ops unless the caller asked for a
+    checkpoint path, so a run without ``checkpoint_path`` pays nothing.
+    """
+    path = sink.get("checkpoint_path")
+    tasks = sink.get("_tasks")
+    if not path or not tasks:
+        return
+    try:
+        from .checkpoint import save_swarm_checkpoint
+        save_swarm_checkpoint(path, board, tasks, sink=sink,
+                              idempotency=idempotency)
+    except Exception as exc:
+        if emit is not None:
+            try:
+                emit("checkpoint_error", {"path": str(path)[:200],
+                                          "error": str(exc)[:200]})
+            except Exception:
+                pass
 
 
 def _staged_lines(staged) -> List[str]:

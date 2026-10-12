@@ -87,6 +87,26 @@ class IdempotencyRegistry:
             return {"completed": list(self._done), "inflight": sorted(
                 self._inflight), "ran": self.ran, "skipped": self.skipped}
 
+    def restore(self, state: Dict[str, Any]) -> None:
+        """Re-load COMPLETED keys from a checkpoint (swarm resume).
+
+        Only completed keys come back: an in-flight claim belongs to a live
+        worker, and after a restart there is none. The outcomes themselves
+        are not part of the snapshot, so a resumed duplicate reuses the FACT
+        that the unit already ran (``begin`` returns False) without replaying
+        its payload.
+        """
+        if not isinstance(state, dict):
+            return
+        with self._lock:
+            for key in (state.get("completed") or ()):
+                self._done[str(key)] = None
+            try:
+                self.ran = int(state.get("ran") or 0)
+                self.skipped = int(state.get("skipped") or 0)
+            except (TypeError, ValueError):
+                pass
+
     @staticmethod
     def key_for(task_id: str, target: str) -> str:
         return f"{task_id}:{target}"

@@ -157,6 +157,79 @@ class Board:
         return {(f.get("kind", ""), f.get("key", ""))
                 for f in data.get("findings", [])}
 
+    # --------------------------------------------------- serialization
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the blackboard for a checkpoint (swarm/checkpoint.py).
+
+        Every committed WorldModel goes out through ``WorldModel.to_dict``,
+        so findings AND belief revisions AND hypotheses survive the round
+        trip; the per-target budget ledger goes out through ``snapshot()``.
+
+        LIVE LEASES are deliberately absent: a lease owns an IN-FLIGHT run
+        and its TTL is measured on ``time.monotonic()``, which is per-process
+        (per boot). A lease from a previous process can never be trusted to
+        be live or expired, so restoring it could wedge a task behind a dead
+        owner or silently reclaim a slot. Nothing is in flight after a crash:
+        only the counters are kept, for the audit trail.
+        """
+        with self._lock:
+            wms = {target: wm.to_dict() for target, wm in self._wms.items()}
+            targets = list(self._wms.keys())
+        try:
+            live = int(self.leases.active())
+        except Exception:
+            live = 0
+        return {
+            "targets": targets,
+            "wms": wms,
+            "added": int(self.added),
+            "skipped": int(self.skipped),
+            "budgets": self.budgets.snapshot(),
+            "leases": {"restored": False, "live_at_save": live},
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Board":
+        """Rebuild a board from ``to_dict`` (swarm resume).
+
+        A fresh, EMPTY lease table by design (see :meth:`to_dict`), and the
+        budget ledger replayed from its snapshot so a resumed target keeps
+        the allowance it had left.
+        """
+        from phantom.automation.belief import WorldModel
+
+        data = data or {}
+        wms = data.get("wms") or {}
+        targets = list(data.get("targets") or list(wms.keys()))
+        # reuse __init__ for target classification, then install the
+        # committed models (it only knows how to build empty ones).
+        board = cls(targets)
+        board._wms = {}
+        for target in targets:
+            raw = wms.get(target)
+            try:
+                board._wms[target] = (WorldModel.from_dict(raw) if raw
+                                      else WorldModel(target=target))
+            except Exception:
+                board._wms[target] = WorldModel(target=target)
+        for target, raw in wms.items():
+            # a model committed for a dynamically resolved target that was
+            # not in the static list (victim IPs...) must come back too
+            if target not in board._wms and raw:
+                try:
+                    board._wms[target] = WorldModel.from_dict(raw)
+                except Exception:
+                    continue
+        board.added = int(data.get("added") or 0)
+        board.skipped = int(data.get("skipped") or 0)
+        try:
+            from .checkpoint import restore_budget_ledger
+            board.budgets = restore_budget_ledger(data.get("budgets"))
+        except Exception:
+            pass
+        return board
+
     # ------------------------------------------------------------ commit
 
     def commit(self, task_id: str, target: str,

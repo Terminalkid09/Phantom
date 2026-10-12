@@ -279,10 +279,15 @@ def _run_swarm_branch(resolved, goal, profile, aggressive, speed, agents,
     it is printed per target — the old single-target branch flattened it
     and showed `10.0.0.5={'service': 3}` instead of the counts."""
     notifier.success("=" * 25 + " PHANTOM AUTO-MODE (swarm) " + "=" * 25)
+    # the swarm writes its own checkpoint after every committed (task,
+    # target): on a resume it is the SAME file we are reading from, on a
+    # fresh run it lives beside the reports so the artifacts stay together.
+    _swarm_cp = resume or os.path.join(out_root, "swarm_checkpoint.json")
     result, summary, merged = _run_swarm_operation(
         resolved, goal, profile, aggressive, speed, agents,
         verbose, on_event, llm, resilient_stager=resilient_stager,
-        resume=resume, experience=experience, evolution=evolution)
+        resume=resume, experience=experience, evolution=evolution,
+        checkpoint_path=_swarm_cp)
     _write_swarm_summary(
         summary, out_root,
         resolved[0] if len(resolved) == 1 else ",".join(resolved))
@@ -301,7 +306,8 @@ def _run_swarm_operation(targets, goal, profile, aggressive, speed,
                          llm: bool = False, budget: int = 10,
                          resilient_stager: bool = True,
                          resume: str = "", experience: bool = False,
-                         evolution: bool = False):
+                         evolution: bool = False,
+                         checkpoint_path: str = ""):
     """Swarm engine for run_auto_mode: fact-driven tasks over a shared
     board, then merge into the manual session. Returns
     (result, summary, merged) where result speaks the legacy keys the
@@ -310,8 +316,7 @@ def _run_swarm_operation(targets, goal, profile, aggressive, speed,
     The agent-path-only flags are announced HERE, once, instead of once per
     caller: --resume/--experience/--evolution are checkpoint/evolution
     features of the agent path and are ignored on the swarm path."""
-    for _flag, _name in ((resume, "--resume"),
-                         (experience, "--experience"),
+    for _flag, _name in ((experience, "--experience"),
                          (evolution, "--evolution")):
         if _flag:
             notifier.warn(
@@ -349,6 +354,7 @@ def _run_swarm_operation(targets, goal, profile, aggressive, speed,
         max_agents=agents or 10, budget=budget, llm_approval=approval,
         seed_facts=seed or None, scope_list=list(session.scope or []),
         toolchain=ToolRegistry(), resilient_stager=resilient_stager,
+        resume=resume, checkpoint_path=checkpoint_path,
         on_event=lambda k, d: _stream_swarm_event(k, d, verbose, on_event))
     board = summary.get("board_ref")
     merged = merge_board_into_session(board) if board is not None else {}
