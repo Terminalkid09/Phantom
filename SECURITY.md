@@ -9,9 +9,12 @@ read the scope below before reporting.
 
 | Version | Supported |
 | --- | --- |
-| `main` (released) | :white_check_mark: |
-| `dev` (integration, what PRs land on) | :white_check_mark: — fixes land here first |
-| anything older | :x: |
+| `dev` — the **v3.0.0** line (in development, untagged) | :white_check_mark: — fixes land here first |
+| `main` — the released line, currently **v2.0.0** | :white_check_mark: |
+| anything older (tags `v1.0.0`, `v1.1.0`) | :x: |
+
+Unless you say otherwise, a report is triaged against `dev`: that is the line
+the next release is built from.
 
 ## What counts as a vulnerability here
 

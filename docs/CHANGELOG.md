@@ -1,4 +1,9 @@
-# Changelog
+# Changelog (legacy — frozen at 1.1.0)
+
+> **This file is a historical record of the 1.x line.** It stops at `1.1.0`
+> and is kept for provenance only. The changelog that is CURRENT is the
+> repository root [`../CHANGELOG.md`](../CHANGELOG.md), which carries the
+> v3.0.0 development line. Do not add entries here.
 
 All notable changes to this project will be documented in this file.
 

@@ -45,7 +45,7 @@ git clone https://github.com/Terminalkid09/Phantom.git
 cd Phantom
 python -m venv .venv && . .venv/Scripts/activate    # Windows: .venv\Scripts\activate
 pip install -e .                                    # runtime deps come from setup.py
-pip install -r requirements-dev.txt                 # pytest, plugins, pyyaml, bandit
+pip install -r requirements-dev.txt                 # pinned dev set: pytest + plugins, pyyaml, bandit, ruff, mypy
 ```
 
 Electron desktop app (Node 20+):
@@ -118,7 +118,7 @@ python scripts/c2d_parity_check.py     # Python <-> Go key derivation
 bandit -r phantom/ -c .bandit          # no unbaselined HIGH findings
 ```
 
-The full hermetic suite is large (~4 500 tests) and takes roughly 15–20
+The full hermetic suite is large (~5 100 tests) and takes roughly 15–20
 minutes serially. `pytest-xdist` is available (`-n auto`) but serial is the
 default on purpose: several modules hold process-wide singletons.
 
@@ -146,4 +146,5 @@ default on purpose: several modules hold process-wide singletons.
 - [ ] Any guardrail override introduced is either blocked or recorded.
 - [ ] No secrets, no generated build headers, no build artefacts committed.
 - [ ] CRLF line endings preserved in files that already use them.
-- [ ] Beacon changes pass `-fsyntax-only` (and `ci_beacon_lint.py` where relevant).
+- [ ] Beacon changes COMPILE (`-c`, not `-fsyntax-only` — see the toolchain
+      note above) and pass `ci_beacon_lint.py`.
