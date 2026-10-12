@@ -147,6 +147,22 @@ def main() -> int:
                             source="http_probe")
     print("[http_probe MANUAL] findings:", [(f.kind, f.key) for f in findings])
 
+    # ── Step 3.5: the app's OWN references (path discovery) ────────────────
+    # The footprint pass reads what the app serves: the paths its page and
+    # scripts reference become `web_path` facts, and THAT is the wordlist
+    # the exploit stage probes. Without this step the RCE probe could only
+    # ever try the conventional /upload.
+    _, cmd, n = run_shell_cap(
+        registry, auto_wm, "http_get",
+        {"url": f"https://{TARGET}:{WEB_PORT}/"}, runner, log)
+    print("\n[http_get] command:", cmd)
+    discovered = [f.value.get("path") for f in auto_wm.find("web_path")
+                  if isinstance(f.value, dict)]
+    discovered = [p for p in discovered if p]
+    print("[http_get] referenced paths:", discovered)
+    print("           -> hidden path", HIDDEN_PATH, "->",
+          "referenced by the app" if HIDDEN_PATH in discovered else "NOT found")
+
     # ── Step 4: the RCE probe — where does it aim? ──────────────────────────
     rce_cap = registry.get("web_rce")
     rce_cmd = rce_cap.make_command(auto_wm, {})
@@ -246,8 +262,17 @@ def main() -> int:
         print("  rce_foothold). The hint is an engine-class move on this target,")
         print("  which this shell-only harness cannot execute; the hand-driven")
         print("  module surface additionally exposes unrestricted fuzzing +")
-        print("  free-form run, so a skilled operator CAN reach the hidden path")
-        print("  the automaton has no move for.")
+        print("  free-form run.")
+        if reached["AUTO/guided hidden-path RCE discovery"]:
+            print("  The RCE probe now AIMs at the path the app itself")
+            print("  references (web_path), so the walk the automaton used to")
+            print("  miss is inside the command. What this offline harness cannot")
+            print("  show is execution: the scripted target never runs an upload,")
+            print("  so 'beacon established' stays a GAP until a REAL target")
+            print("  executes the payload (runtime validation, not planning).")
+        else:
+            print("  so a skilled operator CAN reach the hidden path the")
+            print("  automaton has no move for.")
     return 0
 
 

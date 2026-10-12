@@ -75,6 +75,7 @@ _CAPABILITY_PHASE: Dict[str, str] = {
     # exploit (discovery + weaponization)
     "service_exploit": "exploit",
     "hunt_web": "exploit",
+    "fuzz_params": "exploit",
     "xss_weaponize": "exploit",
     "differential_analysis": "exploit",
     "rce_foothold": "exploit",

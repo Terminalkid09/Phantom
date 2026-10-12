@@ -43,7 +43,13 @@ _FACT_SOURCES = {
     "geolocation": ["phone_osint"],
     "fingerprint": ["fingerprint_services"],
     "exploit_plan": ["service_exploit"],
-    "hunt_anomaly": ["hunt_web"],
+    # two techniques, one effect: `hunt_web` is the anomaly hunt over the
+    # discovered endpoints, `fuzz_params` the generative mutation of the
+    # parameters the target actually exposes. A dead hunt falls to the fuzz.
+    "hunt_anomaly": ["hunt_web", "fuzz_params"],
+    # the app's OWN references, read from the page/script it serves: the
+    # honest wordlist that lets the web chain probe a hidden handler.
+    "web_path": ["http_get"],
     "xss_exfil": ["xss_weaponize"],
     "differential_anomaly": ["differential_analysis"],
     "rce_foothold": ["web_rce", "rce_foothold"],
