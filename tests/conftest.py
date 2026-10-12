@@ -16,12 +16,28 @@ Two responsibilities:
    up here makes the suite order-independent instead of papering over each
    symptom in the individual tests.
 """
+import atexit
+import os
+import shutil
+import tempfile
+
 import pytest
 
 collect_ignore = [
     "test_features_final.py",   # standalone beacon+C2 integration script
     "test_real_deploy.py",      # standalone real-beacon deploy script
 ]
+
+# The C2 engagement state (`data/c2_state.json`) is read by `C2State` when it
+# is CONSTRUCTED, and `phantom.core.c2_server` builds its one process-wide
+# instance at import time — i.e. during collection, before any fixture can
+# run. Pointing the override at a throwaway path HERE is what keeps that
+# import from reading (and the whole run from overwriting) the operator's real
+# engagement file. `setdefault` so an explicit override still wins.
+_C2_TEST_STATE_DIR = tempfile.mkdtemp(prefix="phantom-c2-state-")
+os.environ.setdefault("PHANTOM_C2_STATE_PATH",
+                      os.path.join(_C2_TEST_STATE_DIR, "c2_state.json"))
+atexit.register(shutil.rmtree, _C2_TEST_STATE_DIR, True)
 
 
 @pytest.fixture(autouse=True)
@@ -67,6 +83,42 @@ def _allow_unscoped_auto_mode(monkeypatch):
     """
     monkeypatch.setenv("PHANTOM_ALLOW_UNSCOPED", "1")
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_c2_engagement_state(tmp_path, monkeypatch):
+    """Keep the C2 engagement file out of the operator's REAL data dir.
+
+    `C2State` now persists beacons, their queues, the collected results and
+    the auto-shell grant to `data/c2_state.json`, and the module keeps ONE
+    process-wide instance. Dozens of tests mutate `c2_state` directly and a
+    few construct a fresh `C2State` to simulate a restart, so without this
+    the suite would write the operator's live engagement file and then read
+    it back into unrelated tests.
+
+    Both ends are redirected: the env var for anything constructed during
+    the test, and the live singleton's already-resolved path, because that
+    singleton was built at import time — before any fixture could run.
+
+    Declared BEFORE `_stop_leaked_servers` on purpose: fixtures tear down in
+    reverse, so the server teardown (which flushes the state) still writes to
+    the temp file, and the real path is only restored afterwards.
+    """
+    state_file = tmp_path / "c2_state.json"
+    monkeypatch.setenv("PHANTOM_C2_STATE_PATH", str(state_file))
+    try:
+        from phantom.core.c2_server import c2_state
+    except Exception:  # pragma: no cover - import guard for isolated runs
+        yield
+        return
+    previous = getattr(c2_state, "_state_persist_path", "")
+    c2_state._state_persist_path = str(state_file)
+    c2_state._state_persist_last = 0.0
+    c2_state._state_dirty = False
+    yield
+    c2_state._state_persist_path = previous
+    c2_state._state_persist_last = 0.0
+    c2_state._state_dirty = False
 
 
 @pytest.fixture(autouse=True)

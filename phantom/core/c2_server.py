@@ -100,6 +100,16 @@ class TaskPolicyError(PermissionError):
     capability not granted, expired, or malformed."""
 
 
+# Duro-1: the engagement state (beacons, their queues, the collected
+# results, the auto-shell grant) is written to disk, so a listener restart
+# does not wipe the operation. `_STATE_PERSIST_INTERVAL` is the DEBOUNCE: a
+# beacon checking in every few seconds must not write the file every few
+# seconds, but a change the operator would miss after a crash must not wait
+# for a quiet moment either — see `_persist_state`.
+_STATE_VERSION = 1
+_STATE_PERSIST_INTERVAL = 2.0
+
+
 class C2State:
     """Thread-safe state shared by the C2 shell and aiohttp listener."""
 
@@ -132,6 +142,14 @@ class C2State:
         self._replay_state_path = self._resolve_replay_state_path()
         self._replay_persist_last = 0.0
         self._load_replay_state()
+        # Duro-1: the durable ENGAGEMENT state is a separate file from the
+        # replay guard on purpose. They have different lifecycles (the replay
+        # map is a short-lived security window, the engagement is the
+        # operation) and different failure modes: a corrupt state file must
+        # not be able to disarm replay protection, and vice versa.
+        self._state_persist_path = self._resolve_state_path()
+        self._state_persist_last = 0.0
+        self._state_dirty = False
         # Review-3: the remote-session modules get their OWN expiring token.
         # The global payload token unlocks EVERY payload forever; a remote
         # session is a time-boxed capability grant with its own revocation,
@@ -141,6 +159,10 @@ class C2State:
         # `health` task). Off by default — see `_auto_shell_allowed` —
         # and togglable at runtime from the UI/API.
         self.auto_shell: bool = _auto_shell_allowed()
+        # ...and only NOW, with every default in place, adopt what the
+        # previous process left on disk (the file wins: a runtime toggle is
+        # more recent than the config it was toggled from).
+        self._load_state()
 
     @staticmethod
     def _resolve_replay_state_path() -> str:
@@ -210,10 +232,174 @@ class C2State:
         except Exception:
             pass
 
+    # ── durable engagement state (see _STATE_VERSION above) ────────────
+
+    @staticmethod
+    def _resolve_state_path() -> str:
+        """Where the durable engagement state lives.
+
+        `PHANTOM_C2_STATE_PATH` overrides the location, which is how the test
+        suite and CI keep the operator's REAL state file out of the picture.
+        """
+        override = os.environ.get("PHANTOM_C2_STATE_PATH", "").strip()
+        if override:
+            return override
+        try:
+            from phantom.utils.paths import data_dir
+            return os.path.join(data_dir(), "c2_state.json")
+        except Exception:
+            return ""
+
+    def _load_state(self) -> bool:
+        """Adopt the engagement a previous process left on disk.
+
+        Without this, a listener restart (or a reboot) wiped every beacon
+        record, every queued task and every collected result while the
+        beacons themselves were still out there checking in — the operator
+        lost the operation and could not even tell what had been lost.
+
+        A file we cannot TRUST is refused and SAID OUT LOUD: starting with an
+        empty engagement is a decision the operator has to be able to see,
+        not silent amnesia. Nothing here raises.
+        """
+        path = self._state_persist_path
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as exc:
+            logger.warning(f"C2 state unreadable ({exc}): starting with an "
+                           f"empty engagement, the file is kept for "
+                           f"inspection")
+            return False
+        if not isinstance(data, dict):
+            logger.warning("C2 state is not an object: starting with an empty "
+                           "engagement")
+            return False
+        version = data.get("version")
+        if version != _STATE_VERSION:
+            logger.warning(
+                f"C2 state version {version!r} != {_STATE_VERSION}: refused "
+                f"rather than interpreted, starting with an empty engagement")
+            return False
+
+        def _records(raw: Any, many: bool) -> dict[str, list[dict[str, Any]]]:
+            out: dict[str, list[dict[str, Any]]] = {}
+            if not isinstance(raw, dict):       # valid JSON, wrong shape
+                return out
+            for key, value in raw.items():
+                if many:
+                    out[str(key)] = [dict(item) for item in value or []
+                                     if isinstance(item, dict)]
+                elif isinstance(value, dict):
+                    out[str(key)] = dict(value)
+            return out
+
+        with self.lock:
+            beacons = _records(data.get("beacons"), many=False)
+            tasks = _records(data.get("tasks"), many=True)
+            results = _records(data.get("results"), many=True)
+            # A beacon is the unit of truth: a queue/result list missing from
+            # the file (older schema, partial write) must not make the
+            # beacon undrainable.
+            for beacon_id in beacons:
+                tasks.setdefault(beacon_id, [])
+                results.setdefault(beacon_id, [])
+            self.beacons = beacons
+            self.tasks = tasks
+            self.results = results
+            if isinstance(data.get("auto_shell"), bool):
+                self.auto_shell = bool(data["auto_shell"])
+        queued = sum(len(v) for v in self.tasks.values())
+        logger.info(f"C2 state restored: {len(self.beacons)} beacon(s), "
+                    f"{queued} queued task(s), "
+                    f"{sum(len(v) for v in self.results.values())} result(s), "
+                    f"auto-shell {'on' if self.auto_shell else 'off'}")
+        return True
+
+    def reload(self) -> bool:
+        """Load the persisted state, but ONLY into an empty store.
+
+        A listener started in a fresh process adopts the engagement the
+        previous one left behind; a process that already holds state keeps
+        what it has. Silently replacing live in-memory records with a file
+        would lose whatever happened after the last write.
+        """
+        with self.lock:
+            if self.beacons or self.tasks or self.results:
+                return False
+        return self._load_state()
+
+    def _persist_state(self, force: bool = False) -> None:
+        """Atomically write the engagement state, debounced.
+
+        The debounce exists because `update_beacon` runs on EVERY beacon
+        check-in: writing there would turn a polling beacon into a disk
+        writer. A change inside the window marks the store dirty and the next
+        qualifying change (or `flush()`) writes the latest state, so the loss
+        window is bounded by the interval, never by the end of the run.
+
+        `force=True` is for RARE, deliberate, operator-driven changes (the
+        auto-shell toggle) and for the shutdown flush: those must land even if
+        nothing else ever changes again.
+
+        SECRETS NEVER LAND HERE: the payload goes through the same scrubber
+        the portable `.pm` export uses, so the two persistence paths cannot
+        drift on what a secret is. A beacon HMAC key on disk would let anyone
+        who reads the file impersonate that beacon to this listener.
+        """
+        path = self._state_persist_path
+        if not path:
+            return
+        now = time.monotonic()
+        if not force and now - self._state_persist_last < _STATE_PERSIST_INTERVAL:
+            self._state_dirty = True
+            return
+        try:
+            from phantom.utils.session_bundle import _jsonable, _scrub_secrets
+        except Exception as exc:                # fail CLOSED: no file, no leak
+            logger.warning(f"C2 state NOT written: refusing to persist "
+                           f"engagement state without the secret scrubber "
+                           f"({exc.__class__.__name__})")
+            return
+        with self.lock:
+            payload = {
+                "version": _STATE_VERSION,
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+                "beacons": _scrub_secrets(_jsonable(self.beacons)),
+                "tasks": _scrub_secrets(_jsonable(self.tasks)),
+                "results": _scrub_secrets(_jsonable(self.results)),
+                "auto_shell": bool(self.auto_shell),
+            }
+        try:
+            directory = os.path.dirname(os.path.abspath(path))
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"))
+            # os.replace: a process killed mid-write must never leave a
+            # half-written state file for the next boot to trust.
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.warning(f"C2 state write failed ({exc}): the engagement "
+                           f"on disk is stale")
+            return
+        self._state_persist_last = now
+        self._state_dirty = False
+
+    def flush(self) -> None:
+        """Write whatever the debounce deferred (used on shutdown)."""
+        self._persist_state(force=True)
+
     def set_auto_shell(self, enabled: bool) -> bool:
         """Turn auto-open shell on/off for this run (audited)."""
         self.auto_shell = bool(enabled)
         logger.info(f"Auto-shell {'ENABLED' if self.auto_shell else 'disabled'}")
+        # rare and deliberate: write it now, or a toggle made seconds before a
+        # crash would only exist in the process that just died.
+        self._persist_state(force=True)
         try:
             from phantom.utils.audit_log import audit_log
             audit_log.append("auto_shell_toggled", enabled=self.auto_shell)
@@ -444,6 +630,11 @@ class C2State:
                                          reason="c2.auto_persist disabled")
                     except Exception:
                         pass
+                # A REGISTRATION is a state change a restart must not lose:
+                # the beacon is real, its queue is not empty, and every later
+                # report is built from this record. A mere `last_seen` refresh
+                # is NOT (that is what the debounce is for).
+                self._persist_state()
             else:
                 # Session resume: same beacon_id, still alive. If the beacon was
                 # silent for a while, mark the resume so the operator sees the
@@ -483,6 +674,9 @@ class C2State:
                                  task_id=task_id, command=command[:200])
             except Exception:
                 pass
+            # queued work is exactly what a restart must not lose: a beacon
+            # cannot drain a task nobody remembers issuing.
+            self._persist_state()
             return task_id
 
     def queue_typed_task(self, beacon_id: str,
@@ -512,6 +706,7 @@ class C2State:
                                  capability=task.capability_id, mode="typed")
             except Exception:
                 pass
+            self._persist_state()
             return task.task_id
 
     @staticmethod
@@ -591,6 +786,9 @@ class C2State:
                 pruned = len(existing) - MAX_RESULTS_PER_BEACON
                 del existing[:-MAX_RESULTS_PER_BEACON]
             self._ack_task_locked(beacon_id, task_id)
+            # the result AND the settled task: this is the operator's
+            # evidence, the one thing a restart must never cost them.
+            self._persist_state()
             # Binary artifacts (screenshot / camera / exfil) land as real
             # files in data/screenshots/ + data/downloads/ so the operator
             # gets a usable file instead of a wall of base64 — and the
@@ -1828,6 +2026,10 @@ class C2Server:
     def start(self, host: Optional[str] = None, port: Optional[int] = None, use_ssl: Optional[bool] = None) -> None:
         if self.thread and self.thread.is_alive():
             return
+        # a listener coming up in a fresh process adopts the engagement the
+        # previous one left on disk; a process that already holds records
+        # keeps them (see C2State.reload).
+        c2_state.reload()
         if host:
             self.host = host
         if port:
@@ -1854,6 +2056,11 @@ class C2Server:
             raise RuntimeError(self.bind_error)
 
     def stop(self) -> None:
+        # LAST CHANCE: the debounce may be holding the most recent tasks and
+        # results, and the operator is stopping the listener either to restart
+        # it or to close the engagement. Flush before any of that work can be
+        # mistaken for "nothing happened".
+        c2_state.flush()
         if self.loop and self.runner:
             async def cleanup():
                 await self.runner.cleanup()
