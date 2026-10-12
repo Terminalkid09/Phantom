@@ -97,12 +97,17 @@ def test_backend_run_pipeline_executes_argv():
     the execution claim, not the gate, so it must NOT be mocked: mocking it
     would make it assert nothing. The unit-level argv/shell contract is
     covered hermetically by the safe_exec tests above.
+
+    A host with no backend SKIPS (it used to fail): a suite that is red for a
+    reason nobody can act on hides the failures somebody can.
     """
     from phantom.api.backend import backend_dispatcher
     r = backend_dispatcher.run_pipeline("echo hello-argv", "", timeout=10)
+    if r.returncode == -1 and "backend detected" in (r.error or ""):
+        pytest.skip(f"no execution backend on this host: {r.error}")
     assert r.returncode == 0, (
-        f"no usable execution backend on this host (rc={r.returncode}, "
-        f"error={r.error!r}) - this is an integration_tool test")
+        f"the native backend failed to run an argv command (rc={r.returncode}, "
+        f"error={r.error!r})")
     assert r.stdout.strip() == "hello-argv"
 
 
