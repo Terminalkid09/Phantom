@@ -314,8 +314,10 @@ def _run_swarm_operation(targets, goal, profile, aggressive, speed,
     reporting tail already understands.
 
     The agent-path-only flags are announced HERE, once, instead of once per
-    caller: --resume/--experience/--evolution are checkpoint/evolution
-    features of the agent path and are ignored on the swarm path."""
+    caller: --experience/--evolution are checkpoint/evolution features of the
+    agent path and are ignored on the swarm path. `--resume` is NOT among them
+    any more: the board/DAG checkpoint gave the swarm its own resume, so it is
+    honored here (see `checkpoint_path`) rather than dropped."""
     for _flag, _name in ((experience, "--experience"),
                          (evolution, "--evolution")):
         if _flag:

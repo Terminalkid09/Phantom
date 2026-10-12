@@ -81,11 +81,19 @@ class TestSwarmIgnoredFlags(unittest.TestCase):
         return [str(c.args[0]) for c in m_warn.call_args_list]
 
     def test_each_ignored_flag_is_announced(self):
+        """The swarm announces the flags it DROPS, once each.
+
+        `--resume` left this list when the board/DAG checkpoint gave the swarm
+        path its own resume: passing it now continues a run instead of being
+        ignored, so warning about it would be a lie. The assertion below pins
+        that positively, not just by counting warnings.
+        """
         texts = self._run(resume="cp.json", experience=True, evolution=True)
-        self.assertEqual(len(texts), 3)
-        for flag in ("--resume", "--experience", "--evolution"):
+        self.assertEqual(len(texts), 2, texts)
+        for flag in ("--experience", "--evolution"):
             self.assertTrue(any(flag in t and "ignorato" in t for t in texts),
                             flag)
+        self.assertFalse(any("--resume" in t for t in texts), texts)
 
     def test_silent_when_no_flag_is_given(self):
         self.assertEqual(self._run(), [])
