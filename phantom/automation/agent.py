@@ -128,7 +128,12 @@ _GAP_CAP_HINTS = {
     "network_creds": ("ssh_login", "web_creds", "cred_spray",
                       "breach_check"),
     "exploit_chain": ("service_exploit", "web_rce", "http_probe"),
-    "network_footprint": ("scan_tcp", "version_detect", "surface_map"),
+    # `http_get` belongs to the footprint pass: it is the recon move that
+    # READS what the app serves (its links and script references become the
+    # `web_path` facts the exploit stage probes). Without it in the role the
+    # capability existed but nothing ever planned it.
+    "network_footprint": ("scan_tcp", "version_detect", "surface_map",
+                          "http_get"),
     "identity_breach": ("breach_correlate", "breach_check", "osint_identity"),
     "identity_field": ("email_candidates", "email_verify", "breach_correlate"),
     "identity_phish": ("phish_identity", "campaign_launch", "dm_launch",
@@ -168,6 +173,34 @@ _EDGE_EXEMPT_IDS = ("origin_discovery", "surface_map")
 # ---------------------------------------------------------------------------
 # agent
 # ---------------------------------------------------------------------------
+
+def fuzz_sender_from_hunt(hunt_runner, wm):
+    """Adapt the run's injected HTTP transport into a fuzz sender.
+
+    A run that INJECTS its own prober owns its network path, and no
+    capability may dial out behind it: with a caller-supplied
+    ``hunt_runner`` the fuzz engine was still building its own curl
+    transport, so a worker or a test that had handed over every transport it
+    knew about got real requests anyway (measured: a 45s live pass inside an
+    offline campaign, and a 600s orchestrator stall when the same capability
+    ran in the aggressive chain). The fuzz contract already says the sender
+    is INJECTED; this is the injection.
+
+    The URL is built with the fuzz capability's OWN helpers, so both
+    transports hit the same endpoint instead of two that merely look alike.
+    """
+    from phantom.automation.brain.fuzz.capability import (
+        _as_response, _endpoint_for, _scheme_for, _web_target)
+
+    def sender(param: str, payload: str):
+        from urllib.parse import quote
+        host, port = _web_target(wm)
+        path = _endpoint_for(wm, param) or "/"
+        url = (f"{_scheme_for(wm, port)}://{host}:{port}{path}"
+               f"?{quote(str(param))}={quote(str(payload))}")
+        return _as_response(hunt_runner("GET", url))
+    return sender
+
 
 class AutonomousAgent:
     """Runs a goal-directed kill chain against one target."""
@@ -388,8 +421,16 @@ class AutonomousAgent:
         self.hunt_runner = hunt_runner
         self.hunt_delay = hunt_delay
         # optional in-process fuzz sender (tests / campaigns inject a
-        # scripted sender); None means the bounded urllib sender is used
+        # scripted sender). None and no injected hunt_runner means the fuzz
+        # capability falls back to its own BOUNDED transport; an injected
+        # hunt_runner means this run owns its HTTP path, so that same path
+        # is what the fuzz engine gets.
         self.fuzz_sender = fuzz_sender
+        if self.fuzz_sender is None and hunt_runner is not None:
+            try:
+                self.fuzz_sender = fuzz_sender_from_hunt(hunt_runner, self.wm)
+            except Exception:
+                self.fuzz_sender = None
         # origin-discovery transport: `runner(cmd, timeout=…)` with
         # `.ok`/`.stdout`, injectable exactly like hunt_runner/fuzz_sender so
         # the EDGE gate can be exercised offline with no DNS and no network.
@@ -871,6 +912,16 @@ class AutonomousAgent:
         # (OSINT discovery, breach lookup, persona, phish, IP-grabber polling)
         ("osint",    lambda cap: cap.category in ("osint", "social"),
          "_execute_social_capability"),
+        # P3: generative parameter fuzzing is a HUNT-category move backed by
+        # its OWN in-process engine (the differential fuzz driver), not by
+        # the anomaly hunt. This route must stay BEFORE the `category ==
+        # "hunt"` one below: without it the capability kept its banner and
+        # its `hunt_anomaly` effect but actually ran the anomaly hunt, so
+        # the fuzzing the project owns never reached the chain. The engine
+        # channel hands it the run's own transport and a bounded pass.
+        ("exploit",  lambda cap: cap.id == "fuzz_params"
+                                and getattr(cap, "engine", None) is not None,
+         "_execute_engine_capability"),
         # behavioural hunting executes through the anomaly engine channel
         # (baseline + statistical scoring + mutation escalation, in-process)
         ("exploit",  lambda cap: cap.category == "hunt",
@@ -2251,8 +2302,15 @@ class AutonomousAgent:
         from phantom.automation.guidance.commands import run_engine
         self._emit("run", capability=cap.id, banner=cap.banner,
                    category=cap.category, cost=cap.opsec_cost)
+        # The transports THIS RUN owns travel into the engine: an injected
+        # fuzz sender replaces the engine's own HTTP path exactly like
+        # `hunt_runner` replaces the anomaly hunt's (offline runs and tests
+        # must never open a socket the caller did not hand over).
+        injected: Dict[str, Any] = {}
+        if getattr(self, "fuzz_sender", None) is not None:
+            injected["sender"] = self.fuzz_sender
         try:
-            output = run_engine(cap, self.wm, slots)
+            output = run_engine(cap, self.wm, slots, injected=injected)
         except Exception as e:
             self.wm.record_action(cap.id, slots, f"engine://{cap.id}",
                                   ok=False, note=str(e))
@@ -4089,6 +4147,13 @@ class AutonomousAgent:
                 scope=list(self.scope_list or []),
                 paranoid=bool(self.paranoid),
                 strict=self._auto_gate_strict(),
+                # The posture travels WITH the run: `--aggressive` buys the
+                # AGGRESSIVE tier of techniques (`nmap --script`, uploads,
+                # `--os-*`), and nothing else. `DESTRUCTIVE` stays refused in
+                # every posture, and strict/paranoid still narrows back to a
+                # bare allowlisted command — a loud run is not an unguarded
+                # one.
+                aggressive=bool(self.aggressive),
                 extra_allowed=self._llm_auto_extra_programs(),
             )
             if refused:

@@ -6,7 +6,10 @@ knowledge) and two help tables, which is how `run` after an `auto` came to
 start from a blank slate. One entry point keeps one source of truth; the
 human-in-the-loop path is one command away (`manual`, or `phantom --manual`).
 """
+import json
 import sys
+
+import pytest
 
 from phantom import main as cli
 
@@ -42,6 +45,92 @@ def test_c2_flag_is_unaffected(monkeypatch):
                         lambda: opened.setdefault("c2", True))
     cli.main()
     assert opened == {"c2": True}
+
+
+def _checkpoint(tmp_path):
+    """A checkpoint the resume policy accepts (right schema, on disk)."""
+    from phantom.automation.agent import CHECKPOINT_SCHEMA
+    path = tmp_path / "checkpoint.json"
+    path.write_text(json.dumps({"schema": CHECKPOINT_SCHEMA}),
+                    encoding="utf-8")
+    return path
+
+
+def test_without_supervise_a_crash_is_not_relaunched(tmp_path, monkeypatch):
+    cp = _checkpoint(tmp_path)
+    calls = []
+
+    def fake_run(**kwargs):
+        calls.append(kwargs.get("resume"))
+        raise RuntimeError("OOM")
+
+    monkeypatch.setattr(sys, "argv", ["phantom", "--auto", "10.0.0.5",
+                                      "--resume", str(cp)])
+    monkeypatch.setattr("phantom.core.automode.run_auto_mode", fake_run)
+    with pytest.raises(RuntimeError):
+        cli.main()
+    assert calls == [str(cp)]
+
+
+def test_supervise_relaunches_a_crashed_run_from_its_checkpoint(
+        tmp_path, monkeypatch):
+    """The point of `--supervise`: nobody is there to relaunch it."""
+    from phantom.utils.auto_resume import counter_path_for
+    cp = _checkpoint(tmp_path)
+    calls = []
+
+    def fake_run(**kwargs):
+        calls.append(kwargs.get("resume"))
+        if len(calls) == 1:
+            raise RuntimeError("crashed at hour three")
+
+    monkeypatch.setattr(sys, "argv",
+                        ["phantom", "--auto", "10.0.0.5", "--supervise",
+                         "--max-restarts", "2", "--resume", str(cp)])
+    monkeypatch.setattr("phantom.core.automode.run_auto_mode", fake_run)
+    cli.main()
+
+    # attempt 1 crashes, attempt 2 resumes and finishes normally
+    assert calls == [str(cp), str(cp)]
+    with open(counter_path_for(str(cp)), encoding="utf-8") as fh:
+        assert json.load(fh)["restarts"] == 0      # budget reset for the next one
+
+
+def test_supervise_with_resume_latest_starts_from_the_newest_checkpoint(
+        tmp_path, monkeypatch):
+    """The unattended run: resume the newest engagement AND keep it alive."""
+    cp = _checkpoint(tmp_path)
+    calls = []
+
+    def fake_run(**kwargs):
+        calls.append(kwargs.get("resume"))
+
+    monkeypatch.setattr(sys, "argv",
+                        ["phantom", "--auto", "10.0.0.5", "--resume-latest",
+                         "--supervise", "--max-restarts", "1"])
+    monkeypatch.setattr("phantom.utils.session_bundle.latest_checkpoint",
+                        lambda *a, **k: str(cp))
+    monkeypatch.setattr("phantom.core.automode.run_auto_mode", fake_run)
+    cli.main()
+    assert calls == [str(cp)]
+
+
+def test_supervise_stops_when_the_restart_budget_is_spent(tmp_path, monkeypatch):
+    cp = _checkpoint(tmp_path)
+    calls = []
+
+    def fake_run(**kwargs):
+        calls.append(kwargs.get("resume"))
+        raise RuntimeError("crash loop")
+
+    monkeypatch.setattr(sys, "argv",
+                        ["phantom", "--auto", "10.0.0.5", "--supervise",
+                         "--max-restarts", "1", "--resume", str(cp)])
+    monkeypatch.setattr("phantom.core.automode.run_auto_mode", fake_run)
+    cli.main()
+
+    # two launches: the second crash finds the budget spent and stops there
+    assert calls == [str(cp), str(cp)]
 
 
 def test_auto_shell_exposes_the_manual_mode():

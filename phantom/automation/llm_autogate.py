@@ -23,6 +23,26 @@ explicitly recognise as a bounded, non-destructive action is refused, because a
 refused proposal costs one opportunity while a wrong acceptance can destroy
 evidence, the target or the operator's own machine. Refusals are cheap and
 recorded; that is the trade this module makes in the operator's absence.
+
+THREE TIERS, and the difference between them is the whole policy:
+
+* `DESTRUCTIVE`   — never accepted, in ANY posture. Wiping shadow copies,
+                    killing the box, installing software on the operator's
+                    machine, locking the operator out. Aggressive means LOUD,
+                    never DAMAGING: `--aggressive` does not unlock this tier.
+* AGGRESSIVE flags (`DANGEROUS_FLAGS`) — refused by default, accepted when
+                    the operator chose `--aggressive` (that flag exists
+                    precisely to buy these techniques). Still subject to the
+                    allowlist, the scope and the destructive checks.
+* everything else   — allowlisted enumeration, accepted.
+
+STRUCTURE is checked too, not just the first word: a compound command must
+have EVERY element pass, and the right-hand side of a pipe may additionally be
+a read-only filter (`PIPELINE_HELPERS`) — which is what keeps
+`curl … | grep -i server` a normal enumeration pipeline while `… | xargs`
+(it executes its arguments) and `… | sh` stay refused. The splitter is the
+SAME one the executor uses (`phantom.core.safe_exec.split_operators`), so
+validation and execution can never disagree about what a command means.
 """
 
 from __future__ import annotations
@@ -122,7 +142,34 @@ _PIPE_TO_INTERPRETER = re.compile(
     re.IGNORECASE)
 _REDIRECT_WRITE = re.compile(r">\s*(?:/[A-Za-z]|~|\$|/etc|/boot|/usr|/var|C:)", re.IGNORECASE)
 
-# `--` flags that turn a read-only tool into a destructive one.
+# ...but the executor itself WHITELISTS a handful of redirects
+# (`phantom.core.safe_exec._SAFE_REDIRECTS`): `2>/dev/null` is how every
+# module run silences its own stderr, and `2>&1` merges the streams. Those are
+# not "writing into a system path" — refusing them would refuse the run's own
+# vocabulary and stall a chain for no safety gain, so they are stripped
+# BEFORE the check. The pattern is built from the executor's own tuple instead
+# of being copied, so the gate and the executor cannot drift apart on which
+# redirect is benign; if that import ever fails, the regex matches nothing and
+# the check stays as strict as before (fail closed).
+_SAFE_REDIRECT_RE: Optional[re.Pattern] = None
+
+
+def _safe_redirect_re() -> re.Pattern:
+    """Regex of redirects the EXECUTOR whitelists (built once, lazily)."""
+    global _SAFE_REDIRECT_RE
+    if _SAFE_REDIRECT_RE is None:
+        try:
+            from phantom.core.safe_exec import _SAFE_REDIRECTS
+            alt = "|".join(re.escape(s) for s in _SAFE_REDIRECTS)
+            _SAFE_REDIRECT_RE = re.compile(r"(?<![>\w])(?:" + alt + r")")
+        except Exception:                      # pragma: no cover - defensive
+            _SAFE_REDIRECT_RE = re.compile(r"(?!)")     # matches nothing
+    return _SAFE_REDIRECT_RE
+
+# `--` flags that turn a read-only tool into an AGGRESSIVE one: refused in
+# the default posture, accepted under `--aggressive` (tier 2 above). These are
+# not destructive — `curl -F` uploads a file, `nmap --script` probes for a
+# vulnerability — so they are exactly what the aggressive posture is for.
 DANGEROUS_FLAGS: Dict[str, Tuple[str, ...]] = {
     "nmap": ("--script",),
     "sqlmap": ("--os-shell", "--os-pwn", "--os-cmd", "--file-write",
@@ -138,6 +185,77 @@ DANGEROUS_FLAGS: Dict[str, Tuple[str, ...]] = {
 # takes a wordlist — refusing it would refuse half of the recon vocabulary.
 WRITE_FLAGS = ("--delete", "--remove", "--overwrite", "--truncate",
                "--set", "--create")
+
+# Read-only filters that may sit on the RIGHT-hand side of a PIPE. A pipe is
+# how enumeration actually reads its own output (`curl … | grep -i server`,
+# `… | jq .items`), so refusing every pipe would refuse the vocabulary the
+# model needs — but the right-hand side is also where "read-only" stops being
+# true. Every entry below only READS stdin.
+#
+# Deliberately ABSENT, and this is the point of the list: `xargs` (it executes
+# its arguments), `env`, `find` (it can `-exec`), and every interpreter (which
+# `INTERPRETERS` already refuses wherever it appears after a pipe).
+PIPELINE_HELPERS = frozenset((
+    "grep", "egrep", "fgrep", "awk", "sed", "sort", "uniq", "cut", "tr",
+    "head", "tail", "wc", "jq", "column", "strings", "xxd", "base64",
+    "rev", "nl", "tac", "diff", "md5sum", "sha1sum", "sha256sum",
+))
+
+
+def _flag_present(argv: Sequence[str], flag: str) -> bool:
+    """Is ``flag`` one of this element's OWN arguments (`--x` or `--x=v`)?
+
+    Checked per element instead of over the whole line: a flag belongs to the
+    program that carries it, so `nmap … && curl -F …` must not be judged by
+    nmap's flag list nor by curl's position.
+    """
+    for token in argv:
+        if token == flag or token.startswith(flag + "="):
+            return True
+    return False
+
+
+def _program_of_argv(argv: Sequence[str]) -> str:
+    """The program of ONE parsed element: leading word, env prefixes skipped."""
+    index = 0
+    while index < len(argv) and "=" in argv[index] \
+            and not argv[index].startswith(("/", ".")):
+        index += 1
+    if index >= len(argv):
+        return ""
+    return os.path.basename(argv[index]).lower()
+
+
+def _elements(text: str) -> List[Tuple[str, List[str], str]]:
+    """[(program, argv, joining_operator)] for every element of the command.
+
+    Reuses the SHARED splitter (`phantom.core.safe_exec.split_operators`) the
+    executor parses with, so the gate and the execution agree on the meaning
+    of `;`/`&&`/`||`/`|` AND on quotes: a separator inside quotes
+    (`msfconsole -x "use a; run"`) is DATA, not a second command. Balanced
+    quotes are required; anything the parser cannot model (unbalanced quote,
+    stray operator) raises and the caller refuses.
+    """
+    from phantom.core.safe_exec import split_operators
+    segments, separators = split_operators(text)
+    out: List[Tuple[str, List[str], str]] = []
+    for index, segment in enumerate(segments):
+        if not segment:
+            continue
+        try:
+            argv = shlex.split(segment, posix=True)
+        except ValueError as exc:
+            raise ValueError(f"unparseable segment (check quotes): {exc}") from exc
+        if not argv:
+            continue
+        if index == 0:
+            joined = ""
+        elif index - 1 < len(separators):
+            joined = separators[index - 1]
+        else:
+            joined = ";"
+        out.append((_program_of_argv(argv), argv, joined))
+    return out
 
 
 @dataclass
@@ -182,6 +300,7 @@ def program_of(command: str) -> str:
 def decide(command: str, *, scope: Optional[Sequence[str]] = None,
            paranoid: bool = False,
            strict: bool = False,
+           aggressive: bool = False,
            extra_allowed: Optional[Sequence[str]] = None,
            is_in_scope: Optional[Any] = None) -> Decision:
     """Accept or refuse ONE model proposal, deterministically.
@@ -190,7 +309,10 @@ def decide(command: str, *, scope: Optional[Sequence[str]] = None,
     "it is on the allowlist" must never override "it destroys something"
     (several tools appear in both lists once a dangerous flag is added).
     `paranoid` and `strict` narrow the policy further — in those modes only a
-    bare, allowlisted, single command survives.
+    bare, allowlisted, single command survives. `aggressive` is the operator's
+    POSTURE: it widens the technique set (the AGGRESSIVE flags) and nothing
+    else — `DESTRUCTIVE` is refused in every posture, because aggressive means
+    loud, never damaging.
     """
     text = (command or "").strip()
     if not text:
@@ -204,18 +326,27 @@ def decide(command: str, *, scope: Optional[Sequence[str]] = None,
     if not program:
         return Decision(False, "no program in the proposal")
 
-    # 1. hard refusals first
+    # 0.5 substitution: the shell would run something the policy never saw
+    for token in ("`", "$(", "${"):
+        if token in text:
+            return Decision(False, "command substitution is not reviewable",
+                            program, "remote-code")
+
+    # 1. hard refusals first — identical in EVERY posture
     if program in DESTRUCTIVE:
         return Decision(False, DESTRUCTIVE[program], program, "destructive")
     if _PIPE_TO_INTERPRETER.search(text):
         return Decision(False, "pipes into an interpreter (unreviewable code)",
                         program, "remote-code")
+    if re.search(r"(?:^|\s)-exec(?:dir)?(?:\s|$)", text):
+        return Decision(False, "-exec runs a command per match "
+                               "(unreviewable code)", program, "remote-code")
     lowered = text.lower()
     for token in ("/dev/sd", "/dev/nvme", "/dev/zero", "/dev/urandom"):
         if token in lowered:
             return Decision(False, f"writes to a raw device ({token})",
                             program, "destructive")
-    if _REDIRECT_WRITE.search(text):
+    if _REDIRECT_WRITE.search(_safe_redirect_re().sub(" ", text)):
         return Decision(False, "redirects output into a system path",
                         program, "destructive")
     for flag in WRITE_FLAGS:
@@ -223,11 +354,24 @@ def decide(command: str, *, scope: Optional[Sequence[str]] = None,
             return Decision(False, f"write/delete flag '{flag}' in a proposal",
                             program, "destructive")
 
-    # 2. tool-specific dangerous flags
-    for flag in DANGEROUS_FLAGS.get(program, ()):  # type: ignore[arg-type]
-        if re.search(r"(?:^|\s)" + re.escape(flag) + r"(?:\s|=|$)", text):
-            return Decision(False, f"{program} {flag} is not enumeration",
-                            program, "dangerous-flag")
+    # the STRUCTURE, parsed by the splitter the executor itself uses: a
+    # command the parser cannot model fails CLOSED like everything else here
+    try:
+        elements = _elements(text)
+    except Exception as exc:
+        return Decision(False, f"unparseable command ({exc})", program,
+                        "unparseable")
+
+    # 2. tool-specific AGGRESSIVE flags: refused in the default posture,
+    #    accepted under --aggressive — still subject to the allowlist, the
+    #    scope and the destructive checks below them.
+    if not aggressive:
+        for pid, argv, _sep in elements:
+            for flag in DANGEROUS_FLAGS.get(pid, ()):  # type: ignore[arg-type]
+                if _flag_present(argv, flag):
+                    return Decision(
+                        False, f"{pid} {flag} needs the aggressive posture",
+                        pid, "dangerous-flag")
 
     # 3. allowlist (narrowed in paranoid/strict: no extra programs)
     allowed = set(ALLOWED_PROGRAMS)
@@ -237,21 +381,31 @@ def decide(command: str, *, scope: Optional[Sequence[str]] = None,
         return Decision(False, f"'{program}' is not on the auto-mode allowlist",
                         program, "not-allowlisted")
 
-    # 4. chaining: strict mode refuses anything compound, so the reviewed
+    # 4. EVERY element must pass, not only the first: `;`/`&&`/`||`/`|` used
+    #    to be able to smuggle a program past the check. The right-hand side
+    #    of a PIPE may also be a read-only filter, which is what keeps
+    #    `curl … | grep -i server` usable while `… | xargs` stays refused.
+    for index, (pid, _argv, joined) in enumerate(elements):
+        if index == 0 or not pid:
+            continue
+        if pid in DESTRUCTIVE:
+            return Decision(False, DESTRUCTIVE[pid], pid, "destructive")
+        if joined == "|":
+            if pid in PIPELINE_HELPERS or pid in allowed:
+                continue
+            return Decision(False, f"'{pid}' is not an allowlisted "
+                                   f"pipeline filter", pid, "not-allowlisted")
+        if pid not in allowed:
+            return Decision(False, f"'{pid}' is not on the auto-mode allowlist "
+                                   f"(chained command)", pid, "not-allowlisted")
+
+    # 5. chaining: strict mode refuses anything compound, so the reviewed
     #    command is exactly the one that runs
-    chained = bool(re.search(r"[;&|]{1,2}(?![&|])", text)) or bool(
-        re.search(r"\|\s*\S", text))
-    if chained and (paranoid or strict):
+    if len(elements) > 1 and (paranoid or strict):
         return Decision(False, "compound command in strict/paranoid mode",
                         program, "compound")
-    if chained and re.search(r"(?:;|&&|\|\|)\s*\S", text):
-        # a second command can smuggle anything past the program check
-        second = re.split(r"(?:;|&&|\|\|)", text, maxsplit=1)
-        if len(second) > 1 and program_of(second[1]) in DESTRUCTIVE:
-            return Decision(False, "chains into a destructive command",
-                            program, "destructive")
 
-    # 5. the engagement scope, on the hosts NAMED IN THE COMMAND
+    # 6. the engagement scope, on the hosts NAMED IN THE COMMAND
     if scope:
         from phantom.automation.llm_proposals import out_of_scope_hosts
         checker = is_in_scope
@@ -272,6 +426,11 @@ def apply_decisions(proposals: Sequence[Any], *,
     The queue records the DECIDER (`auto-policy`), so the journal and the CLI
     distinguish an operator decision from an algorithmic one — which is the
     only way a human can afterwards audit what the run did on its own.
+
+    `**context` is forwarded to :func:`decide` verbatim, so the CALLER's
+    posture applies to every proposal in the batch: `aggressive=True` accepts
+    the aggressive tier, `strict`/`paranoid` narrow it back to bare
+    allowlisted commands, and `scope` still bounds the hosts touched.
     """
     from phantom.automation import llm_proposals
     target_queue = queue if queue is not None else llm_proposals.queue

@@ -60,6 +60,21 @@ def main():
                         help="target profile (auto-mode, default: enterprise)")
     parser.add_argument("--resume", default="", metavar="CHECKPOINT",
                         help="resume from an auto-mode checkpoint (auto-mode)")
+    parser.add_argument("--resume-latest", dest="resume_latest", action="store_true",
+                        help="resume the NEWEST auto-mode checkpoint with nobody "
+                             "watching (unattended restart, bounded by a "
+                             "persisted counter so a crash loop terminates)")
+    parser.add_argument("--supervise", action="store_true",
+                        help="auto-mode: keep the run alive WITHOUT anybody "
+                             "watching — a crash mid-engagement relaunches it "
+                             "from its checkpoint (bounded by the same "
+                             "persisted counter; Ctrl+C is a stop, never a "
+                             "relaunch)")
+    parser.add_argument("--max-restarts", dest="max_restarts", type=int,
+                        default=3, metavar="N",
+                        help="auto-mode --supervise: automatic relaunches "
+                             "allowed after a crash (default 3; 0 refuses "
+                             "every unattended restart)")
     parser.add_argument("--llm", action="store_true", help="optional local-LLM advisor (auto-mode)")
     parser.add_argument("--experience", action="store_true",
                         help="CROSS-ENGAGEMENT learning memory (auto-mode): "
@@ -118,28 +133,81 @@ def main():
             run_auto_shell()
             return
         from phantom.core.automode import run_auto_mode
-        run_auto_mode(
-            targets=targets,
-            aggressive=args.aggressive,
-            stealth=args.stealth,
-            speed=args.speed,
-            plan=args.plan,
-            verbose=args.verbose,
-            agents=args.agents or 0,
-            goal=args.goal,
-            profile=args.profile_auto,
-            llm=args.llm,
-            experience=args.experience,
-            evolution=args.evolution,
-            beta=args.beta,
-            resume=args.resume,
-            reason_profile=args.reason,
-            identity_active=args.identity_active,
-            cell_loop=args.cell_loop,
-            cell_stages=[s.strip() for s in args.cell_stages.split(",")
-                         if s.strip()],
-            only_markdown=args.only_markdown,
-        )
+        # --resume-latest: the policy lives in utils/auto_resume (never asks
+        # a human, never raises). A refusal is announced WITH its reason and
+        # the run is not started — that is the point of the counter.
+        _resume_counter = ""
+        if args.resume_latest and not args.resume:
+            from phantom.utils.auto_resume import (counter_path_for,
+                                                   plan_resume)
+            from phantom.utils.notifier import notifier
+            from phantom.utils.session_bundle import latest_checkpoint
+            _decision = plan_resume(latest_checkpoint() or "")
+            if not _decision.ok:
+                notifier.warn(f"--resume-latest: {_decision.reason}")
+                return
+            notifier.info(f"--resume-latest: riprendo "
+                          f"{_decision.checkpoint} "
+                          f"(tentativo {_decision.attempt})")
+            args.resume = _decision.checkpoint
+            _resume_counter = counter_path_for(_decision.checkpoint)
+        def _launch(checkpoint: str):
+            """One auto-mode attempt, resuming from `checkpoint` when given."""
+            return run_auto_mode(
+                targets=targets,
+                aggressive=args.aggressive,
+                stealth=args.stealth,
+                speed=args.speed,
+                plan=args.plan,
+                verbose=args.verbose,
+                agents=args.agents or 0,
+                goal=args.goal,
+                profile=args.profile_auto,
+                llm=args.llm,
+                experience=args.experience,
+                evolution=args.evolution,
+                beta=args.beta,
+                resume=checkpoint,
+                reason_profile=args.reason,
+                identity_active=args.identity_active,
+                cell_loop=args.cell_loop,
+                cell_stages=[s.strip() for s in args.cell_stages.split(",")
+                             if s.strip()],
+                only_markdown=args.only_markdown,
+            )
+
+        if args.supervise:
+            # Nobody is watching: a crash at hour three must not end the
+            # engagement. The supervisor decides WHEN to relaunch (a crash),
+            # `utils/auto_resume` decides WHETHER it may (the persisted
+            # budget), and Ctrl+C stays an operator stop.
+            from phantom.utils.auto_supervisor import supervise
+            from phantom.utils.notifier import notifier
+
+            def _announce(kind: str, payload: dict) -> None:
+                """Surface a relaunch/stop; the first launch needs no line."""
+                if kind != "launch":
+                    notifier.info(f"supervisor: {kind} {payload}")
+
+            _summary = supervise(
+                _launch,
+                resume=args.resume,
+                max_restarts=args.max_restarts,
+                counter_path=_resume_counter,
+                on_event=_announce,
+            )
+            notifier.info(
+                f"auto-mode supervised: {_summary['attempts']} attempt(s), "
+                f"stopped: {_summary['stopped_reason']}")
+            return
+
+        _launch(args.resume)
+        if _resume_counter:
+            # the run finished (clean or not): the restart budget resets, so
+            # the NEXT crash gets its own allowance instead of inheriting a
+            # spent counter forever.
+            from phantom.utils.auto_resume import note_success
+            note_success(_resume_counter)
         return
 
     if args.manual:
