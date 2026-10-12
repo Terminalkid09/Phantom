@@ -179,11 +179,28 @@ function startApiServer(): void {
 }
 
 function stopApiServer(): void {
-  if (apiProcess) {
-    console.log('[main] Stopping API server...')
-    apiProcess.kill('SIGTERM')
-    apiProcess = null
+  const proc = apiProcess
+  if (!proc) return
+  console.log('[main] Stopping API server...')
+  // SIGTERM first, THEN escalation: the API server's shutdown hook is what
+  // persists the engagement (`_persist_session_on_stop` -> auto_export ->
+  // .pm), and on POSIX a single kill without waiting can leave that work
+  // unfinished (on Windows SIGTERM is already a hard terminate). The grace
+  // period is short enough not to hang the quit path.
+  try {
+    proc.kill('SIGTERM')
+  } catch {
+    // already gone
   }
+  const killTimer = setTimeout(() => {
+    try {
+      proc.kill('SIGKILL')
+    } catch {
+      // already gone
+    }
+  }, 3000)
+  proc.once('close', () => clearTimeout(killTimer))
+  apiProcess = null
 }
 
 function createWindow(): void {
@@ -348,7 +365,20 @@ app.whenReady().then(() => {
     try {
       const response = await fetch(url, options)
       clearTimeout(timeout)
-      const data = await response.json()
+      // The body is read as TEXT and parsed only when it really is JSON.
+      // `response.json()` used to throw on an HTML error page or an empty
+      // 500, so the catch turned a real HTTP failure into `status: 0` and
+      // every panel reported "desktop bridge unavailable" instead of the
+      // status the API had actually returned.
+      const text = await response.text()
+      let data: unknown = null
+      if (text) {
+        try {
+          data = JSON.parse(text)
+        } catch {
+          data = { error: text.slice(0, 500) }
+        }
+      }
       return { status: response.status, data }
     } catch (err) {
       clearTimeout(timeout)
