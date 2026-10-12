@@ -115,6 +115,15 @@ def run_swarm_task(task, target: str, board, runner=None,
         governor=TimingGovernor(base_delay=0.0, jitter=0.0))
     if runner is not None and getattr(agent, "hunt_runner", None) is None:
         agent.hunt_runner = _quiet_hunt_runner
+        # The fuzz capability dials out with the same principle, but the
+        # rule in `AutonomousAgent.__init__` ran BEFORE this transport
+        # existed, so it has to be applied again here: otherwise a worker
+        # silently kept a live curl pass (measured: 45s per fuzz move in an
+        # otherwise offline campaign).
+        if getattr(agent, "fuzz_sender", None) is None:
+            from phantom.automation.agent import fuzz_sender_from_hunt
+            agent.fuzz_sender = fuzz_sender_from_hunt(agent.hunt_runner,
+                                                      agent.wm)
 
     budget = max(1, int(task.budget or 1))
     result = agent.run(goal=task.goal, max_iterations=budget)
@@ -170,6 +179,6 @@ def _null_runner():
     return run
 
 
-def _quiet_hunt_runner(method, url, body="", timeout=8.0):
+def _quiet_hunt_runner(method: str, url: str, body: str = "", timeout: float = 8.0):
     from phantom.automation.exploit.anomaly import ProbeResult
     return ProbeResult()

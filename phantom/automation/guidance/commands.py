@@ -10,6 +10,7 @@ Capabilities + WorldModel, never over raw strings.
 
 from __future__ import annotations
 
+import inspect
 import re
 import time
 from dataclasses import dataclass, field
@@ -121,26 +122,44 @@ _engine_cache: Dict[Any, Tuple[float, str]] = {}
 
 
 def run_engine(cap: "Capability", wm: WorldModel,
-               slot_values: Dict[str, Any]) -> str:
+               slot_values: Dict[str, Any],
+               injected: Optional[Dict[str, Any]] = None) -> str:
     """Run an in-process engine under a timeout, with a short TTL cache.
 
     The engine is the ONE place the I/O happens; it never runs during
     command synthesis. A timeout returns a comment line the interpreter
     ignores, so a hung probe cannot stall the run loop.
+
+    ``injected`` carries transports the CALLER owns — today the run's fuzz
+    sender (``AutonomousAgent.fuzz_sender``), the exact analogue of the
+    runner the anomaly hunt is given. A transport is forwarded only to an
+    engine whose signature accepts it, so an engine that takes none keeps
+    working untouched, and an engine that takes one never has to invent its
+    own socket path behind the caller's back.
     """
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TO
 
     key = (cap.id, str(getattr(wm, "target", "")),
-           tuple(sorted((k, str(v)) for k, v in (slot_values or {}).items())))
+           tuple(sorted((k, str(v)) for k, v in (slot_values or {}).items())),
+           tuple(sorted(injected or {})))
     now = time.time()
     hit = _engine_cache.get(key)
     if hit and now - hit[0] < _ENGINE_CACHE_TTL:
         return hit[1]
 
+    kwargs: Dict[str, Any] = {}
+    if injected:
+        try:
+            accepted = inspect.signature(cap.engine).parameters
+            kwargs = {name: value for name, value in injected.items()
+                      if name in accepted}
+        except (TypeError, ValueError):      # a builtin/opaque callable
+            kwargs = {}
+
     # wait=False: a timed-out engine thread must NOT block the run loop
     # while the pool joins. The worker is abandoned to finish on its own.
     pool = ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(cap.engine, wm, slot_values)
+    future = pool.submit(cap.engine, wm, slot_values, **kwargs)
     try:
         out = future.result(timeout=max(1, int(cap.timeout)))
     except _TO:
