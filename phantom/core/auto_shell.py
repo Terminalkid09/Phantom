@@ -930,7 +930,16 @@ def summarize_bundle(result: Dict[str, Any]) -> str:
 
 
 def run_auto_shell():
-    """Start the interactive AUTO-MODE shell."""
+    """Start the interactive AUTO-MODE shell.
+
+    The engagement is persisted on EVERY close path — `back`/`exit`, `quit`,
+    a double Ctrl+C, or a crash inside a command — exactly like the manual
+    shell in `main.py`: `latest.pm` plus the dated copy. Without this the
+    auto-mode UX, which is the surface that actually runs kill chains, wrote
+    no `.pm` at all: the C2 intel, the notes and the reasoning state lived
+    only in memory and were gone at the next open.
+    """
+    from phantom.utils.auto_session import auto_export
     try:
         shell = AutoShell()
         shell.cmdloop()
@@ -938,3 +947,9 @@ def run_auto_shell():
         pass
     except KeyboardInterrupt:
         console.print("\n[dim]AUTO-MODE closed.[/dim]\n")
+    finally:
+        # `auto_export` never raises and returns None when there is nothing
+        # worth persisting, so it cannot break the exit path itself.
+        exported = auto_export()
+        if exported:
+            console.print(f"[dim]Session auto-saved: {exported}[/dim]")

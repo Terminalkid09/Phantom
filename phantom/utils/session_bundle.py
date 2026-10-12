@@ -36,6 +36,7 @@ misparsed.
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import os
 import time
@@ -44,6 +45,17 @@ from typing import Any, Dict, List, Optional
 _FORMAT = "phantom.pm"
 _VERSION = 1
 _MAGIC = "PHANTOM-PM"
+
+#: substring of the ValueError `read_bundle` raises for a key problem, as
+#: opposed to a corrupt/foreign file. The two need DIFFERENT words in front
+#: of the operator: "a file from another machine" is not "your last session
+#: is damaged", and today both printed as "encrypted, key mismatch".
+_KEY_MISMATCH_HINT = "PHANTOM_PM_KEY"
+
+
+def is_key_mismatch(exc: BaseException) -> bool:
+    """Is this `ValueError` a wrong-key failure rather than a corrupt file?"""
+    return _KEY_MISMATCH_HINT in str(exc)
 
 
 # ── encryption (AES-256-GCM, key = operator-local PHANTOM_PM_KEY) ──────────
@@ -177,13 +189,20 @@ def _report_index(root: Optional[str] = None) -> List[Dict[str, str]]:
 # ---------------------------------------------------------------------------
 
 def _session_payload() -> Dict[str, Any]:
+    """The session scalars plus the manual world model.
+
+    A failure to serialize the WM is RECORDED in the payload instead of
+    being swallowed: a `.pm` written without a world model looks like an
+    engagement that found nothing, and that is a lie the importer can act
+    on. `import_session` turns the marker into a warning.
+    """
     from phantom.core.session import session
     data = _jsonable(session.__dict__)
     try:
         from phantom.core.knowledge import session_wm
         data["_wm"] = json.loads(session_wm().to_json())
-    except Exception:
-        pass
+    except Exception as exc:
+        data["_wm_error"] = f"{exc.__class__.__name__}: {exc}"
     return data
 
 
@@ -303,13 +322,37 @@ def export_session(out_path: Optional[str] = None,
             "payload": _encrypt_payload(payload),
         }
         raw = json.dumps(envelope, default=str).encode("utf-8")
-        with gzip.open(out_path, "wb") as f:
-            f.write(raw)
     else:
         raw = json.dumps(payload, default=str).encode("utf-8")
-        with gzip.open(out_path, "wb") as f:
-            f.write(raw)
+    _atomic_gzip_write(out_path, raw)
     return out_path
+
+
+def _atomic_gzip_write(path: str, raw: bytes) -> None:
+    """Write a `.pm` so a reader never sees a half-written file.
+
+    The bundle is the operator's ONLY durable copy of the engagement, and the
+    close paths that write it are exactly the ones that can be killed
+    (Ctrl+C, SIGTERM from the desktop app, a crash mid-export). Written
+    in-place, that leaves a truncated `latest.pm` whose corruption is then
+    reported as a key mismatch and silently replaced by a fresh session.
+
+    A temp file in the SAME directory plus `os.replace` makes the swap
+    atomic on every platform we ship on. `phantom.core.engagement.save`
+    already does exactly this; the `.pm` path was the outlier.
+    """
+    tmp = f"{path}.tmp"
+    try:
+        with gzip.open(tmp, "wb") as fh:
+            fh.write(raw)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def read_bundle(path: str) -> Dict[str, Any]:
@@ -367,6 +410,8 @@ def import_session(path: str, resume_dir: Optional[str] = None) -> Dict[str, Any
                 "history", "results", "active_wordlist", "knowledge_base"):
         if key in sess:
             setattr(session, key, sess[key])
+    scope_restored = list(sess.get("scope") or [])
+    warnings: List[str] = []
     resume_path = ""
     cp = data.get("checkpoint")
     # world model: the checkpoint's WM is the richer one for auto-mode
@@ -377,16 +422,30 @@ def import_session(path: str, resume_dir: Optional[str] = None) -> Dict[str, Any
     else:
         wm_data = sess.get("_wm")
     findings_restored = _hydrate_world_model(wm_data)
+    if wm_data and not findings_restored:
+        warnings.append("world model could not be hydrated "
+                        "(findings restored: 0)")
+    elif not wm_data and sess.get("_wm_error"):
+        warnings.append(f"the bundle carries no world model: "
+                        f"{sess.get('_wm_error')}")
+    # An empty scope is not "no restriction": auto-mode REFUSES an unscoped
+    # target (only the documented PHANTOM_ALLOW_UNSCOPED=1 escape hatch runs
+    # without one). A restore that silently drops the scope turns a bounded
+    # engagement into a run that stops at the first gate — say it out loud
+    # here, where the operator is reading, not three layers down.
+    if not scope_restored:
+        warnings.append("no scope restored: add one (`scope add <cidr>`) "
+                        "before launching")
     c2_restored = _restore_c2_intel(data.get("c2"))
     if isinstance(cp, dict) and cp:
         base = resume_dir or _sessions_root()
         os.makedirs(base, exist_ok=True)
-        resume_path = os.path.join(base, "imported_checkpoint.json")
+        resume_path = os.path.join(base, _imported_checkpoint_name(path, data))
         with open(resume_path, "w", encoding="utf-8") as f:
             json.dump(cp, f, indent=2, default=str)
     return {
         "target": sess.get("target", ""),
-        "scope": list(sess.get("scope") or []),
+        "scope": scope_restored,
         "mode": sess.get("mode", ""),
         "checkpoint_source": data.get("checkpoint_source", ""),
         "resume_path": resume_path,
@@ -395,8 +454,28 @@ def import_session(path: str, resume_dir: Optional[str] = None) -> Dict[str, Any
         "history": len(sess.get("history") or []),
         "findings": findings_restored,
         "c2_intel": c2_restored,
+        "warnings": warnings,
         "session": sess,
     }
+
+
+def _imported_checkpoint_name(bundle_path: str, data: Dict[str, Any]) -> str:
+    """Filename for the staged checkpoint of ONE imported bundle.
+
+    It used to be the fixed `imported_checkpoint.json`, so importing bundle B
+    after bundle A silently overwrote A's checkpoint — and a later
+    `resume imported_checkpoint.json` continued the WRONG engagement (or
+    found a checkpoint no `latest_checkpoint` scan can see, since it only
+    looks at `auto_*`/`agent_*`). The name is now derived from the bundle:
+    the same bundle stages to the same file (idempotent re-import), a
+    different bundle gets its own.
+    """
+    stem = os.path.splitext(os.path.basename(bundle_path))[0] or "bundle"
+    tag = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in stem)
+    digest = hashlib.sha1(
+        f"{stem}|{data.get('engagement_id') or data.get('exported_at') or ''}"
+        .encode("utf-8")).hexdigest()[:8]
+    return f"imported_{tag[:40]}_{digest}_checkpoint.json"
 
 
 def _restore_c2_intel(c2_data: Optional[dict]) -> Dict[str, int]:
@@ -430,7 +509,7 @@ def _restore_c2_intel(c2_data: Optional[dict]) -> Dict[str, int]:
 
 
 def summarize(data: Dict[str, Any]) -> str:
-    """One-line human summary of an imported bundle."""
+    """One-line human summary of an imported bundle, warnings included."""
     lines = [
         f"target={data.get('target') or '-'}",
         f"scope={','.join(data.get('scope') or []) or '-'}",
@@ -441,4 +520,6 @@ def summarize(data: Dict[str, Any]) -> str:
         f"reports={len(data.get('reports') or [])}",
         f"c2_beacons={data.get('c2_intel', {}).get('beacons', 0)}",
     ]
+    for warning in data.get("warnings") or []:
+        lines.append(f"WARNING: {warning}")
     return " | ".join(lines)

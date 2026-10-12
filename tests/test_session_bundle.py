@@ -1,5 +1,6 @@
 """Tests for portable .pm session bundles (export/import/handoff) and the
 identity-target scope discipline."""
+import gzip
 import json
 import os
 import tempfile
@@ -143,6 +144,70 @@ class TestBundleRoundTrip(unittest.TestCase):
             session.target = old_target
             session.scope = list(old_scope)
             reset_wm(target="x")
+
+    def test_importing_two_bundles_keeps_both_staged_checkpoints(self):
+        """A fixed `imported_checkpoint.json` clobbered A with B, silently.
+
+        A later `resume imported_checkpoint.json` then continued the WRONG
+        engagement — and no `latest_checkpoint` scan can even see that file.
+        """
+        old_target, old_scope = session.target, list(session.scope)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                staged = os.path.join(tmp, "staged")
+                written = []
+                for i, target in enumerate(("a@x.com", "b@x.com"), start=1):
+                    pm = dict(FAKE_PM)
+                    pm["session"] = dict(FAKE_PM["session"], target=target)
+                    pm["checkpoint"] = {"wm": {"target": target}, "n": i}
+                    path = os.path.join(tmp, f"sess{i}.pm")
+                    with open(path, "wb") as f:
+                        f.write(gzip.compress(
+                            json.dumps(pm).encode("utf-8")))
+                    written.append(import_session(path,
+                                                  resume_dir=staged)["resume_path"])
+                self.assertNotEqual(written[0], written[1])
+                for path in written:
+                    self.assertTrue(os.path.isfile(path))
+                with open(written[0], encoding="utf-8") as f:
+                    self.assertEqual(json.load(f)["n"], 1)
+        finally:
+            session.target = old_target
+            session.scope = list(old_scope)
+
+    def test_reimporting_the_same_bundle_is_idempotent(self):
+        old_target, old_scope = session.target, list(session.scope)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                pm = os.path.join(tmp, "sess.pm")
+                with open(pm, "wb") as f:
+                    f.write(gzip.compress(json.dumps(FAKE_PM).encode("utf-8")))
+                first = import_session(pm, resume_dir=tmp)["resume_path"]
+                second = import_session(pm, resume_dir=tmp)["resume_path"]
+                self.assertEqual(first, second)
+        finally:
+            session.target = old_target
+            session.scope = list(old_scope)
+
+    def test_import_warns_when_no_scope_was_restored(self):
+        """An empty scope is not "no restriction": auto-mode refuses it."""
+        old_target, old_scope = session.target, list(session.scope)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                pm = dict(FAKE_PM)
+                pm["session"] = dict(FAKE_PM["session"], scope=[])
+                pm["checkpoint"] = None
+                path = os.path.join(tmp, "sess.pm")
+                with open(path, "wb") as f:
+                    f.write(gzip.compress(json.dumps(pm).encode("utf-8")))
+                data = import_session(path, resume_dir=tmp)
+                self.assertEqual(data["scope"], [])
+                self.assertTrue(any("scope" in w for w in data["warnings"]))
+                from phantom.utils.session_bundle import summarize
+                self.assertIn("WARNING", summarize(data))
+        finally:
+            session.target = old_target
+            session.scope = list(old_scope)
 
     def test_latest_checkpoint_discovers_newest(self):
         with tempfile.TemporaryDirectory() as tmp:

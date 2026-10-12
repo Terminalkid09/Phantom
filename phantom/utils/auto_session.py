@@ -16,8 +16,15 @@ operator NEVER loses state:
                    SAME engagement (same target + opening timestamp), a NEW
                    file when it is a different engagement.
 
-Both hooks run from main.py, so the double Ctrl+C exit is covered too
-(not just `exit`/`quit`).
+Both hooks run from main.py AND from `auto_shell.run_auto_shell`, so the
+double Ctrl+C exit is covered too (not just `exit`/`quit`) — including the
+interactive AUTO-MODE shell, which is the surface that actually runs kill
+chains and which used to write no `.pm` at all.
+
+The write itself is atomic (`.pm.tmp` + `os.replace`, see
+`session_bundle._atomic_gzip_write`): the close paths that export are exactly
+the ones that can be killed, and a truncated `latest.pm` used to be reported
+as a key mismatch and quietly replaced by a fresh session.
 """
 
 from __future__ import annotations
@@ -34,10 +41,27 @@ from phantom.utils.session_bundle import (
     _engagement_id,
     export_session,
     import_session,
+    is_key_mismatch,
     read_bundle,
 )
 
 _LATEST = "latest.pm"
+
+
+def _warn(message: str) -> None:
+    """Tell the operator something went wrong on a close/open path.
+
+    Best effort by construction: these hooks run while a shell is shutting
+    down, so the warning must never be the thing that breaks the exit.
+    """
+    try:
+        from phantom.utils.notifier import notifier
+        notifier.warn(message)
+    except Exception:
+        try:
+            print(f"[!] {message}")
+        except Exception:
+            pass
 
 
 def _root() -> str:
@@ -86,8 +110,18 @@ def offer_resume(quiet: bool = False) -> bool:
         return False
     try:
         data = read_bundle(latest)
-    except ValueError:
-        return False  # cannot decrypt on this machine -> fresh start
+    except ValueError as exc:
+        # "a bundle from another machine" and "my last session is damaged"
+        # are different problems and used to print the same way. Both mean a
+        # fresh start, but the operator has to know WHICH ONE happened.
+        if is_key_mismatch(exc):
+            _warn(f"cannot read {latest}: wrong PHANTOM_PM_KEY on this "
+                  f"machine — starting fresh")
+        else:
+            _warn(f"{latest} is unreadable ({exc}) — the last engagement "
+                  f"could NOT be restored; starting fresh. The file is "
+                  f"still on disk.")
+        return False
     sess = data.get("session") or {}
     target = sess.get("target") or "-"
     n_findings = len((data.get("checkpoint") or {}).get("wm", {}).get("findings", []) or []) \
@@ -144,11 +178,18 @@ def auto_export() -> Optional[str]:
     has_content = bool(session.target or session.notes or wm.all_findings())
     if not has_content:
         return None
+    latest_path = os.path.join(_root(), _LATEST)
     try:
-        latest = export_session(out_path=os.path.join(_root(), _LATEST))
+        latest = export_session(out_path=latest_path)
         export_session(out_path=_dated_copy_path())
         return latest
-    except Exception:
+    except Exception as exc:
+        # A failed auto-save IS data loss, and it used to be a silent `None`:
+        # the operator closed the shell believing the engagement was on disk.
+        # The write itself is atomic now (`_atomic_gzip_write`), so what lands
+        # here is a real failure worth saying out loud.
+        _warn(f"session auto-save FAILED ({exc.__class__.__name__}: {exc}) — "
+              f"{latest_path} is stale; run `export <file>.pm` before closing")
         return None
 
 
@@ -174,7 +215,9 @@ def list_auto() -> List[Dict[str, Any]]:
             entry["target"] = sess.get("target") or "-"
             entry["findings"] = len((data.get("checkpoint") or {}).get("wm", {}).get("findings", []) or []) \
                 or len((sess.get("_wm") or {}).get("findings", []) or [])
-        except ValueError:
-            entry["target"] = "(encrypted, key mismatch on this machine)"
+        except ValueError as exc:
+            entry["target"] = ("(wrong key on this machine)"
+                               if is_key_mismatch(exc)
+                               else "(unreadable: corrupt .pm)")
         out.append(entry)
     return out

@@ -200,6 +200,115 @@ class TestResumePrompt(unittest.TestCase):
                 self.assertIn("opened_at", idx[0])
 
 
+class TestNoSilentLoss(unittest.TestCase):
+    """The engagement is the one thing that must not vanish quietly.
+
+    Every failure on these paths used to be an unannounced `None`/`False`:
+    the operator closed the shell believing the run was saved.
+    """
+
+    def setUp(self):
+        self._old = (session.target, list(session.notes or []),
+                     getattr(session, "engagement_started", None))
+        reset_wm(target="")
+        session.notes = []
+        session.target = ""
+        session.engagement_started = "2026-08-26T10:00:00"
+
+    def tearDown(self):
+        session.target, session.notes, session.engagement_started = self._old
+        reset_wm(target="")
+
+    def _run(self, fn):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(AS, "sessions_dir", lambda: tmp):
+                return fn(tmp)
+
+    def test_export_is_atomic_and_leaves_no_half_written_file(self):
+        def check(tmp):
+            session.target = "bob@corp.com"
+            reset_wm(target="bob@corp.com")
+            session_wm().add_finding("service", "tcp/443", {}, source="scan")
+            AS.auto_export()
+            self.assertEqual([f for f in os.listdir(tmp)
+                              if f.endswith(".tmp")], [])
+            data = read_bundle(os.path.join(tmp, "latest.pm"))
+            self.assertEqual(data["session"]["target"], "bob@corp.com")
+        self._run(check)
+
+    def test_a_failed_export_is_announced_not_swallowed(self):
+        def check(tmp):
+            session.target = "bob@corp.com"
+            reset_wm(target="bob@corp.com")
+            with patch.object(AS, "export_session",
+                              side_effect=OSError("disk full")), \
+                 patch.object(AS, "_warn") as warn:
+                self.assertIsNone(AS.auto_export())
+                self.assertTrue(warn.called)
+                self.assertIn("auto-save FAILED", warn.call_args[0][0])
+        self._run(check)
+
+    def test_list_auto_tells_corrupt_from_wrong_key(self):
+        def check(tmp):
+            with open(os.path.join(tmp, "latest.pm"), "wb") as f:
+                f.write(b"not a bundle at all")
+            corrupt = next(a for a in AS.list_auto()
+                           if a["name"] == "latest.pm")
+            self.assertIn("corrupt", corrupt["target"])
+
+            good = os.path.join(tmp, "auto_2026-08-26.pm")
+            export_session(out_path=good)
+            with patch("phantom.utils.session_bundle._pm_key",
+                       return_value=b"\x01" * 32):
+                foreign = next(a for a in AS.list_auto()
+                               if a["name"] == "auto_2026-08-26.pm")
+            self.assertIn("key", foreign["target"])
+        self._run(check)
+
+    def test_offer_resume_warns_when_latest_pm_is_unreadable(self):
+        def check(tmp):
+            with open(os.path.join(tmp, "latest.pm"), "wb") as f:
+                f.write(b"truncated")
+            with patch.object(AS.sys, "stdin") as stdin, \
+                 patch.object(AS, "_warn") as warn:
+                stdin.isatty.return_value = True
+                self.assertFalse(AS.offer_resume())
+                self.assertTrue(warn.called)
+                self.assertIn("unreadable", warn.call_args[0][0])
+        self._run(check)
+
+
+class TestAutoShellPersistsOnExit(unittest.TestCase):
+    """The AUTO-MODE shell is the surface that runs kill chains.
+
+    It used to write no `.pm` at all: the C2 intel and the reasoning state
+    lived only in memory and were gone at the next open.
+    """
+
+    def _run(self, side_effect, expect_raise=False):
+        from phantom.core import auto_shell as SH
+        with patch.object(SH, "AutoShell") as shell_cls, \
+             patch("phantom.utils.auto_session.auto_export",
+                   return_value="latest.pm") as export:
+            shell_cls.return_value.cmdloop.side_effect = side_effect
+            if expect_raise:
+                with self.assertRaises(type(side_effect)):
+                    SH.run_auto_shell()
+            else:
+                SH.run_auto_shell()
+            return export
+
+    def test_back_exit_persists(self):
+        self._run(None).assert_called_once()
+
+    def test_ctrl_c_persists(self):
+        # a Ctrl+C is swallowed by design, but the export must still happen
+        self._run(KeyboardInterrupt()).assert_called_once()
+
+    def test_a_crash_inside_a_command_still_persists(self):
+        self._run(RuntimeError("boom"), expect_raise=True).assert_called_once()
+
+
 class TestShellListSessions(unittest.TestCase):
 
     def test_list_sessions_does_not_crash(self):
