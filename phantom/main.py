@@ -75,6 +75,32 @@ def main():
                         help="auto-mode --supervise: automatic relaunches "
                              "allowed after a crash (default 3; 0 refuses "
                              "every unattended restart)")
+    parser.add_argument("--print-service", dest="print_service", nargs="?",
+                        const="host", default="",
+                        metavar="{systemd,launchd,schtasks}",
+                        help="auto-mode: print the OS service definition for "
+                             "THIS invocation to stdout (nothing is written) "
+                             "— review it, or redirect it into the unit path")
+    parser.add_argument("--install-service", dest="install_service", nargs="?",
+                        const="host", default="",
+                        metavar="{systemd,launchd,schtasks}",
+                        help="auto-mode: WRITE the service definition that "
+                             "starts this run after a reboot (it is not "
+                             "enabled: the command to enable it is printed)")
+    parser.add_argument("--uninstall-service", dest="uninstall_service",
+                        nargs="?", const="host", default="",
+                        metavar="{systemd,launchd,schtasks}",
+                        help="auto-mode: remove the service definition "
+                             "(--service-name selects which one)")
+    parser.add_argument("--service-name", dest="service_name", default="",
+                        metavar="NAME",
+                        help="auto-mode service definition: unit name "
+                             "(default: one per platform)")
+    parser.add_argument("--service-system", dest="service_system",
+                        action="store_true",
+                        help="auto-mode service definition: a system-level "
+                             "unit instead of a per-user one (needs root to "
+                             "enable; survives a logout)")
     parser.add_argument("--llm", action="store_true", help="optional local-LLM advisor (auto-mode)")
     parser.add_argument("--experience", action="store_true",
                         help="CROSS-ENGAGEMENT learning memory (auto-mode): "
@@ -124,10 +150,28 @@ def main():
         run_c2()
         return
 
+    if (args.print_service or args.install_service
+            or args.uninstall_service) and args.auto is None:
+        # A unit describes an AUTO-MODE run: without --auto there is no run to
+        # describe, and silently ignoring the flag would leave the operator
+        # believing a service was written.
+        from phantom.utils.notifier import notifier
+        notifier.error("--print-service/--install-service/"
+                       "--uninstall-service describe an AUTO-MODE run: pass "
+                       "them with --auto <targets> (e.g. `phantom --auto "
+                       "10.0.0.5 --install-service`)")
+        sys.exit(2)
+
     if args.auto is not None:
         # `phantom --auto` (no target) -> interactive AUTO-MODE shell;
         # `phantom --auto <t1[,t2]...> [flags]` -> run the kill chain now.
         targets = [t for t in (args.auto + extra) if t.strip()]
+        # Service definition: render/install/remove the thing that starts this
+        # run after a reboot. Handled BEFORE the interactive-shell fallback,
+        # because `--print-service` is meaningful with or without a target.
+        if (args.print_service or args.install_service
+                or args.uninstall_service):
+            sys.exit(run_service_command(args, targets))
         if not targets:
             from phantom.core.auto_shell import run_auto_shell
             run_auto_shell()
@@ -224,6 +268,152 @@ def main():
     # truth; the human-in-the-loop path is still there, one command away.
     from phantom.core.auto_shell import run_auto_shell
     run_auto_shell()
+
+
+def build_service_command(args, targets) -> list:
+    """The unit's command line: the operator's OWN invocation, verbatim.
+
+    Reconstructed from the PARSED arguments, never from ``sys.argv``: the
+    parser has already decided what each flag meant, so nothing here can
+    invent an argument or mis-split one. Flags are only carried when the
+    operator actually passed them — a unit that hardcodes a default the
+    operator never typed is a unit that lies about what the engagement
+    agreed to (the defaults are applied by the parser on the way back in).
+
+    ``--supervise --resume-latest`` is the point of the exercise: a boot that
+    finds the run dead must relaunch it, and the relaunched process asks
+    `utils/auto_resume` for permission from the persisted budget.
+    """
+    command = [sys.executable or "python", "-m", "phantom.main",
+               "--auto", *targets, "--supervise", "--resume-latest"]
+    for flag, value in (("--aggressive", args.aggressive),
+                        ("--stealth", args.stealth),
+                        ("--speed", args.speed),
+                        ("--llm", args.llm),
+                        ("--experience", args.experience),
+                        ("--evolution", args.evolution),
+                        ("--beta", args.beta),
+                        ("--identity-active", args.identity_active),
+                        ("--only-markdown", args.only_markdown),
+                        ("--verbose", args.verbose)):
+        if value:
+            command.append(flag)
+    if args.goal and args.goal != "deliver":
+        command += ["--goal", args.goal]
+    if args.profile_auto and args.profile_auto != "enterprise":
+        command += ["--profile-auto", args.profile_auto]
+    if args.reason:
+        command += ["--reason", args.reason]
+    if args.agents:
+        command += ["--agents", str(args.agents)]
+    stages = [s.strip() for s in (args.cell_stages or "").split(",")
+              if s.strip()]
+    if stages:
+        command += ["--cell-stages", ",".join(stages)]
+    if args.max_restarts != 3:
+        command += ["--max-restarts", str(args.max_restarts)]
+    return command
+
+
+def run_service_command(args, targets) -> int:
+    """Print, install or remove the OS service definition for this run.
+
+    Returns the exit code. Every refusal is a REASON through the notifier and
+    a non-zero code, and nothing is written on a refusal — the one action that
+    touches the filesystem is `install_service`.
+
+    `--print-service` writes the unit to stdout and NOTHING else there, so
+    `phantom --auto <t> --print-service systemd > unit.service` produces a
+    file that can be dropped straight into the unit directory.
+    """
+    from phantom.utils.service_units import (KINDS, default_name, host_kind,
+                                             install_service, plan_service,
+                                             service_path, supported,
+                                             uninstall_service)
+    from phantom.utils.notifier import notifier
+    from phantom.utils.paths import project_root
+
+    action, kind = "", ""
+    for name, value in (("print", args.print_service),
+                        ("install", args.install_service),
+                        ("uninstall", args.uninstall_service)):
+        if value:
+            action, kind = name, value
+            break
+    if kind == "host":
+        kind = host_kind()
+        if not kind:
+            notifier.error(
+                f"this platform has no service format Phantom knows: name "
+                f"one explicitly ({', '.join(KINDS)})")
+            return 2
+    ok, reason = supported(kind)
+    if not ok:
+        notifier.error(reason)
+        return 2
+
+    unit_name = args.service_name or default_name(kind)
+    user = not args.service_system
+
+    if action == "uninstall":
+        try:
+            path = service_path(kind, unit_name, user=user)
+            removed = uninstall_service(path)
+        except ValueError as exc:
+            # a hostile `--service-name` reaches this branch first: refusing
+            # here is what keeps the flag from naming a path outside the unit
+            # directory
+            notifier.error(str(exc))
+            return 2
+        if removed:
+            notifier.success(f"service definition removed: {path}")
+        else:
+            notifier.warn(f"nothing to remove: {path}")
+        if kind == "schtasks":
+            notifier.info(f'also remove the task itself: schtasks /delete /tn '
+                          f'"{unit_name}" /f')
+        elif kind == "systemd":
+            prefix = "systemctl --user" if user else "sudo systemctl"
+            notifier.info(f"stop it first: {prefix} disable --now "
+                          f"{os.path.basename(path)}")
+        else:
+            notifier.info(f"unload it first: launchctl unload -w {path}")
+        return 0
+
+    if args.plan:
+        notifier.error("--plan only previews a run: a service definition for "
+                       "it would do nothing. Drop --plan to install the real "
+                       "thing.")
+        return 2
+    if not targets:
+        notifier.error("a service definition needs the targets to run: pass "
+                       "them after --auto (e.g. `--auto 10.0.0.5 "
+                       "--install-service`)")
+        return 2
+
+    command = build_service_command(args, targets)
+    try:
+        plan = plan_service(kind, command, working_dir=project_root(),
+                            name=unit_name, user=user)
+    except ValueError as exc:
+        notifier.error(str(exc))
+        return 2
+
+    if action == "print":
+        sys.stdout.write(plan["content"])
+        return 0
+
+    try:
+        path = install_service(plan)
+    except (OSError, ValueError) as exc:
+        notifier.error(f"cannot write {plan['path']}: {exc}")
+        return 2
+    notifier.success(f"service definition written: {path}")
+    notifier.info(f"activate it: {plan['hint']}")
+    notifier.info("the run it starts is supervised and resumes the newest "
+                  "checkpoint; its restart budget is the persisted one, so a "
+                  "crash loop ends with a reason instead of forever")
+    return 0
 
 
 def run_pentest_shell(args) -> None:
