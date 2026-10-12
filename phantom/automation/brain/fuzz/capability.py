@@ -434,8 +434,41 @@ def fuzz_engine(wm, slots: Optional[Dict[str, Any]] = None,
             sender = None
     if sender is None:
         return NO_OP
+    # The declared slots ARE the caller's budget: this capability advertises
+    # `rounds`, `max_requests` and `seed` (see SLOTS), so they have to reach
+    # the engine. They were accepted and then dropped, which made the only
+    # bound a caller could set a fiction — and left the pass running on
+    # Phantom's defaults while the plan said otherwise.
     return "\n".join(run_fuzz(wm, sender=sender, params=params,
+                              rounds=_slot_int(slots, "rounds",
+                                               DEFAULT_ROUNDS),
+                              max_requests=_slot_int(slots, "max_requests",
+                                                     DEFAULT_MAX_REQUESTS),
+                              seed=_slot_optional_int(slots, "seed"),
                               deadline=deadline))
+
+
+def _slot_int(slots: Optional[Dict[str, Any]], name: str, default: int) -> int:
+    """A declared int slot as an int, or ``default`` when absent/garbage."""
+    try:
+        raw = (slots or {}).get(name)
+        if raw in (None, ""):
+            return int(default)
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _slot_optional_int(slots: Optional[Dict[str, Any]],
+                       name: str) -> Optional[int]:
+    """A declared int slot as an int, or None (the engine's "not fixed")."""
+    try:
+        raw = (slots or {}).get(name)
+        if raw in (None, ""):
+            return None
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def _identity(finding: FuzzFinding) -> Tuple[str, str, str]:
