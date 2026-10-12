@@ -97,16 +97,30 @@ class TestElectronConsumesIt(unittest.TestCase):
     def test_opening_a_beacon_queues_no_task(self):
         # The handoff is a navigation action. Queueing work on the target as a
         # side effect of clicking "Open C2" would be an unrequested action.
+        # It DOES record the operator's decision (`automodeHandoff`) - a
+        # decision that lives only in the renderer is lost on reload and
+        # invisible to the CLI - so what is pinned here is that the only call
+        # it makes is that one, and that nothing on the target is touched.
         open_body = _PANEL[_PANEL.index("const openBeacon ="):]
         open_body = open_body[:open_body.index("const handleStop")]
-        # No network call at all, and specifically no task-queueing endpoint.
-        self.assertNotIn("api(", open_body,
-                         "openBeacon must not talk to the backend")
-        for forbidden in ("/api/c2/task", "/api/c2/queue", "sendTask"):
+        self.assertIn("automodeHandoff(beaconId, 'accept'", open_body)
+        for forbidden in ("/api/c2/task", "/api/c2/queue", "sendTask",
+                          "automodeRun", "automodeStop",
+                          "'POST', '/api/c2", "'POST', '/api/session"):
             self.assertNotIn(forbidden, open_body)
 
     def test_the_card_can_be_dismissed(self):
-        self.assertIn("setHandoffStatus(h.id, 'dismissed')", _PANEL)
+        """Dismissing must be RECORDED, not just hidden locally.
+
+        The panel's own `handoffs` are UI state: a dismissal that never reaches
+        the backend comes back on the next status poll, and the CLI keeps
+        showing the handoff as open.
+        """
+        self.assertIn("dismissHandoff(h.beaconId, h.id)", _PANEL)
+        body = _PANEL[_PANEL.index("const dismissHandoff ="):]
+        body = body[:body.index("const handleDryRun")]
+        self.assertIn("setHandoffStatus(recordId, 'dismissed')", body)
+        self.assertIn("automodeHandoff(beaconId, 'dismiss'", body)
 
 
 if __name__ == "__main__":

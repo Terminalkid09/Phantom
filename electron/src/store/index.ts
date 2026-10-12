@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import type { JobState } from '@/lib/api'
 
 // ── Types ──────────────────────────────────────────────
 
@@ -105,6 +106,48 @@ export interface AutoModeState {
   verbose: boolean
 }
 
+/**
+ * F-27: the RUN as the BACKEND sees it.
+ *
+ * `run_state`/`startedAt` above are the panel's optimistic view — it writes
+ * them and nobody corrects them, so a run that died on the backend kept
+ * showing "active" and a stop "in flight" was never confirmed. This record
+ * is refreshed from `GET /api/automode/status` (server.py:1087), so the chip
+ * renders the real job: its id, whether it is still running, and the LLM
+ * gate state. `cancel_requested` is deliberately separate from `running`:
+ * the stop is cooperative, so there is a window where we have asked and the
+ * engine has not halted yet, and that window is exactly what the operator
+ * needs to see.
+ */
+export interface AutoModeJob {
+  /** the backend's job handle (null before a run starts) */
+  id: string | null
+  /**
+   * F-27: the run's lifecycle as the BACKEND reports it — `idle` until a
+   * status answer arrives. `running: boolean` could not tell `stopping` from
+   * `cancelled` from `failed`; this union can, and `deriveJobState` (in
+   * `@/lib/api`) is the one place that reads the snapshot into it.
+   */
+  state: JobState
+  running: boolean
+  current_step: number
+  llm: string
+  llm_pending: number
+  cancel_requested: boolean
+  /** the backend's own message when the run failed */
+  error: string
+  /** WHY the run ended: "stopped by operator" / "sequence complete" / crash */
+  end_reason: string
+  /** when the backend started the job (0 = unknown), for the elapsed clock */
+  started_at: number
+  /** handoffs this run produced, with the operator's decision on each */
+  handoffs: Array<{ beacon_id: string; target?: string; status?: string }>
+  /** ready | accepted | dismissed | none — the run's newest handoff */
+  handoff_state: string
+  /** when the last status answer arrived (0 = never asked) */
+  last_status_at: number
+}
+
 export interface Handoff {
   id: string
   source: 'automode' | 'manual' | 'c2'
@@ -155,6 +198,8 @@ interface PhantomStore {
   // Auto-mode
   autoMode: AutoModeState
   setAutoMode: (a: Partial<AutoModeState>) => void
+  job: AutoModeJob
+  setJob: (j: Partial<AutoModeJob>) => void
   appendReasoning: (
     time: string,
     text: string,
@@ -250,6 +295,26 @@ export const useStore = create<PhantomStore>((set, get) => ({
     verbose: false
   },
   setAutoMode: (a) => set((s) => ({ autoMode: { ...s.autoMode, ...a } })),
+
+  // The backend's view of the run (F-27). `last_status_at: 0` means "never
+  // asked", which is what tells the UI it is still showing an optimistic
+  // state rather than a confirmed one.
+  job: {
+    id: null,
+    state: 'idle',
+    running: false,
+    current_step: -1,
+    llm: 'denied',
+    llm_pending: 0,
+    cancel_requested: false,
+    error: '',
+    end_reason: '',
+    started_at: 0,
+    handoffs: [],
+    handoff_state: 'none',
+    last_status_at: 0
+  },
+  setJob: (j) => set((s) => ({ job: { ...s.job, ...j } })),
   appendReasoning: (
     time: string,
     text: string,

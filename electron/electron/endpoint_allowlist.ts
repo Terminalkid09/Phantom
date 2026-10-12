@@ -81,6 +81,7 @@ const RULES: readonly Rule[] = [
   { pattern: '/api/learning', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/pm/list', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/search', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/automode/status', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/automode/stream', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/vault', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/launcher', methods: ['GET'], group: 'readonly' },
@@ -126,6 +127,10 @@ const RULES: readonly Rule[] = [
   { pattern: '/api/automode/plan', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/automode/run', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/automode/stop', methods: ['POST'], group: 'mutating' },
+  // Recording the operator's decision on a beacon handoff (F-27 / §4). Not
+  // confirm-gated: it records a choice about the UI's next screen, it does not
+  // touch the target, and the run itself keeps going either way.
+  { pattern: '/api/automode/handoff', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/automode/llm', methods: ['POST'], group: 'mutating' },
   // OSINT preview runs the real recon/social engine for the requested
   // handle (outbound provider queries, identity checks) — it is a write-side

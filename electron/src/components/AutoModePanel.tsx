@@ -1,6 +1,11 @@
-import { useState, useRef, useEffect } from 'react'
-import { useStore } from '@/store'
+import { useState, useRef, useEffect, useCallback } from 'react'
+import { useStore, type AutoModeJob } from '@/store'
 import { apiError, useApi } from '@/hooks/useApi'
+import {
+  automodeHandoff, automodePlan, automodeRun, automodeSetLlm, automodeStatus,
+  automodeStop, automodeStream, deriveJobState, sessionSet,
+  type JobState
+} from '@/lib/api'
 import LlmProposals from '@/components/LlmProposals'
 import { useSerialPoll } from '@/hooks/useSerialPoll'
 import {
@@ -42,6 +47,56 @@ const GOAL_HINTS: Record<string, string> = {
   cleanup: 'Post-engagement cleanup simulation'
 }
 
+// F-27: the run state the chip renders, in TWO vocabularies that must never be
+// confused. The lowercase-local ones (`starting`, `active`, `done`) are the
+// panel's own optimistic labels, used only until a status answer arrives; the
+// `JobState` ones are the backend's, and once `backendSeen` is true they are
+// the only thing on screen — which is the whole point of the strip. Where a
+// run ended, `endReason` says WHY (stopped by operator / sequence complete).
+const RUN_STATE_STYLE: Record<string, { label: string; cls: string }> = {
+  // local, pre-confirmation
+  starting: { label: 'Starting', cls: 'bg-phantom-cyan/10 text-phantom-cyan border-phantom-cyan/30' },
+  active: { label: 'Running', cls: 'bg-phantom-magenta/10 text-phantom-magenta border-phantom-magenta/30' },
+  done: { label: 'Completed', cls: 'bg-phantom-green/10 text-phantom-green border-phantom-green/30' },
+  // backend lifecycle (JobState)
+  idle: { label: 'Idle', cls: 'bg-surface text-text-dim border-surface-border' },
+  planning: { label: 'Planning', cls: 'bg-phantom-cyan/10 text-phantom-cyan border-phantom-cyan/30' },
+  running: { label: 'Running', cls: 'bg-phantom-magenta/10 text-phantom-magenta border-phantom-magenta/30' },
+  awaiting_approval: { label: 'Awaiting approval', cls: 'bg-phantom-yellow/10 text-phantom-yellow border-phantom-yellow/30' },
+  handoff_ready: { label: 'Handoff ready', cls: 'bg-phantom-green/10 text-phantom-green border-phantom-green/30' },
+  stopping: { label: 'Stopping', cls: 'bg-phantom-yellow/10 text-phantom-yellow border-phantom-yellow/30' },
+  cancelled: { label: 'Cancelled', cls: 'bg-surface text-text-secondary border-surface-border' },
+  completed: { label: 'Completed', cls: 'bg-phantom-green/10 text-phantom-green border-phantom-green/30' },
+  failed: { label: 'Failed', cls: 'bg-phantom-error/10 text-phantom-error border-phantom-error/30' }
+}
+
+/** A backend terminal/attention state → the panel's own run label, so the
+ *  stream/status polls arm and disarm on the same vocabulary they always
+ *  did while the CHIP shows the backend's state. */
+const LOCAL_RUN_STATE: Partial<Record<JobState, 'idle' | 'active' | 'done' | 'failed'>> = {
+  idle: 'idle',
+  cancelled: 'idle',
+  running: 'active',
+  awaiting_approval: 'active',
+  handoff_ready: 'done',
+  completed: 'done',
+  failed: 'failed'
+}
+
+/** Elapsed time of a live run. Rendered from the timestamp on every store
+ *  update (the stream poll ticks well under a second while a run is live), so
+ *  there is no second timer just to move the clock. */
+function fmtElapsed(startedAt?: number): string {
+  if (!startedAt) return '—'
+  const total = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m`
+  if (m > 0) return `${m}m ${String(s).padStart(2, '0')}s`
+  return `${s}s`
+}
+
 interface IdentityCandidate {
   handle: string
   platform: string
@@ -77,14 +132,16 @@ interface ProfilePreview {
 }
 
 export default function AutoModePanel() {
-  const { autoMode, setAutoMode, appendReasoning, updateStep, ensureStep, session, addHandoff,
+  const { autoMode, setAutoMode, job, setJob, appendReasoning, updateStep, ensureStep, session, addHandoff,
     handoffs, setHandoffStatus, beacons, setActiveBeacon, setActiveTab,
     pushToast
   } = useStore()
   const { api, pollC2 } = useApi()
   const [newTarget, setNewTarget] = useState('')
   const reasoningRef = useRef<HTMLDivElement>(null)
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  // a DRY RUN sets `running` to lock the buttons, but nothing is executing:
+  // the stream/status polls must not arm for it
+  const [planning, setPlanning] = useState(false)
 
   // identity start-gate: precise username + platform -> preview card
   const [idUser, setIdUser] = useState('')
@@ -99,12 +156,8 @@ export default function AutoModePanel() {
   // mid-run ambiguity decisions (operator eyes on close candidates)
   const [idChecks, setIdChecks] = useState<IdentityCheck[]>([])
 
-  // Unmount cleanup
-  useEffect(() => {
-    return () => {
-      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
-    }
-  }, [])
+  // `useSerialPoll` owns every interval and every cleanup (unmount included),
+  // so there is no manual interval to clear here any more.
 
   const handleClearLog = () => setAutoMode({ reasoning: [] })
 
@@ -193,15 +246,22 @@ export default function AutoModePanel() {
       reasoning: [],
       current_step: 0
     })
+    // a NEW run starts from a blank job record: the previous job's id/state/
+    // error must not read as THIS run's state
+    setJob({ id: null, state: 'planning', running: true, current_step: -1,
+             cancel_requested: false, error: '', end_reason: '', started_at: 0,
+             handoffs: [], handoff_state: 'none', last_status_at: 0 })
 
     // Make sure the backend session carries the same target (Suggest Next,
     // reports and the manual Run all read session.target server-side)
     if (!session.target && targets[0]) {
-      await api('POST', '/api/session/set', { key: 'target', value: targets[0] })
+      await sessionSet('target', targets[0])
     }
 
-    // Start the auto-mode engine
-    const res = await api('POST', '/api/automode/run', {
+    // Start the auto-mode engine. This call answers only after the engine has
+    // accepted the job, which is why it is NOT raced against the 15s bridge
+    // timeout (`@/lib/api` gives it the long one).
+    const res = await automodeRun({
       targets,
       mode: autoMode.mode,
       engine: autoMode.engine,
@@ -214,42 +274,33 @@ export default function AutoModePanel() {
       verbose: autoMode.verbose
     })
 
-    if (res.status === 200) {
-      // Poll for stream updates
+    if (res.status === 200 && res.data) {
+      // The job id is what a stop cancels, so record it NOW; the status poll
+      // confirms the rest (the polling hooks arm themselves on `running`).
       setAutoMode({ run_state: 'active' })
-      pollStream()
+      setJob({
+        id: res.data.job_id || null,
+        running: true,
+        // the backend answered `planning`: the job exists and nothing has run
+        state: 'planning',
+        started_at: Date.now()
+      })
     } else {
       setAutoMode({ running: false, run_state: 'failed' })
-      appendReasoning(new Date().toLocaleTimeString(), 'ERROR: Failed to start auto-mode')
+      setJob({ running: false, error: apiError(res) })
+      appendReasoning(new Date().toLocaleTimeString(),
+        `ERROR: Failed to start auto-mode — ${apiError(res)}`)
     }
   }
 
-  const pollStream = async () => {
-    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
-    // P1-14: SERIAL polling — an in-flight request is never overlapped by
-    // the next tick (the old async setInterval stacked concurrent fetches
-    // when the backend answered slowly, and served the same log twice).
-    let busy = false
-    pollIntervalRef.current = setInterval(async () => {
-      if (busy) return            // previous poll still in flight
-      busy = true
-      try {
-      const res = await api('GET', '/api/automode/stream')
+  // The stream is the run's timeline. It is armed by the run being LIVE and
+  // every tick goes through `useSerialPoll`, whose busy-guard replaces the
+  // hand-rolled `busy` flag (an in-flight poll is still never overlapped).
+  const pollStream = useCallback(async () => {
+    {
+      const res = await automodeStream()
       if (res.status === 200 && res.data) {
-        const d = res.data as {
-          done: boolean
-          step_updates?: Array<{ step: number; status: string; detail: string; name?: string }>
-          current_step?: number
-          handoffs?: Array<{ beacon_id: string; kind: string; target?: string; created_at: number }>
-          log?: Array<{
-            time: string
-            text: string
-            level?: 'info' | 'success' | 'warn' | 'error' | 'dim'
-            command?: string
-            reason?: string
-            stealth?: string
-          }>
-        }
+        const d = res.data
 
         if (d.step_updates) {
           d.step_updates.forEach((u) => {
@@ -259,7 +310,7 @@ export default function AutoModePanel() {
             updateStep(u.step, u.status, u.detail)
           })
         }
-        if (d.current_step !== undefined && d.current_step !== -1) {
+        if (d.current_step !== -1) {
           setAutoMode({ current_step: d.current_step })
         }
         if (d.log) {
@@ -290,17 +341,59 @@ export default function AutoModePanel() {
         }
 
         if (d.done) {
-          clearInterval(pollIntervalRef.current!)
           setAutoMode({ running: false, run_state: 'done' })
+          setJob({ running: false, cancel_requested: false })
           appendReasoning(new Date().toLocaleTimeString(), '[■] Auto-mode complete')
           pollC2()
         }
       }
-      } finally {
-        busy = false
-      }
-    }, 800)
-  }
+    }
+  }, [setAutoMode, setJob, ensureStep, updateStep, appendReasoning, addHandoff, pollC2])
+
+  // Status is the chip's source of truth (F-27): the job id, the backend's
+  // own running flag and the LLM gate. It also resolves a run that ended
+  // between stream polls — and a stop the backend has now honoured — instead
+  // of leaving the optimistic label on screen forever.
+  const pollStatus = useCallback(async () => {
+    // Ask about OUR job when we know its id: a second run started elsewhere
+    // must not be able to rewrite this panel's state (and a finished job is
+    // still answerable by id for an hour).
+    const res = await automodeStatus(job.id ?? undefined)
+    if (res.status !== 200 || !res.data) return
+    const s = res.data
+    const state = deriveJobState(s)
+    const patch: Partial<AutoModeJob> = {
+      state,
+      running: s.running,
+      current_step: s.current_step,
+      llm: s.llm,
+      llm_pending: s.llm_pending,
+      end_reason: s.end_reason,
+      error: s.error,
+      handoffs: s.handoffs.map((h) => ({
+        beacon_id: h.beacon_id, target: h.target, status: h.status
+      })),
+      handoff_state: s.handoff_state,
+      last_status_at: Date.now()
+    }
+    if (s.job_id) {
+      patch.id = s.job_id
+      patch.started_at = s.started_at
+    }
+    setJob(patch)
+    // The backend's terminal state settles the panel — `cancelled` is NOT a
+    // completion, and the reason travels with it instead of being guessed
+    // from `cancel_requested`.
+    if (!s.running && autoMode.running && !planning) {
+      setAutoMode({ running: false, run_state: LOCAL_RUN_STATE[state] ?? 'done' })
+      setJob({ cancel_requested: false })
+    }
+  }, [setJob, setAutoMode, autoMode.running, job.id, planning])
+
+  const liveRun = !planning && (autoMode.run_state === 'starting'
+    || autoMode.run_state === 'active' || autoMode.run_state === 'stopping')
+  useSerialPoll(pollStream, 800, liveRun, [liveRun])
+  useSerialPoll(pollStatus, 2000, liveRun, [liveRun])
 
   const handleLlmToggle = async (checked: boolean) => {
     setAutoMode({ llm: checked })
@@ -308,7 +401,7 @@ export default function AutoModePanel() {
     // flips the backend gate immediately, so a pending orchestrator
     // request fires on the next wave; at launch the flag pre-approves
     if (autoMode.running) {
-      const res = await api('POST', '/api/automode/llm', { allow: checked })
+      const res = await automodeSetLlm(checked)
       if (res.status !== 200) {
         appendReasoning(new Date().toLocaleTimeString(),
           `ERROR: LLM toggle failed — ${apiError(res)}`)
@@ -320,12 +413,20 @@ export default function AutoModePanel() {
   // action: no task is queued here, because opening a C2 context must never
   // have a side effect on the target. `interact` is the operator's next,
   // explicit click.
-  const openBeacon = (beaconId: string | undefined, interact = false) => {
+  const openBeacon = async (beaconId: string | undefined, interact = false) => {
     if (!beaconId) return
     setActiveBeacon(beaconId)
     setActiveTab('c2')
     const record = handoffs.find((h) => h.beaconId === beaconId)
     if (record) setHandoffStatus(record.id, 'accepted')
+    // Tell the BACKEND the operator accepted: the panel's own `handoffs` are
+    // UI state, and a decision that only exists in the renderer is lost on
+    // reload (and invisible to the CLI).
+    const res = await automodeHandoff(beaconId, 'accept', job.id ?? undefined)
+    if (res.status !== 200) {
+      appendReasoning(new Date().toLocaleTimeString(),
+        `ERROR: handoff not recorded — ${apiError(res)}`)
+    }
     appendReasoning(
       new Date().toLocaleTimeString(),
       `[→ C2] ${beaconId} selected${interact ? ' — open Interact to send tasks' : ''}`
@@ -339,11 +440,43 @@ export default function AutoModePanel() {
     })
   }
 
+  // The stop is COOPERATIVE: the engine halts at its next iteration boundary
+  // and a long scan already in flight finishes first, so the honest state is
+  // "stopping" until the backend confirms. The old code declared the run
+  // stopped, cancelled its own polling and never learned otherwise.
   const handleStop = async () => {
-    setAutoMode({ run_state: 'stopping' })   // explicit in-flight stop state
-    await api('POST', '/api/automode/stop')
-    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
-    setAutoMode({ running: false, run_state: 'idle' })
+    setAutoMode({ run_state: 'stopping' })
+    // `stopping` is the honest state from the click onwards: the request has
+    // been made, the engine has not halted yet.
+    setJob({ cancel_requested: true, state: 'stopping' })
+    const res = await automodeStop()
+    if (res.status !== 200) {
+      setJob({ cancel_requested: false })
+      setAutoMode({ run_state: 'active' })
+      appendReasoning(new Date().toLocaleTimeString(),
+        `ERROR: Stop failed — ${apiError(res)}`)
+      return
+    }
+    if (res.data.note === 'no active run') {
+      // there was nothing to cancel: settle now rather than showing a stop
+      // that will never be confirmed
+      setAutoMode({ running: false, run_state: 'idle' })
+      setJob({ running: false, cancel_requested: false })
+      return
+    }
+    void pollStatus()   // ask immediately; the 2s tick keeps checking
+  }
+
+  // "Keep AutoMode open": the operator decides NOT to move into the C2 now.
+  // Recording it is what stops the card from coming back on the next poll.
+  const dismissHandoff = async (beaconId: string | undefined, recordId: string) => {
+    if (!beaconId) return
+    setHandoffStatus(recordId, 'dismissed')
+    const res = await automodeHandoff(beaconId, 'dismiss', job.id ?? undefined)
+    if (res.status !== 200) {
+      appendReasoning(new Date().toLocaleTimeString(),
+        `ERROR: handoff not recorded — ${apiError(res)}`)
+    }
   }
 
   const handleDryRun = async () => {
@@ -360,13 +493,15 @@ export default function AutoModePanel() {
       reasoning: [],
       current_step: 0
     })
+    // locks the buttons without arming the run polls (nothing is executing)
+    setPlanning(true)
 
     // The dry run must reflect the SAME posture the run would use: engine,
     // force_network and the worker count all change what gets planned, so
     // they are sent here too (the backend delegates to the engine's own
     // planner). The note the backend returns is shown with the plan so the
     // operator knows a dry run executes nothing.
-    const res = await api('POST', '/api/automode/plan', {
+    const res = await automodePlan({
       targets,
       mode: autoMode.mode,
       profile: autoMode.profile,
@@ -376,14 +511,17 @@ export default function AutoModePanel() {
       agents: autoMode.agents
     })
 
+    setPlanning(false)
     if (res.status === 200 && res.data) {
-      const d = res.data as { plan: string[]; note?: string }
+      const d = res.data
       setAutoMode({
         plan: d.note ? [...d.plan, `- ${d.note}`] : d.plan,
         running: false
       })
     } else {
       setAutoMode({ running: false })
+      appendReasoning(new Date().toLocaleTimeString(),
+        `ERROR: Dry run failed — ${apiError(res)}`)
     }
   }
 
@@ -694,6 +832,25 @@ export default function AutoModePanel() {
             </div>
           </div>
 
+          {/* F-27: the run as the BACKEND sees it — job id, real state and
+              the in-flight window of a stop — instead of an optimistic
+              label nobody ever corrected */}
+          {(liveRun || autoMode.run_state === 'done' || autoMode.run_state === 'failed'
+            // a terminal state the operator must see (cancelled maps to the
+            // local label `idle`, which would otherwise hide the strip)
+            || (job.last_status_at > 0 && job.state !== 'idle')) && (
+            <RunStateStrip
+              state={job.last_status_at > 0 ? job.state : (autoMode.run_state ?? 'idle')}
+              jobId={job.id}
+              startedAt={job.last_status_at > 0 ? (job.started_at || undefined) : autoMode.startedAt}
+              backendSeen={job.last_status_at > 0}
+              llmPending={job.llm_pending}
+              cancelRequested={job.cancel_requested}
+              error={job.error}
+              endReason={job.end_reason}
+            />
+          )}
+
           {/* Action buttons */}
           <div className="flex gap-2">
             <button
@@ -723,13 +880,21 @@ export default function AutoModePanel() {
             >
               <FileText size={13} /> Dry Run
             </button>
-            {autoMode.running && (
+            {liveRun && (
               <button
-                onClick={handleStop}
+                onClick={() => void handleStop()}
+                disabled={job.cancel_requested || job.state === 'stopping'
+                  || !autoMode.running}
+                title={job.cancel_requested || job.state === 'stopping'
+                  ? 'Stop requested — the engine halts at its next iteration boundary'
+                  : 'Stop the run (cooperative: the action in flight finishes first)'}
                 className="px-3 py-2 rounded bg-phantom-error/20 text-phantom-error
-                  text-xs font-semibold flex items-center gap-1.5 hover:bg-phantom-error/30"
+                  text-xs font-semibold flex items-center gap-1.5 hover:bg-phantom-error/30
+                  disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                <Square size={13} /> Stop
+                {job.cancel_requested || job.state === 'stopping'
+                  ? <><Loader2 size={13} className="animate-spin" /> Stopping…</>
+                  : <><Square size={13} /> Stop</>}
               </button>
             )}
           </div>
@@ -952,19 +1117,19 @@ export default function AutoModePanel() {
                       </div>
                     </div>
                     <div className="flex gap-2 mt-2.5">
-                      <button onClick={() => openBeacon(h.beaconId)}
+                      <button onClick={() => void openBeacon(h.beaconId)}
                         className="px-2.5 py-1 text-[11px] rounded bg-phantom-cyan/20
                                    border border-phantom-cyan/40 text-phantom-cyan
                                    hover:bg-phantom-cyan/30">
                         Open C2
                       </button>
-                      <button onClick={() => openBeacon(h.beaconId, true)}
+                      <button onClick={() => void openBeacon(h.beaconId, true)}
                         className="px-2.5 py-1 text-[11px] rounded bg-phantom-magenta/20
                                    border border-phantom-magenta/40 text-phantom-magenta
                                    hover:bg-phantom-magenta/30">
                         Interact
                       </button>
-                      <button onClick={() => setHandoffStatus(h.id, 'dismissed')}
+                      <button onClick={() => void dismissHandoff(h.beaconId, h.id)}
                         className="px-2.5 py-1 text-[11px] rounded bg-surface
                                    border border-surface-border text-text-dim
                                    hover:border-phantom-green/40">
@@ -980,6 +1145,86 @@ export default function AutoModePanel() {
       </div>
     </div>
   )
+}
+
+// ── Run state (F-27) ────────────────────────────────────────────────────────
+
+/**
+ * One line that answers "what is this run actually doing?": the state, the
+ * backend's job id, how long it has been going, whether a stop is still in
+ * flight, and (when the backend reported one) the failure.
+ *
+ * `backendSeen` matters: until a status answer arrives the state is the
+ * panel's own optimistic label, so the chip says `local` instead of letting
+ * "Running" mean "we hoped so". It also surfaces the LLM gate, which used to
+ * be invisible outside the reasoning log.
+ */
+function RunStateStrip({
+  state, jobId, startedAt, backendSeen, llmPending, cancelRequested, error,
+  endReason
+}: {
+  state: string
+  jobId: string | null
+  startedAt?: number
+  backendSeen: boolean
+  llmPending: number
+  cancelRequested: boolean
+  error: string
+  endReason: string
+}) {
+  const style = RUN_STATE_STYLE[state] ?? RUN_STATE_STYLE.idle
+  // The backend states that mean "work is in flight" (the elapsed clock only
+  // makes sense for those) and the ones that mean "this run is over".
+  const inFlight = state === 'starting' || state === 'active' ||
+    state === 'planning' || state === 'running' || state === 'stopping'
+  const over = state === 'cancelled' || state === 'completed' ||
+    state === 'failed' || state === 'done'
+  return (
+    <div className="bg-surface-card border border-surface-border rounded-lg p-3">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className={`px-2 py-0.5 rounded border text-[11px] font-semibold uppercase tracking-wider ${style.cls}`}>
+          {cancelRequested && state === 'running' ? 'Stopping' : style.label}
+        </span>
+        <span className="text-[11px] text-text-dim font-mono">
+          {jobId ? `job ${jobId}` : 'no job id yet'}
+        </span>
+        {inFlight && (
+          <span className="text-[11px] text-text-dim font-mono">
+            {fmtElapsed(startedAt)}
+          </span>
+        )}
+        {!backendSeen && liveRunHint(state) && (
+          <span className="text-[10px] text-text-dim italic">
+            local state — waiting for the backend to confirm
+          </span>
+        )}
+        {state === 'awaiting_approval' && (
+          <span className="text-[10px] text-phantom-yellow">
+            the run is waiting for an LLM decision
+          </span>
+        )}
+        {llmPending > 0 && (
+          <span className="text-[10px] text-phantom-yellow">
+            LLM: {llmPending} request{llmPending === 1 ? '' : 's'} waiting
+          </span>
+        )}
+      </div>
+      {state === 'failed' && error && (
+        <p className="text-[11px] text-phantom-error mt-1.5 break-words flex items-start gap-1.5">
+          <AlertTriangle size={12} className="mt-0.5 flex-shrink-0" />
+          <span>{error}</span>
+        </p>
+      )}
+      {over && endReason && state !== 'failed' && (
+        <p className="text-[11px] text-text-dim mt-1.5 break-words">{endReason}</p>
+      )}
+    </div>
+  )
+}
+
+function liveRunHint(state: string): boolean {
+  return state === 'starting' || state === 'active' || state === 'stopping' ||
+    state === 'planning' || state === 'running'
 }
 
 function KillChainStep({

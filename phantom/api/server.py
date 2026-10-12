@@ -661,6 +661,55 @@ def _cause_labels() -> dict:
 
 _auto_lock = threading.Lock()   # guards every job's stream buffer
 
+# F-27: the run lifecycle the BACKEND can actually assert. A state is listed
+# here only when something in Phantom distinguishes it — a label the engine
+# cannot tell apart would be the UI presenting a guess as a fact, which is the
+# exact failure this set exists to remove (`run_state` was the panel's own
+# optimistic label and nothing ever corrected it).
+#
+#   planning  : the job exists, its thread has not reported an action yet
+#   running   : the engine reported real work (an action went out)
+#   stopping  : a cooperative stop was requested and not yet honoured
+#   cancelled : the loop exited BECAUSE of the stop request
+#   completed : the loop exited on its own
+#   failed    : the loop raised
+#
+# Deliberately absent, because nothing in the backend produces them:
+#   `paused`      — there is no pause control on a run (only stop);
+#   `timed_out`   — a run has no wall-clock deadline (the swarm budget bounds
+#                   STEPS, not time; a slow target is not a failed run);
+#   `partial`     — the engine does not report per-target outcomes separately
+#                   from a normal completion, and inventing the split here
+#                   would be the same lie in a new place.
+AUTOMODE_STATES = ("planning", "running", "stopping", "cancelled",
+                   "completed", "failed")
+
+# The answer for "no job": a SEPARATE token (never a job state), so a finished
+# job answering `completed` is never confused with an absent one.
+AUTOMODE_IDLE = "idle"
+
+AUTOMODE_TRANSITIONS = {
+    "planning": frozenset({"running", "stopping", "cancelled", "completed",
+                           "failed"}),
+    "running": frozenset({"stopping", "cancelled", "completed", "failed"}),
+    "stopping": frozenset({"cancelled", "completed", "failed"}),
+    "cancelled": frozenset(),
+    "completed": frozenset(),
+    "failed": frozenset(),
+}
+
+# The event kinds that mean "the engine is executing". Both engines have one:
+# the agent emits `run` right before a capability goes out, the swarm emits
+# `task_target` when a worker starts a (task, target) slice. Everything else
+# (note, blocked, found, failed...) is commentary ABOUT a run, so a buffered
+# event cannot promote a planning job into running on its own.
+_EXECUTION_KINDS = frozenset({"run", "task_target"})
+
+# Bounded tail of transitions. The history is operator-facing evidence
+# ("why does it say cancelled?"), not a log: a long run must not grow the
+# job's memory without limit.
+_STATE_HISTORY_LIMIT = 40
+
 
 class AutoJob:
     """One auto-mode run: dedicated stream, stop signal, lifecycle."""
@@ -676,6 +725,20 @@ class AutoJob:
         self.stream: list[dict] = []
         self.current_step = -1
         self.done = False
+        # F-27: the lifecycle. `planning` is the honest state at THIS point
+        # (the thread exists, nothing has executed), and every later move goes
+        # through `set_state`, which refuses an illegal transition instead of
+        # writing a state the run never reached.
+        self.state = "planning"
+        self.state_history: list[dict] = [
+            {"state": "planning", "at": time.time(),
+             "detail": "job accepted"},
+        ]
+        self.end_reason = ""
+        self._state_lock = threading.Lock()
+        # A handoff is a DECISION the operator makes, not a notification
+        # (docs/ManusOpenCode.md §4): `ready` until accepted or dismissed.
+        self.handoff_state = "none"
         # Beacons THIS RUN established. The stream flattens events into log
         # lines and drops the event kind, so the UI had no way to tell "this
         # run produced a beacon" from "a beacon was already registered" — it
@@ -711,7 +774,15 @@ class AutoJob:
                                        or (self.targets[0] if self.targets else "")
                                        or ""),
                         "created_at": time.time(),
+                        "status": "ready",
                     })
+                    # A new beacon re-opens a handoff the operator dismissed
+                    # earlier: it is new information, not the old card.
+                    self.handoff_state = "ready"
+        # Outside `_auto_lock`: state has its own lock, and taking both in one
+        # order here is what keeps a callback from deadlocking the run thread.
+        if kind in _EXECUTION_KINDS:
+            self.set_state("running", f"{kind} event")
 
     def handoff_records(self) -> list[dict]:
         """Handoffs so far, oldest first. A snapshot, so a UI poll cannot
@@ -724,6 +795,114 @@ class AutoJob:
             events = self.stream[:]
             self.stream.clear()
         return events
+
+    # ── lifecycle (F-27) ────────────────────────────────────────────────
+
+    def set_state(self, state: str, detail: str = "") -> bool:
+        """Move to `state` when that transition is legal. Never raises.
+
+        This runs on the RUN's own thread (inside the engine callback), where
+        an exception would kill the run it is only describing — and a state
+        machine is not worth a lost engagement. An illegal or repeated
+        transition is dropped silently-but-visibly: the history keeps what
+        really happened.
+        """
+        if state not in AUTOMODE_STATES:
+            return False
+        with self._state_lock:
+            if state == self.state or state not in AUTOMODE_TRANSITIONS[self.state]:
+                return False
+            self.state = state
+            self.state_history.append({
+                "state": state, "at": time.time(),
+                "detail": str(detail or "")[:160],
+            })
+            while len(self.state_history) > _STATE_HISTORY_LIMIT:
+                self.state_history.pop(0)
+            return True
+
+    def request_stop(self) -> bool:
+        """Request a cooperative stop and record that we asked.
+
+        `stopping` is the window the operator needs to see: the request has
+        been made and the engine has not halted yet (a scan already in flight
+        finishes first). Returns True when this call is what asked.
+        """
+        asked = self.stop_event.is_set()
+        self.stop_event.set()
+        if not self.done:
+            self.set_state("stopping", "stop requested by operator")
+        return not asked
+
+    def finish(self, reason: str = "") -> str:
+        """Terminal transition. The CAUSE decides the terminal state, so a
+        cancelled run can never be read as a completed one (or the reverse)."""
+        self.done = True
+        self.end_reason = str(reason or "")
+        if self.error:
+            final = "failed"
+        elif self.stop_event.is_set():
+            final = "cancelled"
+        else:
+            final = "completed"
+        self.set_state(final, self.end_reason or "run ended")
+        return final
+
+    def resolve_handoff(self, beacon_id: str, decision: str) -> bool:
+        """Accept or dismiss ONE handoff. False when it is not this job's.
+
+        Refusing an unknown beacon is the point: the renderer must not be able
+        to talk the backend into "accepted" for a beacon the run never
+        produced (a button that reports success for nothing).
+        """
+        if decision not in ("accept", "dismiss"):
+            return False
+        status = "accepted" if decision == "accept" else "dismissed"
+        with _auto_lock:
+            matched = [h for h in self.handoffs
+                       if h.get("beacon_id") == beacon_id]
+            if not matched:
+                return False
+            for h in matched:
+                h["status"] = status
+                h["resolved_at"] = time.time()
+            self.handoff_state = status
+        return True
+
+    def snapshot(self) -> dict:
+        """The job as the operator (and the renderer) needs to see it.
+
+        ONE shape for every state, idle included (see `_IDLE_STATUS`), so the
+        renderer narrows a single payload instead of a union of "job" and
+        "no job" answers.
+        """
+        approval = getattr(self, "llm_approval", None)
+        with _auto_lock:
+            handoffs = [dict(h) for h in self.handoffs]
+        with self._state_lock:
+            history = [dict(h) for h in self.state_history]
+            state = self.state
+        return {
+            "job_id": self.id,
+            "state": state,
+            "state_history": history,
+            "running": not self.done,
+            "done": self.done,
+            "end_reason": self.end_reason,
+            "error": self.error or "",
+            "current_step": self.current_step,
+            "started_at": self.started_at,
+            "elapsed": max(0.0, time.time() - self.started_at),
+            "targets": list(self.targets),
+            "mode": self.mode,
+            "profile": self.profile,
+            "goal": self.goal,
+            "llm": approval.state if approval is not None else "denied",
+            "llm_pending": len(approval.pending_requests())
+            if approval is not None else 0,
+            "handoffs": handoffs,
+            "handoff_state": self.handoff_state,
+        }
 
 
 class AutoJobManager:
@@ -753,13 +932,21 @@ class AutoJobManager:
                 return self._jobs.get(self._active_id)
             return None
 
+    def get(self, job_id: str) -> Optional[AutoJob]:
+        """One job by id (F-25 `getJob`): the ACTIVE one by default, a
+        finished one by id while it is still retained."""
+        with self._lock:
+            return self._jobs.get(job_id) if job_id else None
+
     def stop_active(self) -> Optional[AutoJob]:
         """Request a cooperative stop: set the Event (the agent's drive loop
-        observes it at the next iteration boundary and halts)."""
+        observes it at the next iteration boundary and halts) and move the job
+        to `stopping` so the UI can show the request without pretending the
+        run is already over."""
         with self._lock:
             job = self._jobs.get(self._active_id) if self._active_id else None
             if job and not job.done:
-                job.stop_event.set()
+                job.request_stop()
                 return job
             return None
 
@@ -995,14 +1182,16 @@ async def automode_run(request: web.Request) -> web.Response:
             job.error = str(exc)
             job.callback("failed", {"output": f"auto-mode crashed: {exc}"})
         finally:
-            job.done = True
-            job.callback("halt", {"reason": (
-                "stopped by operator" if job.stop_event.is_set()
-                else "sequence complete")})
+            # The terminal state comes from the CAUSE, and `halt` keeps being
+            # emitted (the stream contract the UI already reads).
+            job.finish("stopped by operator" if job.stop_event.is_set()
+                       else "sequence complete")
+            job.callback("halt", {"reason": job.end_reason})
 
     job.thread = threading.Thread(target=_run, args=(job,), daemon=True)
     job.thread.start()
     return _json({"status": "started", "job_id": job.id,
+                  "state": job.state, "started_at": job.started_at,
                   "targets": targets, "mode": mode, "engine": engine,
                   "guardrails": guardrails})
 
@@ -1084,21 +1273,77 @@ async def guardrails_post(request: web.Request) -> web.Response:
     return _json({"ok": True, "message": msg, "manifest": manifest_payload})
 
 
+# The answer for "no job at all": the SAME keys as `AutoJob.snapshot()`, so
+# the renderer parses one shape (and `state: "idle"` is never a job state).
+_IDLE_STATUS = {
+    "job_id": None,
+    "state": AUTOMODE_IDLE,
+    "state_history": [],
+    "running": False,
+    "done": True,
+    "end_reason": "",
+    "error": "",
+    "current_step": -1,
+    "started_at": 0.0,
+    "elapsed": 0.0,
+    "targets": [],
+    "mode": "",
+    "profile": "",
+    "goal": "",
+    "llm": "denied",
+    "llm_pending": 0,
+    "handoffs": [],
+    "handoff_state": "none",
+}
+
+
 @routes.get("/api/automode/status")
-async def automode_status(_request: web.Request) -> web.Response:
-    """Current auto-mode state without consuming the event stream."""
-    job = auto_jobs.active()
+async def automode_status(request: web.Request) -> web.Response:
+    """Current auto-mode state without consuming the event stream.
+
+    F-27: this is the renderer's source of truth for the job — its id, the
+    lifecycle state, WHY it ended, the handoffs the run produced and the LLM
+    gate. `?job_id=` asks about a specific (possibly finished) job, which is
+    how a panel that just reconnected finds the run it started.
+    """
+    job_id = str(request.query.get("job_id") or "").strip()
+    job = auto_jobs.get(job_id) if job_id else auto_jobs.active()
     if job is None:
-        return _json({"running": False, "current_step": -1, "job_id": None})
-    approval = getattr(job, "llm_approval", None)
-    return _json({
-        "running": not job.done,
-        "current_step": job.current_step,
-        "job_id": job.id,
-        "llm": approval.state if approval is not None else "denied",
-        "llm_pending": len(approval.pending_requests())
-        if approval is not None else 0,
-    })
+        return _json(dict(_IDLE_STATUS))
+    return _json(job.snapshot())
+
+
+@routes.post("/api/automode/handoff")
+async def automode_handoff(request: web.Request) -> web.Response:
+    """Accept or dismiss the beacon handoff a run produced (§4 / §8.2).
+
+    The backend has always been able to hand AutoMode over to the C2; what was
+    missing is the operator's DECISION being recorded — the panel could only
+    guess from the beacon list. Body:
+
+        {"beacon_id": "B-...", "decision": "accept"|"dismiss"}
+
+    `accept` is what "Open C2"/"Interact" call, `dismiss` is "Keep AutoMode".
+    Both answer with the job snapshot, so the caller never has to re-poll to
+    learn what its own click did.
+    """
+    body = await request.json() or {}
+    beacon_id = str(body.get("beacon_id") or "").strip()
+    decision = str(body.get("decision") or "").strip().lower()
+    if not beacon_id:
+        return _error("beacon_id is required")
+    if decision not in ("accept", "dismiss"):
+        return _error("decision must be 'accept' or 'dismiss'")
+    job_id = str(body.get("job_id") or "").strip()
+    job = auto_jobs.get(job_id) if job_id else auto_jobs.active()
+    if job is None:
+        return _error("no auto-mode job to hand off from", 404)
+    if not job.resolve_handoff(beacon_id, decision):
+        return _error(f"no handoff for beacon {beacon_id}", 404)
+    return _json({"status": "ok", "decision": decision,
+                  "beacon_id": beacon_id, "job_id": job.id,
+                  "handoff_state": job.handoff_state,
+                  "job": job.snapshot()})
 
 
 @routes.post("/api/automode/llm")
@@ -1137,8 +1382,14 @@ async def automode_stop(_request: web.Request) -> web.Response:
     scan already in flight finishes first (never killed mid-action)."""
     job = auto_jobs.stop_active()
     if job is None:
-        return _json({"status": "stopped", "note": "no active run"})
-    return _json({"status": "stopped", "job_id": job.id})
+        return _json({"status": "stopped", "note": "no active run",
+                      "job": dict(_IDLE_STATUS)})
+    # The state is `stopping`, NOT stopped: the stop is cooperative and the
+    # engine halts at the next boundary. The status poll is what reports the
+    # terminal `cancelled`, so the caller gets the snapshot to render the
+    # in-between honestly.
+    return _json({"status": "stopped", "job_id": job.id,
+                  "state": job.state, "job": job.snapshot()})
 
 
 @routes.post("/api/osint/preview")
