@@ -55,6 +55,99 @@ _PROFILE_URLS = {
     "telegram": "https://t.me/{u}",
 }
 
+# The five socials an operator can PIN the OSINT to (the UI checkbox list).
+# A username is NOT a person: the same handle on another network is very
+# often somebody else, and mixing those namesakes into the identity graph
+# is what ruins the plan downstream (a DM/follow lands on a stranger). The
+# operator therefore says WHERE the handle belongs and the pass stays there.
+TOP_SOCIALS = ("instagram", "tiktok", "x", "github", "telegram")
+
+# every fetchable platform that is NOT one of the five above: what the
+# "other" scope searches instead of them.
+ALT_PLATFORMS = tuple(p for p in _PROFILE_URLS if p not in TOP_SOCIALS)
+
+# every platform this module can actually fetch (API/UI validate against it)
+SUPPORTED_PLATFORMS = tuple(_PROFILE_URLS)
+
+# the value the operator/UI sends for "not one of those five": exclude the
+# five and look elsewhere.
+_OTHER_SCOPE_VALUES = ("other", "alt", "others", "elsewhere", "altro")
+
+# domain -> label, used ONLY to label a search hit found elsewhere. Nothing
+# here is ever fetched, so no marker set is needed for it.
+_OTHER_SITES = {
+    "reddit.com": "reddit",
+    "linkedin.com": "linkedin",
+    "facebook.com": "facebook",
+    "pinterest.com": "pinterest",
+    "tumblr.com": "tumblr",
+    "medium.com": "medium",
+    "gitlab.com": "gitlab",
+    "stackoverflow.com": "stackoverflow",
+    "keybase.io": "keybase",
+    "linktr.ee": "linktree",
+    "about.me": "aboutme",
+}
+
+# platform -> the site a dork restricts to / excludes
+_SITE_DOMAINS = {
+    "instagram": "instagram.com",
+    "tiktok": "tiktok.com",
+    "x": "x.com",
+    "github": "github.com",
+    "reddit": "reddit.com",
+    "telegram": "t.me",
+    "linkedin": "linkedin.com",
+    "facebook": "facebook.com",
+}
+
+
+def _site_of(platform: str) -> str:
+    return _SITE_DOMAINS.get(str(platform or "").lower(),
+                             f"{str(platform or '').lower()}.com")
+
+
+def normalize_scope(platform: str = "", scope: str = "") -> Tuple[str, str]:
+    """(scope, platform) from the operator's ONE platform value.
+
+    * ``""``                -> ``("auto", "")``   legacy: primary defaults
+                                             to instagram, every platform
+                                             probed and cross-scored
+    * a known social         -> ``("pin", name)``  ONLY that platform is
+                                             probed, so no other network's
+                                             namesake can enter the graph
+    * ``"other"`` (or alt/…) -> ``("other", "")``  the five top socials are
+                                             EXCLUDED and the pass looks
+                                             everywhere else
+
+    An explicit ``scope`` of ``"pin"``/``"other"``/``"auto"`` wins over the
+    derivation (``"auto"`` keeps ``platform`` as the primary, which is the
+    pre-pin legacy semantic). An unknown value falls back to ``"auto"``:
+    guessing a platform is exactly the mistake this function prevents.
+    """
+    p = str(platform or "").strip().lower().lstrip("@")
+    s = str(scope or "").strip().lower()
+    if s in ("pin", "other"):
+        return s, (p if s == "pin" else "")
+    if s == "auto":
+        return "auto", (p if p in _PROFILE_URLS else "")
+    if p in _OTHER_SCOPE_VALUES:
+        return "other", ""
+    if p in TOP_SOCIALS:
+        return "pin", p
+    return "auto", ""
+
+
+def _primary_for(scope: str, platform: str) -> str:
+    """Which platform the pass opens on.
+
+    ``pin``   -> the pinned one; ``other`` -> the first alternative (reddit);
+    ``auto``  -> the caller's value or instagram.
+    """
+    if scope == "other":
+        return ALT_PLATFORMS[0] if ALT_PLATFORMS else "instagram"
+    return platform or "instagram"
+
 # private / missing markers per platform (page-level, pre-login)
 _PRIVATE_MARKERS = {
     "instagram": ("page not found", "sorry, this page isn't available",
@@ -155,7 +248,12 @@ class ReconResult:
                 out.append(f"TAGGED_IN: handle={l.value} platform={l.platform} "
                            f"evidence={l.evidence}")
             elif l.kind == "search_hit":
-                out.append(f"SEARCH_HIT: url={l.value} evidence={l.evidence}")
+                # the network label travels with the hit: "found elsewhere"
+                # is only useful if the operator can see WHERE.
+                out.append(f"SEARCH_HIT: url={l.value} "
+                           f"platform={l.platform} evidence={l.evidence}"
+                           if l.platform else
+                           f"SEARCH_HIT: url={l.value} evidence={l.evidence}")
             elif l.kind == "wayback":
                 out.append(f"WAYBACK: url={l.value} evidence={l.evidence}")
         return out
@@ -571,43 +669,89 @@ def _wayback_snapshots(username: str, platform: str) -> List[Lead]:
     return leads
 
 
-_DORKS = (
-    '"{u}" (site:instagram.com OR site:tiktok.com OR site:x.com)',
-    '"{u}" (gmail.com OR outlook.com OR yahoo.com OR hotmail.com)',
-    '"{u}" (site:linkedin.com OR site:github.com OR site:reddit.com)',
-)
+def _dork_queries(username: str, full_name: str = "", scope: str = "auto",
+                  platform: str = "") -> List[str]:
+    """The bounded dork set for one pass, in the operator's scope.
+
+    ``full_name`` was accepted and then IGNORED by the old three templates:
+    a person is looked up by their NAME as much as by their handle, and the
+    name query is the one that surfaces a real profile on a site the handle
+    never appeared on. A name query carries the handle too when we have
+    both, so a hit can be tied back to the identity instead of to a
+    namesake who happens to share the name.
+    """
+    name = " ".join((full_name or "").split())[:60]
+    q: List[str] = []
+    if scope == "pin" and platform:
+        q.append(f'site:{_site_of(platform)} "{username}"')
+        if name:
+            q.append(f'site:{_site_of(platform)} "{name}"')
+            q.append(f'site:{_site_of(platform)} "{name}" "{username}"')
+        return q[:4]
+    if scope == "other":
+        excl = " ".join(f"-site:{_site_of(p)}" for p in TOP_SOCIALS)
+        q.append(f'"{username}" {excl}')
+        if name:
+            q.append(f'"{name}" {excl}')
+            q.append(f'"{name}" "{username}"')
+        return q[:4]
+    # auto: the legacy shape (same handle across the big three, mail
+    # providers, code/leak sites) PLUS the name queries the parameter
+    # promised and never ran.
+    q.append(f'"{username}" (site:instagram.com OR site:tiktok.com '
+             f'OR site:x.com)')
+    q.append(f'"{username}" (gmail.com OR outlook.com OR yahoo.com '
+             f'OR hotmail.com)')
+    q.append(f'"{username}" (site:linkedin.com OR site:github.com '
+             f'OR site:reddit.com)')
+    if name:
+        q.append(f'"{name}" "{username}"')
+        q.append(f'"{name}" (site:linkedin.com OR site:facebook.com '
+                 f'OR site:reddit.com)')
+    return q[:5]
 
 
-def _search_dorks(username: str, full_name: str = "") -> List[Lead]:
-    """DuckDuckGo HTML dork search (no API key) — bounded to 3 queries."""
+def _platform_of_url(url: str) -> str:
+    """Which network a search hit belongs to ("" when it is just a URL)."""
+    low = (url or "").lower()
+    for plat, dom in _SITE_DOMAINS.items():
+        if dom in low:
+            return plat
+    for dom, label in _OTHER_SITES.items():
+        if dom in low:
+            return label
+    return ""
+
+
+def _search_dorks(username: str, full_name: str = "",
+                  scope: str = "auto", platform: str = "") -> List[Lead]:
+    """DuckDuckGo HTML dork search (no API key) — bounded to 5 queries.
+
+    Scope-aware: a PINNED pass stays inside that one site; the "other"
+    scope EXCLUDES the five top socials and looks everywhere else, and
+    every hit carries the network it came from.
+    """
+    from urllib.parse import quote_plus
     leads: List[Lead] = []
     seen_urls = set()
-    for tpl in _DORKS:
-        q = tpl.format(u=username).replace(" ", "+").replace('"', "%22")
-        html = _fetch(f"https://html.duckduckgo.com/html/?q={q}", timeout=20.0)
+    for tpl in _dork_queries(username, full_name, scope, platform):
+        html = _fetch(
+            f"https://html.duckduckgo.com/html/?q={quote_plus(tpl)}",
+            timeout=20.0)
         if not html:
             continue
-        for m in re.finditer(r'class="result__url"[^>]*>\s*([^<]+)', html[:200000]):
+        for m in re.finditer(r'class="result__url"[^>]*>\s*([^<]+)',
+                             html[:200000]):
             url = m.group(1).strip()
             if url.startswith("//"):
                 url = "https:" + url
             host = _URL_RE.match(url if "://" in url else "https://" + url)
-            if not host:
-                continue
-            if url in seen_urls:
+            if not host or url in seen_urls:
                 continue
             seen_urls.add(url)
-            # a hit on a profile URL of the same handle = platform lead
-            for plat in _PROFILE_URLS:
-                if f"{plat}.com" in url.lower() and username.lower() in url.lower():
-                    leads.append(Lead("search_hit", url, plat,
-                                      "ddg_dork", 0.5))
-                    break
-            else:
-                if any(d in url.lower() for d in ("linkedin.com", "pastebin",
-                                                  "github.com")):
-                    leads.append(Lead("search_hit", url, "",
-                                      "ddg_dork", 0.4))
+            plat = _platform_of_url(url)
+            leads.append(Lead("search_hit", url, plat, "ddg_dork",
+                              0.5 if plat else 0.4))
         if len(leads) >= 8:
             break
         time.sleep(random.uniform(1.0, 2.5))
@@ -735,9 +879,23 @@ def present_candidate(result: "ReconResult") -> str:
 def deep_recon(username: str, platform: str = "",
                variants: bool = True, wayback: bool = True,
                search: bool = True, second_hop: bool = True,
-               ask=None, jar=None, graph=None) -> Tuple[bool, List[str]]:
+               ask=None, jar=None, graph=None,
+               scope: str = "") -> Tuple[bool, List[str]]:
     """Full reverse-engineering pass. Returns marker lines for the social
     interpreter. Bounded: <= 20 network calls total, never raises.
+
+    `scope` (or, derived from `platform`, one of):
+
+    * `pin`   — `platform` is the ONE network the handle belongs to. No
+      other platform is fetched, so a namesake on another network can
+      never enter the identity graph. This is what the operator selects
+      when they know where the handle lives.
+    * `other` — the five top socials are EXCLUDED and the pass looks
+      everywhere else (alternatives + dorks that carry `-site:` for the
+      five), reporting every correspondence it finds.
+    * `auto`  — legacy: `platform` as primary, every platform probed.
+
+    An unknown/empty value is `auto` (see `normalize_scope`).
 
     `ask`: optional operator hook for ambiguity
     (ask(description, [(handle, platform, result), ...]) -> "same:<handle>"
@@ -759,7 +917,8 @@ def deep_recon(username: str, platform: str = "",
         username = (username or "").strip().lstrip("@")
         if not username:
             return False, ["ERROR: deep_recon needs a username"]
-        platform = (platform or "instagram").lower()
+        scope, platform = normalize_scope(platform, scope)
+        platform = _primary_for(scope, platform)
         jar = jar or {}
 
         results: List[ReconResult] = []
@@ -774,8 +933,17 @@ def deep_recon(username: str, platform: str = "",
             _mine_all(username, platform, html, primary, jar)
         results.append(primary)
 
-        # same handle on OTHER platforms (single quick fetch each)
-        for p in ("instagram", "tiktok", "x", "github", "telegram"):
+        # same handle on OTHER platforms (single quick fetch each).
+        # A PINNED pass probes NOTHING else on purpose: the same handle on
+        # another network is very often a different person, and a wrong
+        # candidate costs the whole chain (the DM lands on a stranger).
+        if scope == "pin":
+            cross: List[str] = []
+        elif scope == "other":
+            cross = list(ALT_PLATFORMS)          # everything but the top five
+        else:
+            cross = list(TOP_SOCIALS)
+        for p in cross:
             if p == platform:
                 continue
             st, cf, h2 = _state_vote(username, p, jar)
@@ -811,7 +979,8 @@ def deep_recon(username: str, platform: str = "",
         if wayback:
             primary.leads.extend(_wayback_snapshots(username, platform))
         if search:
-            primary.leads.extend(_search_dorks(username, primary.full_name))
+            primary.leads.extend(_search_dorks(username, primary.full_name,
+                                               scope=scope, platform=platform))
 
         # second hop: mine the circles of a few circle members (the path that
         # still works on a PRIVATE target, whose public posts show a
@@ -825,6 +994,16 @@ def deep_recon(username: str, platform: str = "",
                 pass
 
         # cross-account correlation across everything collected
+        if scope == "pin":
+            lines.append(
+                "RECON_SCOPE: mode=pin platform=%s excluded=%s "
+                "contact_scope=operator"
+                % (platform, ",".join(p for p in TOP_SOCIALS
+                                      if p != platform)))
+        elif scope == "other":
+            lines.append(
+                "RECON_SCOPE: mode=other excluded=%s platforms=%s"
+                % (",".join(TOP_SOCIALS), ",".join(ALT_PLATFORMS)))
         lines.extend(primary.markers())
         for r in results[1:]:
             if r.state == "public" or r.bio:

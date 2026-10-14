@@ -91,11 +91,20 @@ class TestRunAutoModeRouting(unittest.TestCase):
 
     @staticmethod
     def _quiet(am):
+        """Silence the notifier AND stub the C2 listener.
+
+        These tests are about LOCAL routing. Without the stub they bind the
+        real 0.0.0.0:8080, so any parallel worker holding that port (every
+        test that boots the API app) makes them fail on socket contention —
+        for a reason that has nothing to do with routing. The assertions are
+        unchanged; the dependency on a free port is gone.
+        """
         return (
             patch.object(am.notifier, "success"),
             patch.object(am.notifier, "info"),
             patch.object(am.notifier, "warn"),
             patch.object(am.notifier, "error"),
+            patch.object(am, "_ensure_c2_listener", return_value=True),
         )
 
     @staticmethod
@@ -111,7 +120,7 @@ class TestRunAutoModeRouting(unittest.TestCase):
         import phantom.core.automode as am
         n = self._quiet(am)
         agent = Mock()
-        with n[0], n[1], n[2], n[3], \
+        with n[0], n[1], n[2], n[3], n[4], \
              patch.object(am, "_run_agent_single",
                           return_value=(self._result(), agent)) as m_single, \
              patch.object(am, "_run_agent_campaign") as m_campaign, \
@@ -131,7 +140,7 @@ class TestRunAutoModeRouting(unittest.TestCase):
         fake_writer = Mock()
         fake_writer.write_campaign.return_value = {"campaign_json": "x",
                                                    "campaign_md": "y"}
-        with n[0], n[1], n[2], n[3], \
+        with n[0], n[1], n[2], n[3], n[4], \
              patch.object(am, "_run_agent_campaign",
                           return_value=result) as m_campaign, \
              patch.object(am, "_run_agent_single") as m_single, \
@@ -146,7 +155,7 @@ class TestRunAutoModeRouting(unittest.TestCase):
     def test_verbose_flag_threads_to_single(self):
         import phantom.core.automode as am
         n = self._quiet(am)
-        with n[0], n[1], n[2], n[3], \
+        with n[0], n[1], n[2], n[3], n[4], \
              patch.object(am, "_run_agent_single",
                           return_value=(self._result(), Mock())) as m_single, \
              patch.object(am, "_report_out_dir", return_value="tmp"), \
@@ -172,7 +181,7 @@ class TestRunAutoModeRouting(unittest.TestCase):
         import phantom.core.automode as am
         n = self._quiet(am)
         fake_plan = Mock(steps=[])
-        with n[0], n[1], n[2], n[3], \
+        with n[0], n[1], n[2], n[3], n[4], \
              patch.object(am, "_dry_run_plan",
                           return_value=(fake_plan, "ip", "network",
                                         ["beacon"])) as m_plan, \

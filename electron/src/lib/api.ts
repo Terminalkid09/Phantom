@@ -114,6 +114,19 @@ function asList<T>(v: unknown): T[] {
   return Array.isArray(v) ? (v as T[]) : []
 }
 
+/** A `Record<string, string>` narrowed from an untrusted payload: a non-string
+ * value is DROPPED, never coerced, so a schema drift cannot turn into a
+ * plausible-looking label. */
+function asStringMap(v: unknown): Record<string, string> {
+  const out: Record<string, string> = {}
+  const rec = asRecord(v)
+  for (const key of Object.keys(rec)) {
+    const value = rec[key]
+    if (typeof value === 'string') out[key] = value
+  }
+  return out
+}
+
 // ── payload types, mirrored from phantom/api/server.py ─────────────────────
 
 /** `POST /api/automode/run` (server.py:1040) */
@@ -129,6 +142,13 @@ export interface AutomodeRunRequest {
   experience: boolean
   verbose: boolean
   resume?: string
+  /**
+   * OSINT scope for a username target: `''` = auto (probe every platform),
+   * a pinned social (`instagram|tiktok|x|github|telegram`) = the pass reads
+   * ONLY that network, `'other'` = exclude those five and search
+   * elsewhere. Omitted/empty keeps the legacy auto behaviour.
+   */
+  platform?: string
 }
 
 export interface AutomodeRunResult {
@@ -170,6 +190,19 @@ export interface AutomodeStatus {
   llm_pending: number
   handoffs: AutomodeHandoffRecord[]
   handoff_state: 'none' | 'ready' | 'accepted' | 'dismissed'
+  /**
+   * P0: what the run ACHIEVED, as opposed to what the process is DOING.
+   *
+   * `state` answers "is it still working?"; `outcome` answers "did the
+   * engagement reach anything?". A run can be `completed` and
+   * `completed_without_goal` at once, and the panel must be able to say so
+   * instead of showing a green "completed". Tokens are declared by the
+   * backend (`automation/engagement_outcome.OUTCOMES`); the label is derived
+   * there too, so the renderer never invents wording for a token.
+   */
+  outcome: string
+  outcome_label: string
+  targets_outcome: Record<string, string>
 }
 
 /**
@@ -202,9 +235,52 @@ const JOB_STATES: readonly string[] = [
   'stopping', 'cancelled', 'completed', 'failed',
 ]
 
+/**
+ * A state the backend sent that this renderer does not know is a SCHEMA
+ * MISMATCH, not "idle". It used to be folded silently into `idle`, which is
+ * the one failure mode the parsers in this file exist to prevent: a renamed
+ * backend state degraded to "nothing is running", said nothing anywhere, and
+ * the operator had no way to tell the difference between an idle engine and a
+ * broken contract (the audit's finding 4.3.2).
+ *
+ * Each unseen value is reported ONCE (a poll loop must not spam the console),
+ * the safe display fallback is kept, and the report is readable from tests via
+ * `schemaMismatches()`. The console warning is the whole channel on purpose:
+ * mis-reporting is a developer-facing contract break, while the operator keeps
+ * seeing a sane panel.
+ */
+const _schemaMismatches: Array<{ field: string; value: string; known: string[] }> = []
+
+export function reportSchemaMismatch(field: string, value: unknown,
+                                    known: readonly string[]): void {
+  const as_text = str(value)
+  if (_schemaMismatches.some((m) => m.field === field && m.value === as_text)) {
+    return
+  }
+  _schemaMismatches.push({ field, value: as_text, known: [...known] })
+  const message =
+    `[phantom] schema mismatch: ${field}=${JSON.stringify(as_text)} is not `
+    + `one of ${known.join(', ')} — falling back for display`
+  try {
+    // eslint-disable-next-line no-console
+    console.warn(message)
+  } catch {
+    /* a renderer without a console still gets the fallback */
+  }
+}
+
+/** Every schema mismatch seen so far (tests read this; the app logs it). */
+export function schemaMismatches(): ReadonlyArray<{ field: string; value: string; known: string[] }> {
+  return _schemaMismatches
+}
+
 function asJobState(v: unknown): JobState {
   const s = str(v)
-  return JOB_STATES.includes(s) ? (s as JobState) : 'idle'
+  if (JOB_STATES.includes(s)) {
+    return s as JobState
+  }
+  reportSchemaMismatch('automode.state', s, JOB_STATES)
+  return 'idle'
 }
 
 /**
@@ -251,6 +327,9 @@ function parseAutomodeStatus(raw: unknown): AutomodeStatus {
     llm: str(d.llm, 'denied'),
     llm_pending: num(d.llm_pending),
     handoffs: parseHandoffs(d.handoffs),
+    outcome: str(d.outcome, 'not_started'),
+    outcome_label: str(d.outcome_label, 'not started'),
+    targets_outcome: asStringMap(d.targets_outcome),
     handoff_state: (['none', 'ready', 'accepted', 'dismissed'] as const)
       .includes(str(d.handoff_state) as 'none')
       ? (str(d.handoff_state) as AutomodeStatus['handoff_state'])
@@ -335,6 +414,10 @@ export interface AutomodePlanRequest {
   engine: string
   force_network: boolean
   agents: number
+  /** OSINT scope for a username target: '' = auto, a social = pinned to it,
+   *  'other' = everywhere except the 5 top socials. The dry run states it
+   *  so a preview can never disagree with the run. */
+  platform?: string
 }
 
 export interface AutomodePlanResult {
@@ -415,10 +498,16 @@ export function automodeStop(): Promise<ApiResponse<AutomodeStopResult>> {
   return request('POST', '/api/automode/stop', undefined, FAST_MS,
     (raw): AutomodeStopResult => {
       const d = asRecord(raw)
+      // `state` and `job` ARE in the backend's answer (server.py:1441 sends
+      // both, and `_IDLE_STATUS` for the no-run case). They used to be parsed
+      // away: a caller reading the declared fields got `undefined` forever,
+      // which is the same lie as a field that was never declared. Parse them.
       return {
         status: str(d.status),
         job_id: d.job_id === undefined ? undefined : str(d.job_id),
         note: d.note === undefined ? undefined : str(d.note),
+        state: d.state === undefined ? undefined : asJobState(d.state),
+        job: d.job === undefined ? undefined : parseAutomodeStatus(d.job),
       }
     })
 }

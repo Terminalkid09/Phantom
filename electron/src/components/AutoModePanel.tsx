@@ -131,6 +131,62 @@ interface ProfilePreview {
   avatar_url: string
 }
 
+/**
+ * OSINT scope for a username target. ONE wire value, sent to
+ * `/api/automode/run` as `platform`:
+ *
+ *   ''         auto   — every platform is probed (legacy behaviour)
+ *   <social>   pin    — the pass reads ONLY that network: the same handle on
+ *                       another network is very often a different person,
+ *                       and a namesake inside the identity graph sends the
+ *                       whole chain (DM, follow, phish) at a stranger
+ *   'other'    other  — the five top socials are EXCLUDED and the pass
+ *                       searches everywhere else
+ */
+const IDENTITY_SCOPES = ['auto', 'instagram', 'tiktok', 'x', 'github',
+  'telegram', 'other'] as const
+type IdentityScope = typeof IDENTITY_SCOPES[number]
+
+const SCOPE_LABELS: Record<IdentityScope, string> = {
+  auto: 'Auto',
+  instagram: 'instagram',
+  tiktok: 'tiktok',
+  x: 'x',
+  github: 'github',
+  telegram: 'telegram',
+  other: 'Other'
+}
+
+/** `auto` travels as the empty string; every other choice is its own value. */
+const scopeValue = (s: IdentityScope): string => (s === 'auto' ? '' : s)
+
+/** What the run will ACTUALLY do, readable before Launch instead of after. */
+const scopeHint = (s: IdentityScope): string =>
+  s === 'auto'
+    ? 'OSINT scope: auto — every platform is probed'
+    : s === 'other'
+      ? 'OSINT scope: everywhere except the 5 top socials'
+      : `OSINT scope: ${s} only — other platforms are not probed`
+
+const scopeAria = (s: IdentityScope): string =>
+  s === 'auto'
+    ? 'Probe every platform (auto OSINT scope)'
+    : s === 'other'
+      ? 'Search everywhere except the 5 top socials'
+      : `Pin the OSINT to ${s} only`
+
+/**
+ * Does this look like a @handle rather than an address/machine?
+ *
+ * The scope control is only meaningful for an identity target, so it appears
+ * when one is recognised instead of sitting there as a permanently visible
+ * knob. This is a UI HINT that mirrors the backend's classifier — the run
+ * itself always classifies the target server-side (`classify_target`), so a
+ * wrong guess here changes nothing but what the panel shows.
+ */
+const identityLooksLikeUsername = (value: string): boolean =>
+  /^@?[A-Za-z][A-Za-z0-9_.\-]{1,63}$/.test((value || '').trim())
+
 export default function AutoModePanel() {
   const { autoMode, setAutoMode, job, setJob, appendReasoning, updateStep, ensureStep, session, addHandoff,
     handoffs, setHandoffStatus, beacons, setActiveBeacon, setActiveTab,
@@ -145,7 +201,23 @@ export default function AutoModePanel() {
 
   // identity start-gate: precise username + platform -> preview card
   const [idUser, setIdUser] = useState('')
-  const [idPlatform, setIdPlatform] = useState('instagram')
+  // ONE source of truth for the scope: the store field the run reads. The
+  // chips derive their pressed state from it, so the button the operator
+  // sees and the value the backend receives cannot drift apart.
+  const idScope: IdentityScope = autoMode.identityPlatform === ''
+    ? 'auto'
+    : (autoMode.identityPlatform as IdentityScope)
+  const setIdScope = (s: IdentityScope) =>
+    setAutoMode({ identityPlatform: scopeValue(s) })
+  // the RUN scope and the PREVIEW platform are not the same thing: `auto`
+  // and `other` are run scopes with no single profile page to preview, so
+  // only a pinned social can be previewed (the endpoint rejects the rest).
+  const idPlatform = idScope === 'auto' || idScope === 'other' ? '' : idScope
+  const previewable = idPlatform !== ''
+  // the scope control appears once an identity target is recognised — and
+  // stays visible while a non-default scope is in force, so it can be undone.
+  const showScopeChips = identityLooksLikeUsername(idUser)
+    || autoMode.identityPlatform !== ''
   const [idPreview, setIdPreview] = useState<ProfilePreview | null>(null)
 
   // Handoffs this run produced and the operator has not acted on yet. The
@@ -163,7 +235,7 @@ export default function AutoModePanel() {
 
   const handlePreview = async () => {
     const username = idUser.trim().replace(/^@/, '')
-    if (!username) return
+    if (!username || !previewable) return
     setIdLoading(true)
     setIdPreview(null)
     const res = await api('POST', '/api/osint/preview', { username, platform: idPlatform })
@@ -271,7 +343,11 @@ export default function AutoModePanel() {
       agents: autoMode.agents,
       llm: autoMode.llm,
       experience: autoMode.experience,
-      verbose: autoMode.verbose
+      verbose: autoMode.verbose,
+      // where the operator says the handle belongs ('' = auto, a pinned
+      // social, or 'other'): the OSINT pass must not widen to a namesake
+      // on a network the operator did not name.
+      platform: autoMode.identityPlatform
     })
 
     if (res.status === 200 && res.data) {
@@ -508,7 +584,10 @@ export default function AutoModePanel() {
       goal: autoMode.goal,
       engine: autoMode.engine,
       force_network: autoMode.forceNetwork,
-      agents: autoMode.agents
+      agents: autoMode.agents,
+      // the dry run carries the SAME scope the run will use, so the plan the
+      // operator reads can never disagree with the pass that executes
+      platform: autoMode.identityPlatform
     })
 
     setPlanning(false)
@@ -552,6 +631,7 @@ export default function AutoModePanel() {
               <input
                 type="text"
                 value={newTarget}
+                aria-label="Add a target (IP, domain, email, phone)"
                 onChange={(e) => setNewTarget(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleAddTarget()}
                 placeholder="IP, domain, email, phone..."
@@ -564,6 +644,7 @@ export default function AutoModePanel() {
               <button
                 onClick={handleAddTarget}
                 disabled={autoMode.running}
+                aria-label="Add target"
                 className="px-2.5 py-1.5 rounded bg-phantom-magenta/20 text-phantom-magenta
                   text-xs hover:bg-phantom-magenta/30 transition-colors
                   disabled:opacity-30 disabled:cursor-not-allowed"
@@ -584,6 +665,7 @@ export default function AutoModePanel() {
                   <button
                     onClick={() => handleRemoveTarget(i)}
                     disabled={autoMode.running}
+                    aria-label={`Remove target ${t}`}
                     className="hover:text-phantom-error transition-colors"
                   >
                     <X size={11} />
@@ -602,10 +684,43 @@ export default function AutoModePanel() {
             <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-2 flex items-center gap-1.5">
               <UserCheck size={12} /> Identity check
             </h2>
+            {showScopeChips && (
+            <div className="flex flex-wrap gap-1 mb-2" role="group"
+              aria-label="OSINT platform scope">
+              {IDENTITY_SCOPES.map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => {
+                    setIdScope(s)
+                    setAutoMode({ identityPlatform: scopeValue(s) })
+                    setIdPreview(null)
+                  }}
+                  disabled={autoMode.running}
+                  aria-pressed={idScope === s}
+                  aria-label={scopeAria(s)}
+                  className={`px-2 py-1 rounded text-[10px] font-medium border
+                    transition-colors disabled:opacity-30
+                    ${idScope === s
+                      ? 'bg-phantom-magenta/20 text-phantom-magenta border-phantom-magenta/50'
+                      : 'bg-surface text-text-secondary border-surface-border hover:text-text-primary'
+                    }`}
+                >
+                  {SCOPE_LABELS[s]}
+                </button>
+              ))}
+            </div>
+            )}
+            {showScopeChips && (
+              <p className="text-[10px] text-text-dim mb-2">
+                {scopeHint(idScope)}
+              </p>
+            )}
             <div className="flex gap-1.5 mb-2">
               <input
                 type="text"
                 value={idUser}
+                aria-label="Username to preview"
                 onChange={(e) => setIdUser(e.target.value)}
                 onKeyDown={(e) => { if (e.key === 'Enter') void handlePreview() }}
                 placeholder="@username"
@@ -613,19 +728,13 @@ export default function AutoModePanel() {
                   text-xs font-mono text-text-primary placeholder-text-dim
                   focus:outline-none focus:border-phantom-magenta"
               />
-              <select
-                value={idPlatform}
-                onChange={(e) => setIdPlatform(e.target.value)}
-                className="bg-surface border border-surface-border rounded px-2 py-1.5
-                  text-xs text-text-primary focus:outline-none"
-              >
-                {['instagram', 'tiktok', 'x', 'github', 'telegram'].map((p) => (
-                  <option key={p} value={p}>{p}</option>
-                ))}
-              </select>
               <button
                 onClick={() => void handlePreview()}
-                disabled={idLoading || !idUser.trim()}
+                disabled={idLoading || !idUser.trim() || !previewable}
+                aria-label={previewable
+                  ? `Preview this identity on ${idPlatform}`
+                  : 'Preview needs one pinned platform (pick a social, not Auto or Other)'}
+                title={previewable ? '' : 'Preview needs one pinned platform'}
                 className="px-2.5 py-1.5 rounded bg-phantom-cyan/20 text-phantom-cyan
                   text-xs hover:bg-phantom-cyan/30 transition-colors
                   disabled:opacity-30 disabled:cursor-not-allowed"
@@ -637,7 +746,7 @@ export default function AutoModePanel() {
               <div className="rounded border border-surface-border bg-surface p-2.5 flex gap-2.5">
                 {idPreview.avatar_url ? (
                   // eslint-disable-next-line @next/next/no-img-element
-                  <img src={idPreview.avatar_url} alt="avatar"
+                  <img src={idPreview.avatar_url} alt={`Avatar of @${idPreview.username}`}
                     className="w-12 h-12 rounded-full object-cover flex-shrink-0" />
                 ) : (
                   <div className="w-12 h-12 rounded-full bg-surface-border flex-shrink-0" />
@@ -691,6 +800,8 @@ export default function AutoModePanel() {
                     key={m}
                     onClick={() => handleSetMode(m)}
                     disabled={autoMode.running}
+                    aria-pressed={autoMode.mode === m}
+                    aria-label={MODE_LABELS[m]}
                     className={`flex items-center gap-2 px-2.5 py-2 rounded text-xs
                       transition-colors text-left
                       ${autoMode.mode === m
@@ -851,11 +962,21 @@ export default function AutoModePanel() {
             />
           )}
 
+          {/* what the run will do with the identity, readable before Launch.
+              Only when a scope was actually chosen: `auto` is the default and
+              does not need a standing warning. */}
+          {autoMode.identityPlatform !== '' && (
+            <p className="text-[10px] text-text-dim mb-1.5">
+              {scopeHint(idScope)}
+            </p>
+          )}
+
           {/* Action buttons */}
           <div className="flex gap-2">
             <button
               onClick={handleLaunch}
               disabled={autoMode.running || (autoMode.targets.length === 0 && !session.target)}
+              aria-label="Launch the auto-mode run"
               className={`flex-1 py-2 rounded text-xs font-semibold uppercase tracking-wider
                 flex items-center justify-center gap-1.5 transition-colors
                 ${autoMode.running || (autoMode.targets.length === 0 && !session.target)
@@ -872,6 +993,7 @@ export default function AutoModePanel() {
             <button
               onClick={handleDryRun}
               disabled={autoMode.running || (autoMode.targets.length === 0 && !session.target)}
+              aria-label="Dry run — plan only, execute nothing"
               className={`px-3 py-2 rounded text-xs font-semibold flex items-center gap-1.5 transition-colors
                 ${autoMode.running || (autoMode.targets.length === 0 && !session.target)
                   ? 'bg-surface-border text-text-dim cursor-not-allowed'
@@ -883,6 +1005,7 @@ export default function AutoModePanel() {
             {liveRun && (
               <button
                 onClick={() => void handleStop()}
+                aria-label="Stop the run"
                 disabled={job.cancel_requested || job.state === 'stopping'
                   || !autoMode.running}
                 title={job.cancel_requested || job.state === 'stopping'
@@ -927,7 +1050,7 @@ export default function AutoModePanel() {
             <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-3">
               Kill Chain
             </h2>
-            <div className="flex items-center gap-1 flex-wrap">
+            <div role="group" aria-label="Kill chain steps" className="flex items-center gap-1 flex-wrap">
               {autoMode.steps.map((step, i) => (
                 <div key={i} className="flex items-center gap-1">
                   <div className={`animate-step-enter`} style={{ animationDelay: `${i * 50}ms` }}>
@@ -990,6 +1113,7 @@ export default function AutoModePanel() {
                           <button
                             onClick={() => copyText(`https://${c.platform}.com/${c.handle}`)}
                             title="Copy profile URL"
+                            aria-label="Copy profile URL"
                             className="px-1.5 py-1 rounded bg-surface-border text-text-secondary
                               hover:text-text-primary transition-colors"
                           >
@@ -1022,19 +1146,22 @@ export default function AutoModePanel() {
           <div className="bg-surface-card border border-surface-border rounded-lg flex-1 flex flex-col min-h-0 relative">
             {/* Global Progress Bar */}
             {autoMode.running && (
-              <div className="absolute top-0 left-0 h-1 bg-phantom-magenta transition-all duration-500 rounded-tl-lg" 
+              <div role="progressbar" aria-label="Kill chain progress" aria-valuemin={0} aria-valuemax={Math.max(1, autoMode.steps.length - 1)} aria-valuenow={Math.max(0, autoMode.current_step)} className="absolute top-0 left-0 h-1 bg-phantom-magenta transition-all duration-500 rounded-tl-lg" 
                    style={{ width: `${Math.max(5, (autoMode.current_step / Math.max(1, autoMode.steps.length - 1)) * 100)}%` }} />
             )}
             <div className="px-3 py-2 border-b border-surface-border flex items-center justify-between">
               <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider">
                 Reasoning Stream
               </h2>
-              <button onClick={handleClearLog} className="text-[10px] text-text-dim hover:text-text-primary transition-colors">
+              <button onClick={handleClearLog} aria-label="Clear the reasoning stream" className="text-[10px] text-text-dim hover:text-text-primary transition-colors">
                 Clear
               </button>
             </div>
             <div
               ref={reasoningRef}
+              role="log"
+              aria-live="polite"
+              aria-label="Auto-mode reasoning stream"
               className="flex-1 overflow-auto p-3 font-mono text-[11px] space-y-1"
             >
               {autoMode.reasoning.length === 0 ? (
@@ -1095,13 +1222,18 @@ export default function AutoModePanel() {
                 const beacon = beacons.find((b) => b.id === h.beaconId)
                 return (
                   <div key={h.id}
+                    role="region"
+                    aria-labelledby={`handoff-title-${h.id}`}
+                    aria-describedby={`handoff-detail-${h.id}`}
                     className="rounded-lg border border-phantom-green/40 bg-phantom-green/5 p-3">
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <div className="text-[13px] font-semibold text-phantom-green">
+                        <div id={`handoff-title-${h.id}`}
+                          className="text-[13px] font-semibold text-phantom-green">
                           Beacon available — {h.beaconId}
                         </div>
-                        <div className="text-[11px] text-text-dim mt-0.5">
+                        <div id={`handoff-detail-${h.id}`}
+                          className="text-[11px] text-text-dim mt-0.5">
                           {h.target && <span className="mr-2">Target: {h.target}</span>}
                           {beacon?.os && <span className="mr-2">OS: {beacon.os}</span>}
                           {beacon?.hostname && <span className="mr-2">Host: {beacon.hostname}</span>}
@@ -1180,7 +1312,8 @@ function RunStateStrip({
   const over = state === 'cancelled' || state === 'completed' ||
     state === 'failed' || state === 'done'
   return (
-    <div className="bg-surface-card border border-surface-border rounded-lg p-3">
+    <div role="status" aria-live="polite" aria-label="Auto-mode run state"
+      className="bg-surface-card border border-surface-border rounded-lg p-3">
       <div className="flex items-center gap-2 flex-wrap">
         <span className={`px-2 py-0.5 rounded border text-[11px] font-semibold uppercase tracking-wider ${style.cls}`}>
           {cancelRequested && state === 'running' ? 'Stopping' : style.label}
@@ -1280,7 +1413,7 @@ function KnowledgeWidget({ api }: { api: ReturnType<typeof import('@/hooks/useAp
 
   return (
     <div className="bg-surface-card border border-surface-border rounded-lg p-3">
-      <button onClick={load} className="flex items-center justify-between w-full text-left">
+      <button onClick={load} aria-expanded={open} className="flex items-center justify-between w-full text-left">
         <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
           <Brain size={13} className="text-phantom-green" /> WorldModel Knowledge
         </h2>

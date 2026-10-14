@@ -240,7 +240,8 @@ class AutonomousAgent:
                  cell_stages: Optional[List[str]] = None,
                  evolution_mode: str = "code",
                  identity_active: bool = False,
-                 resilient_stager: bool = True) -> None:
+                 resilient_stager: bool = True,
+                 social_platform: str = "") -> None:
         self.target = target
         if target_type in ("", "auto"):
             from phantom.automation.guidance.targets import classify_target
@@ -262,6 +263,13 @@ class AutonomousAgent:
         # works when the C2 happens to be up is a one-shot gamble. Opting out
         # is explicit (`--no-resilient`), never a side effect of max-OPSEC.
         self.resilient_stager = resilient_stager
+        # operator OSINT scope for an identity target (the checkbox in the
+        # UI / `--platform` on the CLI): "" = auto (probe everything), a
+        # known social = PINNED (only that network — a namesake on another
+        # one must never enter the graph), "other" = exclude the five top
+        # socials and search elsewhere. It reaches the social engine
+        # through the capability-slot autofill.
+        self.social_platform = str(social_platform or "").strip().lower()
         self.scope_list = scope_list or []
         # AUTO-MODE LLM GATE: with no operator watching, the deterministic
         # policy (`llm_autogate`) is the decider. Bounded per run so a
@@ -1284,6 +1292,22 @@ class AutonomousAgent:
             self._emit("unverified", capability=cap.id,
                        detail="postcondition not met: no declared effect "
                               "observed (" + ", ".join(missing) + ")")
+            # A MANIFEST driver declared its effects explicitly, so producing
+            # none of them is a broken CONTRACT, not a negative target: it is
+            # recorded as `driver_contract_violation` (the binary check says
+            # the right program ran; this says the program did what it
+            # promised). A built-in capability is left alone — an engine that
+            # finds nothing is a normal negative, not a lie.
+            try:
+                from phantom.automation.runtime.driver_contract import (
+                    record_effects_violation)
+                from phantom.automation.runtime.drivers import ToolDriver
+                if isinstance(getattr(cap, "driver", None), ToolDriver):
+                    record_effects_violation(cap.driver, missing)
+            except Exception as exc:  # never let telemetry break the run
+                from phantom.utils.failure_taxonomy import record
+                record("agent.postcondition_contract", exc, best_effort=True,
+                       detail=f"capability={cap.id}")
         # v3.0: record success for fallback/learning engine
         self._fallback.record(
             cap.category, cap.id, self.target, ok=True,
@@ -1644,6 +1668,15 @@ class AutonomousAgent:
           (platform from the OS finding); the beacon itself checks in to
           our C2 and post-exploitation runs through that channel.
         """
+        # the operator's OSINT scope, as an optional capability slot. It is
+        # filled BEFORE the `required` early-return below because `platform`
+        # is an OPTIONAL input: without this it stayed empty forever and
+        # every run silently defaulted to instagram.
+        if (self.social_platform
+                and cap.id in ("deep_recon", "profile_recon")
+                and not slots.get("platform")):
+            slots["platform"] = self.social_platform
+
         if cap.id in ("lateral_pivot", "smb_pivot", "winrm_pivot") \
                 and "host" not in slots:
             # host is an OPTIONAL input (peers may be absent) — autofill it
@@ -3319,7 +3352,9 @@ class AutonomousAgent:
             max_iterations: int = 20,
             checkpoint_path: Optional[str] = None,
             phase_wait: Optional[str] = None,
-            phase_wait_timeout: float = 900.0) -> Dict[str, Any]:
+            phase_wait_timeout: float = 900.0,
+            stage_hook: Optional[Callable[[Any, str, int, int, bool], None]]
+            = None) -> Dict[str, Any]:
         """Run the kill chain; `phase_wait` optionally gates the start of
         the loop on a WorldModel fact (same-target worker discipline: a
         phase worker never fires tools before its phase facts exist).
@@ -3332,6 +3367,11 @@ class AutonomousAgent:
         credentials + lateral movement) and hands the beacon over once.
         """
         self.goal = goal
+        # P1 (per-phase reports): a caller that wants an artifact at the end
+        # of EVERY stage hands in a hook; the agent only announces the
+        # boundary and never writes the report itself (the orchestrator owns
+        # the report layout).
+        self.stage_hook = stage_hook
         # P1-5: every run is PINNED to the engine/registry versions it was
         # started with. Learned/beta capabilities authored during THIS run
         # change the registry on disk but never inject into a run already
@@ -3370,10 +3410,16 @@ class AutonomousAgent:
                                satisfied=_ok, total=len(stages),
                                detail="stage goal satisfied" if _ok else
                                "no further move viable in this stage")
+                    self._notify_stage(_sg, _idx, len(stages), _ok)
                 self._stage_outcomes = dict(stage_results)
             else:
                 self._drive_stage(goal, max_iterations, checkpoint_path, orch,
                                   phase_wait, phase_wait_timeout)
+                # P1: a single-goal run is a one-stage ladder, and it gets the
+                # same per-phase artifact as every stage of a deep run —
+                # "report at the end of each phase" holds for goal=identity
+                # exactly as it does for goal=deep.
+                self._notify_stage(goal, 1, 1, self._goal_reached(goal))
         except Exception:
             raise
         finally:
@@ -3788,6 +3834,23 @@ class AutonomousAgent:
                 return True
         return self._goal_reached(goal)
 
+    def _notify_stage(self, stage: str, index: int, total: int,
+                      ok: bool) -> None:
+        """Announce that one PHASE just ended, to an injected hook.
+
+        The hook is the orchestrator's (`automode_report.write_phase_report`);
+        the agent deliberately does not import the reporting layer. A hook
+        that raises must never abort a finished stage, so the failure is
+        recorded as a degradation instead.
+        """
+        hook = getattr(self, "stage_hook", None)
+        if hook is None:
+            return
+        try:
+            hook(self, stage, int(index), int(total), bool(ok))
+        except Exception as exc:
+            self._degrade("stage_report", exc)
+
     def _wait_phase(self, fact_kind: str, timeout: float) -> bool:
         """Poll for a WorldModel fact (shared across same-target workers);
         used to keep phase workers quiet until their phase facts exist."""
@@ -3987,7 +4050,14 @@ class AutonomousAgent:
         if key in seen:
             return
         seen.add(key)
-        self._emit("degraded", layer=layer,
+        # P1 failure taxonomy: a degradation carries its CATEGORY, so the
+        # report/stream can say "tool_missing" instead of "something failed".
+        try:
+            from phantom.utils.failure_taxonomy import classify
+            _category = classify(exc)
+        except Exception:
+            _category = "internal_bug"
+        self._emit("degraded", layer=layer, category=_category,
                    detail=f"{type(exc).__name__}: {str(exc)[:120]}")
 
     def search_policy(self) -> str:
@@ -4468,6 +4538,13 @@ class AutonomousAgent:
         return {
             "target": self.target,
             "goal": self.goal,
+            # P0 engagement outcome: did the run REACH the goal, as opposed to
+            # merely finishing? This is the SAME fact check the drive loop
+            # used to decide `success`, so the report, the job state and the
+            # operator's summary cannot disagree about it.
+            "goal_reached": self._goal_reached(self.goal),
+            "goal_facts_missing": [f for f in self._goal_facts()
+                                   if not self.wm.has_any(f)],
             "job_pin": getattr(self, "job_pin", {}),
             "stages": dict(self._stage_outcomes or {}),
             "beacon_id": self._session.beacon_id if self._session else "",
@@ -4617,7 +4694,9 @@ def _run_target_with_workers(target: str, profile: str, aggressive: bool,
                              identity_active: bool = False,
                              cell_loop: bool = False,
                              cell_stages: Optional[List[str]] = None,
-                             evolution_mode: str = "code") -> tuple:
+                             evolution_mode: str = "code",
+                             stage_hook=None,
+                             social_platform: str = "") -> tuple:
     """Same-target parallel workers sharing ONE WorldModel (stealth design).
 
     The lead runs the full kill chain as usual; extra workers deepen single
@@ -4663,7 +4742,8 @@ def _run_target_with_workers(target: str, profile: str, aggressive: bool,
             resilient_stager=resilient_stager,
             identity_active=identity_active,
             cell_loop=cell_loop, cell_stages=cell_stages,
-            evolution_mode=evolution_mode)
+            evolution_mode=evolution_mode,
+            social_platform=social_platform)
         if runner is not None:
             from phantom.automation.runtime.stealth_runtime import TimingGovernor
             agent.runtime = StealthRuntime(
@@ -4705,7 +4785,7 @@ def _run_target_with_workers(target: str, profile: str, aggressive: bool,
     lead = _build()
     _seed_agent(lead, seed_findings)
     result = lead.run(goal=goal, max_iterations=max_iterations,
-                      checkpoint_path=state_path)
+                      checkpoint_path=state_path, stage_hook=stage_hook)
     for th in threads:
         th.join(timeout=300.0)
     if worker_results:
@@ -4748,7 +4828,9 @@ def run_autonomous(target: str, target_type: str = "auto",
                    identity_active: bool = False,
                    cell_loop: bool = True,
                    cell_stages: Optional[List[str]] = None,
-                   evolution_mode: str = "code"):
+                   evolution_mode: str = "code",
+                   stage_hook=None,
+                   social_platform: str = ""):
     """Full autonomous kill-chain run against a target.
 
     target_type defaults to "auto": the target is classified at runtime as
@@ -4776,6 +4858,10 @@ def run_autonomous(target: str, target_type: str = "auto",
             social_engine=social_engine, trojan_assets=trojan_assets,
             command_seed=command_seed, hunt_runner=hunt_runner,
             hunt_delay=hunt_delay, resilient_stager=resilient_stager)
+        # the operator's OSINT scope survives a RESUME too: it is INTENT,
+        # not run state, so it is re-applied on the restored agent.
+        agent.social_platform = str(social_platform
+                                    or agent.social_platform or "")
         agent.enterprise = EnterpriseBrain(agent.profile,
                                            threat_intel=threat_intel)
         agent.persist_learning = persist_learning
@@ -4797,7 +4883,8 @@ def run_autonomous(target: str, target_type: str = "auto",
         agent._stop_event = stop_event
         _seed_agent(agent, seed_findings)
         result = agent.run(goal=goal, max_iterations=max_iterations,
-                           checkpoint_path=state_path)
+                           checkpoint_path=state_path,
+                           stage_hook=stage_hook)
         if return_agent:
             return result, agent
         return result
@@ -4818,7 +4905,8 @@ def run_autonomous(target: str, target_type: str = "auto",
             reason_profile=reason_profile,
             resilient_stager=resilient_stager,
             cell_loop=cell_loop, cell_stages=cell_stages,
-            evolution_mode=evolution_mode)
+            evolution_mode=evolution_mode, stage_hook=stage_hook,
+            social_platform=social_platform)
         if return_agent:
             return result, agent
         return result
@@ -4845,7 +4933,8 @@ def run_autonomous(target: str, target_type: str = "auto",
                             identity_active=identity_active,
                             cell_loop=cell_loop,
                             cell_stages=cell_stages,
-                            evolution_mode=evolution_mode)
+                            evolution_mode=evolution_mode,
+                            social_platform=social_platform)
     if runner is not None:
         from phantom.automation.runtime.stealth_runtime import TimingGovernor
         agent.runtime = StealthRuntime(
@@ -4854,7 +4943,7 @@ def run_autonomous(target: str, target_type: str = "auto",
             governor=TimingGovernor(base_delay=0.0, jitter=0.0))
     _seed_agent(agent, seed_findings)
     result = agent.run(goal=goal, max_iterations=max_iterations,
-                       checkpoint_path=state_path)
+                       checkpoint_path=state_path, stage_hook=stage_hook)
     if return_agent:
         return result, agent
     return result
@@ -4913,7 +5002,9 @@ def run_campaign(targets: List[str], profile: str = "enterprise",
                  evolution: bool = False,
                  llm: bool = False,
                  identity_active: bool = False,
-                 stop_event=None) -> Dict[str, Any]:
+                 stop_event=None,
+                 stage_hook=None,
+                 social_platform: str = "") -> Dict[str, Any]:
     """Multi-target campaign: one sub-agent per target, fanned out through a
     bounded pool (`max_agents` concurrent sub-agents).
 
@@ -4976,7 +5067,8 @@ def run_campaign(targets: List[str], profile: str = "enterprise",
                     threat_intel=threat_intel,
                     persist_learning=persist_learning, experience=experience,
                     evolution=evolution, llm=llm,
-                    identity_active=identity_active, stop_event=stop_event)
+                    identity_active=identity_active, stop_event=stop_event,
+                    stage_hook=stage_hook, social_platform=social_platform)
 
             else:
                 result, agent = run_autonomous(
@@ -4992,7 +5084,8 @@ def run_campaign(targets: List[str], profile: str = "enterprise",
                     hunt_delay=hunt_delay, threat_intel=threat_intel,
                     persist_learning=persist_learning, experience=experience,
                     evolution=evolution, llm=llm, stop_event=stop_event,
-                    identity_active=identity_active)
+                    identity_active=identity_active, stage_hook=stage_hook,
+                    social_platform=social_platform)
         _stream("worker", {
             "worker": target, "phase": "done",
             "seconds": round(time.time() - started, 1),

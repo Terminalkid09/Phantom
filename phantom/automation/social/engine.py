@@ -617,7 +617,28 @@ class SocialEngine:
             if not username:
                 return False, [_marker_error("profile_recon needs a username")]
             platform = (platform or self._discovered.get("platform") or "").lower()
-            urls = self._profile_candidates(platform, username)
+            # operator SCOPE: a pinned run reads that one network only.
+            # Probing the other networks "just in case" is exactly how a
+            # namesake (same handle, different person) ends up in the chain.
+            from phantom.automation.social.recon import (
+                normalize_scope, TOP_SOCIALS)
+            scope, pinned = normalize_scope(platform)
+            scope_note = ""
+            if scope == "pin" and pinned:
+                url_platforms = [pinned]
+                scope_note = (
+                    f"SCOPE: mode=pin platform={pinned} "
+                    f"excluded={','.join(p for p in TOP_SOCIALS if p != pinned)}")
+            elif scope == "other":
+                url_platforms = [p for p in _PROFILE_URLS
+                                 if p not in TOP_SOCIALS]
+                scope_note = (f"SCOPE: mode=other "
+                              f"excluded={','.join(TOP_SOCIALS)}")
+            else:
+                url_platforms = None
+            urls = self._profile_candidates(pinned or platform, username)
+            if url_platforms is not None:
+                urls = [u for u in urls if u[0] in url_platforms]
             best_private = None
             for p, url in urls:
                 res = execute_quiet(
@@ -657,6 +678,10 @@ class SocialEngine:
                 if not private and handles:
                     lines.extend(self._sherlock_handles(username, handles))
                 break  # one solid profile is enough for this pass
+            # the scope receipt rides WITH a result: a pass that found
+            # nothing stays as silent as it always was (no news, no lines).
+            if lines and scope_note:
+                lines.insert(0, scope_note)
             return (True, lines) if lines else (True, [])
         except Exception as e:
             return False, [f"ERROR: profile recon failed: {e}"]

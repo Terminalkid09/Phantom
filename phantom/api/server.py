@@ -718,6 +718,13 @@ class AutoJob:
                  profile: str, goal: str) -> None:
         self.id = job_id
         self.verbose = False
+        # P0: the SECOND axis. `state` is the job lifecycle; `outcome` is
+        # whether the ENGAGEMENT reached anything. They are independent on
+        # purpose: a cancelled job can have a partial outcome, a completed
+        # job can have reached nothing.
+        self.outcome = "not_started"
+        self.outcome_label = "not started"
+        self.targets_outcome: dict = {}
         self.targets = list(targets)
         self.mode = mode
         self.profile = profile
@@ -783,6 +790,35 @@ class AutoJob:
         # order here is what keeps a callback from deadlocking the run thread.
         if kind in _EXECUTION_KINDS:
             self.set_state("running", f"{kind} event")
+
+    def set_outcome(self, envelope: dict) -> bool:
+        """Record the engagement outcome a run produced.
+
+        Refuses an unknown token or an empty envelope rather than storing
+        something the UI cannot render: the whole point of this field is
+        that it never claims more than the run proved. The label is derived
+        here so every producer (CLI orchestrator, API thread, a future
+        caller) reports the same words for the same token.
+        """
+        if not isinstance(envelope, dict):
+            return False
+        token = str(envelope.get("outcome") or "").strip()
+        if not token:
+            return False
+        try:
+            from phantom.automation.engagement_outcome import (
+                OUTCOMES, outcome_label)
+            if token not in OUTCOMES:
+                return False
+            label = outcome_label(token)
+        except Exception:
+            label = token
+        with self._state_lock:
+            self.outcome = token
+            self.outcome_label = label
+            tgt = envelope.get("targets")
+            self.targets_outcome = dict(tgt) if isinstance(tgt, dict) else {}
+        return True
 
     def handoff_records(self) -> list[dict]:
         """Handoffs so far, oldest first. A snapshot, so a UI poll cannot
@@ -890,6 +926,11 @@ class AutoJob:
             "done": self.done,
             "end_reason": self.end_reason,
             "error": self.error or "",
+            # P0 engagement outcome (what the run ACHIEVED), alongside the
+            # lifecycle state (what the process is DOING).
+            "outcome": self.outcome,
+            "outcome_label": self.outcome_label,
+            "targets_outcome": dict(self.targets_outcome),
             "current_step": self.current_step,
             "started_at": self.started_at,
             "elapsed": max(0.0, time.time() - self.started_at),
@@ -1135,6 +1176,10 @@ async def automode_run(request: web.Request) -> web.Response:
     experience = _experience_enabled(
         None if _exp_flag is None else bool(_exp_flag))
     verbose = bool(body.get("verbose", False))
+    # OSINT scope for a username target: a pinned social (instagram|tiktok|x|
+    # github|telegram) or "other" (exclude those five, search elsewhere).
+    # Empty = auto. Validated HERE so a typo can never silently pin nothing.
+    platform = str(body.get("platform", "") or "").strip().lower()
     engine = str(body.get("engine", "agent") or "agent").strip().lower()
     if engine not in ("agent", "swarm"):
         return _error("engine must be 'agent' or 'swarm'")
@@ -1154,7 +1199,7 @@ async def automode_run(request: web.Request) -> web.Response:
     _preapprove_llm(job, llm)
     def _run(job: AutoJob) -> None:
         try:
-            run_auto_mode(
+            _outcome = run_auto_mode(
                 targets=targets,
                 aggressive=(mode == "aggressive"),
                 stealth=(mode == "stealth"),
@@ -1172,7 +1217,10 @@ async def automode_run(request: web.Request) -> web.Response:
                 stop_event=job.stop_event,
                 engine=engine,
                 force_network=force_network,
+                social_platform=platform,
             )
+            if isinstance(_outcome, dict):
+                job.set_outcome(_outcome)
         except Exception as exc:
             # Never die silently: surface the crash in the UI stream. A
             # UnicodeEncodeError from the legacy Windows console renderer
@@ -1180,6 +1228,10 @@ async def automode_run(request: web.Request) -> web.Response:
             # leaving the UI with just "sequence complete".
             traceback.print_exc()
             job.error = str(exc)
+            job.set_outcome({
+                "goal": goal, "outcome": "failed_infrastructure",
+                "targets": {t: "failed_infrastructure" for t in targets},
+            })
             job.callback("failed", {"output": f"auto-mode crashed: {exc}"})
         finally:
             # The terminal state comes from the CAUSE, and `halt` keeps being
@@ -1291,6 +1343,9 @@ _IDLE_STATUS = {
     "profile": "",
     "goal": "",
     "llm": "denied",
+    "outcome": "not_started",
+    "outcome_label": "not started",
+    "targets_outcome": {},
     "llm_pending": 0,
     "handoffs": [],
     "handoff_state": "none",
@@ -1403,8 +1458,8 @@ async def osint_preview(request: web.Request) -> web.Response:
     platform = str(body.get("platform", "") or "instagram").strip().lower()
     if not username:
         return _error("username required")
-    if platform not in ("instagram", "tiktok", "x", "github",
-                        "telegram", "reddit"):
+    from phantom.automation.social.recon import SUPPORTED_PLATFORMS
+    if platform not in SUPPORTED_PLATFORMS:
         return _error("unsupported platform")
     try:
         from phantom.automation.social.recon import (
@@ -1536,11 +1591,22 @@ async def automode_plan(request: web.Request) -> web.Response:
     if force_network:
         plan.append("!! force_network=on: the run may engage the FULL range "
                     "(scope-widening override; recorded at launch)")
+    # the OSINT scope the RUN would use: a dry run that stayed silent about
+    # it read as unscoped while the real pass was pinned to one network.
+    from phantom.automation.social.recon import normalize_scope
+    _scope_mode, _scope_platform = normalize_scope(
+        str(body.get("platform", "") or ""))
+    if _scope_mode == "pin":
+        plan.append(f"OSINT scope: PINNED to {_scope_platform} "
+                    "(the other platforms are not probed)")
+    elif _scope_mode == "other":
+        plan.append("OSINT scope: everywhere EXCEPT the 5 top socials")
     plan.append("-- GENERATE DUAL REPORT (raw audit + sanitized client) --")
 
     return _json({
         "plan": plan,
         "steps": steps,
+        "scope": {"mode": _scope_mode, "platform": _scope_platform},
         "engine": engine,
         "mode": mode,
         "profile": profile,

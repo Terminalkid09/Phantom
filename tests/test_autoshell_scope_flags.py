@@ -193,7 +193,9 @@ class TestTheApiRecordsTheSameOverride(unittest.TestCase):
     def test_the_endpoint_actually_calls_it(self):
         from phantom.api import server
         src = pathlib.Path(server.__file__).read_text(encoding="utf-8")
-        block = src[src.index("async def automode_run"):][:4000]
+        # the window is a source-scan heuristic, not an assertion: it only
+        # has to reach the response the handler builds at the end.
+        block = src[src.index("async def automode_run"):][:6000]
         self.assertIn("_record_automode_guardrails(", block)
         self.assertIn('"guardrails": guardrails', block)
 

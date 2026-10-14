@@ -46,6 +46,61 @@ from phantom.core.automode_report import (  # noqa: E402
     write_agent_reports as _write_agent_reports,
     write_swarm_summary as _write_swarm_summary,
 )
+from phantom.automation.engagement_outcome import (  # noqa: E402
+    board_goal_reached as _board_goal_reached,
+    derive_engagement as _derive_engagement,
+    derive_target_outcome as _derive_target_outcome,
+    missing_goal_facts as _missing_goal_facts,
+    needs_callback as _needs_callback,
+    outcome_label as _outcome_label,
+)
+
+
+def _listenerless_allowed() -> bool:
+    """May a callback-dependent goal run with NO C2 listener?
+
+    Default NO. Deploying a beacon nobody can answer only burns the
+    engagement, so the operator opts in explicitly (config
+    `c2.allow_listenerless`, or PHANTOM_ALLOW_LISTENERLESS=1) when they
+    intend to bring a listener up by hand later (a different host, a
+    tunnel, a Go data plane).
+    """
+    try:
+        from phantom.utils import config as cfg
+        raw = cfg.get("c2.allow_listenerless", False,
+                      env="PHANTOM_ALLOW_LISTENERLESS")
+    except Exception:
+        return False
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _announce_outcome(goal: str, outcome: str, target: str, result,
+                      on_event=None) -> None:
+    """Say what the run achieved, on the CLI and on the event stream.
+
+    The job lifecycle answers "is the process done?"; this answers "is the
+    GOAL done?" — and when it is not, it names the goal facts still
+    missing, so a partial run leaves the operator with a lead instead of a
+    shrug.
+    """
+    label = _outcome_label(outcome)
+    missing = _missing_goal_facts(goal, result or {})
+    if outcome == "completed_goal":
+        notifier.success(f"Esito [{target}]: {label} — obiettivo "
+                         f"'{goal}' raggiunto.")
+    elif outcome in ("partial", "completed_without_goal"):
+        gap = f" Fact mancanti: {', '.join(missing)}." if missing else ""
+        notifier.warn(f"Esito [{target}]: {label} — obiettivo '{goal}' NON "
+                      f"raggiunto.{gap}")
+    else:
+        notifier.error(f"Esito [{target}]: {label} — goal '{goal}'.")
+    if on_event is not None:
+        try:
+            on_event("outcome", {"outcome": outcome, "label": label,
+                                 "goal": goal, "target": target,
+                                 "missing": missing})
+        except Exception:
+            pass
 
 
 def _callback_preflight(targets, goal: str) -> None:
@@ -163,7 +218,8 @@ def _run_agent_single(target, goal, profile, aggressive, paranoid, speed,
                       identity_active: bool = False,
                       cell_loop: bool = True,
                       cell_stages: Optional[List[str]] = None,
-                      evolution_mode: str = "code"):
+                      evolution_mode: str = "code",
+                      social_platform: str = ""):
     from phantom.automation.agent import run_autonomous
     workers = agents if agents > 0 else _auto_workers(
         target, goal, profile, aggressive, paranoid, speed)
@@ -179,6 +235,19 @@ def _run_agent_single(target, goal, profile, aggressive, paranoid, speed,
         notifier.info(
             f"Seed dal core manuale: {len(seed)} fact già noti "
             "(l'auto-mode non li riscopre da zero).")
+    # P1 per-phase reports: an artifact at the end of EVERY stage, written
+    # into <run dir>/phases/<NN>_<stage>/. The run directory is DERIVED from
+    # the checkpoint path the orchestrator already computed, so no new
+    # parameter has to be threaded through the whole call chain.
+    _phase_root = os.path.dirname(state_path) if state_path else ""
+
+    def _stage_hook(_agent, _stage, _index, _total, _ok):
+        if not _phase_root:
+            return
+        from phantom.core.automode_report import write_phase_report
+        write_phase_report(_agent, profile, _phase_root, _stage,
+                           _index, _total, _ok)
+
     return run_autonomous(
         target=target, profile=profile, aggressive=aggressive,
         paranoid=paranoid, speed=speed, goal=goal,
@@ -191,7 +260,8 @@ def _run_agent_single(target, goal, profile, aggressive, paranoid, speed,
         resilient_stager=resilient_stager,
         identity_active=identity_active,
         cell_loop=cell_loop, cell_stages=cell_stages,
-        evolution_mode=evolution_mode)
+        evolution_mode=evolution_mode, stage_hook=_stage_hook,
+        social_platform=social_platform)
 
 
 def _run_agent_campaign(targets, goal, profile, aggressive, paranoid, speed,
@@ -201,7 +271,8 @@ def _run_agent_campaign(targets, goal, profile, aggressive, paranoid, speed,
                         experience: bool = False,
                         evolution: bool = False,
                         identity_active: bool = False,
-                        stop_event: Optional[threading.Event] = None):
+                        stop_event: Optional[threading.Event] = None,
+                        social_platform: str = ""):
     from phantom.automation.agent import run_campaign
     n = len(targets)
     # -aN on a campaign is the concurrent fan-out pool; when N exceeds the
@@ -218,6 +289,17 @@ def _run_agent_campaign(targets, goal, profile, aggressive, paranoid, speed,
     else:
         max_agents = agents if agents > 0 else min(n, 3)
         workers_per_target = 1
+    # P1 per-phase reports for a campaign: one phases/ ladder PER TARGET,
+    # beside that target's end-of-run report, so the artifacts stay together.
+    def _campaign_stage_hook(_agent, _stage, _index, _total, _ok):
+        if not state_dir:
+            return
+        from phantom.core.automode_report import write_phase_report
+        write_phase_report(
+            _agent, profile,
+            os.path.join(state_dir, _safe_target_dir(_agent.target)),
+            _stage, _index, _total, _ok)
+
     return run_campaign(
         targets=targets, profile=profile, aggressive=aggressive,
         paranoid=paranoid, speed=speed, goal=goal,
@@ -227,7 +309,8 @@ def _run_agent_campaign(targets, goal, profile, aggressive, paranoid, speed,
         state_dir=state_dir or None,
         threat_intel=_threat_intel_feed(), persist_learning=True, llm=llm,
         experience=experience, evolution=evolution,
-        identity_active=identity_active, stop_event=stop_event)
+        identity_active=identity_active, stop_event=stop_event,
+        stage_hook=_campaign_stage_hook, social_platform=social_platform)
 
 
 def _handoff_c2(beacon_id: str) -> None:
@@ -299,6 +382,11 @@ def _run_swarm_branch(resolved, goal, profile, aggressive, speed, agents,
                         f"{k}={v}" for k, v in sorted(counts.items())))
     _print_swarm_tail(result, summary, out_root, started_wall,
                       goal, on_event, handoff_c2)
+    # P0: swarm outcome, announced per target and returned as the envelope.
+    _outcome = _derive_target_outcome(goal, result)
+    for _t in resolved:
+        _announce_outcome(goal, _outcome, _t, result, on_event)
+    return _derive_engagement(goal, {t: _outcome for t in resolved})
 
 
 def _run_swarm_operation(targets, goal, profile, aggressive, speed,
@@ -389,6 +477,11 @@ def _run_swarm_operation(targets, goal, profile, aggressive, speed,
                    "ad": n_ad > 0, "crack": n_cracked > 0,
                    "lateral": n_lateral > 0},
     }
+    # P0: the swarm has no per-target `result`, so the goal is read off the
+    # shared board with the SAME fact vocabulary the agent uses — one goal
+    # registry decides both engines' notion of "done".
+    result["goal_reached"] = bool(
+        board is not None and _board_goal_reached(goal, board, targets))
     return result, summary, merged
 
 
@@ -462,6 +555,15 @@ def _ensure_c2_listener(server=None) -> bool:
         return False
 
 
+# The MANUAL path needs the same thing (audit §1.2): `craft beacon`,
+# `payload deploy` and `exploit deploy-agent` compile a dropper that has to
+# check in SOMEWHERE, and only auto-mode brought a listener up — a hand-
+# deployed beacon could have nobody to call back to. Same helper, same
+# `c2.listener_auto_start` gate, one policy; the private name stays the call
+# site inside this module (tests patch it there).
+ensure_c2_listener = _ensure_c2_listener
+
+
 def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                   speed: bool = False, plan: bool = False, agents: int = 0,
                   goal: str = "deliver", profile: str = "enterprise",
@@ -481,7 +583,8 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                    only_markdown: bool = False,
                    engine: str = "agent",
                    force_network: bool = False,
-                   force_profile: bool = False) -> None:
+                   force_profile: bool = False,
+                   social_platform: str = "") -> None:
     """Autonomous kill chain (planner agent) — the `auto` entry point.
 
     Classifies each target (ip/domain/url/email/username/phone) and drives
@@ -587,6 +690,20 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
         _warn_missing_scope(resolved)
 
     if plan:
+        # the dry run must not read as unscoped while a pinned scope is set:
+        # the OSINT pass is exactly where the choice changes the steps.
+        if social_platform:
+            from phantom.automation.social.recon import normalize_scope
+            _sc, _sp = normalize_scope(social_platform)
+            if _sc == "pin":
+                _scope_txt = (f"PINNED to {_sp} — the other platforms are "
+                              f"not probed")
+            elif _sc == "other":
+                _scope_txt = ("everywhere EXCEPT the 5 top socials "
+                              "(instagram, tiktok, x, github, telegram)")
+            else:
+                _scope_txt = "every platform is probed (auto)"
+            console.print(f"[dim]OSINT scope: {_scope_txt}[/]")
         for t in resolved:
             p, tt, chain, _goal_facts = _dry_run_plan(
                 t, goal, profile, aggressive, stealth, speed)
@@ -608,7 +725,31 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
     # its own listener (HTTPS + auto-generated mTLS material) unless
     # c2.listener_auto_start is off, binding c2.bind (every interface by
     # default) and dialing the derived beacon-facing address.
-    _ensure_c2_listener()
+    _listener_up = _ensure_c2_listener()
+    if not _listener_up and _needs_callback(goal) \
+            and not _listenerless_allowed():
+        # P0 FAIL-CLOSED. A callback-bound goal with no listener can only
+        # deploy beacons that have nowhere to check in: the run would work
+        # the whole chain and end on a late "nessun beacon stabilito". The
+        # prerequisite is knowable NOW, so the run refuses BEFORE the deploy
+        # and names the cause — the job lifecycle says `failed`, the
+        # engagement outcome says `blocked_preflight`.
+        notifier.error(
+            f"Nessun listener C2 e goal '{goal}' dipende dal callback: run "
+            f"rifiutato PRIMA di deployare (nessun engagement sprecato).",
+            hint="avvia il listener (`c2` -> listener start) o libera "
+                 "c2.bind/porta; se intendi avviarlo a mano dopo, imposta "
+                 "c2.allow_listenerless=true (o PHANTOM_ALLOW_LISTENERLESS=1)")
+        for _t in resolved:
+            _announce_outcome(goal, "blocked_preflight", _t, {}, on_event)
+        return {
+            "goal": goal,
+            "outcome": "blocked_preflight",
+            "label": _outcome_label("blocked_preflight"),
+            "goal_reached": False,
+            "targets": {t: "blocked_preflight" for t in resolved},
+            "reached": [], "partial": [], "failed": list(resolved),
+        }
 
     started_wall = time.time()
     out_root = resume or _report_out_dir()
@@ -651,14 +792,19 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
     engine, engine_note = _engine_for(goal, engine)
     if engine_note:
         notifier.warn(engine_note)
+    # the OSINT scope (--platform / the UI checkbox) is an AGENT-path input:
+    # say so rather than let a swarm run look scoped when it is not.
+    if social_platform and engine == "swarm":
+        notifier.warn(
+            "--platform scopes the agent OSINT pass (pin/other): the swarm "
+            "engine does not consume it in this run.")
 
     if len(resolved) == 1:
         if engine == "swarm":
-            _run_swarm_branch(
+            return _run_swarm_branch(
                 resolved, goal, profile, aggressive, speed, agents,
                 verbose, on_event, llm, out_root, started_wall, handoff_c2,
                 resilient_stager, resume, experience, evolution)
-            return
         state_path = resume or os.path.join(out_root, "checkpoint.json")
         result, agent = _run_agent_single(
             resolved[0], goal, profile, aggressive, stealth, speed,
@@ -668,7 +814,8 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
             reason_profile=reason_profile, cell_loop=cell_loop,
             cell_stages=cell_stages, resilient_stager=resilient_stager,
             identity_active=identity_active,
-            evolution_mode=("proposal" if only_markdown else "code"))
+            evolution_mode=("proposal" if only_markdown else "code"),
+            social_platform=social_platform)
         tdir, paths = _write_agent_reports(agent, profile, out_root, resolved[0])
         # auto-mode -> manual core: everything the agent learned is merged
         # into the session + manual WorldModel, so `map`, `suggest`,
@@ -681,6 +828,13 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                 " (visibili ora anche nel core manuale)")
         _print_agent_single_tail(result, paths, agent, goal,
                                  started_wall, out_root)
+        # P0: the PROCESS finished — say whether the GOAL finished with it.
+        # Announced BEFORE the handoff opens an interactive shell, so the
+        # operator reads the verdict and not just a prompt.
+        _outcome = _derive_target_outcome(
+            goal, result,
+            cancelled=bool(stop_event is not None and stop_event.is_set()))
+        _announce_outcome(goal, _outcome, resolved[0], result, on_event)
         if result.get("beacon_established"):
             beacon_id = result.get("beacon_id") or ""
             if handoff_c2:
@@ -690,20 +844,19 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
         else:
             notifier.warn("Nessun beacon stabilito: niente handoff. "
                           "Usa 'c2' -> 'beacons' per monitorare callback")
-        return
+        return _derive_engagement(goal, {resolved[0]: _outcome})
 
     if engine == "swarm":
-        _run_swarm_branch(
+        return _run_swarm_branch(
             resolved, goal, profile, aggressive, speed, agents,
             verbose, on_event, llm, out_root, started_wall, handoff_c2,
             resilient_stager, resume, experience, evolution)
-        return
     campaign = _run_agent_campaign(
         resolved, goal, profile, aggressive, stealth, speed,
         scope_list, agents, verbose, on_event, llm,
         state_dir=out_root, experience=_experience_enabled(experience),
         evolution=evolution, identity_active=identity_active,
-        stop_event=stop_event)
+        stop_event=stop_event, social_platform=social_platform)
     elapsed = _fmt_elapsed(time.time() - started_wall)
     per_target = {}
     for t in resolved:
@@ -720,6 +873,17 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
     for r in campaign.get("results", {}).values():
         if r.get("beacon_established") and not first_beacon:
             first_beacon = r.get("beacon_id", "")
+    # P0: per-target outcomes, then the engagement-level answer. A campaign
+    # that delivered on one host out of five is `partial`, never
+    # `completed_goal`.
+    _results = campaign.get("results", {}) if isinstance(campaign, dict) else {}
+    _cancelled = bool(stop_event is not None and stop_event.is_set())
+    _per_outcome = {t: _derive_target_outcome(
+        goal, _results.get(t, {}), cancelled=_cancelled)
+        for t in resolved}
+    for _t in resolved:
+        _announce_outcome(goal, _per_outcome[_t], _t,
+                          _results.get(_t, {}), on_event)
     if first_beacon:
         if handoff_c2:
             _handoff_c2(first_beacon)
@@ -727,3 +891,4 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
             on_event("handoff", {"beacon_id": first_beacon})
     else:
         notifier.info("Nessun beacon stabilito. Usa 'c2' per monitorare.")
+    return _derive_engagement(goal, _per_outcome)

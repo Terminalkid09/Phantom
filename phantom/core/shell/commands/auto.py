@@ -213,12 +213,15 @@ def cmd_auto(shell, arg: str):
                              "exist (max-OPSEC engagements)")
     parser.add_argument("--platform", default="",
                         metavar="PLATFORM",
-                        help="social platform of a username target "
-                             "(instagram|tiktok|x|github): with a tty, "
+                        help="social platform of a username target: "
+                             "instagram|tiktok|x|github|telegram PINS the "
+                             "OSINT to that one network (the same handle "
+                             "elsewhere is often a different person), "
+                             "`other` EXCLUDES those five and looks "
+                             "elsewhere. With a tty and a pinned platform, "
                              "shows the profile preview (avatar URL, bio, "
                              "follower counts) for one confirmation before "
-                             "launch — beats 2 hours of OSINT on the wrong "
-                             "person")
+                             "launch")
 
     try:
         args = parser.parse_args(arg.split())
@@ -243,14 +246,19 @@ def cmd_auto(shell, arg: str):
     # operator KNOWS who they mean — show the profile preview (avatar
     # URL, bio, follower counts, direct link) for one confirmation.
     # Wrong-person OSINT costs hours; this question costs seconds.
-    if (args.platform and len(targets) == 1 and not args.plan
+    _pin_scope, _pin_platform = "", ""
+    if args.platform:
+        from phantom.automation.social.recon import normalize_scope
+        _pin_scope, _pin_platform = normalize_scope(args.platform)
+    if (_pin_scope == "pin" and _pin_platform and len(targets) == 1
+            and not args.plan
             and sys.stdin.isatty() and sys.stdout.isatty()):
         try:
             from phantom.automation.guidance.targets import classify_target
             if classify_target(targets[0]) == "username":
                 from phantom.automation.social.recon import (
                     present_candidate, preview_profile)
-                _prof = preview_profile(targets[0], args.platform)
+                _prof = preview_profile(targets[0], _pin_platform)
                 _sh.console.print(
                     "\n[bold cyan]Identity start-gate "
                     f"({_prof.username} @ {_prof.platform}, "
@@ -393,6 +401,7 @@ def cmd_auto(shell, arg: str):
         only_markdown=args.only_markdown,
         force_network=args.force_network,
         experience=args.experience,
+        social_platform=args.platform,
     )
 
 

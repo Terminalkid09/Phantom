@@ -944,6 +944,7 @@ _SOCIAL_MARKERS = {
     "identity_resolved": "IDENTITY_RESOLVED:",
     "identity_widened": "IDENTITY_WIDENED:",
     "avatar": "AVATAR:",
+    "recon_scope": "RECON_SCOPE:",
     # identity-field primitives (I2)
     "email_candidate": "EMAIL_CANDIDATE:",
     "email_masked": "EMAIL_MASKED:",
@@ -1117,6 +1118,37 @@ def _social_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[F
                 value={"handle": kv.get("handle"),
                        "platform": kv.get("platform", "")},
                 confidence=0.5, source="deep_recon", target=wm.target))
+        # The operator's OSINT scope is a RECEIPT, and receipts have to be
+        # visible: `SEARCH_HIT`/`WAYBACK` were emitted as plain lines that
+        # nothing interpreted, so "every correspondence found elsewhere"
+        # existed in a string nobody read. They become facts now.
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["recon_scope"])
+        if kv.get("mode"):
+            findings.append(Finding(
+                kind="recon_scope",
+                key=f"recon_scope:{kv.get('mode')}:{kv.get('platform', '')}",
+                value={"mode": kv.get("mode", ""),
+                       "platform": kv.get("platform", ""),
+                       "excluded": kv.get("excluded", ""),
+                       "platforms": kv.get("platforms", "")},
+                confidence=0.95, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["search_hit"])
+        if kv.get("url"):
+            findings.append(Finding(
+                kind="search_hit",
+                key=f"search_hit:{kv['url'][:80]}",
+                value={"url": kv.get("url", "")[:300],
+                       "platform": kv.get("platform", ""),
+                       "evidence": kv.get("evidence", "")},
+                confidence=0.5, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["wayback"])
+        if kv.get("url"):
+            findings.append(Finding(
+                kind="wayback",
+                key=f"wayback:{kv['url'][:80]}",
+                value={"url": kv.get("url", "")[:300],
+                       "evidence": kv.get("evidence", "")},
+                confidence=0.6, source="deep_recon", target=wm.target))
         kv = _parse_marker_line(line, _SOCIAL_MARKERS["email_candidate"])
         if kv.get("email"):
             findings.append(Finding(
@@ -4366,7 +4398,10 @@ CAPABILITIES = [
         "mario.rossi) so the reverse pass runs for every identity type that "
         "OSINT can pin a handle on",
         [_mk_slot("platform", "str", False,
-                  "instagram|tiktok|x|github|reddit|telegram")],
+                  "instagram|tiktok|x|github|telegram PINS the pass to that "
+                  "one network (a namesake elsewhere is a different "
+                  "person); `other` EXCLUDES those five and looks "
+                  "elsewhere")],
         ["profile", "account_link"], _profile_recon_adapter, _social_interp,
         opsec_cost=0.5, detection_risk=0.0, stealth_level="passive", timeout=60,
         preconditions=[_has_target_type("username", "email")],
@@ -4376,11 +4411,14 @@ CAPABILITIES = [
         "DEEP profile reverse-engineering (the reliable pass): multi-marker "
         "private-state voting across two fetches, tagged/commenter/follower "
         "mining from embedded JSON, username-variant probing, Wayback "
-        "snapshots of ex-public profiles, search dorks, avatar-hash and "
-        "bio-similarity cross-account correlation — every lead carries its "
-        "evidence source. Pure OSINT, bounded (<=20 calls), never blocks",
+        "snapshots of ex-public profiles, search dorks (by handle AND by "
+        "the real name, when one was found), avatar-hash and bio-similarity "
+        "cross-account correlation — every lead carries its evidence "
+        "source. Pure OSINT, bounded (<=20 calls), never blocks",
         [_mk_slot("platform", "str", False,
-                  "instagram|tiktok|x|github|reddit|telegram")],
+                  "instagram|tiktok|x|github|telegram PINS the pass to that "
+                  "one network; `other` EXCLUDES those five and searches "
+                  "elsewhere")],
         ["profile", "account_link", "identity"], _profile_recon_adapter,
         _social_interp,
         opsec_cost=0.8, detection_risk=0.0, stealth_level="passive", timeout=240,

@@ -104,6 +104,14 @@ export interface AutoModeState {
   llm: boolean
   experience: boolean
   verbose: boolean
+  /**
+   * OSINT scope for a username target, sent to `/api/automode/run` as
+   * `platform`: `''` = auto (every platform probed), a pinned social
+   * (`instagram|tiktok|x|github|telegram`) = only that network is read so a
+   * namesake elsewhere cannot enter the identity graph, `'other'` = exclude
+   * the five top socials and search elsewhere.
+   */
+  identityPlatform: string
 }
 
 /**
@@ -292,7 +300,8 @@ export const useStore = create<PhantomStore>((set, get) => ({
     goal: 'deliver',
     llm: false,
     experience: true,
-    verbose: false
+    verbose: false,
+    identityPlatform: ''
   },
   setAutoMode: (a) => set((s) => ({ autoMode: { ...s.autoMode, ...a } })),
 
