@@ -28,6 +28,22 @@ def _capture(fn) -> str:
     return " ".join(buffer.getvalue().split())
 
 
+def _squash(text: str) -> str:
+    """``text`` with EVERY whitespace character removed.
+
+    The renderer (rich) folds a line at the console width, and the fold lands
+    wherever the column happens to fall: on the CI runner the path
+    ``/tmp/pytest-of-runner/pytest-0/test_a_broken_write_warns_with0/readonly/
+    auto_restarts.json`` is long enough that it broke INSIDE the file name
+    (``auto_re`` / ``starts.json``), so an assertion on the contiguous name
+    failed there and passed on a Windows disk, where the break fell elsewhere.
+    Where a line wraps is the renderer's business; that the warning NAMES the
+    file and the count is the assertion, so the comparison happens on
+    whitespace-free text.
+    """
+    return "".join(str(text).split())
+
+
 def test_a_broken_write_warns_with_the_path_and_the_count(tmp_path,
                                                           monkeypatch):
     target = tmp_path / "readonly" / "auto_restarts.json"
@@ -36,11 +52,11 @@ def test_a_broken_write_warns_with_the_path_and_the_count(tmp_path,
         raise OSError("read-only file system")
 
     monkeypatch.setattr("builtins.open", refuse)
-    text = _capture(lambda: AR._write_counter(str(target), 3))
-    assert "restart counter NOT persisted" in text
+    text = _squash(_capture(lambda: AR._write_counter(str(target), 3)))
+    assert _squash("restart counter NOT persisted") in text
     assert "auto_restarts.json" in text
-    assert "read-only file system" in text
-    assert "is 3" in text, "the in-memory count must be reported"
+    assert _squash("read-only file system") in text
+    assert _squash("is 3") in text, "the in-memory count must be reported"
 
 
 def test_a_broken_write_never_raises_into_the_runner(tmp_path, monkeypatch):

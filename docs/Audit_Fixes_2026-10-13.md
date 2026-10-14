@@ -234,6 +234,24 @@ correzioni — il primo passaggio (§1-§6) e il secondo (§7), `.gitignore` rip
 compreso — ed è il numero da citare. Rispetto ai `5386` del run precedente, i
 `5414` includono i 28 test nuovi aggiunti dal secondo passaggio.
 
+**Errata (2026-10-14).** Il corpo del commit `e7c2a74` cita «suite completa 5446
+passed, 8 skipped, 0 failed»: quel numero è **sbagliato di +32**. Rimisurato, per
+albero:
+
+| Albero | Comando | Risultato |
+|---|---|---|
+| `e7c2a74` (l'albero di QUESTA pagina) | `pytest --collect-only -q` | `5422 tests collected` = i **5414 passed** + gli **8 skipped** di sopra |
+| `91b437c` (commit di scope OSINT, +2 file di test) | `pytest -q` seriale **e** `pytest -q -n auto` | **5448 passed, 8 skipped, 0 failed** in entrambi i modi |
+
+Il numero da citare per questa pagina resta quindi **`5414 passed`** (è l'albero
+di `e7c2a74`); **`5448`** è il numero dell'albero attuale. La stessa frase
+del commit raggruppava i rilievi aperti come «tre per natura»: l'artefatto dice
+altro, e la fonte è §7.1 — 2 `APERTO (per natura)` (esecuzione delle feature su
+un OS reale, BadUSB su hardware), 2 `APERTO` di sola distribuzione/igiene (§5.5
+immagine non pubblicata, §6.5.6 `.pm` d'esempio) e 2 `CHIUSO (decisione)` (§2.8.3
+`auto_persist`, §5.6.5 nessun `pyproject.toml`). La history non si riscrive: la
+correzione vive qui e nel commit che la registra.
+
 Gli 8 test saltati sono skip **dichiarati**, con la loro ragione, non test
 disattivati da questo lavoro — ma non tutti gli skip sono uguali, e due
 meritano di essere letti perché uno skip non prova niente:
@@ -460,3 +478,43 @@ esistono — se un file non ha una ragione in una riga, è un file di troppo.
 | `electron/package-lock.json` | Il lockfile che la release chiede (`npm ci`) e che `.gitignore` teneva fuori dal repository. |
 | `scripts/automode_benchmark.py`, `scripts/beacon_matrix_verify.py` | I due eseguibili che la CI chiama (benchmark **gating**, verifica della griglia per piattaforma). |
 | `.gitignore:39` (`data/c2_state.json`) | Una riga in un file esistente: lo snapshot di stato del C2 non va committato (vedi §6). |
+
+---
+
+## 9. Il primo push è arrivato con la CI ROSSA: quattro test, tre cause, nessuna visibile in locale
+
+Il primo push di questo lavoro (`91b437c`) è arrivato su `dev` con la CI
+**rossa**: il run `38589092431` è `failure` sulla `lint-and-test` di tutte e tre
+le versioni di Python, e i **quindici** job che dichiarano `needs: lint-and-test`
+sono stati saltati dietro di lei (il commit precedente, `b8a79eab`, era verde).
+Quattro test falliti, in **tre cause distinte** — e nessuna delle tre si vede su
+un disco di sviluppo, che è la lezione di questa sezione. Il messaggio d'errore
+non è stato indovinato: è stato letto dalle **annotations** della check-run, che
+l'API pubblica restituisce senza login mentre il log del job richiede i diritti
+di admin (`403`).
+
+| Test fallito | Causa vera | Perché era verde in locale | Chiusura |
+|---|---|---|---|
+| `test_beacon_matrix.py::TestTheGridMatchesTheSource::test_a_feature_named_on_posix_has_a_posix_branch` | la griglia nominava `beacon_auth.h`, un header **generato** da `scripts/ci_beacon_prepare.py` e **gitignorato** (`.gitignore:124`): in un clone quel file **non esiste** | esisteva su disco, lasciato lì da un build precedente | `beacon_matrix.GENERATED_HEADERS` + `beacon_matrix.source_headers()`: la griglia può **nominare** un header generato, nessuno può **leggerlo**. Guardia nuova: ogni header che gli scan leggono deve essere **tracciato da git** |
+| `test_resume_counter_guard.py::test_a_broken_write_warns_with_the_path_and_the_count` | rich **folda** la riga alla larghezza della console e il taglio è caduto **dentro il nome del file** (`auto_re` / `starts.json`): il path sotto `/tmp/pytest-of-runner/...` è più lungo di quello di una macchina di sviluppo | su Windows il taglio cadeva altrove, e per caso dopo il nome | l'assert confronta testo **senza spazi** (`_squash`): che l'avviso **nomini** il file è l'assert; dove la riga va a capo è del renderer |
+| `test_dependency_manifests.py` (2 test) | `setup.py` importa `setuptools`, che **Python 3.12 non spedisce più** (ensurepip l'ha tolto) e che nessun file di requirements dichiarava | l'interprete locale ce l'ha (3.10/3.11 ce l'hanno nel tool-cache, 3.12 no: le due voci sono infatti fallite **solo** sul job 3.12) | `setuptools>=70.0` nel dev set, `setuptools==84.0.0` in `constraints.txt` |
+
+**Come è stata provata ogni chiusura** (non «adesso il test passa»):
+
+* **causa 1** — un **worktree di git** contiene solo i file tracciati, quindi *è*
+  la condizione del clone: prima `1 failed, 23 passed` con `FileNotFoundError`
+  su `beacon_auth.h`, dopo **26 passed**. E la guardia è stata verificata **per
+  mutazione**: togliendo `beacon_auth.h` da `GENERATED_HEADERS` falliscono sia lo
+  scan sia la guardia, con un messaggio che nomina la cura — una guardia che non
+  può fallire non è una guardia;
+* **causa 2** — `COLUMNS=40` riproduce il fold della CI **sullo stesso host**:
+  prima `1 failed`, dopo **4 passed**;
+* **causa 3** — container `python:3.12-slim` con il **nuovo**
+  `requirements-dev.txt`: senza `setuptools` `2 failed, 6 passed` (identico alla
+  CI), con il dev set corretto `setuptools 84.0.0` e **8 passed**.
+
+Il debito che questa sezione dichiara, per intero: i tre falsi verdi erano tutti
+la stessa cosa — *l'ambiente di sviluppo non è un clone, non è 3.12, e non ha
+una console stretta*. La suite da sola non può coprire la prima differenza; la
+copre la CI, ed è per questo che il verdetto del run di correzione — non un run
+locale — è ciò che chiude questa voce.

@@ -20,6 +20,13 @@ pytest-xdist>=3.5
 # `mocker` fixture: without this line in the "exactly what CI installs" set,
 # those three tests ERROR with "fixture 'mocker' not found" on every run.
 pytest-mock>=3.12
+# tests/test_dependency_manifests.py imports setup.py to prove the packaging
+# path and the requirements path carry ONE list, and setup.py imports
+# setuptools. Python 3.12 no longer ships it (ensurepip dropped it), so those
+# two tests ERRORed with "No module named 'setuptools'" on the 3.12 leg of the
+# matrix while passing on 3.10/3.11, where the tool-cache interpreter still
+# carries it — a red build that said nothing about the code.
+setuptools>=70.0
 pyyaml>=6.0
 bandit>=1.7
 # static-analysis gates (ruff.toml + mypy.ini, CI job `static-analysis`).

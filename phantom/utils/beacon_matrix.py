@@ -29,7 +29,9 @@ the truth it can from the payload itself:
   * every header in ``payloads/beacon/src`` is classified (feature, helper, or
     documented non-beacon file);
   * a feature the grid calls usable on POSIX must have a non-Windows branch in
-    every header it names — the header scan that decides this is the same one
+    every COMMITTED header it names (``source_headers``; a generated header
+    cannot be read in a clean checkout — see :data:`GENERATED_HEADERS`) — the
+    header scan that decides this is the same one
     ``test_beacon_arsenal_parity`` uses, so the two cannot disagree;
   * a feature the grid calls ``windows_only`` must live in a header with NO
     non-Windows branch at all.
@@ -397,6 +399,26 @@ HELPER_HEADERS: Mapping[str, str] = {
     "secure_heap.h": "allocator hardening used by several features",
 }
 
+#: Headers under ``src/`` that are WRITTEN AT BUILD TIME and never committed:
+#: a fresh clone has none of them, and ``scripts/ci_beacon_prepare.py`` (or the
+#: builder) is what puts them on disk before a compile. The grid may still NAME
+#: one — a feature can genuinely be implemented against a generated define —
+#: but nothing may READ it, and that distinction is the bug this list closes:
+#: ``beacon_auth.h`` is written by the CI prepare step and ignored in git, so a
+#: scan that read every header a POSIX feature names raised FileNotFoundError
+#: on the runner while passing on a developer's disk, where an earlier build
+#: had left the file behind. :func:`source_headers` is the read that respects
+#: this, and ``tests/test_beacon_matrix.py`` pins it against ``git ls-files``
+#: so a newly generated header cannot re-enter a scan in silence.
+GENERATED_HEADERS: Mapping[str, str] = {
+    "beacon_auth.h": "generated: per-beacon auth identity (ci_beacon_prepare)",
+    "c2_config.h": "generated: the endpoint the builder burns in",
+    "crypto_config.h": "generated: per-beacon crypto material",
+    "build_id.h": "generated: the build provenance string",
+    "config_encrypted.h": "generated: the encrypted config blob",
+    "malleable_config.h": "generated: the malleable profile the builder embeds",
+}
+
 #: Files under src/ that are NOT beacon headers at all (asm/stubs/tests).
 NON_HEADER_FILES: Mapping[str, str] = {
     "main.cpp": "the beacon entry point and the ONE command dispatcher",
@@ -438,6 +460,18 @@ def feature_for_verb(verb: str) -> Feature | None:
         if target in item.verbs:
             return item
     return None
+
+
+def source_headers(item: Feature) -> Tuple[str, ...]:
+    """The headers ``item`` names that a FRESH CLONE actually has.
+
+    ``Feature.headers`` may name a generated header — the implementation can
+    include a define the build writes (see :data:`GENERATED_HEADERS`) — and a
+    scanner cannot read a file that is not there. Every scan reads this, and
+    ``tests/test_beacon_matrix.py`` proves the result is git-TRACKED, which is
+    the same thing as "present in a clone".
+    """
+    return tuple(h for h in item.headers if h not in GENERATED_HEADERS)
 
 
 def support_for(name: str, os_name: str) -> str:

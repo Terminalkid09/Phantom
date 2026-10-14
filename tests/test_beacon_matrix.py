@@ -22,6 +22,8 @@ smoke jobs are what compile the branches for real.
 import importlib.util
 import os
 import pathlib
+import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -182,7 +184,10 @@ class TestTheGridMatchesTheSource(unittest.TestCase):
             for os_name in ("linux", "macos", "android"):
                 if feature.support.get(os_name) not in ("native", "posix"):
                     continue
-                for header in feature.headers:
+                # source_headers, not feature.headers: a header the grid names
+                # may be GENERATED (absent from a fresh clone), and reading one
+                # is what made this test fail on CI and pass locally.
+                for header in bm.source_headers(feature):
                     text = (_SRC / header).read_text(encoding="utf-8",
                                                      errors="replace")
                     if "#ifdef _WIN32" not in text:
@@ -198,7 +203,7 @@ class TestTheGridMatchesTheSource(unittest.TestCase):
         for feature in bm.FEATURES:
             if feature.support.get("windows") != "windows_only":
                 continue
-            for header in feature.headers:
+            for header in bm.source_headers(feature):
                 text = (_SRC / header).read_text(encoding="utf-8",
                                                  errors="replace")
                 if "#ifdef _WIN32" not in text:
@@ -223,6 +228,54 @@ class TestTheGridMatchesTheSource(unittest.TestCase):
             text = (_SRC / header).read_text(encoding="utf-8", errors="replace")
             self.assertNotIn("#else", text.split("#endif")[0],
                              f"{header} gained a POSIX branch")
+
+    def test_every_scanned_header_is_tracked_by_git(self):
+        """The property that keeps the two scans above honest in a CLONE.
+
+        `beacon_auth.h` is written by `scripts/ci_beacon_prepare.py` and
+        ignored in git, so the unit-test job saw
+        `FileNotFoundError: .../src/beacon_auth.h` while a developer's disk
+        passed — a build had left the file there. "The header exists" is not
+        the invariant; "a clone HAS it" is, and that is what git tracking
+        means. A newly generated header added to a feature row fails HERE,
+        with the reason, instead of on a runner far from the cause.
+        """
+        if shutil.which("git") is None:
+            self.skipTest("git not installed — cannot prove what a clone has")
+        missing, untracked = [], []
+        for feature in bm.FEATURES:
+            for header in bm.source_headers(feature):
+                rel = f"phantom/payloads/beacon/src/{header}"
+                if not (_SRC / header).exists():
+                    missing.append(f"{rel} ({feature.name})")
+                    continue
+                if subprocess.run(["git", "ls-files", "--error-unmatch", rel],
+                                  cwd=_ROOT, capture_output=True,
+                                  text=True).returncode != 0:
+                    untracked.append(f"{rel} ({feature.name})")
+        self.assertEqual(missing, [],
+                         "the grid names source headers this tree does not "
+                         "have — a scanner cannot read them")
+        self.assertEqual(untracked, [],
+                         "the grid SCANS headers that are not tracked in git, "
+                         "so a fresh clone has no such file: declare them in "
+                         "GENERATED_HEADERS (beacon_matrix) instead")
+
+    def test_a_generated_header_is_never_committed(self):
+        """A declared generated header that git tracks is a contradiction:
+        the builder overwrites it, so what the clone carries cannot be the
+        truth (the beacon-lint job enforces the same rule on the source)."""
+        if shutil.which("git") is None:
+            self.skipTest("git not installed — cannot prove what a clone has")
+        tracked = subprocess.run(
+            ["git", "ls-files", "phantom/payloads/beacon/src"],
+            cwd=_ROOT, capture_output=True, text=True).stdout.split()
+        tracked = {os.path.basename(p) for p in tracked}
+        offenders = sorted(set(bm.GENERATED_HEADERS) & tracked)
+        self.assertEqual(offenders, [],
+                         "these are declared GENERATED and are tracked in "
+                         "git: either the declaration is stale or the file "
+                         "must stop being committed")
 
 
 class TestTheParityGapIsExplicit(unittest.TestCase):
