@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "note": "Shared audit-chain contract: both implementations hash the same canonical record and must produce this digest.",
+  "canonical": "{\"beacon_id\":\"B-TEST\",\"bytes\":5,\"event\":\"task_queued\",\"mode\":\"legacy\",\"prev\":\"\",\"seq\":1,\"task_id\":\"20260101000000-000000-abcd1234\",\"ts\":\"2026-01-01T00:00:00Z\"}",
+  "record": {
+    "seq": 1,
+    "ts": "2026-01-01T00:00:00Z",
+    "event": "task_queued",
+    "beacon_id": "B-TEST",
+    "task_id": "20260101000000-000000-abcd1234",
+    "bytes": 5,
+    "mode": "legacy",
+    "prev": ""
+  },
+  "sha256": "9372c2b40b4364b43d952552aaf59dc3b62d58e83eaf894b3a7244fad7aaf0cc"
+}

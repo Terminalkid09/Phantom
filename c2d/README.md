@@ -32,15 +32,29 @@ pinned fingerprint and per-request HMAC.
 - mTLS with a TLS 1.2 floor and AEAD-only suites, the same plaintext refusal
   on a non-loopback bind
 
-**NOT ported (stays Python):**
+**Ported since the first release (the audit's P1/P2 gaps):**
+
+- the **capability/grant task policy** (`task_policy.go`) — `POST
+  /api/v1/queue` now goes through the same legacy/typed checks as Python:
+  a known beacon verb, a per-beacon grant manifest, a size cap, and the typed
+  form (`capability_id` + args + expiry). Both modes are pinned to the Python
+  policy by `policy_vectors.json`.
+- **result retention** (`MaxResultsPerBeacon`) and **task TTL**: the oldest
+  results are pruned (and audited) at the same ceiling the Python listener
+  uses, and a queued task whose window closed before delivery is dropped.
+- the **hash-chained audit trail** (`audit.go`): `seq`/`prev`/`hash` with
+  sha256 over the canonical record, verified by `Verify()` and pinned to the
+  Python chain by `audit_vectors.json`. It used to be plain JSONL, i.e.
+  editable without a trace.
+- `/x` (PIC stager) — a plain file fetch, byte-identical to Python's.
+
+**NOT ported (stays Python, answered honestly):**
 
 - the shell, the automation agent/planner, the brain/experience memory
-- the **capability/grant task policy** — `POST /api/v1/queue` here is guarded
-  only by the operator token and mTLS. Do **not** expose that endpoint beyond
-  the operator network until the policy is ported.
-- artifact retention/TTL, the audit-log hashing implementation
-- `/x` (PIC stager) and `/s/android` — they answer `501`, deliberately, rather
-  than 404-ing silently
+- `/s/android` — it needs the Python dropper generator. The route answers
+  `501` with a machine-readable body (`handled_by: python-control-plane`)
+  rather than 404-ing silently, and `GET /api/v1/capabilities` reports it as
+  `stager_android: false`. Run the Python listener for that route.
 
 ## Build and run
 
@@ -74,7 +88,8 @@ Read from the SAME files as Python — one source of truth:
 
 ## Parity guarantees
 
-Pinned by tests so a drift cannot ship silently:
+Pinned by tests so a drift cannot ship silently (`python
+scripts/c2d_parity_check.py`, plus `go test ./...`):
 
 - **AES key derivation** is a port of `c2_crypto._derive_to_length`, checked
   against vectors produced by the Python function.
@@ -86,6 +101,20 @@ Pinned by tests so a drift cannot ship silently:
 - **Anti-replay** keeps a bounded, epoch-bound nonce set (a restart must not
   reopen an old window); the counter is a high-water mark only, because a
   restarted beacon legitimately resets it.
+- **The task policy** is the same table and the same decisions:
+  `c2d/policy_vectors.json` holds the cases (granted verb, unknown verb,
+  `shell` granted or not, typed capability granted/expired/oversized, …) with
+  the expectations the PYTHON policy produced. Python re-checks the file in
+  `scripts/c2d_parity_check.py`; Go asserts it in `task_policy_test.go`. The
+  verb list itself is pinned against `task_policy.py` AND the beacon's
+  dispatcher by `tests/test_beacon_verb_contract.py`.
+- **The audit chain** hashes the same canonical record:
+  `c2d/audit_vectors.json` pins the canonical JSON and its sha256, computed
+  with Python's serializer and asserted from both sides.
+- **Behaviour constants** (`TaskLeaseSeconds`, `MaxResultsPerBeacon`) are
+  compared by the parity script against `TASK_LEASE_SECONDS` and
+  `MAX_RESULTS_PER_BEACON`: a different lease on one backend would redeliver
+  work the other one is still running.
 
 ## Tests
 

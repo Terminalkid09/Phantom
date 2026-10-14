@@ -20,6 +20,14 @@ from phantom.utils.state import use_mtls
 console = Console()
 
 
+#: How long `run_c2(preferred_beacon=…)` waits for the handed-off beacon to
+#: APPEAR in the C2 registry before falling back to the manual hint.
+_HANDOFF_WAIT_SECONDS = 8.0
+#: Poll step for that wait (4 Hz: the registration is a sub-second event, and
+#: a tighter loop would only spin the CPU for nothing).
+_HANDOFF_POLL_SECONDS = 0.25
+
+
 def _resolve_beacon_id(bid: str) -> str | None:
     """Match beacon by full or prefix ID."""
     beacons = c2_state.get_beacons()
@@ -28,6 +36,38 @@ def _resolve_beacon_id(bid: str) -> str | None:
     matches = [k for k in beacons if k.startswith(bid)]
     if len(matches) == 1:
         return matches[0]
+    return None
+
+
+def _await_beacon_id(bid: str, timeout: float = _HANDOFF_WAIT_SECONDS,
+                     interval: float = _HANDOFF_POLL_SECONDS, *,
+                     sleep=_time_mod.sleep,
+                     now=_time_mod.monotonic) -> "str | None":
+    """Resolve ``bid``, waiting briefly for it to APPEAR.
+
+    The auto-mode handoff is safe today only because `_await_beacon()` blocks
+    the AGENT until the check-in lands before `_handoff_c2` is called. That
+    leaves the other door unguarded: any caller (or future one) that hands
+    off on `beacon_established` while the registration is still in flight
+    lands in the ``Beacon <id> non trovato`` branch and silently gets the
+    GLOBAL C2 context instead of the beacon the run just established.
+
+    So the wait belongs here, where the handoff actually happens: bounded
+    (never blocks the operator for longer than ``timeout``), and it returns
+    whatever the resolver says at the end — including ``None``.
+
+    ``sleep``/``now`` are injected so the wait can be tested without
+    sleeping for real.
+    """
+    resolved = _resolve_beacon_id(bid)
+    if resolved:
+        return resolved
+    deadline = now() + max(0.0, float(timeout))
+    while now() < deadline:
+        sleep(interval)
+        resolved = _resolve_beacon_id(bid)
+        if resolved:
+            return resolved
     return None
 
 def build_c2_banner():
@@ -1488,7 +1528,9 @@ def run_c2(preferred_beacon: Optional[str] = None):
     try:
         shell = C2Shell()
         if preferred_beacon:
-            resolved = _resolve_beacon_id(preferred_beacon)
+            # wait-to-appear: the handoff must not degrade to the global
+            # context just because the registration landed a moment late.
+            resolved = _await_beacon_id(preferred_beacon)
             if resolved:
                 shell.active_beacon = resolved
                 notifier.success(
@@ -1498,7 +1540,8 @@ def run_c2(preferred_beacon: Optional[str] = None):
                               "'back' per tornare al C2 globale.")
             else:
                 notifier.warn(
-                    f"Beacon {preferred_beacon} non trovato. "
+                    f"Beacon {preferred_beacon} non trovato dopo "
+                    f"{_HANDOFF_WAIT_SECONDS:.0f}s di attesa. "
                     "Usa 'beacons' e 'interact <id>'.")
         # Telegram is opt-in: start it explicitly with `telegram`.
         # Entering C2 must not spawn background services or emit configuration alerts.

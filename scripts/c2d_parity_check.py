@@ -90,12 +90,117 @@ def check_beacon_source() -> bool:
     return ok
 
 
+def check_task_policy() -> bool:
+    """The Go data plane must enforce the SAME task policy as Python.
+
+    `c2d/policy_vectors.json` holds cases with the expectations the Python
+    policy produced; both sides assert them (Python here, Go in
+    c2d/task_policy_test.go). This is the check that keeps
+    POST /api/v1/queue from being a task-injection primitive on one backend.
+    """
+    import json
+    from phantom.core.task_policy import TaskPolicy, TypedTask
+
+    path = os.path.join(ROOT, "c2d", "policy_vectors.json")
+    try:
+        doc = json.load(open(path, "r", encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"FAIL task policy: cannot read c2d/policy_vectors.json ({exc})")
+        return False
+    ok = True
+    for case in doc.get("cases", []):
+        policy = TaskPolicy()
+        if case.get("grants") is not None:
+            policy.set_grants(case["beacon"], case["grants"])
+        typed = case.get("typed")
+        if typed:
+            decision = policy.check_typed(case["beacon"], TypedTask(
+                capability_id=typed.get("capability_id", ""),
+                args=typed.get("args", []),
+                expires_at=typed.get("expires_at", 0.0)))
+        else:
+            decision = policy.check_legacy(case["beacon"],
+                                           case.get("command") or "")
+        if (decision.allowed, decision.mode, decision.reason) != (
+                case["allowed"], case["mode"], case["reason"]):
+            print(f"FAIL task policy case {case['name']!r}: python says "
+                  f"{decision.allowed}/{decision.mode} but the shared "
+                  f"vector says {case['allowed']}/{case['mode']}")
+            ok = False
+    go = open(os.path.join(ROOT, "c2d", "task_policy.go"), "r",
+              encoding="utf-8").read()
+    if "CheckLegacy" not in go or "CheckTyped" not in go:
+        print("FAIL task policy: c2d/task_policy.go no longer implements the "
+              "typed AND legacy checks")
+        ok = False
+    if ok:
+        n = len(doc.get("cases", []))
+        print(f"OK   task policy ({n} shared cases, python == go)")
+    return ok
+
+
+def check_audit_chain() -> bool:
+    """Both audit trails must hash the same canonical record."""
+    import hashlib
+    import json
+    from phantom.utils.audit_log import _canonical
+
+    path = os.path.join(ROOT, "c2d", "audit_vectors.json")
+    try:
+        doc = json.load(open(path, "r", encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"FAIL audit chain: cannot read c2d/audit_vectors.json ({exc})")
+        return False
+    canonical = _canonical(doc["record"])
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if canonical != doc["canonical"] or digest != doc["sha256"]:
+        print(f"FAIL audit chain: python canonical/hash drifted from the "
+              f"shared vector ({digest} != {doc['sha256']})")
+        return False
+    go = open(os.path.join(ROOT, "c2d", "audit.go"), "r",
+              encoding="utf-8").read()
+    for token in ("prev", "recordHash", "Verify"):
+        if token not in go:
+            print(f"FAIL audit chain: c2d/audit.go lost {token!r} (the chain "
+                  f"is no longer tamper-evident)")
+            return False
+    print("OK   audit chain (python == go, canonical record + digest pinned)")
+    return True
+
+
+def check_behaviour_constants() -> bool:
+    """Lease and retention must not differ between the two backends."""
+    from phantom.core.c2_server import (MAX_RESULTS_PER_BEACON,
+                                        TASK_LEASE_SECONDS)
+
+    text = open(os.path.join(ROOT, "c2d", "store.go"), "r",
+                encoding="utf-8").read()
+    ok = True
+    for name, python_value in (("TaskLeaseSeconds", TASK_LEASE_SECONDS),
+                               ("MaxResultsPerBeacon",
+                                MAX_RESULTS_PER_BEACON)):
+        match = re.search(rf"{name}\s*=\s*(\d+)", text)
+        if not match:
+            print(f"FAIL constants: c2d/store.go has no {name}")
+            ok = False
+        elif int(match.group(1)) != python_value:
+            print(f"FAIL constants: {name} is {match.group(1)} in Go and "
+                  f"{python_value} in Python")
+            ok = False
+    if ok:
+        print("OK   constants (lease + result retention agree)")
+    return ok
+
+
 def main() -> int:
     results = [
         check_python(),
         _pinned("c2d/c2d_test.go", "go (c2d/c2d_test.go)"),
         _pinned("tests/test_c2_crypto_keys.py", "beacon tests"),
         check_beacon_source(),
+        check_task_policy(),
+        check_audit_chain(),
+        check_behaviour_constants(),
     ]
     if all(results):
         print("PARITY OK: python == go == beacon, one set of vectors.")

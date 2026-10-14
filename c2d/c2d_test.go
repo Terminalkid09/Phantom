@@ -599,11 +599,21 @@ func TestCapabilitiesEndpoint(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&caps); err != nil {
 		t.Fatal(err)
 	}
-	if caps["task_policy"] != false {
-		t.Error("task_policy must be advertised false until it is ported (D-2)")
+	// D-2 was the audit's finding: the Go data plane enforced NO task policy
+	// while the Python listener did. It is ported now, so the endpoint must say
+	// so — and must keep saying so honestly, which is what this asserts.
+	if caps["task_policy"] != true {
+		t.Error("task_policy is ported: the endpoint must advertise it")
 	}
 	if caps["checkin"] != true || caps["results"] != true {
 		t.Errorf("core surfaces must be advertised true: %v", caps)
+	}
+	// the stager the data plane still does not serve must stay false
+	if caps["stager_android"] != false {
+		t.Error("stager_android is served by the control plane, not here")
+	}
+	if caps["retention"].(float64) != float64(MaxResultsPerBeacon) {
+		t.Errorf("retention must be advertised: %v", caps["retention"])
 	}
 }
 
@@ -637,10 +647,17 @@ func TestCatchAllStoresResult(t *testing.T) {
 	h := newHarness(t)
 	h.do(h.signed("POST", "/api/v1/ping", "", "b5r-1", 1)).Body.Close()
 
+	// `shell id` is the form the policy accepts; a bare `id` is a command the
+	// Python listener would also refuse (it is not a beacon verb) — see
+	// TestQueueRefusesAnUnauthorizedTask below.
 	qreq, _ := http.NewRequest("POST", h.srv.URL+"/api/v1/queue",
-		strings.NewReader(`{"beacon_id":"B-TEST","command":"id"}`))
+		strings.NewReader(`{"beacon_id":"B-TEST","command":"shell id"}`))
 	qreq.Header.Set("X-Api-Token", "api-token")
-	h.do(qreq).Body.Close()
+	if resp := h.do(qreq); resp.StatusCode != 200 {
+		t.Fatalf("queue rejected a valid task: %d", resp.StatusCode)
+	} else {
+		resp.Body.Close()
+	}
 
 	res := h.do(h.signed("POST", "/api/v1/ping", "", "b5r-2", 2))
 	resbody, _ := io.ReadAll(res.Body)

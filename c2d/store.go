@@ -20,13 +20,28 @@ import (
 )
 
 // TaskLeaseSeconds is how long a delivered task is withheld from redelivery.
+// Pinned against the Python listener (TASK_LEASE_SECONDS) by
+// scripts/c2d_parity_check.py: a shorter lease on one backend would redeliver
+// work the other one is still running.
 const TaskLeaseSeconds = 60
 
+// MaxResultsPerBeacon bounds the stored results, oldest first. The Python
+// listener has always had this ceiling (MAX_RESULTS_PER_BEACON); without it a
+// long engagement grew the Go store without limit, in memory AND in every
+// snapshot write. A-2 of the audit: retention/TTL parity.
+const MaxResultsPerBeacon = 1000
+
 type taskEntry struct {
-	id       string
-	command  string
-	leasedAt time.Time
-	sentAt   time.Time
+	id        string
+	command   string
+	leasedAt  time.Time
+	sentAt    time.Time
+	expiresAt time.Time // zero = no deadline
+}
+
+// expired reports whether the task's delivery window has closed.
+func (t *taskEntry) expired(now time.Time) bool {
+	return !t.expiresAt.IsZero() && now.After(t.expiresAt)
 }
 
 // Store is the state of one listener process: in-memory, with an optional
@@ -37,7 +52,7 @@ type Store struct {
 	tasks     map[string][]*taskEntry
 	results   map[string][]map[string]any
 	registry  string
-	auditPath string
+	auditLog  *AuditLog
 	statePath string
 
 	// D-1 follow-up: the snapshot used to be rewritten on EVERY mutation
@@ -66,7 +81,7 @@ func NewStore(registry string) *Store {
 func NewStorePersistent(registry, dataDir string) *Store {
 	s := NewStore(registry)
 	if dataDir != "" {
-		s.auditPath = filepath.Join(dataDir, "c2_audit.jsonl")
+		s.auditLog = NewAuditLog(filepath.Join(dataDir, "c2_audit.jsonl"))
 		s.statePath = filepath.Join(dataDir, "c2_store.json")
 		s.flushEvery = 500 * time.Millisecond
 		s.stopCh = make(chan struct{})
@@ -124,42 +139,25 @@ func (s *Store) touchLocked() {
 }
 
 // auditEnabled reports whether this store writes an audit trail.
-func (s *Store) auditEnabled() bool { return s.auditPath != "" }
+func (s *Store) auditEnabled() bool { return s.auditLog.Enabled() }
 
-// audit appends one JSONL record. Best-effort: an audit write failure must
-// never take the listener down or block a beacon.
+// audit appends one HASH-CHAINED record. Best-effort: an audit write failure
+// must never take the listener down or block a beacon.
 func (s *Store) audit(event string, fields map[string]any) {
-	if s.auditPath == "" {
-		return
-	}
-	rec := map[string]any{
-		"ts":    time.Now().UTC().Format(time.RFC3339Nano),
-		"event": event,
-	}
-	for k, v := range fields {
-		rec[k] = v
-	}
-	raw, err := json.Marshal(rec)
-	if err != nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	f, err := os.OpenFile(s.auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	_, _ = f.Write(append(raw, '\n'))
+	s.auditLog.Append(event, fields)
 }
+
+// AuditVerify re-reads the trail and validates the hash chain.
+func (s *Store) AuditVerify() (bool, int, int) { return s.auditLog.Verify() }
 
 // ── persistence (D-1) ───────────────────────────────────────────────────
 
 type taskSnapshot struct {
-	ID       string    `json:"id"`
-	Command  string    `json:"command"`
-	LeasedAt time.Time `json:"leased_at"`
-	SentAt   time.Time `json:"sent_at"`
+	ID        string    `json:"id"`
+	Command   string    `json:"command"`
+	LeasedAt  time.Time `json:"leased_at"`
+	SentAt    time.Time `json:"sent_at"`
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
 }
 
 type storeSnapshot struct {
@@ -191,6 +189,7 @@ func (s *Store) load() {
 			s.tasks[id] = append(s.tasks[id], &taskEntry{
 				id: t.ID, command: t.Command,
 				leasedAt: t.LeasedAt, sentAt: t.SentAt,
+				expiresAt: t.ExpiresAt,
 			})
 		}
 	}
@@ -214,6 +213,7 @@ func (s *Store) saveLocked() {
 			snap.Tasks[id] = append(snap.Tasks[id], taskSnapshot{
 				ID: t.id, Command: t.command,
 				LeasedAt: t.leasedAt, SentAt: t.sentAt,
+				ExpiresAt: t.expiresAt,
 			})
 		}
 	}
@@ -272,6 +272,13 @@ func (s *Store) Registered(beaconID string) bool {
 
 // QueueTask appends a command and returns its task id.
 func (s *Store) QueueTask(beaconID, command string) (string, error) {
+	return s.QueueTaskWithTTL(beaconID, command, 0)
+}
+
+// QueueTaskWithTTL is QueueTask with a delivery deadline (0 = none). A task
+// whose window closed before it was ever delivered is dropped at lease time
+// and audited, instead of being handed to a beacon long after it mattered.
+func (s *Store) QueueTaskWithTTL(beaconID, command string, ttlSeconds int) (string, error) {
 	if strings.TrimSpace(beaconID) == "" || strings.TrimSpace(command) == "" {
 		return "", fmt.Errorf("beacon_id and command required")
 	}
@@ -281,8 +288,11 @@ func (s *Store) QueueTask(beaconID, command string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := newTaskID()
-	s.tasks[beaconID] = append(s.tasks[beaconID],
-		&taskEntry{id: id, command: command})
+	entry := &taskEntry{id: id, command: command}
+	if ttlSeconds > 0 {
+		entry.expiresAt = time.Now().Add(time.Duration(ttlSeconds) * time.Second)
+	}
+	s.tasks[beaconID] = append(s.tasks[beaconID], entry)
 	s.touchLocked()
 	return id, nil
 }
@@ -294,7 +304,14 @@ func (s *Store) PendingTasks(beaconID string) []map[string]any {
 	defer s.mu.Unlock()
 	now := time.Now()
 	out := []map[string]any{}
+	kept := make([]*taskEntry, 0, len(s.tasks[beaconID]))
+	expired := 0
 	for _, t := range s.tasks[beaconID] {
+		if t.expired(now) {
+			expired++
+			continue
+		}
+		kept = append(kept, t)
 		if !t.leasedAt.IsZero() && now.Sub(t.leasedAt) < TaskLeaseSeconds*time.Second {
 			continue
 		}
@@ -305,11 +322,20 @@ func (s *Store) PendingTasks(beaconID string) []map[string]any {
 			"command": t.command,
 		})
 	}
+	if expired > 0 {
+		s.tasks[beaconID] = kept
+		s.touchLocked()
+		s.audit("tasks_expired", map[string]any{
+			"beacon_id": beaconID, "expired": expired, "dropped": len(kept)})
+	}
 	return out
 }
 
 // AddResult stores a result and acknowledges (removes) its task. It is
-// idempotent: a retry after a lost 200 must not duplicate the output.
+// idempotent: a retry after a lost 200 must not duplicate the output. The
+// per-beacon ceiling matches the Python listener: the OLDEST results are
+// pruned (and the pruning is audited), so an engagement cannot grow the store
+// without bound — in memory or in every snapshot write.
 func (s *Store) AddResult(beaconID, taskID, output string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -323,6 +349,11 @@ func (s *Store) AddResult(beaconID, taskID, output string) {
 		"output":    output,
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	})
+	pruned := 0
+	if n := len(s.results[beaconID]); n > MaxResultsPerBeacon {
+		pruned = n - MaxResultsPerBeacon
+		s.results[beaconID] = s.results[beaconID][pruned:]
+	}
 	kept := s.tasks[beaconID][:0]
 	for _, t := range s.tasks[beaconID] {
 		if t.id != taskID {
@@ -331,6 +362,11 @@ func (s *Store) AddResult(beaconID, taskID, output string) {
 	}
 	s.tasks[beaconID] = kept
 	s.touchLocked()
+	if pruned > 0 {
+		s.audit("results_pruned", map[string]any{
+			"beacon_id": beaconID, "pruned": pruned,
+			"kept": MaxResultsPerBeacon})
+	}
 }
 
 // Results returns the cached results for a beacon.

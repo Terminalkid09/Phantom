@@ -2054,6 +2054,31 @@ class C2Server:
         self._started_evt.wait(timeout=15)
         if self.bind_error:
             raise RuntimeError(self.bind_error)
+        self._record_engagement_grants()
+
+    def _record_engagement_grants(self) -> None:
+        """Write the PASSIVE side effects this engagement has agreed to.
+
+        `c2.auto_persist` (default ON) and `c2.auto_shell` (default OFF) act on
+        their own the moment a beacon checks in; the audit asked for that
+        consent to be explicit instead of implied by a default. The listener
+        opening is the one moment the engagement's terms are known, so the
+        grant is stated here, once, in the tamper-evident chain — with the
+        exact way to revoke it. Never raises: telemetry must not decide
+        whether a listener runs.
+        """
+        try:
+            from phantom.utils.audit_log import audit_log
+            audit_log.append(
+                "engagement_grants",
+                listener=f"{self.host}:{self.port}",
+                tls=bool(self.use_ssl),
+                auto_persist=bool(_auto_persist_allowed()),
+                auto_shell=bool(_auto_shell_allowed()),
+                revoke="c2.auto_persist=false / c2.auto_shell=false "
+                       "(or PHANTOM_AUTO_PERSIST=0 / PHANTOM_AUTO_SHELL=0)")
+        except Exception:
+            pass
 
     def stop(self) -> None:
         # LAST CHANCE: the debounce may be holding the most recent tasks and
