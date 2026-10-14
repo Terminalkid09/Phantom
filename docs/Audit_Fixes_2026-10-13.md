@@ -518,3 +518,12 @@ la stessa cosa — *l'ambiente di sviluppo non è un clone, non è 3.12, e non h
 una console stretta*. La suite da sola non può coprire la prima differenza; la
 copre la CI, ed è per questo che il verdetto del run di correzione — non un run
 locale — è ciò che chiude questa voce.
+
+**Il verdetto è verde**, ed è il primo run **completo** di questo lavoro: run
+`38596333230` sul commit `6546c99`, **20 job su 20 `success`** — `lint-and-test`
+sulle tre versioni di Python, `beacon-syntax` su tre OS, gli smoke del beacon per
+linux/windows/macos/android, `c2d-test` (la parità Python↔Go), `docker-test`,
+`electron-build`, `static-analysis`, `security-scan`, `security-sweep` e
+`integration-tools`. Nel run rosso quei quindici job non erano «verdi»: erano
+**saltati** dietro una `needs:` — che è esattamente la differenza fra «non
+verificato» e «verificato» che questa pagina intera prova a non confondere.
