@@ -97,6 +97,27 @@ Phantom generates its C2 key, payload token, API token, TLS material and beacon
 secrets on first use, stores them in `data/phantom_state.json` (`0600`,
 gitignored), and keeps the API token out of the renderer. If your deployment
 differs — a shared `.env`, a token in the process table, a world-readable
-`data/` — fix that first; it is the most common way an engagement leaks. Run
-`guardrails` in either shell to see exactly which controls are on and which you
-have overridden.
+`data/` — fix that first; it is the most common way an engagement leaks.
+
+### Guardrails — what is enforced, and where to look
+
+Run `guardrails list` in the manual shell to see every control and its state;
+`guardrails why <key>` for the reason a control is on or off, and
+`guardrails enable|disable <key>` to change one **with the change recorded** in
+the guardrail manifest and the hash-chained audit log (`guardrails record`
+prints the snapshot). The families:
+
+| Control | What it stops |
+| --- | --- |
+| `scope` / network range | any action on a target outside the declared engagement scope; a name resolving to a MIX of in/out-of-scope addresses is refused |
+| `strict` | running with an empty scope (unscoped mode is an explicit opt-in) |
+| `hmac` / `mtls` / `c2-encryption` | an unauthenticated or plaintext beacon channel |
+| `api-auth` | the operator API without its bearer token (and never on a non-loopback bind) |
+| `payload-token` | a delivered payload that was not issued by this control plane |
+| `driver-approval` | a discovered runtime tool being used before an operator approves it |
+| auto-persist grant | **not** a block: a beacon's first check-in queues persistence by default (`c2.auto_persist`). `phantom doctor` reports the grant, the listener records it in the audit chain at start, and `c2.auto_persist=false` / `PHANTOM_AUTO_PERSIST=0` revokes it |
+
+Beacon-side persistence is reversible with `unpersist` (it removes exactly what
+`persist`/`autopersist` installed), and the manual dropper paths bring up the C2
+listener before printing a dropper, so a hand-deployed beacon is not left
+without somewhere to check in.

@@ -125,10 +125,11 @@ export default function RecordingsPanel() {
   const selectedSrc = selected ? mediaCache.get(`${selected.dir}/${selected.name}`) : undefined
 
   return (
-    <div className="h-full flex flex-col p-4 gap-4 overflow-auto">
+    <div role="region" aria-label="Recordings"
+      className="h-full flex flex-col p-4 gap-4 overflow-auto">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <Film size={18} className="text-phantom-cyan" />
+          <Film size={18} className="text-phantom-cyan" aria-hidden="true" />
           <h2 className="text-lg font-bold text-text-primary">Recordings</h2>
           {activeBeacon && (
             <span className="text-xs px-2 py-0.5 rounded-full bg-phantom-cyan/10 text-phantom-cyan">
@@ -140,7 +141,7 @@ export default function RecordingsPanel() {
           onClick={() => void refresh()}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-surface-card border border-surface-border text-xs text-text-secondary hover:text-text-primary hover:border-phantom-cyan/40"
         >
-          <RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} /> Refresh
+          <RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} aria-hidden="true" /> Refresh
         </button>
       </div>
 
@@ -153,12 +154,14 @@ export default function RecordingsPanel() {
               onClick={() => void saveToDisk(selected)}
               className="flex items-center gap-1 px-2.5 py-1 rounded bg-phantom-cyan/10 text-phantom-cyan text-xs hover:bg-phantom-cyan/20"
             >
-              <Download size={12} /> Save to disk
+              <Download size={12} aria-hidden="true" /> Save to disk
             </button>
           </div>
           {selectedSrc ? (
             selected.kind === 'video' ? (
-              <video src={selectedSrc} controls autoPlay muted className="w-full max-h-[420px] rounded bg-black" />
+              <video src={selectedSrc} controls autoPlay muted
+                aria-label={`Recording ${selected.name}`}
+                className="w-full max-h-[420px] rounded bg-black" />
             ) : (
               <img src={selectedSrc} alt={selected.name} className="w-full max-h-[420px] rounded bg-black object-contain" />
             )
@@ -171,7 +174,7 @@ export default function RecordingsPanel() {
       {/* Library */}
       <div>
         <div className="flex items-center gap-2 mb-2">
-          <Radio size={13} className="text-text-dim" />
+          <Radio size={13} className="text-text-dim" aria-hidden="true" />
           <span className="text-xs font-semibold text-text-secondary uppercase tracking-wider">Library ({artifacts.length})</span>
         </div>
         {artifacts.length === 0 ? (
@@ -180,13 +183,17 @@ export default function RecordingsPanel() {
             <code className="text-phantom-cyan">screen-record-live</code>, then <code className="text-phantom-cyan">screen-dump</code>.
           </div>
         ) : (
-          <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+          <div role="group" aria-label={`Recordings library, ${artifacts.length} item(s)`}
+            className="grid grid-cols-2 md:grid-cols-3 gap-2">
             {artifacts.map((a) => {
               const key = `${a.dir}/${a.name}`
               const isNew = a.dir === 'recordings/live'
               return (
                 <div
                   key={key}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Open recording ${a.name}`}
                   className={`group rounded-lg border p-2.5 cursor-pointer transition-colors ${
                     selected?.name === a.name
                       ? 'border-phantom-cyan/60 bg-phantom-cyan/5'
@@ -195,6 +202,13 @@ export default function RecordingsPanel() {
                   onClick={() => {
                     setSelected(a)
                     void loadArtifactMedia(a)
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      setSelected(a)
+                      void loadArtifactMedia(a)
+                    }
                   }}
                 >
                   <div className="flex items-center gap-2 mb-1">
@@ -208,12 +222,14 @@ export default function RecordingsPanel() {
                   <div className="hidden group-hover:flex items-center gap-1 mt-1.5">
                     <button
                       onClick={(e) => { e.stopPropagation(); setSelected(a); void loadArtifactMedia(a) }}
+                      aria-label={`Play ${a.name}`}
                       className="text-[10px] px-1.5 py-0.5 rounded bg-surface-border text-text-secondary hover:text-text-primary"
                     >
                       play
                     </button>
                     <button
                       onClick={(e) => { e.stopPropagation(); void saveToDisk(a) }}
+                      aria-label={`Save ${a.name} to disk`}
                       className="text-[10px] px-1.5 py-0.5 rounded bg-surface-border text-text-secondary hover:text-text-primary"
                     >
                       save

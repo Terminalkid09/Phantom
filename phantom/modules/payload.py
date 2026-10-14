@@ -949,6 +949,25 @@ class PayloadModule(BaseModule):
         console.print(f"\n[bold green][+] Deploy command (run on target):[/]")
         console.print(f"    [yellow]{dropper}[/]\n")
         session.add_note(f"Payload: {platform} beacon built for {c2_host}:{c2_port}")
+        # The beacon is told to check in HERE, so this is where a listener has
+        # to exist — announcing "the beacon checks in" with nothing listening
+        # was the manual path's version of a false success (audit §1.2).
+        from phantom.core.automode import ensure_c2_listener
+        from phantom.utils.network import get_c2_endpoint
+        dial_host, dial_port = get_c2_endpoint()
+        if int(c2_port) != int(dial_port):
+            notifier.warn(f"This dropper dials {c2_host}:{c2_port} but the "
+                          f"configured C2 endpoint is {dial_host}:{dial_port} "
+                          f"— start the listener on {c2_port} so the beacon "
+                          f"has somewhere to check in.")
+        elif ensure_c2_listener():
+            notifier.success(f"C2 listener up on port {c2_port} — the beacon "
+                             f"has somewhere to check in.")
+        else:
+            notifier.warn(f"No C2 listener on port {c2_port}: the beacon "
+                          f"would have nowhere to check in. Start one "
+                          f"('phantom --c2' -> 'listeners start {c2_port}'), "
+                          f"or the dropper's first fetch retries on its own.")
         notifier.info("The beacon checks in to your C2 — 'phantom --c2' -> "
                       "'beacons' to interact.")
 

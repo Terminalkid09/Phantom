@@ -37,6 +37,121 @@ FAKE_PM = {
 }
 
 
+def _write_bundle(path, payload, *, encrypted=False):
+    """A .pm on disk, optionally through the encrypted envelope path."""
+    if encrypted:
+        from phantom.utils.session_bundle import _encrypt_payload
+        block = {"magic": _MAGIC, "format": "phantom.pm",
+                 "version": payload.get("version", 1), "enc": 1,
+                 "exported_at": "2026-08-26T00:00:00Z",
+                 "payload": _encrypt_payload(payload)}
+    else:
+        block = payload
+    with gzip.open(path, "wb") as fh:
+        fh.write(json.dumps(block).encode("utf-8"))
+    return path
+
+
+class TestVersionIsValidatedOnRead(unittest.TestCase):
+    """The audit: `version` was written and never read.
+
+    A future build can reshape a field; parsing it best-effort restores a
+    session that LOOKS complete and is not. The gate has to be explicit in
+    both directions of the envelope.
+    """
+
+    def test_a_bundle_from_a_newer_build_is_refused_with_both_numbers(self):
+        from phantom.utils.session_bundle import _VERSION
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_bundle(os.path.join(tmp, "future.pm"),
+                                 dict(FAKE_PM, version=_VERSION + 1))
+            with self.assertRaises(ValueError) as ctx:
+                read_bundle(path)
+            message = str(ctx.exception)
+            self.assertIn(f"version {_VERSION + 1}", message)
+            self.assertIn(f"up to {_VERSION}", message)
+
+    def test_the_refusal_is_not_reported_as_a_key_mismatch(self):
+        """Different problem, different words: this is not a wrong key."""
+        from phantom.utils.session_bundle import _VERSION, is_key_mismatch
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_bundle(os.path.join(tmp, "future.pm"),
+                                 dict(FAKE_PM, version=_VERSION + 5))
+            try:
+                read_bundle(path)
+                self.fail("a newer bundle must be refused")
+            except ValueError as exc:
+                self.assertFalse(is_key_mismatch(exc))
+                self.assertIn("NEWER Phantom", str(exc))
+
+    def test_the_encrypted_envelope_is_gated_too(self):
+        """The OUTER version, and the payload's, are both checked."""
+        from phantom.utils.session_bundle import _VERSION
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_bundle(os.path.join(tmp, "future.pm"),
+                                 dict(FAKE_PM, version=1),
+                                 encrypted=True)
+            # envelope claiming a future format
+            with gzip.open(path, "rb") as fh:
+                block = json.loads(fh.read().decode("utf-8"))
+            block["version"] = _VERSION + 1
+            with gzip.open(path, "wb") as fh:
+                fh.write(json.dumps(block).encode("utf-8"))
+            with self.assertRaises(ValueError) as ctx:
+                read_bundle(path)
+            self.assertIn("bundle", str(ctx.exception))
+
+    def test_a_payload_from_a_future_build_is_refused(self):
+        """A current envelope carrying a future PAYLOAD is refused by name."""
+        from phantom.utils.session_bundle import _VERSION
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_bundle(os.path.join(tmp, "future.pm"),
+                                 dict(FAKE_PM, version=_VERSION + 1),
+                                 encrypted=True)
+            # leave the envelope at the CURRENT version, so only the payload
+            # is newer — the case an attacker or a partial upgrade produces
+            with gzip.open(path, "rb") as fh:
+                block = json.loads(fh.read().decode("utf-8"))
+            block["version"] = _VERSION
+            with gzip.open(path, "wb") as fh:
+                fh.write(json.dumps(block).encode("utf-8"))
+            with self.assertRaises(ValueError) as ctx:
+                read_bundle(path)
+            self.assertIn("payload", str(ctx.exception))
+
+    def test_the_current_version_still_reads(self):
+        from phantom.utils.session_bundle import _VERSION
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_bundle(os.path.join(tmp, "now.pm"),
+                                 dict(FAKE_PM, version=_VERSION))
+            self.assertEqual(read_bundle(path)["magic"], _MAGIC)
+
+    def test_a_bundle_without_a_version_is_the_legacy_format(self):
+        """Written before the field existed => version 1, still readable."""
+        legacy = {k: v for k, v in FAKE_PM.items() if k != "version"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_bundle(os.path.join(tmp, "legacy.pm"), legacy)
+            self.assertEqual(read_bundle(path)["session"]["target"],
+                             "mario.rossi@acme.it")
+
+    def test_a_malformed_version_is_refused(self):
+        for bad in ("two", 0, -3, 1.5, True):
+            with self.subTest(version=bad):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = _write_bundle(os.path.join(tmp, "bad.pm"),
+                                         dict(FAKE_PM, version=bad))
+                    with self.assertRaises(ValueError):
+                        read_bundle(path)
+
+    def test_check_version_names_the_case(self):
+        from phantom.utils.session_bundle import check_version
+        self.assertEqual(check_version(None), 1)
+        self.assertEqual(check_version(1), 1)
+        with self.assertRaises(ValueError) as ctx:
+            check_version(99)
+        self.assertIn("99", str(ctx.exception))
+
+
 class TestBundleRoundTrip(unittest.TestCase):
 
     def test_export_writes_valid_pm(self):
@@ -222,6 +337,86 @@ class TestBundleRoundTrip(unittest.TestCase):
             os.utime(p1, (0, 100))
             os.utime(p2, (0, 200))
             self.assertEqual(latest_checkpoint(root=tmp), p2)
+
+
+class TestManualReportsAreIndexed(unittest.TestCase):
+    """Audit §6.5.5: the index walked only `auto_*`/`agent_*` run dirs.
+
+    So an engagement whose reports came from the MANUAL generator
+    (`report` / `export all` → `data/reports/report_*`, `engagement_*`)
+    travelled as a bundle with an EMPTY report index: the artifacts the
+    operator most often hands to somebody else were the ones it did not
+    mention. Both trees are indexed now, and the manual entries are tagged
+    so a reader can tell them from the run dirs.
+    """
+
+    def _layout(self, tmp):
+        sessions = os.path.join(tmp, "sessions")
+        reports = os.path.join(tmp, "reports")
+        os.makedirs(os.path.join(sessions, "auto_2026-01-01"))
+        os.makedirs(os.path.join(sessions, "not_an_engagement"))
+        os.makedirs(os.path.join(reports, "report_10.0.0.5_2026-01-01"))
+        os.makedirs(os.path.join(reports, "engagement_2026-01-01"))
+
+        def touch(*parts):
+            path = os.path.join(*parts)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("{}")
+
+        touch(sessions, "auto_2026-01-01", "raw_report.json")
+        touch(sessions, "not_an_engagement", "raw_report.json")
+        touch(reports, "report_10.0.0.5_2026-01-01", "raw_audit.json")
+        touch(reports, "report_10.0.0.5_2026-01-01", "client_report.pdf")
+        touch(reports, "engagement_2026-01-01", "client_report.md")
+        return sessions, reports
+
+    def _index(self, sessions, reports):
+        from unittest.mock import patch as _patch
+
+        from phantom.utils.session_bundle import _report_index
+        with _patch("phantom.utils.paths.reports_dir", lambda: reports):
+            return _report_index(root=sessions)
+
+    def test_a_manual_report_set_is_indexed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions, reports = self._layout(tmp)
+            entries = self._index(sessions, reports)
+        dirs = {e["dir"] for e in entries}
+        self.assertIn("auto_2026-01-01", dirs)
+        self.assertIn("reports/report_10.0.0.5_2026-01-01", dirs)
+        self.assertIn("reports/engagement_2026-01-01", dirs)
+
+    def test_the_manual_entries_are_tagged_not_confusable_with_run_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions, reports = self._layout(tmp)
+            entries = self._index(sessions, reports)
+        auto = [e for e in entries if e["dir"].startswith("auto_")]
+        manual = [e for e in entries if e["dir"].startswith("reports/")]
+        self.assertTrue(auto and manual)
+        self.assertFalse(any(e["dir"].startswith("reports/") for e in auto))
+
+    def test_only_report_files_are_indexed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions, reports = self._layout(tmp)
+            entries = self._index(sessions, reports)
+        files = {e["file"] for e in entries}
+        self.assertIn("raw_audit.json", files)
+        self.assertNotIn("client_report.pdf", files)
+
+    def test_an_unrelated_sessions_directory_is_not_indexed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions, reports = self._layout(tmp)
+            entries = self._index(sessions, reports)
+        self.assertNotIn("not_an_engagement",
+                         {e["dir"] for e in entries})
+
+    def test_a_missing_reports_tree_still_indexes_the_run_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions, reports = self._layout(tmp)
+            import shutil
+            shutil.rmtree(reports)
+            entries = self._index(sessions, reports)
+        self.assertEqual([e["dir"] for e in entries], ["auto_2026-01-01"])
 
 
 class TestIdentityScope(unittest.TestCase):

@@ -5,6 +5,84 @@ jobs in CI compile a real artefact for each). Building is not the same as featur
 parity, so this page is the contract: what is implemented on every OS, and what is
 deliberately Windows-only.
 
+## The enforced grid (feature × OS × arch × transport)
+
+This table is GENERATED from `phantom/utils/beacon_matrix.py`, and checked by
+`tests/test_beacon_matrix.py`: every C2 verb, every source header and every
+documented Windows-only module is classified here, and the docs quote the same
+data the code enforces. Regenerate with
+`python scripts/beacon_matrix_verify.py --write-docs`.
+
+What was wrong before: the CI `beacon-smoke` jobs proved that a real binary was
+produced for each OS, which says nothing about WHICH capabilities it carries,
+and the per-feature tables further down were a reviewed claim nobody
+re-checked. The grid closes that gap in three places:
+
+* **source level** — every verb the C2 may send belongs to exactly one
+  feature row; a header the grid calls usable on POSIX must have a
+  non-Windows branch, and one it calls `windows_only` must have none;
+* **artefact level** — after each `beacon-smoke` build the job runs
+  `scripts/beacon_matrix_verify.py --platform <os> [--arch <arch>]`, which
+  checks the CONTAINER and the MACHINE field against the cell (an x86-64 ELF
+  that should be aarch64 is still `\x7fELF`) and prints the parity gap of that
+  OS;
+* **docs level** — this block is compared verbatim with the generated table, so
+  the page cannot drift from the code.
+
+Support levels are the vocabulary that keeps it honest: `native` (the
+platform's own API), `posix` (the shared POSIX path is compiled in),
+`posix (degrade)` (it runs but leans on Linux-first tooling), `windows_only`
+(NT-specific mechanism, no POSIX analogue) and `absent` (no path at all).
+
+<!-- beacon-matrix:begin -->
+| Feature | Kind | Windows | Linux | macOS | Android | Verbs |
+|---|---|---|---|---|---|---|
+| shell_exec | shell | native | native | native | native | `run`, `exec`, `shell`, `kill`, `mem-run`, `download`, `upload`, `remote`, `exit`, `sleep`, `set-sleep`, `health`, `auth-rotate` |
+| filesystem | shell | native | native | native | native | `ls`, `cat`, `cd`, `cd..`, `pwd`, `dir`, `drives`, `find` |
+| process_recon | collection | native | native | native | native | `processes`, `whoami`, `sysinfo`, `netinfo` |
+| recon_net | collection | native | native | native | native | `recon` |
+| keylogger | collection | native | posix | posix | posix | `keylog` |
+| persistence | action | native | posix | posix | posix | `persist`, `unpersist` |
+| edr_awareness | evasion | native | native | native | native | `edrcheck` |
+| edr_kill | action | native | posix | posix | posix | `edr-kill` |
+| masked_sleep | evasion | native | native | native | native | — |
+| module_hiding | evasion | native | posix | absent | absent | — |
+| call_stack_spoof | evasion | windows_only | absent | absent | absent | — |
+| sleep_ekko_timer | evasion | windows_only | absent | absent | absent | — |
+| winhttp_resolver | helper | windows_only | absent | absent | absent | — |
+| wasapi_engine | helper | windows_only | absent | absent | absent | — |
+| nt_syscalls | evasion | windows_only | absent | absent | absent | — |
+| apc_injection | action | windows_only | absent | absent | absent | — |
+| ppid_spoof | evasion | windows_only | absent | absent | absent | — |
+| jpeg_encoder | helper | windows_only | absent | absent | absent | — |
+| screenshot | collection | native | posix | posix (degrade) | posix | `screenshot`, `screen-dump` |
+| screen_record | collection | native | posix | posix (degrade) | posix | `screen-record`, `screen-record-live`, `screen-stream`, `screen-stream-stop` |
+| camera | collection | native | posix | posix (degrade) | posix | `camera` |
+| audio | collection | native | posix | posix (degrade) | posix | `audio` |
+| gps | collection | native | posix | posix (degrade) | posix | `gps` |
+| netstat | collection | native | posix | posix (degrade) | posix | `netstat`, `netstat-json` |
+| cookies | collection | native | posix | absent | absent | `cookies`, `cookies-json` |
+| wlan | collection | native | posix | posix | posix (degrade) | `wlan-scan`, `wlan-locate` |
+| bluetooth | collection | native | posix | posix | posix (degrade) | `bt-scan`, `bt-scan-json` |
+| browser_pivot | action | native | posix | posix | posix | `browser-pivot`, `browser-pivot-stop`, `browser-list` |
+| cdp_pivot | action | native | posix | posix | posix | `cdp-launch`, `cdp-nav`, `cdp-eval`, `cdp-fetch`, `cdp-cookies` |
+| socks_proxy | action | native | posix | posix | posix | `socks`, `socks-stop` |
+| port_forward | action | native | posix | posix | posix | `portfwd`, `portfwd-stop` |
+| process_injection | action | native | posix | posix (degrade) | posix | `inject`, `inject-eb`, `inject-tl`, `migrate` |
+| smb_pipe | action | windows_only | absent | absent | absent | `smb-pipe`, `smb-pipe-stop` |
+| task_lifecycle | protocol | native | native | native | native | — |
+| beacon_auth | protocol | native | native | native | native | — |
+| transport_pinning | protocol | native | native | native | native | — |
+| malleable_profile | protocol | native | native | native | native | — |
+
+| OS | arches | transport | pin | container | artefact |
+|---|---|---|---|---|---|
+| windows | `x86_64`, `x86` | `winhttp` | `cert-sha256-der` | PE | `beacon.pe` |
+| linux | `x86_64`, `aarch64` | `openssl` | `cert-sha256-der` | ELF | `beacon_linux` |
+| macos | `arm64`, `x86_64` | `libcurl` | `pubkey-spki-sha256` | Mach-O | `beacon_macos` |
+| android | `aarch64` | `openssl` | `cert-sha256-der` | ELF | `beacon_android` |
+<!-- beacon-matrix:end -->
+
 ## Anti-analysis (evasion.h)
 
 | Capability | Windows | Linux | macOS | Android |

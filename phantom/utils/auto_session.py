@@ -170,12 +170,25 @@ def auto_export() -> Optional[str]:
     """Export the current engagement to latest.pm + a dated copy.
 
     Returns the latest.pm path written, or None when there is nothing
-    worth persisting (no target AND no notes AND no findings).
+    worth persisting — no target, no notes, no findings, no result from any
+    module, and an empty knowledge base.
+
+    `session.results` (what each module actually produced) and the knowledge
+    base count as content: an engagement whose ONLY durable output was, say, a
+    scan result was not persisted at all (audit §6.5.4 holds that a bundle
+    WITH data must exist). `export_session` records the results either way, so
+    the gate only has to stop refusing them.
     """
     from phantom.core.knowledge import session_wm
     from phantom.core.session import session
     wm = session_wm()
-    has_content = bool(session.target or session.notes or wm.all_findings())
+    # `session.results` is what the MODULES produced: an engagement whose only
+    # durable output was a scan (no note, no finding in the world model) used
+    # to be dropped on the floor. History is deliberately NOT part of this:
+    # every typed command lands there, so it would make the gate always true
+    # and write a bundle for an empty shell.
+    has_content = bool(session.target or session.notes or wm.all_findings()
+                       or session.results)
     if not has_content:
         return None
     latest_path = os.path.join(_root(), _LATEST)

@@ -66,6 +66,8 @@ export default function ExternalTools() {
             <span className="text-[10px] text-text-dim font-mono">{data.environment}</span>
           )}
           <button onClick={load} disabled={loading}
+            aria-label="Refresh the external tools report"
+            aria-busy={loading}
             className="text-[10px] text-text-dim hover:text-phantom-cyan flex items-center gap-1">
             <RefreshCw size={10} className={loading ? 'animate-spin' : ''} /> Refresh
           </button>
@@ -80,7 +82,7 @@ export default function ExternalTools() {
         </p>
       )}
 
-      <div className="space-y-2">
+      <div className="space-y-2" role="region" aria-live="polite" aria-label="Missing tools">
         {data?.missing.map((row) => (
           <div key={row.tool} className="flex items-start justify-between gap-3">
             <div className="min-w-0">
@@ -101,6 +103,8 @@ export default function ExternalTools() {
             </div>
             {row.command.length > 0 && (
               <button onClick={() => install(row.tool)} disabled={busy === row.tool}
+                aria-label={`Install ${row.tool} with this machine's package manager`}
+                aria-busy={busy === row.tool}
                 className="shrink-0 flex items-center gap-1 px-2 py-1 rounded text-[10px]
                   border border-phantom-cyan/40 text-phantom-cyan hover:bg-phantom-cyan/10
                   disabled:opacity-40">
@@ -117,7 +121,10 @@ export default function ExternalTools() {
         {data?.wsl ? ', WSL' : ''}) for one tool only, and the request carries an
         explicit confirmation the backend refuses without.
       </p>
-      {msg && <p className="text-[10px] text-text-secondary mt-1">{msg}</p>}
+      {msg && (
+        <p className="text-[10px] text-text-secondary mt-1" role="status"
+          aria-live="polite">{msg}</p>
+      )}
     </div>
   )
 }

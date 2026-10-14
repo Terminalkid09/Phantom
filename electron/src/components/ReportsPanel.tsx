@@ -90,11 +90,12 @@ export default function ReportsPanel() {
             <div className="space-y-2.5">
               <div>
                 <label className="text-[10px] text-text-dim block mb-1">Format</label>
-                <div className="flex gap-1.5">
+                <div className="flex gap-1.5" role="group" aria-label="Report format">
                   {(['json', 'html', 'pdf'] as const).map((f) => (
                     <button
                       key={f}
                       onClick={() => setFormat(f)}
+                      aria-pressed={format === f}
                       className={`flex-1 py-1.5 rounded text-xs font-medium transition-colors
                         ${format === f
                           ? 'bg-phantom-green/20 text-phantom-green border border-phantom-green/50'
@@ -110,6 +111,7 @@ export default function ReportsPanel() {
               <button
                 onClick={handleGenerate}
                 disabled={generating}
+                aria-busy={generating}
                 className={`w-full py-2 rounded text-xs font-semibold uppercase tracking-wider
                   flex items-center justify-center gap-2 transition-colors
                   ${generating
@@ -185,14 +187,16 @@ export default function ReportsPanel() {
         {/* Right — preview */}
         <div className="flex-1 flex flex-col gap-3 min-w-0">
           {/* Raw report preview */}
-          <div className="bg-surface-card border border-surface-border rounded-lg flex-1 flex flex-col min-h-0">
+          <div className="bg-surface-card border border-surface-border rounded-lg flex-1 flex flex-col min-h-0"
+            role="region" aria-label="Raw audit report preview">
             <div className="px-3 py-2 border-b border-surface-border flex items-center justify-between">
               <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
-                <Shield size={13} className="text-phantom-red" /> Raw Audit Report
+                <Shield size={13} className="text-phantom-red" aria-hidden="true" /> Raw Audit Report
               </h2>
               {report.raw_path && (
                 <button
                   onClick={() => handleExport('raw')}
+                  aria-label="Export the raw audit report"
                   className="flex items-center gap-1 px-2 py-1 rounded text-[10px]
                     bg-phantom-red/20 text-phantom-red hover:bg-phantom-red/30 transition-colors"
                 >
@@ -202,7 +206,8 @@ export default function ReportsPanel() {
             </div>
             <div className="flex-1 overflow-auto p-3">
               {report.raw ? (
-                <pre className="text-xs font-mono text-text-primary whitespace-pre-wrap">{report.raw}</pre>
+                <pre className="text-xs font-mono text-text-primary whitespace-pre-wrap"
+                  role="log" aria-live="polite" aria-label="Raw audit report">{report.raw}</pre>
               ) : (
                 <div className="flex flex-col items-center justify-center h-full text-text-dim gap-2">
                   <Shield size={32} className="text-text-dim" />
@@ -214,14 +219,16 @@ export default function ReportsPanel() {
           </div>
 
           {/* Client report preview */}
-          <div className="bg-surface-card border border-surface-border rounded-lg flex-1 flex flex-col min-h-0">
+          <div className="bg-surface-card border border-surface-border rounded-lg flex-1 flex flex-col min-h-0"
+            role="region" aria-label="Client report preview">
             <div className="px-3 py-2 border-b border-surface-border flex items-center justify-between">
               <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
-                <UserCheck size={13} className="text-phantom-cyan" /> Client Report
+                <UserCheck size={13} className="text-phantom-cyan" aria-hidden="true" /> Client Report
               </h2>
               {report.client_path && (
                 <button
                   onClick={() => handleExport('client')}
+                  aria-label="Export the client report"
                   className="flex items-center gap-1 px-2 py-1 rounded text-[10px]
                     bg-phantom-cyan/20 text-phantom-cyan hover:bg-phantom-cyan/30 transition-colors"
                 >
@@ -231,7 +238,8 @@ export default function ReportsPanel() {
             </div>
             <div className="flex-1 overflow-auto p-3">
               {report.client ? (
-                <pre className="text-xs font-mono text-text-primary whitespace-pre-wrap">{report.client}</pre>
+                <pre className="text-xs font-mono text-text-primary whitespace-pre-wrap"
+                  role="log" aria-live="polite" aria-label="Client report">{report.client}</pre>
               ) : (
                 <div className="flex flex-col items-center justify-center h-full text-text-dim gap-2">
                   <UserCheck size={32} className="text-text-dim" />
@@ -244,8 +252,9 @@ export default function ReportsPanel() {
 
           {/* Info footer */}
           {report.generated_at && (
-            <div className="flex items-center gap-2 text-[10px] text-text-dim px-1">
-              <Clock size={11} />
+            <div className="flex items-center gap-2 text-[10px] text-text-dim px-1"
+              role="status" aria-live="polite">
+              <Clock size={11} aria-hidden="true" />
               <span>Generated: {report.generated_at}</span>
               <span className="text-text-dim">·</span>
               <span>{format.toUpperCase()}</span>

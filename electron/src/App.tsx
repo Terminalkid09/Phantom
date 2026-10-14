@@ -139,6 +139,14 @@ export default function App() {
     <div className="flex h-screen w-screen overflow-hidden">
       <Sidebar />
       <div className="flex-1 flex flex-col min-w-0">
+        {/* Keyboard users land on the sidebar first; this jumps straight to
+            the panel, and is only visible while focused. */}
+        <a
+          href="#main"
+          className="sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:z-50 focus:rounded focus:bg-surface-card focus:px-3 focus:py-1 focus:text-xs focus:text-phantom-cyan"
+        >
+          Skip to content
+        </a>
         {/* Title bar with drag region */}
         <div style={{ WebkitAppRegion: 'drag' } as any} className="h-9 flex-shrink-0 bg-surface-card border-b border-surface-border flex items-center px-4">
           <span className="text-sm font-semibold text-phantom-red tracking-wider">
@@ -150,13 +158,21 @@ export default function App() {
         </div>
 
         {/* Panel content — all panels mounted, only the active one visible */}
-        <div className="flex-1 overflow-auto min-h-0">
+        <main
+          id="main"
+          aria-label={`Phantom panel: ${active.id}`}
+          className="flex-1 overflow-auto min-h-0"
+        >
           {visible.map((p) => (
-            <div key={p.id} className={p.id === active.id ? 'h-full' : 'hidden'}>
+            <div
+              key={p.id}
+              aria-hidden={p.id === active.id ? undefined : true}
+              className={p.id === active.id ? 'h-full' : 'hidden'}
+            >
               {p.node}
             </div>
           ))}
-        </div>
+        </main>
 
         {/* Status bar */}
         <StatusBar />

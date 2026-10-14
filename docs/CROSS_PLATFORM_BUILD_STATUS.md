@@ -1,4 +1,18 @@
-# Cross-Platform Beacon Build Status
+# Cross-Platform Beacon Build Status — SUPERSEDED (do not act on this file)
+
+> **Superseded as of 2026-10-13.** Two claims below are FALSE for the current
+> branch and were measured as such by [`Audit_2026-10-13.md`](Audit_2026-10-13.md):
+>
+> * *"macOS — toolchain present but SDK missing… skip macOS"*: the CI job
+>   `beacon-smoke-macos` builds natively with `clang++` and runs with
+>   `--require`, so a missing macOS artefact FAILS the build;
+> * *"166 test files"*: the root [`../README.md`](../README.md) carries the
+>   contract-tested count (a test compares it with the tree).
+>
+> The live contract for what builds and runs per platform is
+> [`beacon_platform_matrix.md`](beacon_platform_matrix.md) plus the beacon jobs
+> in `.github/workflows/ci.yml`. This file is kept only as a dated snapshot of
+> the Docker cross-compile work.
 
 ## Summary
 La refactoring di Phantom è quasi completa. Tutti i moduli Python sono corretti (166 test passing), e la infraruttura di builder è pronta. Rimangono problemi **nel C++ beacon source code** per la compilazione cross-platform in Docker.

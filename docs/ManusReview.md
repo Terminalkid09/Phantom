@@ -1,6 +1,15 @@
 # Phantom `dev` — Audit comparativo professionale
 ## Branch aggiornato al 5 ottobre 2026
 
+> **Provenienza e stato (aggiunto il 2026-10-13).** Questo audit è un
+> point-in-time al commit `b751fe6` (364 file, finding F-01…F-07). **Non è la
+> review più recente**: l'analisi corrente è
+> [`Audit_2026-10-13.md`](Audit_2026-10-13.md), che verifica riga per riga
+> un'altra review (quella del 12 ottobre) e ne misura ogni affermazione su
+> `dev`. Leggi i due documenti nell'ordine: qui la fotografia di inizio
+> ottobre, là lo stato verificato. Un finding non citato dall'audit più recente
+> **non** è automaticamente aperto: va riprovato sul codice di oggi.
+
 > **Uso del documento:** review statica e di test del progetto Phantom in contesto di laboratorio/red-team autorizzato. Non è stata eseguita alcuna operazione contro target esterni, né è stato avviato il beacon/C2 su sistemi reali.
 
 ## 1. Executive summary

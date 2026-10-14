@@ -335,6 +335,63 @@ class TestAutonomousAgent(unittest.TestCase):
         kinds = [k for k, _ in self.events]
         self.assertIn("unverified", kinds, self.events)
 
+    def test_a_driver_that_never_delivers_its_effects_breaks_its_contract(self):
+        """A manifest driver DECLARED its effects, so producing none of them
+        is a broken CONTRACT — recorded as `driver_contract_violation` — not a
+        plain negative result.
+
+        `unverified` already reports the unmet postcondition; what was missing
+        is the typed outcome, because "the tool you added to the toolbelt did
+        not do what its manifest promised" is a different fact from "the
+        target had nothing". The pin check says the right program ran; this
+        says the program did what it promised.
+        """
+        import os
+        from phantom.automation.runtime.broker import ExecutionBroker
+        from phantom.automation.runtime.capability_registry import (
+            CapabilityRecord, CapabilityRegistry)
+        from phantom.automation.runtime.drivers import (
+            driver_capability, parse_driver)
+        from phantom.automation.runtime.toolchain import ToolRegistry
+        from phantom.utils import failure_taxonomy as ft
+
+        driver = parse_driver({
+            "id": "dnscan_subdomains", "tool": "dnscan", "category": "recon",
+            "argv": ["dnscan", "-d", "{target}"],
+            "effects": ["service"], "requires": ["target"],
+            # a marker the fake runner's output never carries
+            "markers": [{"prefix": "SUB:", "kind": "subdomain"}],
+        })
+        self.assertIsNotNone(driver)
+        agent = self._agent()
+        # the tool is installed and the capability is ENABLED in the trust
+        # store, so the broker lets the move through and the POSTCONDITION is
+        # what has to catch the empty promise
+        agent.toolchain = ToolRegistry(installed={"dnscan"})
+        registry = CapabilityRegistry(path=os.devnull)
+        registry.discover(CapabilityRecord(capability="dnscan_subdomains",
+                                           tool="dnscan", sha256="h"))
+        registry.enable("dnscan_subdomains")
+        agent._cap_registry = registry
+        agent._broker = ExecutionBroker(registry=registry,
+                                        toolchain=agent.toolchain)
+        cap = driver_capability(driver)
+
+        class _Step:
+            capability = cap
+            slot_values = {"target": TARGET}
+
+        ft.reset()
+        try:
+            agent._execute_capability(_Step())
+            entries = ft.recent()
+        finally:
+            ft.reset()
+        self.assertTrue(any(e["category"] == "contract_violation"
+                            for e in entries), entries)
+        self.assertEqual(entries[-1]["contract"],
+                         "driver_contract_violation")
+
     def test_a_blocked_event_carries_the_unblock_condition(self):
         agent = self._agent()
         agent._mark_failed("ssh_login")

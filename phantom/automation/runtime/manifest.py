@@ -24,6 +24,7 @@ from phantom.automation.runtime.drivers import (
     _KNOWN_CATEGORIES,
     _as_str_tuple,
     _binary_matches,
+    _norm_sha256,
     parse_driver,
 )
 
@@ -114,6 +115,13 @@ def validate_manifest(data: Any) -> ValidationResult:
         errors.append(ManifestError(
             "tool", f"the executable does not match the declared tool "
                     f"{tool!r} (command/argv[0] must invoke it)"))
+
+    # optional binary pin: a malformed one is rejected rather than ignored,
+    # otherwise a typo would silently downgrade a pinned driver to unpinned
+    if "binary_sha256" in data and _norm_sha256(data.get("binary_sha256")) is None:
+        errors.append(ManifestError(
+            "binary_sha256",
+            "must be a 64-character hex sha256 digest (or omitted)"))
 
     # declared input slots
     declared: List[str] = []

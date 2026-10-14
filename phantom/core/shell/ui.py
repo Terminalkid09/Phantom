@@ -38,6 +38,27 @@ load_phantom_env()
 console = Console()
 
 
+def ask_to_install(tool: str, cmd) -> bool:
+    """Ask the operator, in the shell, before running a package manager.
+
+    ONE policy for every door that can install software. There used to be two:
+    `deps install` asked (and refused in a non-interactive shell) while
+    `install <tool>` ran the package manager straight away — the audit called
+    it "two doors, two policies". Both now call this.
+
+    Defaults to NO on anything but an explicit yes, and treats a broken or
+    non-interactive prompt as a refusal: an automated run must never install
+    software on the operator's machine because a scan wanted a tool.
+    """
+    from rich.prompt import Confirm
+    try:
+        return bool(Confirm.ask(
+            "Install " + tool + "?  ($ " + " ".join(map(str, cmd)) + ")",
+            default=False))
+    except Exception:
+        return False
+
+
 def _context_hint() -> str:
     """Faded one-line hint: what to do NEXT given the current state.
     Shown after every command so the operator never gets stuck reading

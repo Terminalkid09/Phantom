@@ -94,15 +94,41 @@ def _read_counter(path: str) -> int:
 
 
 def _write_counter(path: str, value: int) -> None:
-    """Persist the counter. Best effort: a read-only disk must not kill the
-    run, it only loses the loop guard for the next process."""
+    """Persist the counter. A failure is LOUD, never a silent stale budget.
+
+    The write is still best-effort in the only sense that matters here: it
+    never raises into the caller (a read-only disk must not kill a running
+    engagement). It used to `pass` in silence, though — and this file IS the
+    loop guard: a failed write means the next process sees the OLD count and
+    can relaunch a crash loop past its budget (audit §6.5.3). So the failure
+    is announced, with the number of relaunches that are now unaccounted for.
+    """
     try:
         directory = os.path.dirname(os.path.abspath(path))
         if directory:
             os.makedirs(directory, exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump({"restarts": max(0, int(value))}, fh, indent=2)
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError) as exc:
+        _warn_counter(exc, path, value)
+
+
+def _warn_counter(exc: BaseException, path: str, value: int) -> None:
+    """Say the loop guard was lost — through whichever channel exists."""
+    message = (f"restart counter NOT persisted ({path}): "
+               f"{type(exc).__name__}: {exc} — the crash-loop guard is "
+               f"stale, so a relaunch may exceed its budget. The in-memory "
+               f"count is {max(0, int(value))}.")
+    try:
+        from phantom.utils.notifier import notifier
+        notifier.warn(message)
+        return
+    except Exception:
+        pass
+    try:
+        import logging
+        logging.getLogger("phantom").warning(message)
+    except Exception:
         pass
 
 

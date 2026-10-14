@@ -1,0 +1,69 @@
+# .dockerignore — what the image build must NOT send to the daemon.
+#
+# The Dockerfile does `COPY . .` on purpose (the image IS the framework), so
+# without this file the build context was the entire working tree: `.git`,
+# `data/` (the operator's engagement state!), `tests/`, `electron/node_modules`,
+# `build/`, `dist/`, `*.egg-info`. That is slow to upload, and the layers bake a
+# copy of local state that has nothing to do with the image (the audit's §5.4).
+#
+# The image needs: phantom/ (code + payloads/exploits), setup.py, MANIFEST.in
+# and requirements.txt. Everything below is either generated, local-only, or a
+# language tree the image does not build.
+
+# ── version control ────────────────────────────────────────────────────────
+.git
+.gitattributes
+.gitignore
+.gitlab-ci.yml
+.github
+
+# ── the operator's own state: never in an image ───────────────────────────
+data/
+.env
+*.env
+!*.env.example
+data/*.pm
+*.pm
+
+# ── build output / caches ──────────────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+.eggs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+
+# ── python envs ────────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── the Electron app: built and released on its own ───────────────────────
+electron/
+**/node_modules/
+
+# ── tests and docs: contributors' material, not runtime ───────────────────
+# (lab/ and scripts/ stay: they are small text, and the evolution/lab flow
+# and the parity checks reference them from inside the tree.)
+tests/
+docs/
+
+# ── cross-compiled artefacts (the image builds its own) ───────────────────
+c2d/c2d
+c2d/c2d.exe
+phantom/payloads/**/*.exe
+phantom/payloads/**/*.o
+phantom/payloads/**/*.bin
+phantom/payloads/remote/**/*.apk
+phantom/payloads/**/build/
+
+# ── editor / OS noise ─────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

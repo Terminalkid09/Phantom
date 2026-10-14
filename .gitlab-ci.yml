@@ -11,10 +11,22 @@ unit_tests:
   stage: test
   image: python:3.10
   script:
-    - pip install -r requirements.txt
-    - pip install pytest pytest-asyncio pytest-cov
-    - pip install -e .
-    - pytest tests/ -v --tb=short --cov=phantom --cov-report=term --cov-report=xml
+    # ONE dependency set: the same two files the GitHub workflow installs.
+    # This job used `pip install -e .` (setup.py's install_requires — a
+    # DIFFERENT list, historically missing two runtime deps) plus a hand-typed
+    # `pip install pytest pytest-asyncio pytest-cov` that omitted pytest-mock,
+    # so tests/test_payload_engine_core.py errored with "fixture 'mocker' not
+    # found" on every run of this job.
+    - pip install -r requirements.txt -r requirements-dev.txt
+    # Same selection as .github/workflows/ci.yml: glob collection minus the
+    # two standalone integration scripts, whose module body compiles a real
+    # beacon and sys.exit()s at import.
+    - |
+      TEST_FILES=$(ls tests/test_*.py | sort \
+        | grep -v -e 'tests/test_features_final.py' -e 'tests/test_real_deploy.py' \
+        | tr '\n' ' ')
+      pytest $TEST_FILES -q --tb=short -m "not integration_tool" \
+        --cov=phantom --cov-report=term --cov-report=xml
   coverage: '/TOTAL.*\d+%$/'
   artifacts:
     reports:

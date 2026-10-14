@@ -76,7 +76,8 @@ _BASE = """{
   job_id: null, state: 'idle', state_history: [], running: false, done: true,
   end_reason: '', error: '', current_step: -1, started_at: 0, elapsed: 0,
   targets: [], mode: '', profile: '', goal: '', llm: 'denied',
-  llm_pending: 0, handoffs: [], handoff_state: 'none',
+  llm_pending: 0, handoffs: [], handoff_state: 'none', outcome: 'not_started',
+  outcome_label: '', targets_outcome: {},
 }"""
 
 _HARNESS = """import {{ deriveJobState, type AutomodeStatus }} from '{api}'

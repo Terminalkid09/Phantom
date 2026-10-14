@@ -5,19 +5,36 @@
 #
 # What it does:
 #   1. checks python >= 3.10 (tells you exactly what to install if missing)
-#   2. downloads the repository tarball from main (github codeload)
-#   3. installs into ~/.phantom (user scope)
+#   2. downloads the repository tarball from the BRANCH you chose (github
+#      codeload) and checks the archive before touching anything
+#   3. installs into ~/.phantom (user scope) — the FILES the framework needs,
+#      not the whole working tree
 #   4. venv + requirements.txt
 #   5. launchers in ~/.local/bin (PATH-checked, user scope)
 #   6. prints the follow-up steps (`phantom doctor`, `phantom setup`)
+#
+# Branch: `dev` by default, because that is the line these docs describe
+# (v3.0.0). The released line is `main` (v2.0.0) — install it explicitly with
+# `PHANTOM_BRANCH=main`. The installer PRINTS what it installed, so the version
+# you get is never a surprise.
+#
+# Size: the copy is a KEEP-LIST (code, packaging metadata, requirements). The
+# old one copied the entire tarball into ~/.phantom — docs, tests, the Electron
+# app, `data/` — which is how a "just install it" path grew into ~1 GB. Set
+# PHANTOM_FULL_TREE=1 for the old behaviour.
 #
 # Idempotent: re-running refreshes the install in place.
 set -eu
 
 REPO="Terminalkid09/Phantom"
-BRANCH="main"
+BRANCH="${PHANTOM_BRANCH:-dev}"
 DEST="$HOME/.phantom"
 BIN_DIR="$HOME/.local/bin"
+FULL_TREE="${PHANTOM_FULL_TREE:-0}"
+
+# What a run needs: the package (code + payloads + exploits), the packaging
+# metadata `pip install -e .` reads, the requirement list, and the licence/readme.
+KEEP="phantom setup.py MANIFEST.in requirements.txt README.md LICENSE"
 
 say()  { printf '  %s\n' "$1"; }
 step() { printf '\n[*] %s\n' "$1"; }
@@ -58,23 +75,52 @@ else
     say "need curl or wget to download — install one and retry"
     exit 1
 fi
-# integrity: a real tarball is megabytes; a captive-portal HTML page is not
+# integrity, in the order a failure is likely:
+#   1. a real tarball is megabytes; a captive-portal HTML page is not;
+#   2. it must actually be gzip + tar (a truncated download passes #1);
+#   3. it must contain the files this script is about to rely on. Size alone
+#      says nothing about WHAT was downloaded — that was the old check.
 SIZE=$(wc -c < "$TMP/phantom.tar.gz")
 if [ "$SIZE" -lt 100000 ]; then
     say "download looks truncated ($SIZE bytes) — aborting"
     exit 1
 fi
+if ! gzip -t "$TMP/phantom.tar.gz" 2>/dev/null; then
+    say "download is not a gzip archive (captive portal? proxy?) — aborting"
+    exit 1
+fi
+if ! tar -tzf "$TMP/phantom.tar.gz" >/dev/null 2>&1; then
+    say "download is not a readable tar archive — aborting"
+    exit 1
+fi
+say "downloaded $((SIZE / 1024)) KiB from branch '$BRANCH'"
 
-# ── 3. extract into ~/.phantom (contents at the repo root)
-step "Extracting into $DEST"
-mkdir -p "$DEST"
+# ── 3. extract (contents at the repo root) and install the KEEP-LIST
+step "Installing into $DEST"
 tar -xzf "$TMP/phantom.tar.gz" -C "$TMP"
 SRC="$(find "$TMP" -maxdepth 1 -type d -name 'Phantom-*' | head -n 1)"
 if [ -z "$SRC" ]; then
     say "archive layout unexpected — aborting"
     exit 1
 fi
-cp -a "$SRC/." "$DEST/"
+for needed in phantom/main.py requirements.txt setup.py; do
+    if [ ! -e "$SRC/$needed" ]; then
+        say "this archive has no $needed — wrong branch or a partial tag?"
+        say "branch '$BRANCH' may not exist; try PHANTOM_BRANCH=main"
+        exit 1
+    fi
+done
+mkdir -p "$DEST"
+if [ "$FULL_TREE" = "1" ]; then
+    say "PHANTOM_FULL_TREE=1: copying the whole tree (old behaviour)"
+    cp -a "$SRC/." "$DEST/"
+else
+    for item in $KEEP; do
+        [ -e "$SRC/$item" ] || continue
+        cp -a "$SRC/$item" "$DEST/"
+    done
+fi
+say "installed: $(du -sh "$DEST" 2>/dev/null | cut -f1) of files in $DEST (the venv below adds more)"
 
 # ── 4. venv + deps
 step "Creating virtualenv"
@@ -108,7 +154,8 @@ case ":$PATH:" in
 esac
 
 printf '\n'
-printf '  [OK] phantom installed (user scope)\n\n'
+printf '  [OK] phantom installed from branch %s (user scope)\n\n' "$BRANCH"
+printf '  %s\n' "$(grep -m1 -E '^version|version=' "$DEST/setup.py" 2>/dev/null | tr -d ' ' || true)"
 printf '  next steps:\n'
 printf '    phantom doctor      - what is missing (tools, docker)\n'
 printf '    phantom setup       - guided toolbox setup (asks once, installs)\n'

@@ -30,8 +30,35 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# ── Stage 1b: ci-smoke — the cheapest REAL build the CI can afford ──────────
+# `docker build --target ci-smoke .` pulls the base image, parses this file
+# and resolves requirements.txt INSIDE the image, without paying for the NDK
+# download / OpenSSL cross-compile / osxcross clone below (30+ minutes).
+#
+# This stage exists because the old `docker-test` job printed "Dockerfile
+# exists and checked" while running nothing that could fail: the Docker path
+# was not gated at all (audit §2.8.5). Building THIS stage is a real gate — a
+# broken COPY, an unresolvable requirement or a base image that moved all
+# fail it. The full image is still built by `docker compose build` (operator)
+# and by .gitlab-ci.yml `docker_build`.
+FROM kalilinux/kali-rolling AS ci-smoke
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip ca-certificates \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt .
+# resolves (and downloads) every requirement, installing nothing: a pin that
+# the base image cannot satisfy fails the CI here instead of at run time.
+RUN pip install --no-cache-dir --break-system-packages --dry-run \
+        -r requirements.txt > /dev/null
+
 # ── Stage 2: Final runtime image ────────────────────────────────────────────
-FROM kalilinux/kali-rolling
+FROM kalilinux/kali-rolling AS runtime
 
 LABEL org.opencontainers.image.title="Phantom Framework" \
       org.opencontainers.image.description="Offensive Security CLI & C2 Framework" \

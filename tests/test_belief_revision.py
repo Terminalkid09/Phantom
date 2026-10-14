@@ -209,7 +209,11 @@ class TestAgentWiring:
         agent = _Agent()
         agent.reasoning = _Boom()
         assert agent._resolve() == []
+        # the degradation carries its failure CATEGORY as well (P1 taxonomy):
+        # a report has to be able to say "internal_bug" and not just
+        # "something failed".
         assert ("degraded", {"layer": "hypotheses",
+                             "category": "internal_bug",
                              "detail": "RuntimeError: resolver exploded"}) \
             in agent.events
 

@@ -129,6 +129,13 @@ class WorkflowManager:
         """Get the phase sequence for a target type."""
         return self.phases.get(target_type, self.phases.get("ip", []))
 
+    def registered_phases(self) -> List[str]:
+        """Phase names that currently have an executor (public view of
+        ``_executors``), so the `workflow` command can report which phases
+        the legacy chain could actually run instead of reaching for a
+        private attribute."""
+        return sorted(self._executors)
+
     def execute_phase(self, phase: str) -> WorkflowResult:
         """Execute a single phase by name."""
         notifier.status(f"[workflow] Executing phase: {phase}")

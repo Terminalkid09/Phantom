@@ -19,6 +19,11 @@ out of the trail. The vocabulary is fixed so a reader can grep for one kind:
   * ``capability_chosen`` / ``capability_rejected`` — the arbiter's pick and
     the moves it passed over, with the reason;
   * ``llm_proposal`` — an advisory proposal and whether a policy accepted it.
+  * ``service_unit_installed`` / ``service_unit_removed`` — a BOOT-LEVEL
+    service definition was written or deleted: the exact render path, the
+    unit name, and the sha256 of the invocation it will run. Enabling the
+    service stays the operator's visible step, but writing its definition is
+    a change to the machine that outlives the process, so it leaves a trail.
 
 Recording is best-effort: an audit write must NEVER take the planner down, so
 every call is wrapped and a failure is swallowed (the decision still happens;
@@ -38,6 +43,8 @@ KIND_SCOPE = "scope_decision"
 KIND_CHOSEN = "capability_chosen"
 KIND_REJECTED = "capability_rejected"
 KIND_LLM = "llm_proposal"
+KIND_SERVICE_INSTALLED = "service_unit_installed"
+KIND_SERVICE_REMOVED = "service_unit_removed"
 
 _DEFAULT_NAME = "decision_audit.log"
 

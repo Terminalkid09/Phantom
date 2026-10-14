@@ -245,7 +245,8 @@ export default function SessionPanel() {
   }
 
   return (
-    <div className="p-4 flex flex-col gap-4 h-full">
+    <div className="p-4 flex flex-col gap-4 h-full" role="region"
+      aria-label="Session Manager">
       <div>
         <h1 className="text-lg font-bold text-text-primary flex items-center gap-2">
           <Target size={19} className="text-phantom-cyan" /> Session Manager
@@ -257,9 +258,10 @@ export default function SessionPanel() {
         {/* Left: Configuration */}
         <div className="w-[380px] flex-shrink-0 flex flex-col gap-2 overflow-auto">
           {/* Target */}
-          <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 0 }}>
+          <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 0 }}
+            role="region" aria-label="Target and scope">
             <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-3 flex items-center gap-1.5">
-              <Crosshair size={13} /> Target
+              <Crosshair size={13} aria-hidden="true" /> Target
             </h2>
             <div className="space-y-2">
               <div className="flex items-end gap-1.5">
@@ -270,6 +272,7 @@ export default function SessionPanel() {
                 </div>
                 {session.target && (
                   <button title="Remove target (leave session without a target)"
+                    aria-label="Remove target"
                     onClick={async () => {
                       const res = await api('POST', '/api/session/set', { key: 'target', value: '' })
                       const d = res.data as { status?: string; error?: string; cleared?: boolean }
@@ -298,7 +301,8 @@ export default function SessionPanel() {
                   onEnter={() => draftLport !== null && persist('lport', draftLport, () => setDraftLport(null))} />
               </div>
               {setMsg && (
-                <div className={`text-[10px] ${setMsg.ok ? 'text-emerald-400' : 'text-red-400'}`}>
+                <div className={`text-[10px] ${setMsg.ok ? 'text-emerald-400' : 'text-red-400'}`}
+                  role="status" aria-live="polite">
                   {setMsg.ok ? '✓ ' : '✗ '}{setMsg.text}
                 </div>
               )}
@@ -317,7 +321,9 @@ export default function SessionPanel() {
                 </button>
               </div>
               {suggestion && (
-                <div className="mt-2 p-2 rounded bg-surface border border-phantom-cyan/40">
+                <div className="mt-2 p-2 rounded bg-surface border border-phantom-cyan/40"
+                  role="status" aria-live="polite"
+                  aria-label={`Suggested next module: ${suggestion.module}`}>
                   <div className="text-[10px] font-semibold text-phantom-cyan uppercase tracking-wider">
                     Next: {suggestion.module.toUpperCase()}
                   </div>
@@ -335,22 +341,27 @@ export default function SessionPanel() {
           </div>
 
           {/* Knowledge */}
-          <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 3 }}>
+          <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 3 }}
+            role="region" aria-label="Knowledge">
             <div className="flex items-center justify-between mb-2">
               <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
-                <Brain size={13} className="text-phantom-green" /> Knowledge
+                <Brain size={13} className="text-phantom-green" aria-hidden="true" /> Knowledge
               </h2>
               <div className="flex gap-1">
-                <button onClick={handleShowKnowledge} className="text-[10px] text-text-dim hover:text-text-primary px-2 py-0.5 rounded bg-surface border border-surface-border">
+                <button onClick={handleShowKnowledge} aria-expanded={showKnowledge}
+                  aria-controls="session-knowledge-body"
+                  className="text-[10px] text-text-dim hover:text-text-primary px-2 py-0.5 rounded bg-surface border border-surface-border">
                   {showKnowledge ? 'Hide' : 'Show'}
                 </button>
-                <button onClick={handleResetKnowledge} className="text-[10px] text-text-dim hover:text-text-primary px-2 py-0.5 rounded bg-surface border border-surface-border">
+                <button onClick={handleResetKnowledge} aria-label="Reset knowledge"
+                  className="text-[10px] text-text-dim hover:text-text-primary px-2 py-0.5 rounded bg-surface border border-surface-border">
                   Reset
                 </button>
               </div>
             </div>
             {showKnowledge && knowledge && (
-              <div className="space-y-1.5 text-xs">
+              <div className="space-y-1.5 text-xs" id="session-knowledge-body"
+                aria-live="polite">
                 <div className="text-text-dim">Target: <span className="text-text-primary">{knowledge.target || '—'}</span></div>
                 {Object.entries(knowledge.summary).map(([k, v]) => (
                   <div key={k} className="flex justify-between">
@@ -375,12 +386,13 @@ export default function SessionPanel() {
 
           {/* Core sync — facts the auto-mode bridged into the manual session */}
           {coreKnow && (
-            <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 3 }}>
+            <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 3 }}
+              role="region" aria-label="Core Sync">
               <div className="flex items-center justify-between mb-2">
                 <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
-                  <Brain size={13} className="text-phantom-green" /> Core Sync
+                  <Brain size={13} className="text-phantom-green" aria-hidden="true" /> Core Sync
                 </h2>
-                <button onClick={loadCoreKnowledge}
+                <button onClick={loadCoreKnowledge} aria-label="Refresh core knowledge"
                   className="text-[10px] text-text-dim hover:text-text-primary px-2 py-0.5 rounded bg-surface border border-surface-border">
                   Refresh
                 </button>
@@ -411,10 +423,11 @@ export default function SessionPanel() {
           )}
 
           {/* Preflight */}
-          <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 4 }}>
+          <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 4 }}
+            role="region" aria-label="Preflight">
             <div className="flex items-center justify-between mb-2">
               <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
-                <Wrench size={13} className="text-phantom-yellow" /> Preflight
+                <Wrench size={13} className="text-phantom-yellow" aria-hidden="true" /> Preflight
               </h2>
             </div>
             <div className="flex gap-1.5 mb-2">
@@ -432,7 +445,7 @@ export default function SessionPanel() {
               </button>
             </div>
             {preflight && (
-              <div className="text-xs">
+              <div className="text-xs" role="status" aria-live="polite">
                 {preflight.ok ? (
                   <div className="flex items-center gap-1.5 text-phantom-green"><CheckCircle2 size={12} /> All tools installed</div>
                 ) : (
@@ -462,10 +475,11 @@ export default function SessionPanel() {
           </div>
 
           {/* Craft Lures */}
-          <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 1 }}>
+          <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 1 }}
+            role="region" aria-label="Craft Lure">
             <div className="flex items-center justify-between mb-2">
               <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
-                <Wand2 size={13} className="text-phantom-magenta" /> Craft Lure
+                <Wand2 size={13} className="text-phantom-magenta" aria-hidden="true" /> Craft Lure
               </h2>
             </div>
             <p className="text-[10px] text-text-dim mb-2">Build the delivery layer: IP grabbers on a link or image YOU choose, zero-click pixels, or a camouflaged beacon link. Paste into a DM / WhatsApp / email, then watch for the target.</p>
@@ -482,6 +496,7 @@ export default function SessionPanel() {
             <div className="space-y-1.5 mb-2">
               <div className="flex gap-1.5">
                 <input type="text" value={craftReelArg} onChange={(e) => setCraftReelArg(e.target.value)}
+                  aria-label="Reel source: link or search term"
                   placeholder="Reel: paste an IG/TikTok/YT link or a search term"
                   className="flex-1 bg-surface border border-surface-border rounded px-2 py-1 text-[10px] font-mono text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-magenta" />
                 <button onClick={() => handleCraft('reel', craftReelArg)} disabled={crafting || !craftReelArg.trim()}
@@ -489,18 +504,25 @@ export default function SessionPanel() {
               </div>
               <div className="flex gap-1.5">
                 <input type="text" value={craftImgArg} onChange={(e) => setCraftImgArg(e.target.value)}
+                  aria-label="Image path or URL for the zero-click pixel"
                   placeholder="Image: local path or URL (zero-click on render)"
                   className="flex-1 bg-surface border border-surface-border rounded px-2 py-1 text-[10px] font-mono text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-magenta" />
                 <button onClick={() => handleCraft('image', craftImgArg)} disabled={crafting || !craftImgArg.trim()}
                   className="px-2.5 py-1 rounded bg-phantom-magenta/20 text-phantom-magenta text-[10px] font-medium disabled:opacity-50">Image</button>
               </div>
             </div>
-            {crafting && <div className="text-[10px] text-text-dim">Crafting...</div>}
+            {crafting && (
+              <div className="text-[10px] text-text-dim" role="status"
+                aria-live="polite">Crafting...</div>
+            )}
             {craftOut && !crafting && (
-              <div className="rounded bg-surface border border-phantom-magenta/40 p-2 space-y-1.5">
+              <div className="rounded bg-surface border border-phantom-magenta/40 p-2 space-y-1.5"
+                role="status" aria-live="polite"
+                aria-label="Crafted lure">
                 <div className="flex items-center justify-between">
                   <span className="text-[10px] font-bold text-phantom-magenta uppercase tracking-wider">READY TO PASTE</span>
                   <button onClick={() => { if (craftOut.url) navigator.clipboard?.writeText(craftOut.url); setCraftMsg('Copied!') }}
+                    aria-label="Copy the lure URL"
                     className="px-1.5 py-0.5 rounded bg-surface-border text-text-secondary text-[9px] hover:text-text-primary">
                     {craftMsg || 'Copy'}
                   </button>
@@ -527,12 +549,15 @@ export default function SessionPanel() {
           </div>
 
           {/* Wordlists */}
-          <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 5 }}>
+          <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 5 }}
+            role="region" aria-label="Wordlists">
             <div className="flex items-center justify-between mb-2">
               <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
-                <BookOpen size={13} className="text-phantom-cyan" /> Wordlists
+                <BookOpen size={13} className="text-phantom-cyan" aria-hidden="true" /> Wordlists
               </h2>
-              <button onClick={handleLoadWordlists} className="text-[10px] text-text-dim hover:text-text-primary px-2 py-0.5 rounded bg-surface border border-surface-border">
+              <button onClick={handleLoadWordlists} aria-expanded={showWordlists}
+                aria-controls="session-wordlists-body"
+                className="text-[10px] text-text-dim hover:text-text-primary px-2 py-0.5 rounded bg-surface border border-surface-border">
                 {showWordlists ? 'Hide' : 'Manage'}
               </button>
             </div>
@@ -540,18 +565,25 @@ export default function SessionPanel() {
               <div className="text-[10px] text-text-dim mb-2">Active: <span className="text-phantom-green font-mono">{session.active_wordlist.split('/').pop()}</span></div>
             )}
             {showWordlists && (
-              <div className="space-y-2 text-xs">
-                <div className="flex gap-1">
+              <div className="space-y-2 text-xs" id="session-wordlists-body">
+                <div className="flex gap-1" role="search">
                   <input type="text" value={wlSearch} onChange={(e) => setWlSearch(e.target.value)} placeholder="Search..."
+                    aria-label="Search wordlists"
                     className="flex-1 bg-surface border border-surface-border rounded px-2 py-1 text-[10px] text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-cyan" />
-                  <button className="px-2 py-1 rounded bg-phantom-cyan/20 text-phantom-cyan text-[10px]"><Search size={11} /></button>
+                  <button aria-label="Search wordlists" className="px-2 py-1 rounded bg-phantom-cyan/20 text-phantom-cyan text-[10px]"><Search size={11} aria-hidden="true" /></button>
                 </div>
-                {wlMsg && <div className={`text-[10px] ${wlMsg.includes('✓') ? 'text-phantom-green' : 'text-phantom-yellow'}`}>{wlMsg}</div>}
-                <div className="max-h-[80px] overflow-auto space-y-0.5">
+                {wlMsg && (
+                  <div className={`text-[10px] ${wlMsg.includes('✓') ? 'text-phantom-green' : 'text-phantom-yellow'}`}
+                    role="status" aria-live="polite">{wlMsg}</div>
+                )}
+                <div className="max-h-[80px] overflow-auto space-y-0.5"
+                  role="list" aria-label="Available wordlists">
                   {wordlists.map((w) => (
-                    <div key={w} className="flex justify-between items-center text-[10px] bg-surface rounded px-2 py-1">
+                    <div key={w} role="listitem"
+                      className="flex justify-between items-center text-[10px] bg-surface rounded px-2 py-1">
                       <span className="text-text-primary truncate">{w}</span>
-                      <button onClick={() => handleUseWordlist(w)} className="text-phantom-cyan hover:text-phantom-magenta ml-1">use</button>
+                      <button onClick={() => handleUseWordlist(w)} aria-label={`Use wordlist ${w}`}
+                        className="text-phantom-cyan hover:text-phantom-magenta ml-1">use</button>
                     </div>
                   ))}
                 </div>
@@ -560,8 +592,10 @@ export default function SessionPanel() {
                   <div className="text-[10px] text-text-dim mb-1">Generate custom</div>
                   <div className="flex gap-1">
                     <input type="text" value={wlPattern} onChange={(e) => setWlPattern(e.target.value)}
+                      aria-label="Wordlist pattern (e.g. aA1)"
                       className="w-12 bg-surface border border-surface-border rounded px-1.5 py-1 text-[10px] font-mono text-text-primary focus:outline-none focus:border-phantom-cyan" />
                     <input type="text" value={wlName} onChange={(e) => setWlName(e.target.value)}
+                      aria-label="Wordlist name"
                       className="flex-1 bg-surface border border-surface-border rounded px-1.5 py-1 text-[10px] text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-cyan" />
                     <button onClick={handleGenerateWordlist}
                       className="px-2 py-1 rounded bg-phantom-green/20 text-phantom-green text-[10px] flex items-center gap-1">
@@ -574,12 +608,14 @@ export default function SessionPanel() {
           </div>
 
           {/* Profiles */}
-          <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 6 }}>
+          <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 6 }}
+            role="region" aria-label="Profiles">
             <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-2 flex items-center gap-1.5">
-              <Save size={13} /> Profiles
+              <Save size={13} aria-hidden="true" /> Profiles
             </h2>
             <div className="flex gap-1.5 mb-2">
               <input type="text" value={profileName} onChange={(e) => setProfileName(e.target.value)} placeholder="profile name"
+                aria-label="Profile name"
                 className="flex-1 bg-surface border border-surface-border rounded px-2 py-1 text-xs text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-cyan" />
               <button onClick={handleSaveProfile}
                 className="px-2.5 py-1 rounded bg-phantom-cyan/20 text-phantom-cyan text-xs hover:bg-phantom-cyan/30">Save</button>
@@ -587,16 +623,18 @@ export default function SessionPanel() {
           </div>
 
           {/* Full Session Save/Load */}
-          <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 7 }}>
+          <div className="bg-surface-card border border-surface-border rounded-lg p-3" style={{ order: 7 }}
+            role="region" aria-label="Session save and load">
             <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-2 flex items-center gap-1.5">
-              <FolderOpen size={13} /> Session Save/Load
+              <FolderOpen size={13} aria-hidden="true" /> Session Save/Load
             </h2>
             <div className="flex gap-1.5">
               <input type="text" value={sessionName} onChange={(e) => setSessionName(e.target.value)} placeholder="session name"
+                aria-label="Session name"
                 className="flex-1 bg-surface border border-surface-border rounded px-2 py-1 text-xs text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-cyan" />
-              <button onClick={handleSaveSession}
+              <button onClick={handleSaveSession} aria-label="Save session"
                 className="px-2.5 py-1 rounded bg-phantom-green/20 text-phantom-green text-xs flex items-center gap-1 hover:bg-phantom-green/30">
-                <Download size={11} /> Save
+                <Download size={11} aria-hidden="true" /> Save
               </button>
             </div>
           </div>
@@ -604,17 +642,20 @@ export default function SessionPanel() {
 
         {/* Right: History + Notes */}
         <div className="flex-1 flex flex-col gap-2 min-w-0">
-          <div className="bg-surface-card border border-surface-border rounded-lg flex-1 flex flex-col min-h-0">
+          <div className="bg-surface-card border border-surface-border rounded-lg flex-1 flex flex-col min-h-0"
+            role="region" aria-label="Session notes">
             <div className="px-3 py-2 border-b border-surface-border">
               <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
-                <StickyNote size={13} /> Notes
+                <StickyNote size={13} aria-hidden="true" /> Notes
               </h2>
             </div>
-            <div className="flex-1 overflow-auto p-2 space-y-1">
+            <div className="flex-1 overflow-auto p-2 space-y-1" role="list"
+              aria-label="Notes" aria-live="polite">
               {session.notes.length === 0 ? (
                 <div className="text-xs text-text-dim p-4 text-center">No notes yet</div>
               ) : session.notes.map((n, i) => (
-                <div key={i} className="text-xs text-text-primary py-1 px-2 rounded bg-surface border border-surface-border">
+                <div key={i} role="listitem"
+                  className="text-xs text-text-primary py-1 px-2 rounded bg-surface border border-surface-border">
                   ✓ {typeof n === 'string' ? n : n?.text ?? String(n)}
                 </div>
               ))}
@@ -622,23 +663,27 @@ export default function SessionPanel() {
             <div className="p-2 border-t border-surface-border flex gap-2">
               <input type="text" value={newNote} onChange={(e) => setNewNote(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleAddNote()} placeholder="Add a note..."
+                aria-label="Add a note"
                 className="flex-1 bg-surface border border-surface-border rounded px-2 py-1 text-xs text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-cyan" />
               <button onClick={handleAddNote}
                 className="px-2.5 py-1 rounded bg-phantom-cyan/20 text-phantom-cyan text-xs hover:bg-phantom-cyan/30">Add</button>
             </div>
           </div>
 
-          <div className="bg-surface-card border border-surface-border rounded-lg h-[160px] flex-shrink-0 flex flex-col">
+          <div className="bg-surface-card border border-surface-border rounded-lg h-[160px] flex-shrink-0 flex flex-col"
+            role="region" aria-label="Command history">
             <div className="px-3 py-2 border-b border-surface-border">
               <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
-                <History size={13} /> Command History
+                <History size={13} aria-hidden="true" /> Command History
               </h2>
             </div>
-            <div className="flex-1 overflow-auto p-2">
+            <div className="flex-1 overflow-auto p-2" role="list"
+              aria-label="Command history">
               {session.history.length === 0 ? (
                 <div className="text-xs text-text-dim p-4 text-center">No commands yet</div>
               ) : session.history.slice(-20).map((h, i) => (
-                <div key={i} className="text-xs font-mono text-text-secondary py-0.5">
+                <div key={i} role="listitem"
+                  className="text-xs font-mono text-text-secondary py-0.5">
                   <span className="text-text-dim mr-2">{String(i + 1).padStart(2)}</span>{h}
                 </div>
               ))}
@@ -651,10 +696,12 @@ export default function SessionPanel() {
 }
 
 function InputGroup({ label, value, onChange, placeholder, onBlur, onEnter }: { label: string; value: string; onChange: (v: string) => void; placeholder: string; onBlur?: () => void; onEnter?: () => void }) {
+  // The label must name the input for assistive tech, not just sit above it.
+  const inputId = `session-input-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
   return (
     <div className={label.length < 6 ? 'flex-1' : ''}>
-      <label className="text-[10px] text-text-dim block mb-1">{label}</label>
-      <input type="text" value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder}
+      <label htmlFor={inputId} className="text-[10px] text-text-dim block mb-1">{label}</label>
+      <input id={inputId} type="text" value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder}
         onBlur={onBlur}
         onKeyDown={(e) => { if (e.key === 'Enter' && onEnter) { onEnter(); (e.target as HTMLInputElement).blur() } }}
         className="w-full bg-surface border border-surface-border rounded px-2.5 py-1.5 text-xs font-mono text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-cyan" />

@@ -16,9 +16,18 @@ in *this* folder is the frozen 1.x one.
 | Document | What it is |
 | --- | --- |
 | [`Phantom.md`](Phantom.md) | Project specification / reference model. |
-| [`ROADMAP.md`](ROADMAP.md) | Consolidated work roadmap. Where it disagrees with an older review, the roadmap (and `master_review.md`) is authoritative. |
+| [`ROADMAP.md`](ROADMAP.md) | Consolidated work roadmap. Where it disagrees with an older review, the roadmap is authoritative (the code wins over both). |
 | [`THREAT_MODEL.md`](THREAT_MODEL.md) | What Phantom defends (the operator and the engagement), from whom, and — explicitly — what it does not defend. |
 | [`beacon_platform_matrix.md`](beacon_platform_matrix.md) | Which beacon features actually build/run per platform (the live contract). |
+| [`AutoModeBenchmark.md`](AutoModeBenchmark.md) | How auto-mode is MEASURED (ground truth scenarios, failure injection, what the numbers do and do not prove) and how to run the suite. |
+| [`service_units.md`](service_units.md) | `--print-service` / `--install-service` / `--uninstall-service`: how a run survives a reboot, and what the install writes, audits and verifies. |
+| [`c2d.md`](c2d.md) | The Go data plane (`c2d/`): what it ports, what stays in Python (answered `501`), and how to run it. |
+
+**Test counts.** Only the repository root [`README.md`](../README.md) states a
+current test count, and it is contract-tested against the tree
+(`tests/test_readme_contract.py`). Any number in a dated document here
+(3.319 / 3.710 / 3.881 / 166 …) is a snapshot of the day it was written —
+never a figure to quote as today's.
 
 ## Audits & reviews (historical, dated)
 
@@ -27,12 +36,14 @@ roadmap or the code before treating a finding as still open.
 
 | Document | Scope | Date |
 | --- | --- | --- |
+| [`Audit_2026-10-13.md`](Audit_2026-10-13.md) | Verification of the 12-Oct review + deep audit of core / C2+beacon / AutoMode / handoff / UI / deps / sessions+reports+.pm / docs. All findings are measured at commit `b8a79eab`. | 2026-10-13 |
+| [`Audit_Fixes_2026-10-13.md`](Audit_Fixes_2026-10-13.md) | **The AFTER document**: each finding of `Audit_2026-10-13.md` mapped to the fix and to the test that fails without it, a second pass that re-reads the audit point by point (what is closed, what was only partial, what is open by nature), the regressions the fixes surfaced, the measured verification numbers, a `.gitignore` hygiene note, the updated grade table, and the list of every file this work created. Where the two disagree, this one wins. | 2026-10-13 |
 | [`BEACON_AUDIT.md`](BEACON_AUDIT.md) | C++ beacon transport, Python C2, payload delivery, operator state. | 2026-08-21 |
 | [`Phantom_dev_audit.md`](Phantom_dev_audit.md) | Security & architecture audit of `dev`. | — |
-| [`master_review.md`](master_review.md) | Master review handoff (authoritative where reviews disagree). | — |
+| [`master_review.md`](master_review.md) | **Reviewer INSTRUCTIONS, not findings** — a handoff prompt written for an external model (what to verify, how to classify it). Its claims are working hypotheses; do not quote them as results. | — |
 | [`REVIEW.md`](REVIEW.md) | Code review & analysis. | 2026-05-05 |
 | [`manus.md`](manus.md) | Deep technical analysis + AutoMode redesign. | — |
-| [`ManusReview.md`](ManusReview.md) | Independent review: architecture, C2, AutoMode, gaps. | — |
+| [`ManusReview.md`](ManusReview.md) | Independent review: architecture, C2, AutoMode, gaps. Point-in-time at commit `b751fe6`; **superseded** where it overlaps by `Audit_2026-10-13.md` (re-prove a finding from it before treating it as open). | 2026-10-05 |
 | [`ManusOpenCode.md`](ManusOpenCode.md) | AutoMode/handoff redesign proposal. | — |
 | [`AutoModeBrief.md`](AutoModeBrief.md) | AutoMode + tool-discovery brief. Its P0/P1 items are now IMPLEMENTED in `phantom/automation/` — read it as the design intent, and check the code/roadmap for current status, not as an open-work list. | 2026-10-05 |
 | [`CROSS_PLATFORM_BUILD_STATUS.md`](CROSS_PLATFORM_BUILD_STATUS.md) | Early cross-platform beacon build snapshot ("166 tests"); superseded by `beacon_platform_matrix.md` and the CI beacon jobs. | — |

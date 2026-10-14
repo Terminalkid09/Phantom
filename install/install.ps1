@@ -3,9 +3,14 @@
 #   irm https://raw.githubusercontent.com/Terminalkid09/Phantom/main/install/install.ps1 | iex
 #
 # What it does:
-#   1. downloads the repository tarball from main (github codeload)
-#   2. verifies the download (size sanity + zip integrity)
-#   3. installs into %LOCALAPPDATA%\Phantom (user scope, no admin)
+#   1. downloads the repository tarball from the BRANCH you chose (github
+#      codeload; `dev` by default — the line these docs describe — override
+#      with $env:PHANTOM_BRANCH = 'main' for the released line)
+#   2. verifies the download (size sanity + zip integrity + the files the
+#      installer is about to rely on)
+#   3. installs into %LOCALAPPDATA%\Phantom (user scope, no admin) — the files
+#      the framework needs, not the whole working tree
+#      (set $env:PHANTOM_FULL_TREE = 1 for the old whole-tree copy)
 #   4. creates a private venv with the pinned python it finds (>=3.10)
 #   5. pip-installs requirements.txt
 #   6. writes launchers: phantom.ps1 / phantom.cmd / phantom.c2.cmd /
@@ -18,9 +23,16 @@
 $ErrorActionPreference = "Stop"
 
 $Repo   = "Terminalkid09/Phantom"
-$Branch = "main"
+$Branch = if ($env:PHANTOM_BRANCH) { $env:PHANTOM_BRANCH } else { "dev" }
 $Dest   = Join-Path $env:LOCALAPPDATA "Phantom"
 $Zip    = Join-Path $env:TEMP "phantom-install.zip"
+$FullTree = ($env:PHANTOM_FULL_TREE -eq "1")
+
+# What a run needs: the package (code + payloads + exploits), the packaging
+# metadata, the requirement list, the licence/readme. Everything else (docs,
+# tests, the Electron app) is the repository, not the product.
+$Keep = @("phantom", "setup.py", "MANIFEST.in", "requirements.txt",
+          "README.md", "LICENSE")
 
 function Say($m)  { Write-Host "  $m" }
 function Step($m) { Write-Host "`n[*] $m" -ForegroundColor Cyan }
@@ -61,15 +73,33 @@ if ((Get-Item $Zip).Length -lt $minSize) {
 }
 
 # ── 3. extract
-Step "Extracting to $Dest"
+Step "Installing to $Dest (branch: $Branch)"
 if (Test-Path $Dest) { Remove-Item -Recurse -Force $Dest }
 Expand-Archive -Path $Zip -DestinationPath $env:TEMP -Force
 $inner = Get-ChildItem $env:TEMP -Directory -Filter "Phantom-$Branch*" |
          Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $inner) { Say "archive layout unexpected — aborting"; exit 1 }
+# the archive must actually contain what this script is about to rely on:
+# "it downloaded" and "it is the right thing" are different claims
+foreach ($needed in @("phantom\main.py", "requirements.txt", "setup.py")) {
+    if (-not (Test-Path (Join-Path $inner.FullName $needed))) {
+        Say "this archive has no $needed — wrong branch ($Branch) or a partial tag?"
+        Say "try: `$env:PHANTOM_BRANCH = 'main'; rerun the installer"
+        exit 1
+    }
+}
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
-# move CONTENTS of Phantom-main/ into $Dest (so %LOCALAPPDATA%\Phantom is the repo root)
-Copy-Item -Path (Join-Path $inner.FullName "*") -Destination $Dest -Recurse -Force
+if ($FullTree) {
+    Say "PHANTOM_FULL_TREE=1: copying the whole tree (old behaviour)"
+    Copy-Item -Path (Join-Path $inner.FullName "*") -Destination $Dest -Recurse -Force
+} else {
+    foreach ($item in $Keep) {
+        $source = Join-Path $inner.FullName $item
+        if (Test-Path $source) {
+            Copy-Item -Path $source -Destination $Dest -Recurse -Force
+        }
+    }
+}
 Remove-Item $inner.FullName -Recurse -Force
 Remove-Item $Zip -Force
 
@@ -108,7 +138,8 @@ if (($userPath -split ";") -notcontains $bin) {
 
 # ── 7. done + next steps
 Write-Host ""
-Write-Host "  [OK] phantom installed (user scope)" -ForegroundColor Green
+Write-Host "  [OK] phantom installed from branch $Branch (user scope)" -ForegroundColor Green
+Write-Host "       $Dest"
 Write-Host ""
 Write-Host "  next steps (open a NEW terminal):"
 Write-Host "    phantom doctor      - what is missing (tools, docker, WSL)"

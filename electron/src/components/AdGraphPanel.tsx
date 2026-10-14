@@ -56,18 +56,21 @@ export default function AdGraphPanel() {
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       <div className="flex items-center gap-2 px-3 py-2 border-b border-white/10">
-        <Network size={14} className="text-cyan-300" />
+        <Network size={14} aria-hidden="true" className="text-cyan-300" />
         <span className="text-xs font-semibold text-text">
           AD Attack Graph {graph.domain ? `— ${graph.domain}` : ''}
         </span>
         <div className="flex-1" />
         <button onClick={() => setShowForm(s => !s)}
+          aria-expanded={showForm}
+          aria-label="Add an AD node"
           className="flex items-center gap-1 text-[10px] px-2 py-1 rounded border border-white/15 hover:bg-white/10">
-          <Plus size={11} /> Add
+          <Plus size={11} aria-hidden="true" /> Add
         </button>
         <button onClick={load} disabled={loading}
+          aria-label="Refresh the AD graph"
           className="flex items-center gap-1 text-[10px] px-2 py-1 rounded border border-white/15 hover:bg-white/10">
-          <RefreshCw size={11} className={loading ? 'animate-spin' : ''} /> Refresh
+          <RefreshCw size={11} aria-hidden="true" className={loading ? 'animate-spin' : ''} /> Refresh
         </button>
       </div>
 
@@ -75,7 +78,7 @@ export default function AdGraphPanel() {
         <div className="px-3 py-2 border-b border-white/10 space-y-2 text-xs">
           <div className="flex gap-2">
             <input value={form.user} onChange={e => setForm(f => ({ ...f, user: e.target.value }))}
-              placeholder="username" className="flex-1 bg-black/40 rounded px-2 py-1 border border-white/10" />
+              placeholder="username" aria-label="username" className="flex-1 bg-black/40 rounded px-2 py-1 border border-white/10" />
             <label className="flex items-center gap-1"><input type="checkbox" checked={form.kerberoastable}
               onChange={e => setForm(f => ({ ...f, kerberoastable: e.target.checked }))} /> kerberoastable</label>
             <label className="flex items-center gap-1"><input type="checkbox" checked={form.as_rep}
@@ -85,21 +88,21 @@ export default function AdGraphPanel() {
           </div>
           <div className="flex gap-2">
             <input value={form.admin_to} onChange={e => setForm(f => ({ ...f, admin_to: e.target.value }))}
-              placeholder="admin_to hosts (comma sep)" className="flex-1 bg-black/40 rounded px-2 py-1 border border-white/10" />
+              placeholder="admin_to hosts (comma sep)" aria-label="admin_to hosts" className="flex-1 bg-black/40 rounded px-2 py-1 border border-white/10" />
             <input value={form.session_on} onChange={e => setForm(f => ({ ...f, session_on: e.target.value }))}
-              placeholder="sessions on hosts" className="flex-1 bg-black/40 rounded px-2 py-1 border border-white/10" />
+              placeholder="sessions on hosts" aria-label="sessions on hosts" className="flex-1 bg-black/40 rounded px-2 py-1 border border-white/10" />
             <input value={form.groups} onChange={e => setForm(f => ({ ...f, groups: e.target.value }))}
-              placeholder="member of groups" className="flex-1 bg-black/40 rounded px-2 py-1 border border-white/10" />
+              placeholder="member of groups" aria-label="member of groups" className="flex-1 bg-black/40 rounded px-2 py-1 border border-white/10" />
           </div>
           <div className="flex gap-2 items-center">
-            <button onClick={submit} className="px-3 py-1 rounded bg-cyan-600/80 hover:bg-cyan-500">Save</button>
-            {msg && <span className="text-[10px] text-text-dim">{msg}</span>}
+            <button onClick={submit} aria-label="Record this AD user" className="px-3 py-1 rounded bg-cyan-600/80 hover:bg-cyan-500">Save</button>
+            {msg && <span role="status" aria-live="polite" className="text-[10px] text-text-dim">{msg}</span>}
           </div>
         </div>
       )}
 
-      <div className="flex-1 overflow-auto p-3 space-y-3 text-xs">
-        {graph.error && <div className="text-red-300">{graph.error}</div>}
+      <div className="flex-1 overflow-auto p-3 space-y-3 text-xs" aria-label="AD attack graph">
+        {graph.error && <div role="alert" className="text-red-300">{graph.error}</div>}
         {graph.nodes.length === 0 && !graph.error && (
           <div className="text-text-dim p-4 text-center">
             No AD data yet. Collect with <code>use ad</code>, an auto-mode run, or add users above —
@@ -111,7 +114,7 @@ export default function AdGraphPanel() {
         {graph.nodes.filter(n => ['dc', 'computer'].includes(n.type)).map(n => (
           <div key={n.id} className={`border rounded p-2 ${TYPE_COLOR[n.type] ?? 'border-white/15'}`}>
             <div className="flex items-center gap-2">
-              {n.type === 'dc' ? <ShieldAlert size={12} /> : null}
+              {n.type === 'dc' ? <ShieldAlert size={12} aria-hidden="true" /> : null}
               <span className="font-semibold">{n.id}</span>
               <span className="text-[10px] uppercase opacity-60">{n.type}</span>
             </div>

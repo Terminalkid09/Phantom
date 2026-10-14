@@ -117,7 +117,8 @@ export default function C2Dashboard() {
         </div>
         <div className="flex items-center gap-2">
           <span className={`w-2 h-2 rounded-full ${c2Connected ? 'bg-phantom-green' : 'bg-phantom-error'}`} />
-          <span className="text-xs text-text-secondary">
+          <span className="text-xs text-text-secondary" role="status"
+            aria-live="polite">
             {c2Connected ? 'API connected' : 'API disconnected'}
           </span>
           {!c2Connected && c2Error && (
@@ -180,8 +181,9 @@ export default function C2Dashboard() {
               <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
                 <Monitor size={13} className="text-phantom-cyan" /> Beacons
               </h2>
-              <button onClick={pollC2} className="text-text-dim hover:text-text-primary transition-colors">
-                <RefreshCw size={13} />
+              <button onClick={pollC2} aria-label="Refresh beacon list"
+                className="text-text-dim hover:text-text-primary transition-colors">
+                <RefreshCw size={13} aria-hidden="true" />
               </button>
             </div>
             <div className="overflow-auto flex-1">
@@ -276,7 +278,16 @@ function BeaconRow({
 }) {
   return (
     <div
+      role="button"
+      tabIndex={0}
+      aria-label={`Interact with beacon ${beacon.id.slice(0, 12)}`}
       onClick={onInteract}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onInteract()
+        }
+      }}
       className={`px-3 py-2 border-b border-surface-border cursor-pointer transition-colors
         ${isActive ? 'bg-phantom-magenta/10 border-l-2 border-l-phantom-magenta' : 'hover:bg-surface-hover border-l-2 border-l-transparent'}`}
     >
@@ -301,8 +312,9 @@ function BeaconRow({
             onClick={(e) => { e.stopPropagation(); onKill() }}
             className="text-text-dim hover:text-phantom-error transition-colors p-0.5"
             title="Kill beacon"
+            aria-label="Kill beacon"
           >
-            <X size={12} />
+            <X size={12} aria-hidden="true" />
           </button>
           <ChevronRight size={12} className="text-text-dim" />
         </div>
@@ -415,9 +427,11 @@ function InteractPanel({
         </div>
       </div>
 
-      <div className="flex border-b border-surface-border">
+      <div className="flex border-b border-surface-border" role="tablist"
+        aria-label="Beacon view">
         {(['tasks', 'results', 'remote'] as const).map((t) => (
-          <button key={t} onClick={() => setInteractView(t as 'tasks' | 'results' | 'remote')}
+          <button key={t} role="tab" aria-selected={interactView === t}
+            onClick={() => setInteractView(t as 'tasks' | 'results' | 'remote')}
             className={`px-3 py-1.5 text-xs font-medium border-b-2 transition-colors
               ${interactView === t ? 'border-phantom-magenta text-phantom-magenta' : 'border-transparent text-text-secondary hover:text-text-primary'}`}>
             {t === 'tasks' ? 'Tasks' : t === 'results' ? 'Results' : 'Remote'}
@@ -443,7 +457,8 @@ function InteractPanel({
           </div>
         </div>
         {healthText && (
-          <pre className="mt-1.5 text-[10px] font-mono text-text-secondary whitespace-pre-wrap bg-surface rounded p-2 border border-surface-border">
+          <pre role="status" aria-live="polite"
+            className="mt-1.5 text-[10px] font-mono text-text-secondary whitespace-pre-wrap bg-surface rounded p-2 border border-surface-border">
             {healthText}
           </pre>
         )}
@@ -461,10 +476,10 @@ function InteractPanel({
             ) : (
               <table className="w-full text-xs">
                 <thead><tr className="text-text-dim border-b border-surface-border">
-                  <th className="text-left py-1.5 px-2 w-8">#</th>
-                  <th className="text-left py-1.5 px-2">Command</th>
-                  <th className="text-center py-1.5 px-2 w-16">Status</th>
-                  <th className="text-left py-1.5 px-2">Result</th>
+                  <th scope="col" className="text-left py-1.5 px-2 w-8">#</th>
+                  <th scope="col" className="text-left py-1.5 px-2">Command</th>
+                  <th scope="col" className="text-center py-1.5 px-2 w-16">Status</th>
+                  <th scope="col" className="text-left py-1.5 px-2">Result</th>
                 </tr></thead>
                 <tbody>
                   {[...tasks].reverse().map((task, ri) => (
@@ -490,6 +505,7 @@ function InteractPanel({
             <div className="flex gap-2">
               <input
                 type="text" value={taskInput}
+                aria-label="Beacon task command"
                 onChange={(e) => onTaskInput(e.target.value)}
                 onBlur={() => setTimeout(() => setShowSuggests(false), 150)}
                 onKeyDown={(e) => {
@@ -577,11 +593,14 @@ function MediaStrip({ api, beaconId, compact }: {
 
       {viewing && (
         <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-8"
+          role="dialog" aria-modal="true"
+          aria-label={`Captured media: ${viewing.name}`}
           onClick={() => setViewing(null)}>
           <div className="max-w-[90vw] max-h-[90vh] flex flex-col gap-2" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between">
               <span className="text-xs font-mono text-text-primary">{viewing.name}</span>
-              <button onClick={() => setViewing(null)} className="text-text-dim hover:text-text-primary"><X size={16} /></button>
+              <button onClick={() => setViewing(null)} aria-label="Close viewer"
+                className="text-text-dim hover:text-text-primary"><X size={16} /></button>
             </div>
             <img src={`data:${viewing.media};base64,${viewing.data}`}
               className="max-w-[90vw] max-h-[80vh] object-contain rounded border border-surface-border" alt={viewing.name} />
@@ -646,16 +665,18 @@ function SleepControl({ onApply }: { onApply: (ms: string, jitter: string) => vo
   return (
     <div className="flex items-center gap-1">
       <input value={ms} onChange={(e) => setMs(e.target.value)} placeholder="ms"
+        aria-label="Sleep interval in milliseconds"
         className="w-14 bg-surface border border-surface-border rounded px-1.5 py-1
           text-[10px] font-mono text-text-primary focus:outline-none focus:border-phantom-cyan" />
       <input value={jitter} onChange={(e) => setJitter(e.target.value)} placeholder="%"
+        aria-label="Jitter percent"
         className="w-10 bg-surface border border-surface-border rounded px-1.5 py-1
           text-[10px] font-mono text-text-primary focus:outline-none focus:border-phantom-cyan" />
       <button onClick={() => { onApply(ms, jitter); setOpen(false) }}
         className="px-2 py-1 rounded bg-phantom-cyan/25 text-phantom-cyan text-[10px] hover:bg-phantom-cyan/35">
         apply
       </button>
-      <button onClick={() => setOpen(false)}
+      <button onClick={() => setOpen(false)} aria-label="Cancel sleep change"
         className="px-1.5 py-1 text-text-dim hover:text-text-primary text-[10px]">✕</button>
     </div>
   )
@@ -780,7 +801,10 @@ function BeaconAuthPanel({ api }: { api: ReturnType<typeof useApi>['api'] }) {
           <Key size={17} className="text-phantom-yellow" />
           <h2 className="text-sm font-bold text-text-primary">Beacon Authentication</h2>
         </div>
-        <button onClick={load} className="text-text-dim hover:text-text-primary"><RefreshCw size={13} /></button>
+        <button onClick={load} aria-label="Refresh beacon identities"
+          className="text-text-dim hover:text-text-primary">
+          <RefreshCw size={13} aria-hidden="true" />
+        </button>
       </div>
       <p className="text-xs text-text-dim -mt-2">Per-beacon HMAC identity keys — only authenticated beacons can communicate with the C2.</p>
 
@@ -850,7 +874,10 @@ function CertsPanel({ api }: { api: ReturnType<typeof useApi>['api'] }) {
           <FileLock size={17} className="text-phantom-magenta" />
           <h2 className="text-sm font-bold text-text-primary">TLS Certificates</h2>
         </div>
-        <button onClick={load} className="text-text-dim hover:text-text-primary"><RefreshCw size={13} /></button>
+        <button onClick={load} aria-label="Refresh certificate status"
+          className="text-text-dim hover:text-text-primary">
+          <RefreshCw size={13} aria-hidden="true" />
+        </button>
       </div>
       <p className="text-xs text-text-dim -mt-2">Auto-generated server.crt + server.key for HTTPS/mTLS. Rotated on listener start if missing.</p>
 
@@ -922,11 +949,15 @@ function BeaconHelpPanel({ api }: { api: ReturnType<typeof useApi>['api'] }) {
           <HelpCircle size={17} className="text-phantom-cyan" />
           <h2 className="text-sm font-bold text-text-primary">Beacon Commands</h2>
         </div>
-        <button onClick={load} className="text-text-dim hover:text-text-primary"><RefreshCw size={13} /></button>
+        <button onClick={load} aria-label="Reload beacon commands"
+          className="text-text-dim hover:text-text-primary">
+          <RefreshCw size={13} aria-hidden="true" />
+        </button>
       </div>
       <p className="text-xs text-text-dim -mt-2">All commands supported by the cross-platform beacon agent. Queue them via the Interact panel — the task input also autocompletes while you type.</p>
 
       <input value={filter} onChange={(e) => setFilter(e.target.value)}
+        aria-label="Filter beacon commands"
         placeholder="filter commands…"
         className="bg-surface border border-surface-border rounded px-3 py-1.5 text-xs font-mono text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-cyan" />
 
@@ -938,9 +969,9 @@ function BeaconHelpPanel({ api }: { api: ReturnType<typeof useApi>['api'] }) {
         ) : (
           <table className="w-full text-xs">
             <thead><tr className="text-text-dim border-b border-surface-border">
-              <th className="text-left py-1.5 px-3">Command</th>
-              <th className="text-left py-1.5 px-3">Description</th>
-              <th className="text-left py-1.5 px-3 w-20">Platform</th>
+              <th scope="col" className="text-left py-1.5 px-3">Command</th>
+              <th scope="col" className="text-left py-1.5 px-3">Description</th>
+              <th scope="col" className="text-left py-1.5 px-3 w-20">Platform</th>
             </tr></thead>
             <tbody>
               {filtered.map((cmd) => (

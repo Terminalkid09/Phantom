@@ -95,6 +95,7 @@ class ToolDriver:
     requires_service: Tuple[str, ...] = ()
     source_path: str = ""
     digest: str = ""                     # sha256 of the manifest (provenance)
+    binary_sha256: str = ""               # optional PIN of the declared binary
 
 
 def _as_float(value: Any, default: float) -> float:
@@ -127,6 +128,23 @@ def _as_str_tuple(value: Any) -> Tuple[str, ...]:
 def _norm_binary(name: Any) -> str:
     base = os.path.basename(str(name or "").strip()).lower()
     return base[:-4] if base.endswith(".exe") else base
+
+
+def _norm_sha256(value: Any) -> Optional[str]:
+    """A declared binary pin: "" when absent, ``None`` when MALFORMED.
+
+    The distinction is load-bearing. An unreadable pin must never be dropped
+    silently, because dropping it turns a CHECKED driver into an unchecked
+    one while the manifest still claims to be pinned. Callers refuse the
+    manifest on ``None``.
+    """
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    text = text.replace(":", "").replace(" ", "").removeprefix("sha256-")
+    if len(text) != 64 or any(c not in "0123456789abcdef" for c in text):
+        return None
+    return text
 
 
 def _binary_matches(tool: str, command: str, argv: Tuple[str, ...]) -> bool:
@@ -188,6 +206,10 @@ def parse_driver(data: Any, source_path: str = "") -> Optional[ToolDriver]:
     # allowlist: the executable must be the declared tool
     if not _binary_matches(tool, command, argv):
         return None
+    # a malformed pin is fatal (see _norm_sha256): never silently unpin
+    binary_sha256 = _norm_sha256(data.get("binary_sha256"))
+    if binary_sha256 is None:
+        return None
 
     markers: List[Dict[str, Any]] = []
     raw_markers = data.get("markers") or []
@@ -240,6 +262,7 @@ def parse_driver(data: Any, source_path: str = "") -> Optional[ToolDriver]:
         requires_service=_as_str_tuple(data.get("requires_service")),
         source_path=source_path,
         digest=_manifest_digest(data),
+        binary_sha256=binary_sha256,
     )
 
 
@@ -517,5 +540,6 @@ def driver_summary() -> List[Dict[str, Any]]:
             "effects": list(drv.effects), "source": drv.source_path,
             "approved": drv.id in approved,
             "digest": drv.digest[:12],
+            "pinned": bool(drv.binary_sha256),
         })
     return out

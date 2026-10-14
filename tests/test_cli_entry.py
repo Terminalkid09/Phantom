@@ -38,6 +38,22 @@ def test_auto_flag_still_opens_auto_mode(monkeypatch):
     assert _run(monkeypatch, ["phantom", "--auto"]) == {"auto": True}
 
 
+def test_an_abbreviated_flag_is_refused_not_guessed(monkeypatch):
+    """`--agent` used to be accepted as a PREFIX of `--agents`.
+
+    With no value that means the default, so the typo changed nothing and said
+    nothing — the exact failure mode this entry point was fixed for. A prefix
+    is now as unknown as any other option it does not have.
+    """
+    monkeypatch.setattr(sys, "argv",
+                        ["phantom", "--auto", "10.0.0.5", "--agent"])
+    monkeypatch.setattr("phantom.core.automode.run_auto_mode",
+                        lambda **kwargs: None)
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2
+
+
 def test_c2_flag_is_unaffected(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["phantom", "--c2"])
     opened = {}

@@ -1,5 +1,14 @@
 # Phantom `dev` — Master Review Handoff for DeepSeek / GLM
 
+> **Questo documento sono ISTRUZIONI, non finding (nota aggiunta il
+> 2026-10-13).** È l'handoff scritto per un revisore esterno: dice cosa
+> verificare, come classificarlo e quali domande restano aperte. Le sue
+> affermazioni sono contesto e ipotesi di lavoro, **non risultati**; l'indice
+> lo classificava prima come "authoritative where reviews disagree", che
+> scambiava un prompt per una fonte normativa. Le fonti di stato restano
+> [`Audit_2026-10-13.md`](Audit_2026-10-13.md) (misurato),
+> [`ROADMAP.md`](ROADMAP.md) (lavoro vivo) e il codice.
+
 ## Obiettivo
 
 Eseguire una review indipendente, completa e tecnicamente verificabile del repository `Terminalkid09/Phantom`, branch `dev`.

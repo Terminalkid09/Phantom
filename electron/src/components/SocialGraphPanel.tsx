@@ -177,16 +177,19 @@ export default function SocialGraphPanel() {
         )}
         <div className="flex-1" />
         <button onClick={exportGraphml} disabled={!payload?.graphml}
+          aria-label="Download the identity graph as GraphML"
           className="flex items-center gap-1 text-[10px] px-2 py-1 rounded border border-white/15 hover:bg-white/10 disabled:opacity-40">
-          <Download size={11} /> GraphML
+          <Download size={11} aria-hidden="true" /> GraphML
         </button>
         <button onClick={load} disabled={loading}
+          aria-label="Refresh the identity graph"
+          aria-busy={loading}
           className="flex items-center gap-1 text-[10px] px-2 py-1 rounded border border-white/15 hover:bg-white/10">
-          <RefreshCw size={11} className={loading ? 'animate-spin' : ''} /> Refresh
+          <RefreshCw size={11} aria-hidden="true" className={loading ? 'animate-spin' : ''} /> Refresh
         </button>
       </div>
 
-      <div className="flex-1 overflow-auto p-3 space-y-3">
+      <div className="flex-1 overflow-auto p-3 space-y-3" role="region" aria-label="Identity graph contents">
         {(stats?.same_person_groups.length ?? 0) > 0 && (
           <section className="rounded border border-emerald-500/30 bg-emerald-500/5 p-2">
             <div className="flex items-center gap-1 text-[11px] text-emerald-200">
@@ -220,6 +223,7 @@ export default function SocialGraphPanel() {
             <div className="flex flex-wrap gap-1">
               {group.map(node => (
                 <button key={node.id} onClick={() => setSelected(node.id)}
+                  aria-pressed={selected === node.id}
                   className={`text-[10px] font-mono px-2 py-1 rounded border hover:bg-white/10 ${KIND_STYLE[node.kind] ?? 'border-white/20 text-text'} ${selected === node.id ? 'ring-1 ring-cyan-400' : ''}`}
                   title={`${node.id}\nconfidence ${node.confidence}\nsources: ${node.sources.join(', ')}`}>
                   {node.label || node.id}
@@ -293,6 +297,7 @@ export default function SocialGraphPanel() {
           </div>
           <div className="flex items-center gap-2">
             <input value={address} onChange={e => setAddress(e.target.value)}
+              aria-label="Email address to check for account existence"
               placeholder="address to check"
               className="text-[11px] px-2 py-1 rounded bg-black/30 border border-white/15 flex-1 font-mono" />
             <button onClick={askPlan} disabled={!address.includes('@')}
@@ -303,7 +308,7 @@ export default function SocialGraphPanel() {
           {masked && <div className="text-[10px] text-text-dim">target: {masked}</div>}
           {plan && (
             <>
-              <ul className="space-y-0.5 max-h-40 overflow-auto">
+              <ul className="space-y-0.5 max-h-40 overflow-auto" aria-live="polite" aria-label="Services that would be asked">
                 {plan.map(row => (
                   <li key={row.service} className="text-[10px] font-mono text-text-dim">
                     <span className="text-text-secondary">{row.service}</span> {row.url}
@@ -327,7 +332,7 @@ export default function SocialGraphPanel() {
             </>
           )}
           {verdicts && (
-            <ul className="space-y-0.5">
+            <ul className="space-y-0.5" aria-live="polite" aria-label="Account existence verdicts">
               {verdicts.map((v, i) => (
                 <li key={i} className="text-[10px] font-mono">
                   <span className="text-text-secondary">{v.service}</span>{' '}
@@ -341,8 +346,9 @@ export default function SocialGraphPanel() {
             </ul>
           )}
           {msg && (
-            <p className="text-[10px] text-text-dim flex items-center gap-1">
-              <HelpCircle size={10} /> {msg}
+            <p className="text-[10px] text-text-dim flex items-center gap-1" role="status"
+              aria-live="polite">
+              <HelpCircle size={10} aria-hidden="true" /> {msg}
             </p>
           )}
         </section>

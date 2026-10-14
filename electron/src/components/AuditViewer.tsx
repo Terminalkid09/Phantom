@@ -67,8 +67,9 @@ export default function AuditViewer({ standalone }: { standalone?: boolean }) {
 
   if (!data) {
     return (
-      <div className="h-full flex flex-col items-center justify-center text-text-dim">
-        <ScrollText size={30} className="mb-2" />
+      <div className="h-full flex flex-col items-center justify-center text-text-dim"
+        role="status" aria-live="polite" aria-label="C2 audit log status">
+        <ScrollText size={30} className="mb-2" aria-hidden="true" />
         {error ? (
           <>
             <p className="text-xs text-phantom-error">Audit log unavailable — {error}</p>
@@ -87,7 +88,8 @@ export default function AuditViewer({ standalone }: { standalone?: boolean }) {
   }
 
   return (
-    <div className={`flex flex-col h-full ${standalone ? 'p-4' : ''}`}>
+    <div className={`flex flex-col h-full ${standalone ? 'p-4' : ''}`}
+      role="region" aria-label="C2 Audit Log">
       {standalone && (
         <div className="flex items-center justify-between mb-3">
           <h1 className="text-lg font-bold text-text-primary flex items-center gap-2">
@@ -97,13 +99,15 @@ export default function AuditViewer({ standalone }: { standalone?: boolean }) {
             <select
               value={tail}
               onChange={(e) => setTail(Number(e.target.value))}
+              aria-label="How many audit records to load"
               className="bg-surface border border-surface-border rounded px-2 py-1.5 text-xs text-text-secondary"
             >
               {[50, 100, 250, 500].map((n) => (
                 <option key={n} value={n}>last {n}</option>
               ))}
             </select>
-            <button onClick={load} className="p-2 rounded text-text-secondary hover:text-text-primary hover:bg-surface-hover">
+            <button onClick={load} aria-label="Refresh audit log"
+              className="p-2 rounded text-text-secondary hover:text-text-primary hover:bg-surface-hover">
               <RefreshCw size={14} />
             </button>
           </div>
@@ -114,7 +118,8 @@ export default function AuditViewer({ standalone }: { standalone?: boolean }) {
       <div className={`flex items-center gap-3 px-3 py-2.5 rounded-lg border mb-3 flex-shrink-0
         ${data.verified
           ? 'bg-phantom-green/10 border-phantom-green/30'
-          : 'bg-phantom-red/10 border-phantom-red/40'}`}>
+          : 'bg-phantom-red/10 border-phantom-red/40'}`}
+        role="status" aria-live="polite" aria-label="Hash-chain verdict">
         {data.verified ? (
           <ShieldCheck size={18} className="text-phantom-green flex-shrink-0" />
         ) : (
@@ -139,10 +144,11 @@ export default function AuditViewer({ standalone }: { standalone?: boolean }) {
       </div>
 
       {/* Record feed */}
-      <div className="flex-1 min-h-0 overflow-auto bg-surface-card border border-surface-border rounded-lg">
+      <div className="flex-1 min-h-0 overflow-auto bg-surface-card border border-surface-border rounded-lg"
+        role="log" aria-live="polite" aria-label="Audit records, newest first">
         {data.entries.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-text-dim">
-            <Activity size={26} className="mb-2" />
+            <Activity size={26} className="mb-2" aria-hidden="true" />
             <p className="text-xs">No audit records yet.</p>
             <p className="text-[10px] mt-1">Start the C2 listener — registrations, tasks and results appear here.</p>
           </div>

@@ -29,8 +29,13 @@ transit. Legacy plaintext bundles are still read for backwards
 compatibility.
 
 The format is gzipped JSON (inside the AES-GCM envelope) with a magic
-marker so a corrupted or foreign file is rejected cleanly instead of
-misparsed.
+marker AND a format version, so a corrupted or foreign file — or one
+written by a NEWER build, whose fields this one may not understand — is
+rejected cleanly instead of being read half-way (`check_version`), just
+like the auto-mode checkpoint refuses a schema mismatch. Plaintext
+bundles written before the version field existed are version 1. A file
+from a future version is REFUSED with both numbers rather than parsed
+best-effort.
 """
 
 from __future__ import annotations
@@ -161,26 +166,63 @@ def latest_checkpoint(root: Optional[str] = None,
     return best
 
 
-def _report_index(root: Optional[str] = None) -> List[Dict[str, str]]:
-    root = root or _sessions_root()
+#: Directory prefixes that hold a MANUAL report set under data/reports/
+#: (`report <target>` runs and `/export all` engagements).
+_MANUAL_REPORT_PREFIXES = ("report_", "engagement_")
+
+
+def _reports_root() -> str:
+    """`data/reports/` — where the MANUAL report generator writes."""
+    from phantom.utils.paths import reports_dir
+    return reports_dir()
+
+
+def _index_report_dir(full: str, name: str,
+                      prefix: str = "") -> List[Dict[str, str]]:
+    """Every report file in ONE run/report directory."""
     out: List[Dict[str, str]] = []
     try:
-        names = sorted(os.listdir(root))
+        files = sorted(os.listdir(full))
+    except OSError:
+        return out
+    for f in files:
+        if f.endswith((".md", ".json", ".html")):
+            out.append({"dir": f"{prefix}{name}", "file": f,
+                        "path": os.path.join(full, f)})
+    return out
+
+
+def _report_index(root: Optional[str] = None) -> List[Dict[str, str]]:
+    """Every report artifact this engagement left, auto-mode AND manual.
+
+    The index used to walk only `auto_*`/`agent_*` under `data/sessions/`,
+    so an engagement whose reports came from the MANUAL generator
+    (`report` / `export all` → `data/reports/report_*`, `engagement_*`)
+    travelled as a bundle with an empty index — the artifacts the operator
+    most often wants to hand over were the ones it did not mention (audit
+    §6.5.5). Both trees are indexed now; the manual entries are tagged with
+    a `reports/` prefix so a reader can tell them apart from the run dirs.
+    """
+    out: List[Dict[str, str]] = []
+    sessions = root or _sessions_root()
+    try:
+        names = sorted(os.listdir(sessions))
+    except OSError:
+        names = []
+    for n in names:
+        full = os.path.join(sessions, n)
+        if os.path.isdir(full) and (n.startswith("auto_")
+                                    or n.startswith("agent_")):
+            out.extend(_index_report_dir(full, n))
+    reports = _reports_root()
+    try:
+        names = sorted(os.listdir(reports))
     except OSError:
         return out
     for n in names:
-        full = os.path.join(root, n)
-        if not os.path.isdir(full):
-            continue
-        if not (n.startswith("auto_") or n.startswith("agent_")):
-            continue
-        try:
-            files = sorted(os.listdir(full))
-        except OSError:
-            continue
-        for f in files:
-            if f.endswith((".md", ".json", ".html")):
-                out.append({"dir": n, "file": f, "path": os.path.join(full, f)})
+        full = os.path.join(reports, n)
+        if os.path.isdir(full) and n.startswith(_MANUAL_REPORT_PREFIXES):
+            out.extend(_index_report_dir(full, n, prefix="reports/"))
     return out
 
 
@@ -355,9 +397,48 @@ def _atomic_gzip_write(path: str, raw: bytes) -> None:
         raise
 
 
+def check_version(version: Any, *, where: str = "bundle") -> int:
+    """Validate a bundle's format version. Returns the number it means.
+
+    `_VERSION` used to be WRITTEN and never read: `read_bundle` checked the
+    magic marker and `enc` and nothing else, so a bundle from a future build
+    was parsed best-effort. That is the one failure a version field exists to
+    prevent — a newer writer can have renamed or reshaped a field, and silently
+    reading it half-way produces a session that looks restored and is wrong.
+
+    Three cases, all explicit:
+
+    * absent — a bundle written before the field existed is version 1;
+    * not a positive integer — malformed, refuse;
+    * GREATER than `_VERSION` — refuse with the numbers, because there is no
+      honest way to read a format this build does not know (the checkpoint gate
+      in `utils/auto_resume` already refuses a schema mismatch the same way).
+    """
+    if version is None:
+        return 1
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ValueError(
+            f"not a valid .pm {where}: version {version!r} is not a number")
+    if version < 1:
+        raise ValueError(
+            f"not a valid .pm {where}: version {version} is not a format this "
+            f"build knows")
+    if version > _VERSION:
+        raise ValueError(
+            f"this .pm needs a NEWER Phantom: the {where} says format "
+            f"version {version}, this build reads up to {_VERSION}. Update "
+            f"Phantom on this machine, or open the bundle where it was "
+            f"written — reading a newer format half-way would restore a "
+            f"session that looks complete and is not")
+    return version
+
+
 def read_bundle(path: str) -> Dict[str, Any]:
     """Parse + validate a .pm file. Raises ValueError on foreign/corrupt.
-    Handles both encrypted (v2) and legacy plaintext (v1) bundles."""
+
+    Handles both the encrypted envelope and legacy plaintext bundles, and
+    GATES ON THE VERSION in both (see `check_version`).
+    """
     path = os.path.abspath(path)
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
@@ -368,8 +449,13 @@ def read_bundle(path: str) -> Dict[str, Any]:
         raise ValueError(f"not a valid .pm bundle ({e})") from e
     if not isinstance(data, dict) or data.get("magic") != _MAGIC:
         raise ValueError("not a Phantom .pm bundle (magic marker missing)")
+    check_version(data.get("version"), where="bundle")
     if data.get("enc") == 1:
-        return _decrypt_payload(data.get("payload", ""))
+        payload = _decrypt_payload(data.get("payload", ""))
+        # The envelope and the inner payload are written by the same build,
+        # so a disagreement means one of them was edited: check both.
+        check_version(payload.get("version"), where="payload")
+        return payload
     return data
 
 

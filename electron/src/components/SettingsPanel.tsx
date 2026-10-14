@@ -156,8 +156,10 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
           </h2>
           <div className="space-y-2.5">
             <div>
-              <label className="text-[10px] text-text-dim block mb-1">Type</label>
+              <label htmlFor="settings-backend-type" className="text-[10px] text-text-dim block mb-1">Type</label>
               <select
+                id="settings-backend-type"
+                aria-label="Backend type"
                 value={settings.backend_type}
                 onChange={(e) => setSettings({ backend_type: e.target.value as typeof settings.backend_type })}
                 className="w-full bg-surface border border-surface-border rounded px-2.5 py-1.5
@@ -231,8 +233,8 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
                   : 'all on'}
               </span>
             )}
-          </div>
-          <button onClick={loadGuardrails}
+          </div>            <button onClick={loadGuardrails}
+            aria-label="Reload the guardrail manifest"
             className="text-[10px] text-text-dim hover:text-phantom-cyan mb-2">
             Refresh
           </button>
@@ -268,6 +270,8 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
                   {toggleable ? (
                     <button
                       onClick={() => toggleGuardrail(g.key, !g.enabled)}
+                      aria-pressed={g.enabled}
+                      aria-label={`${g.label} guardrail: ${g.enabled ? 'enabled' : 'disabled'} — activate to ${g.enabled ? 'disable' : 'enable'} it`}
                       className={`shrink-0 px-3 py-1 rounded text-xs font-medium transition-colors
                         ${g.enabled
                           ? 'bg-phantom-green/20 text-phantom-green hover:bg-phantom-green/30'
@@ -322,6 +326,8 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
               </div>
               <button
                 onClick={handleToggleMtls}
+                aria-pressed={listener.mtls}
+                aria-label={`Mutual TLS: ${listener.mtls ? 'enabled' : 'disabled'} — activate to ${listener.mtls ? 'disable' : 'enable'} it`}
                 className={`px-3 py-1 rounded text-xs font-medium transition-colors
                   ${listener.mtls
                     ? 'bg-phantom-green/20 text-phantom-green hover:bg-phantom-green/30'
@@ -347,7 +353,7 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
                     bg-phantom-yellow/20 text-phantom-yellow hover:bg-phantom-yellow/30
                     transition-colors"
                 >
-                  <RotateCw size={11} /> Rotate
+                  <RotateCw size={11} aria-hidden="true" /> Rotate
                 </button>
               </div>
               {apiToken && (
@@ -356,8 +362,12 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
                   <span className="text-xs font-mono text-text-primary flex-1 truncate">
                     {showToken ? apiToken : '●●●●●●●●●●●●●●●●●●●●'}
                   </span>
-                  <button onClick={() => setShowToken(!showToken)} className="text-text-dim hover:text-text-primary">
-                    {showToken ? <EyeOff size={13} /> : <Eye size={13} />}
+                  <button
+                    onClick={() => setShowToken(!showToken)}
+                    aria-pressed={showToken}
+                    aria-label={showToken ? 'Hide the API token' : 'Reveal the API token'}
+                    className="text-text-dim hover:text-text-primary">
+                    {showToken ? <EyeOff size={13} aria-hidden="true" /> : <Eye size={13} aria-hidden="true" />}
                   </button>
                 </div>
               )}
@@ -414,6 +424,7 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
                 <div className="flex gap-2 mt-1.5">
                   <input
                     type="password"
+                    aria-label={`${info.label} API key`}
                     value={keyDrafts[name] ?? ''}
                     onChange={(e) => setKeyDrafts((s) => ({ ...s, [name]: e.target.value }))}
                     placeholder={info.env}
@@ -461,6 +472,8 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
             </div>
             <button
               onClick={toggleSaveRecordings}
+              aria-pressed={settings.save_recordings_to_disk}
+              aria-label={`Save recordings to disk: ${settings.save_recordings_to_disk ? 'enabled' : 'disabled'} — activate to ${settings.save_recordings_to_disk ? 'disable' : 'enable'} it`}
               className={`px-3 py-1 rounded text-xs font-medium transition-colors
                 ${settings.save_recordings_to_disk
                   ? 'bg-phantom-green/20 text-phantom-green hover:bg-phantom-green/30'
@@ -508,10 +521,14 @@ function InputGroup({
   onChange: (v: string) => void
   placeholder: string
 }) {
+  // `htmlFor` needs a stable id: label text is unique within the panel, so a
+  // slug of it is enough (and readable in the accessibility tree).
+  const inputId = `settings-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
   return (
     <div className={label.length < 6 ? 'flex-1' : ''}>
-      <label className="text-[10px] text-text-dim block mb-1">{label}</label>
+      <label htmlFor={inputId} className="text-[10px] text-text-dim block mb-1">{label}</label>
       <input
+        id={inputId}
         type="text"
         value={value}
         onChange={(e) => onChange(e.target.value)}

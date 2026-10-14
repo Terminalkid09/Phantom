@@ -72,12 +72,15 @@ export default function LlmProposals() {
   const pending = proposals.filter(p => p.state === 'pending').length
 
   return (
-    <div className="bg-surface-card border border-surface-border rounded-lg p-3">
+    <div className="bg-surface-card border border-surface-border rounded-lg p-3"
+      role="region" aria-label="Model proposals">
       <button onClick={() => setOpen(!open)}
+        aria-expanded={open} aria-controls="llm-proposals-body"
+        aria-label={`Model proposals (${open ? 'collapse' : 'expand'})`}
         className="w-full flex items-center gap-1.5 text-xs font-semibold text-text-secondary
           uppercase tracking-wider hover:text-text-primary">
-        {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-        <Brain size={13} className="text-phantom-magenta" />
+        {open ? <ChevronDown size={13} aria-hidden="true" /> : <ChevronRight size={13} aria-hidden="true" />}
+        <Brain size={13} className="text-phantom-magenta" aria-hidden="true" />
         Model proposals
         {pending > 0 && (
           <span className="ml-1 px-1.5 py-0.5 rounded text-[9px] normal-case
@@ -91,11 +94,14 @@ export default function LlmProposals() {
       </button>
 
       {open && (
-        <div className="mt-2 space-y-2">
+        <div className="mt-2 space-y-2" id="llm-proposals-body">
           <div className="flex items-center gap-2">
-            <div className="flex rounded border border-surface-border overflow-hidden">
+            <div className="flex rounded border border-surface-border overflow-hidden"
+              role="tablist" aria-label="Proposal queue or model reasoning">
               {(['proposals', 'journal'] as const).map(t => (
                 <button key={t} onClick={() => { setTab(t); load() }}
+                  role="tab" aria-selected={tab === t}
+                  aria-label={t === 'proposals' ? 'Proposal queue' : 'Model reasoning journal'}
                   className={`px-2 py-0.5 text-[10px] ${tab === t
                     ? 'bg-phantom-magenta/20 text-phantom-magenta'
                     : 'text-text-dim hover:bg-surface-hover'}`}>
@@ -103,9 +109,9 @@ export default function LlmProposals() {
                 </button>
               ))}
             </div>
-            <button onClick={load}
+            <button onClick={load} aria-label="Refresh proposals and journal"
               className="text-[10px] text-text-dim hover:text-phantom-cyan flex items-center gap-1">
-              <RefreshCw size={10} /> Refresh
+              <RefreshCw size={10} aria-hidden="true" /> Refresh
             </button>
           </div>
 
@@ -117,6 +123,9 @@ export default function LlmProposals() {
             </p>
           )}
 
+          <div role="tabpanel"
+            aria-label="Model proposals and reasoning journal"
+            aria-live="polite">
           {tab === 'proposals' && proposals.map(p => (
             <div key={p.id} className="border border-surface-border rounded p-2 space-y-1">
               <div className="flex items-start justify-between gap-2">
@@ -134,16 +143,18 @@ export default function LlmProposals() {
               {p.state === 'pending' ? (
                 <div className="flex items-center gap-2">
                   <button onClick={() => decide(p, 'accept')} disabled={busy === p.id}
+                    aria-label={`Accept and run proposal #${p.id}`}
                     className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px]
                       bg-phantom-magenta/20 text-phantom-magenta hover:bg-phantom-magenta/30
                       disabled:opacity-40">
-                    <Play size={10} /> Accept &amp; run
+                    <Play size={10} aria-hidden="true" /> Accept &amp; run
                   </button>
                   <button onClick={() => decide(p, 'reject')} disabled={busy === p.id}
+                    aria-label={`Reject proposal #${p.id}`}
                     className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px]
                       border border-surface-border text-text-dim hover:bg-surface-hover
                       disabled:opacity-40">
-                    <X size={10} /> Reject
+                    <X size={10} aria-hidden="true" /> Reject
                   </button>
                   <span className="text-[9px] text-text-dim">
                     it runs through the engagement scope, not around it
@@ -191,7 +202,11 @@ export default function LlmProposals() {
             </div>
           ))}
 
-          {msg && <p className="text-[10px] text-text-secondary">{msg}</p>}
+          </div>
+          {msg && (
+            <p className="text-[10px] text-text-secondary" role="status"
+              aria-live="polite">{msg}</p>
+          )}
         </div>
       )}
     </div>

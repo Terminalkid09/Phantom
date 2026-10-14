@@ -37,17 +37,21 @@ argument LIST — never the string.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import platform
 import re
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 __all__ = [
     "KINDS",
+    "content_digest",
     "default_name",
+    "file_digest",
     "host_kind",
     "install_service",
+    "invocation_digest",
     "plan_service",
     "render_launchd_plist",
     "render_systemd_unit",
@@ -57,6 +61,33 @@ __all__ = [
     "supported",
     "uninstall_service",
 ]
+
+
+def invocation_digest(command: Sequence[str]) -> str:
+    """sha256 of the exact argv the unit will run — the invocation's identity.
+
+    The unit records WHAT the engagement agreed to (`--auto <targets> ...`),
+    and this is the value an operator can compare between the moment of
+    `--install-service` and the file/audit trail later: the arguments are
+    joined with NUL so `["a b", "c"]` and `["a", "b c"]` cannot collide, and
+    the order is part of the identity.
+    """
+    payload = "\x00".join(str(part) for part in command)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def content_digest(content: str, encoding: str = "utf-8") -> str:
+    """sha256 of the BYTES a unit file will hold (encoding included)."""
+    return hashlib.sha256(str(content).encode(encoding)).hexdigest()
+
+
+def file_digest(path: str) -> str:
+    """sha256 of a file's bytes, or "" when there is no file to read."""
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except (OSError, TypeError):
+        return ""
 
 #: the three unit formats this module knows how to render
 KINDS = ("systemd", "launchd", "schtasks")
@@ -497,29 +528,67 @@ def plan_service(kind: str, command: Sequence[str], *, working_dir: str,
                           restart_sec=restart_sec,
                           restart_count=restart_count)
     path = service_path(kind, unit_name, user=user, host_os=host_os)
+    # The Task Scheduler reads its definition as UTF-16, and the declaration
+    # inside the document has to match the bytes on disk or the import rejects
+    # the file. The plist and the systemd unit are UTF-8 (systemd requires it;
+    # nobody reads a plist as UTF-16).
+    encoding = "utf-16" if kind == "schtasks" else "utf-8"
     return {"kind": kind, "name": unit_name, "path": path,
             "content": content, "user": "1" if user else "0",
-            # The Task Scheduler reads its definition as UTF-16, and the
-            # declaration inside the document has to match the bytes on disk
-            # or the import rejects the file. The plist and the systemd unit
-            # are UTF-8 (systemd requires it; nobody reads a plist as UTF-16).
-            "encoding": "utf-16" if kind == "schtasks" else "utf-8",
+            "encoding": encoding,
+            # WHAT this unit is (the exact invocation) and WHICH bytes it is
+            # (so a pre-existing file can be told apart from this one).
+            "digest": invocation_digest(command),
+            "content_digest": content_digest(content, encoding),
             "hint": activate_hint(kind, unit_name, path=path, user=user)}
 
 
-def install_service(plan: Dict[str, str]) -> str:
+def existing_service(path: str, content: str = "",
+                     encoding: str = "utf-8") -> Tuple[str, bool]:
+    """``(digest, same)`` for a file already at ``path``.
+
+    ``("", False)`` when nothing is there. ``same`` is True only when the file
+    is byte-identical to what this invocation would render — that is the
+    difference between "re-running my own install" (a no-op) and "overwriting
+    whatever was already there", which this module refuses to do silently.
+    """
+    found = file_digest(path)
+    if not found:
+        return "", False
+    return found, found == content_digest(content, encoding)
+
+
+def install_service(plan: Dict[str, str], *, overwrite: bool = False) -> str:
     """Write a rendered plan to disk and return the path.
 
     The ONLY function in this module that touches the filesystem, and it
     refuses an empty plan instead of writing a half-unit. It creates parents
     (``~/.config/systemd/user`` may not exist yet) and leaves the file
     readable: the operator is meant to review it.
+
+    Two refusals the operator asked for (audit P2, "rete di sicurezza"):
+
+    * a DIFFERENT unit already at that path is not overwritten — the file may
+      be another engagement's, or the operator's hand-edited copy, and a
+      framework that clobbers a boot-level file in silence is unauditable.
+      Re-installing the SAME content is idempotent (and still verified);
+      replacing it is explicit (`overwrite=True`);
+    * the write is READ BACK and hashed: if the bytes on disk are not the
+      bytes that were rendered (a short write, a wrong encoding), this raises
+      instead of leaving a half-unit that the OS will parse and reject later.
     """
     path = str((plan or {}).get("path") or "")
     content = (plan or {}).get("content") or ""
     if not path or not content:
         raise ValueError("refusing to install an empty service plan")
     encoding = (plan or {}).get("encoding") or "utf-8"
+    found, same = existing_service(path, content, encoding)
+    if found and not same and not overwrite:
+        raise ValueError(
+            f"a DIFFERENT service definition already exists at {path} "
+            f"(sha256 {found[:16]}… vs {content_digest(content, encoding)[:16]}… "
+            f"for this invocation): refusing to overwrite it — review it, "
+            f"remove it with --uninstall-service, or re-run with overwrite")
     directory = os.path.dirname(os.path.abspath(path))
     if directory:
         os.makedirs(directory, exist_ok=True)
@@ -530,18 +599,33 @@ def install_service(plan: Dict[str, str]) -> str:
     except OSError:
         # Windows has no POSIX mode bits; the write itself already succeeded.
         pass
+    written = file_digest(path)
+    expected = content_digest(content, encoding)
+    if written != expected:
+        raise ValueError(
+            f"the file written to {path} is not what was rendered "
+            f"(sha256 {written[:16] or 'unreadable'}… != {expected[:16]}…) — "
+            f"the definition is untrustworthy, remove it")
     return path
 
 
 def uninstall_service(path: str) -> bool:
-    """Remove a unit file. True when it is gone, False when it never existed."""
+    """Remove a unit file. True when it is gone, False when it never existed.
+
+    "Verifiable" is literal: after ``os.remove`` the path is checked again, and
+    a file still standing there is an ERROR rather than a success message —
+    "removed" that leaves a unit behind is worse than a refusal.
+    """
     target = str(path or "")
     if not target:
         raise ValueError("refusing to uninstall without a path")
     try:
         os.remove(target)
-        return True
     except FileNotFoundError:
         return False
     except OSError as exc:
         raise ValueError(f"cannot remove {target}: {exc}") from exc
+    if os.path.exists(target):
+        raise ValueError(f"{target} still exists after removal — the unit was "
+                         f"NOT uninstalled")
+    return True

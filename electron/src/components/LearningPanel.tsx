@@ -107,38 +107,43 @@ export default function LearningPanel() {
   const label = (c: string) => data.labels?.[c] || c
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 h-full bg-surface-base">
+    <div className="flex-1 flex flex-col min-h-0 h-full bg-surface-base"
+      role="region" aria-label="Learning Memory">
       <div className="flex items-center justify-between px-3 py-2 border-b border-surface-border">
         <div className="flex items-center gap-2">
-          <Brain size={15} className="text-phantom-magenta" />
+          <Brain size={15} className="text-phantom-magenta" aria-hidden="true" />
           <span className="text-sm font-semibold text-text-primary">Learning Memory</span>
           <span className="text-[11px] text-text-dim">
             cross-engagement experience · {data.stats.enabled ? 'persistent' : 'run-only'}
           </span>
         </div>
         <div className="flex items-center gap-2">
-          <button onClick={load}
+          <button onClick={load} aria-label="Refresh learning memory"
+            aria-busy={loading}
             className="flex items-center gap-1 text-xs px-2 py-1 rounded border border-surface-border hover:bg-surface-hover">
-            <RefreshCw size={12} className={loading ? 'animate-spin' : ''} /> Refresh
+            <RefreshCw size={12} className={loading ? 'animate-spin' : ''} aria-hidden="true" /> Refresh
           </button>
-          <button onClick={reset}
+          <button onClick={reset} aria-label="Reset learning memory"
             className="flex items-center gap-1 text-xs px-2 py-1 rounded border border-phantom-red/40 text-phantom-red hover:bg-phantom-red/10">
-            <Trash2 size={12} /> Reset
+            <Trash2 size={12} aria-hidden="true" /> Reset
           </button>
         </div>
       </div>
       {loadError && (
-        <div className="px-3 py-1 text-[11px] text-phantom-error border-b border-phantom-error/30 bg-phantom-error/5">
+        <div className="px-3 py-1 text-[11px] text-phantom-error border-b border-phantom-error/30 bg-phantom-error/5"
+          role="alert">
           Learning memory unavailable — {loadError}
         </div>
       )}
       {notice && (
-        <div className="px-3 py-1 text-[11px] text-phantom-magenta border-b border-surface-border">
+        <div className="px-3 py-1 text-[11px] text-phantom-magenta border-b border-surface-border"
+          role="status" aria-live="polite">
           {notice}
         </div>
       )}
 
-      <div className="grid grid-cols-4 gap-2 p-3">
+      <div className="grid grid-cols-4 gap-2 p-3" role="group"
+        aria-label="Learning memory totals">
         <Stat label="Episodes" value={data.stats.episodes ?? 0} icon={<Database size={12} />} />
         <Stat label="Learnable" value={data.stats.learnable ?? 0} />
         <Stat label="Successes" value={data.stats.successes ?? 0}
@@ -148,7 +153,8 @@ export default function LearningPanel() {
       </div>
 
       <div className="flex-1 overflow-auto px-3 pb-3 grid grid-cols-1 xl:grid-cols-2 gap-3 min-h-0">
-        <section className="rounded border border-surface-border bg-surface-card p-3">
+        <section className="rounded border border-surface-border bg-surface-card p-3"
+          aria-label="Failure causes">
           <h3 className="text-xs font-semibold text-text-primary mb-2">
             Failure causes — where engagements get stuck
           </h3>
@@ -172,7 +178,8 @@ export default function LearningPanel() {
           )}
         </section>
 
-        <section className="rounded border border-surface-border bg-surface-card p-3">
+        <section className="rounded border border-surface-border bg-surface-card p-3"
+          aria-label="Learned patterns">
           <h3 className="text-xs font-semibold text-text-primary mb-2">
             Learned patterns <span className="text-text-dim font-normal">(rate · runs)</span>
           </h3>
@@ -220,12 +227,16 @@ export default function LearningPanel() {
           )}
         </section>
 
-        <section className="xl:col-span-2 rounded border border-surface-border bg-surface-card p-3">
+        <section className="xl:col-span-2 rounded border border-surface-border bg-surface-card p-3"
+          aria-label="Recent episodes" aria-live="polite">
           <div className="flex items-center justify-between mb-2">
             <h3 className="text-xs font-semibold text-text-primary">Recent episodes</h3>
-            <div className="flex gap-1">
+            <div className="flex gap-1" role="group"
+              aria-label="Filter episodes">
               {(['all', 'repairs', 'failures'] as const).map((f) => (
                 <button key={f} onClick={() => setFilter(f)}
+                  aria-pressed={filter === f}
+                  aria-label={`Show ${f} episodes`}
                   className={`text-[10px] px-2 py-0.5 rounded border ${
                     filter === f
                       ? 'border-phantom-magenta/50 text-phantom-magenta'
@@ -269,8 +280,10 @@ function Stat({ label, value, icon, tone }: {
   label: string; value: number; icon?: JSX.Element; tone?: string
 }) {
   return (
-    <div className="rounded border border-surface-border bg-surface-card px-3 py-2">
-      <div className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-text-dim">
+    <div className="rounded border border-surface-border bg-surface-card px-3 py-2"
+      role="group" aria-label={`${label}: ${value}`}>
+      <div className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-text-dim"
+        aria-hidden="true">
         {icon}{label}
       </div>
       <div className={`text-lg font-semibold ${tone || 'text-text-primary'}`}>{value}</div>

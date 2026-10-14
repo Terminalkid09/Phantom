@@ -183,29 +183,29 @@ export default function RemoteCanvas({ beacon, api }: Props) {
       {/* controls */}
       <div className="flex items-center gap-2 px-3 py-2 border-b border-surface-border">
         <span className="text-[10px] font-semibold text-text-dim uppercase tracking-wider flex items-center gap-1.5">
-          <Monitor size={12} className="text-phantom-magenta" /> Remote Session
+          <Monitor size={12} className="text-phantom-magenta" aria-hidden="true" /> Remote Session
         </span>
-        <div className="ml-auto flex items-center gap-1.5">
+        <div role="toolbar" aria-label="Remote session controls" className="ml-auto flex items-center gap-1.5">
           {!streaming ? (
             <>
               <button onClick={() => startStream(false)}
                 className="px-2 py-1 rounded bg-phantom-green/15 text-phantom-green text-[10px] hover:bg-phantom-green/25 flex items-center gap-1">
-                <Play size={10} /> start
+                <Play size={10} aria-hidden="true" /> start
               </button>
               <button onClick={() => startStream(true)} title="fast cadence (~250ms)"
                 className="px-2 py-1 rounded bg-phantom-yellow/15 text-phantom-yellow text-[10px] hover:bg-phantom-yellow/25 flex items-center gap-1">
-                <Zap size={10} /> live
+                <Zap size={10} aria-hidden="true" /> live
               </button>
             </>
           ) : (
             <button onClick={stopStream}
               className="px-2 py-1 rounded bg-phantom-error/15 text-phantom-error text-[10px] hover:bg-phantom-error/25 flex items-center gap-1">
-              <Square size={10} /> stop {liveMode ? '(live)' : ''}
+              <Square size={10} aria-hidden="true" /> stop {liveMode ? '(live)' : ''}
             </button>
           )}
           <button onClick={grabFrame} title="single frame now"
             className="px-2 py-1 rounded bg-phantom-cyan/15 text-phantom-cyan text-[10px] hover:bg-phantom-cyan/25 flex items-center gap-1">
-            <Camera size={10} /> frame
+            <Camera size={10} aria-hidden="true" /> frame
           </button>
         </div>
       </div>
@@ -213,13 +213,17 @@ export default function RemoteCanvas({ beacon, api }: Props) {
       {/* canvas */}
       <div className="flex-1 min-h-0 flex items-center justify-center bg-black/60 relative overflow-hidden">
         {latest ? (
+          /* The canvas is driven by the mouse only (a click on the image is
+             an input task on the target); the label says so, and the frame
+             history below is keyboard-reachable. */
           <img ref={imgRef} src={latest.src} key={seq} alt={latest.name}
+            aria-label={`Remote screen frame ${latest.name} — mouse moves and clicks are sent to the target`}
             onMouseMove={onMouseMove} onMouseDown={onMouseDown} onWheel={onWheel}
             className="max-w-full max-h-full object-contain cursor-crosshair select-none"
             draggable={false} />
         ) : (
           <div className="text-center text-text-dim text-xs space-y-2 p-6">
-            <MousePointer2 size={28} className="mx-auto opacity-40" />
+            <MousePointer2 size={28} className="mx-auto opacity-40" aria-hidden="true" />
             <p>No remote frames yet.</p>
             <p className="text-[10px] max-w-sm">
               Deploy the module from a beacon (<code>remote</code>) or from any
@@ -230,8 +234,8 @@ export default function RemoteCanvas({ beacon, api }: Props) {
           </div>
         )}
         {streaming && (
-          <div className="absolute top-2 right-2 flex items-center gap-1 text-[9px] text-phantom-error bg-black/60 px-1.5 py-0.5 rounded">
-            <span className="w-1.5 h-1.5 rounded-full bg-phantom-error animate-pulse" />
+          <div role="status" aria-live="polite" className="absolute top-2 right-2 flex items-center gap-1 text-[9px] text-phantom-error bg-black/60 px-1.5 py-0.5 rounded">
+            <span className="w-1.5 h-1.5 rounded-full bg-phantom-error animate-pulse" aria-hidden="true" />
             {liveMode ? 'LIVE' : 'STREAMING'}
           </div>
         )}
@@ -242,6 +246,7 @@ export default function RemoteCanvas({ beacon, api }: Props) {
         <div className="px-3 py-2 border-t border-surface-border flex items-center gap-2">
           <input
             value={typeText}
+            aria-label="Keystrokes to send to the remote screen"
             onChange={(e) => setTypeText(e.target.value)}
             onKeyDown={onTypeKey}
             placeholder="type text → Enter to send · mouse on image = move/click · wheel = scroll"
@@ -257,17 +262,19 @@ export default function RemoteCanvas({ beacon, api }: Props) {
 
       {/* frame history strip */}
       {history.length > 1 && (
-        <div className="flex gap-1 px-3 py-1.5 border-t border-surface-border overflow-x-auto">
+        <div role="group" aria-label="Recent frames" className="flex gap-1 px-3 py-1.5 border-t border-surface-border overflow-x-auto">
           {history.map((name) => (
             <button key={name} onClick={() => setLatest({ name, src: thumbs.current.get(name)! })}
+              aria-pressed={latest?.name === name}
+              aria-label={`Show frame ${name}`}
               className={`flex-shrink-0 rounded border overflow-hidden ${latest?.name === name ? 'border-phantom-magenta' : 'border-surface-border hover:border-phantom-cyan/50'}`}>
-              <img src={thumbs.current.get(name)} alt={name} className="h-10 w-16 object-cover" />
+              <img src={thumbs.current.get(name)} alt="" className="h-10 w-16 object-cover" />
             </button>
           ))}
         </div>
       )}
 
-      {err && <p className="px-3 py-1 text-[10px] text-phantom-error">{err}</p>}
+      {err && <p role="alert" className="px-3 py-1 text-[10px] text-phantom-error">{err}</p>}
     </div>
   )
 }

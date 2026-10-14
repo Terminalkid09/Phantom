@@ -288,6 +288,30 @@ def _r_success(d: dict) -> List[str]:
     return [f"[+] {_tag(d)}{d.get('detail') or 'step complete'}"]
 
 
+def _r_outcome(d: dict) -> List[str]:
+    """P0: the ENGAGEMENT outcome — what the run ACHIEVED, not whether the
+    process is still alive. Marker-coded ([+] goal reached, [~] partial,
+    [!] failure), and the goal facts still missing when the run named them:
+    a partial run must leave the operator a lead, not a shrug. The severity
+    also travels structured in `fields`, and the job snapshot carries the
+    token, so the stream line never has to be parsed to learn the verdict.
+    """
+    token = str(d.get("outcome") or "")
+    if token == "completed_goal":
+        marker = "[+]"
+    elif token.startswith("failed") or token in ("cancelled",
+                                                  "blocked_preflight"):
+        marker = "[!]"
+    else:
+        marker = "[~]"
+    label = _first(d.get("label"), token, "outcome")
+    missing = d.get("missing")
+    gap = ""
+    if isinstance(missing, (list, tuple)) and missing:
+        gap = " — missing: " + ", ".join(str(m) for m in missing)
+    return [f"{marker} {_tag(d)}outcome: {label}{gap}"]
+
+
 def _r_done(d: dict) -> List[str]:
     bits = []
     for key in ("beacon_established", "persistence_installed",
@@ -550,9 +574,20 @@ def _r_contradiction(d: dict) -> List[str]:
 
 
 def _r_degraded(d: dict) -> List[str]:
+    category = d.get("category")
+    cat = f" [{category}]" if category else ""
     return [f"[!] {_tag(d)}reasoning degraded: "
-            f"{d.get('layer') or 'layer'} unavailable "
+            f"{d.get('layer') or 'layer'} unavailable{cat} "
             f"({_clip(d.get('detail'), 140)}) — fell back to raw priority"]
+
+
+def _r_failure(d: dict) -> List[str]:
+    """P1: a caught error WITH its category and the site that caught it."""
+    category = str(d.get("category") or "internal_bug")
+    where = d.get("where") or "?"
+    detail = _clip(d.get("detail"), 140)
+    return [f"[!] {_tag(d)}failure [{category}] at {where}"
+            + (f": {detail}" if detail else "")]
 
 
 def _r_worker(d: dict) -> List[str]:
@@ -622,6 +657,12 @@ EVENTS: Dict[str, EventSpec] = {
     "unverified": EventSpec("warn", _r_unverified,
                             fields=("capability", "detail")),
     "success": EventSpec("success", _r_success),
+    # P0: the second axis next to the job lifecycle. Emitted once per target
+    # by the auto-mode orchestrator, so a run that finished but reached
+    # nothing is legible in the stream, in the UI log and in the report —
+    # not just in an exit code nobody reads.
+    "outcome": EventSpec("info", _r_outcome,
+                         fields=("outcome", "goal", "label", "missing")),
     "done": EventSpec("success", _r_done),
     "sandbox": EventSpec("dim", _r_sandbox, verbose_only=True),
     "cadence": EventSpec("dim", _r_cadence, verbose_only=True),
@@ -698,7 +739,12 @@ EVENTS: Dict[str, EventSpec] = {
                       fields=("goal", "rejected", "rejected_total",
                               "stale")),
     "degraded": EventSpec("warn", _r_degraded,
-                          fields=("layer", "capability")),
+                          fields=("layer", "capability", "category")),
+    # P1 failure taxonomy: a recorded failure is an EVENT, not a log line. The
+    # category is what makes it actionable (tool_missing vs internal_bug are
+    # different problems with different owners).
+    "failure": EventSpec("warn", _r_failure,
+                         fields=("category", "where", "detail")),
     "gap": EventSpec("info", _r_gap,
                      fields=("missing", "goal", "hints", "policy")),
     "worker": EventSpec("info", _r_worker,

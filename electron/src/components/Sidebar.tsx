@@ -79,19 +79,37 @@ export default function Sidebar() {
       </div>
 
       {/* Navigation sections */}
-      <div className="flex-1 overflow-auto py-2">
+      {/* `<nav>` IS the navigation landmark; an explicit role would be
+          redundant, so the accessibility contract accepts either spelling. */}
+      <nav
+        aria-label="Panels"
+        className="flex-1 overflow-auto py-2"
+      >
         {sections.map((section) => (
           <div key={section.label}>
-            <div className="px-4 py-1.5 text-[9px] font-semibold text-text-dim uppercase tracking-[0.15em]">
+            <div
+              aria-hidden="true"
+              className="px-4 py-1.5 text-[9px] font-semibold text-text-dim uppercase tracking-[0.15em]"
+            >
               {section.label}
             </div>
             {section.items.map((item) => {
               const Icon = item.icon
               const isActive = activeTab === item.id
+              const running = item.id === 'automode' && autoMode.running
+              // One accessible name per control: the running dot below is
+              // decorative, so the state it shows is part of THIS label (a
+              // bare span with an aria-label is not reliably announced).
+              const label = [item.label,
+                             isActive ? 'current panel' : '',
+                             running ? 'run in progress' : '']
+                .filter(Boolean).join(' — ')
               return (
                 <button
                   key={item.id}
                   onClick={() => setActiveTab(item.id)}
+                  aria-current={isActive ? 'page' : undefined}
+                  aria-label={label}
                   className={`w-full text-left flex items-center justify-between px-4 py-1.5 text-[12px] transition-colors
                     ${isActive
                       ? 'bg-phantom-magenta/10 text-phantom-magenta border-r-2 border-phantom-magenta'
@@ -99,11 +117,14 @@ export default function Sidebar() {
                     }`}
                 >
                   <div className="flex items-center gap-2.5 min-w-0">
-                    <Icon size={14} className={isActive ? 'text-phantom-magenta' : 'text-text-dim flex-shrink-0'} />
+                    <Icon size={14} aria-hidden="true" className={isActive ? 'text-phantom-magenta' : 'text-text-dim flex-shrink-0'} />
                     <span className="truncate">{item.label}</span>
                   </div>
-                  {item.id === 'automode' && autoMode.running && (
-                    <span className="flex-shrink-0 relative flex h-2 w-2 ml-2">
+                  {running && (
+                    <span
+                      aria-hidden="true"
+                      className="flex-shrink-0 relative flex h-2 w-2 ml-2"
+                    >
                       <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-phantom-magenta opacity-75"></span>
                       <span className="relative inline-flex rounded-full h-2 w-2 bg-phantom-magenta"></span>
                     </span>
@@ -113,7 +134,7 @@ export default function Sidebar() {
             })}
           </div>
         ))}
-      </div>
+      </nav>
 
       {/* Footer */}
       <div className="px-4 py-2 border-t border-surface-border flex-shrink-0">

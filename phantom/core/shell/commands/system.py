@@ -14,6 +14,37 @@ from phantom.core.shell.ui import (
 from phantom.utils.notifier import notifier
 
 
+def _print_unlisted_commands(covered) -> None:
+    """Print every REGISTERED command the curated tables above missed.
+
+    The registry is the single source of truth (`iter_commands`); the tables
+    are just a nicer presentation of most of it. Anything they forget is
+    still a command an operator can run, so it is listed with the first line
+    of its own help — never silently absent
+    (`tests/test_core_help.py::test_help_lists_every_registered_command`).
+    """
+    from rich.table import Table
+
+    from phantom.core.shell.registry import iter_commands
+
+    missing = []
+    for name, handler in iter_commands():
+        if name in covered:
+            continue
+        doc = (handler.__doc__ or "").strip().splitlines()
+        missing.append((name, doc[0] if doc else "(no help text)"))
+    if not missing:
+        return
+    table = Table(title="[bold white]Also available[/]", border_style="white",
+                  show_lines=False)
+    table.add_column("Command", style="cyan", no_wrap=True)
+    table.add_column("Description", style="white")
+    for name, summary in missing:
+        table.add_row(name.replace("_", "-"), summary)
+    _sh.console.print(table)
+    _sh.console.print()
+
+
 def cmd_help(shell, arg: str):
     """help [command] — Show the help panel or details about a specific command."""
     from rich.table import Table
@@ -68,7 +99,7 @@ def cmd_help(shell, arg: str):
     t2b.add_column("Description", style="white")
     t2b.add_row("craft ipgrab|reel|image|pixel|beacon|hits|wait", "Build social-engineering lures (IP grabber, zero-click pixel, disguised beacon link)")
     t2b.add_row("map [cidr]", "Discover live hosts on the network and feed the WorldModel")
-    t2b.add_row("install <tool>", "Install a missing tool (apt/brew/choco/pip, auto-selected)")
+    t2b.add_row("install <tool>", "Install a missing tool — asks first, like 'deps install' (apt/brew/choco/pip, auto-selected)")
     t2b.add_row("tool list|import <binary>|approve <id>|enable <id>|disable <id>", "Runtime tool drivers: discover a new tool (probe --help/--version only), review, approve, enable")
     t2b.add_row("wordlists list|use|search|info", "Manage attack dictionaries (rockyou, seclists, custom)")
     t2b.add_row("ad tree|paths|add-user|add-dc|add-edge|reset", "BloodHound-style AD graph: ingest auto-mode data + manual nodes, shortest paths to Domain Admin")
@@ -113,6 +144,20 @@ def cmd_help(shell, arg: str):
     t4.add_row("wordlist", "Wordlist Generator & Manager (see: wordlists list)")
     t4.add_row("report", "Report Generation (JSON, PDF, HTML)")
     t4.add_row("c2", "Command & Control Operations Center")
+    # ── Every REGISTERED command must appear above ────────────────────
+    # The tables are curated by hand (grouping and wording an operator
+    # wants), and the audit found four registered commands (`malleable`,
+    # `guardrails`, `deps`, `llm`) with zero occurrences in this file: the
+    # operator had to already know they existed. Rather than trust the
+    # next hand-edit, the curated tables are checked against the REGISTRY
+    # and whatever they miss is printed from the handlers' own docstrings,
+    # so `help` can never hide a command again (`tests/test_core_help.py`).
+    tables = (t1, t2, t2b, t3, t4)
+    covered = set()
+    for table in tables:
+        for cell in table.columns[0]._cells:
+            first = str(cell).split()[0].replace("-", "_")
+            covered.add(first)
     _sh.console.print()
     _sh.console.print(t1)
     _sh.console.print()
@@ -124,6 +169,7 @@ def cmd_help(shell, arg: str):
     _sh.console.print()
     _sh.console.print(t4)
     _sh.console.print()
+    _print_unlisted_commands(covered)
     _sh.console.print("[dim]  Type 'help <command>' for details on a specific command.[/]")
     _sh.console.print("[dim]  Type 'ad paths' for Domain Admin attack paths — 'help ad' for the full AD syntax.[/]")
     _sh.console.print("[dim]  Type 'wordlists list' to manage attack dictionaries.[/]")
@@ -303,6 +349,11 @@ def _cmd_config_drivers(parts) -> None:
     into a live capability: it declares the binary, the command template and
     the output markers. Drop one in data/drivers/ (gitignored) and it is
     planned like any built-in move.
+
+    The Binary column is the binary CONTRACT: a manifest may pin the sha256
+    of the tool it declares (`binary_sha256`), and the broker refuses the run
+    (`driver_contract_violation`) when the binary on disk is not that one.
+    "unpinned" is NOT "verified" — it says no check was declared at all.
     """
     from rich.table import Table
     from phantom.automation.runtime import drivers as drv
@@ -313,17 +364,20 @@ def _cmd_config_drivers(parts) -> None:
                       "data/drivers/ (or toolbelt.drivers_dir) to register "
                       "a tool Phantom has never seen.")
     else:
+        contracts = _binary_contract_column()
         table = Table(title="[bold]Discovered tool drivers[/]",
                       border_style="magenta")
         table.add_column("Capability", style="cyan")
         table.add_column("Tool", style="white")
         table.add_column("Category", style="white")
         table.add_column("Approved", style="white")
+        table.add_column("Binary", style="white")
         table.add_column("Effects", style="dim")
         table.add_column("Manifest", style="dim")
         for row in rows:
             table.add_row(row["id"], row["tool"], row["category"],
                           "yes" if row.get("approved") else "no",
+                          contracts.get(row["id"], "-"),
                           ", ".join(row["effects"]),
                           row["source"] or "-")
         _sh.console.print(table)
@@ -334,7 +388,39 @@ def _cmd_config_drivers(parts) -> None:
                 + ", ".join(unapproved)
                 + "\nApprove by adding the id to toolbelt.approved in "
                   "data/config.json (or via PHANTOM_APPROVED_DRIVERS).")
+        broken = [cid for cid, status in contracts.items()
+                  if status == "MISMATCH"]
+        if broken:
+            notifier.error(
+                "Binary contract broken (the broker will refuse them): "
+                + ", ".join(broken)
+                + "\nThe pinned sha256 no longer matches the binary on PATH — "
+                  "re-verify the tool, then update or remove the pin.")
     notifier.info("Scanned: " + ", ".join(drv.driver_dirs()))
+
+
+def _binary_contract_column() -> dict:
+    """{capability id: binary-contract status} for the drivers table.
+
+    Never raises: this is a display helper, and a hashing failure must not
+    take `config drivers` down (it shows as "?" instead).
+    """
+    out: dict = {}
+    try:
+        from phantom.automation.runtime import driver_contract as dc
+        for row in dc.verify_drivers():
+            if not row.get("pinned"):
+                out[row["id"]] = "unpinned"
+            elif row.get("verified"):
+                out[row["id"]] = "verified"
+            else:
+                out[row["id"]] = "MISMATCH"
+    except Exception:
+        from phantom.utils.failure_taxonomy import record
+        record("config_drivers._binary_contract_column",
+               category="internal_bug", best_effort=True,
+               detail="binary contract status unavailable")
+    return out
 
 
 def cmd_config(shell, arg: str):
@@ -996,8 +1082,100 @@ def cmd_tool(shell, arg: str):
                      hint="'tool list' shows the registry")
 
 
+def cmd_workflow(shell, arg: str):
+    """workflow [show|types|next] [target-type] — inspect the LEGACY phase engine
+
+    `run` and `suggest` decide through `phantom/core/next_moves.py` — ONE engine.
+    There is a SECOND kill-chain model in `phantom/core/workflow.py`: phase lists
+    per target type, scored from findings, threat intel, history and calibration.
+    No command ever wired it, so it drifted unseen (the audit called it dead
+    surface). It is not going away — tests and CI exercise it — so it is made
+    INSPECTABLE instead: this command PRINTS the model and never runs a phase,
+    and says which engine actually drives the engagement."""
+    from rich.table import Table
+
+    from phantom.core.workflow import STATUS_KEY_MAP, workflow_manager
+
+    parts = arg.split()
+    sub = parts[0].lower() if parts else "show"
+    types = sorted(workflow_manager.phases)
+
+    if sub in ("types", "list"):
+        table = Table(title="[bold]Legacy workflow — target types[/]",
+                      border_style="white")
+        table.add_column("Type", style="cyan", no_wrap=True)
+        table.add_column("Phases", style="white")
+        table.add_column("Chain", style="dim")
+        for name in types:
+            chain = workflow_manager.get_phases(name)
+            table.add_row(name, str(len(chain)), " -> ".join(chain))
+        _sh.console.print(table)
+        return
+
+    if sub not in ("show", "next"):
+        notifier.unknown("subcommand", sub, ["show", "types", "next"],
+                         hint="'workflow show <target-type>' prints the phase "
+                              "chain and the adaptive decision")
+        return
+
+    target_type = parts[1].lower() if len(parts) > 1 else ""
+    if not target_type:
+        # Derive it the same way the rest of the shell classifies a target.
+        target_type = "ip"
+        try:
+            from phantom.automation.guidance.targets import classify_target
+            target_type = classify_target(session.target or "") or "ip"
+        except Exception as exc:                      # loud, not swallowed
+            notifier.warn(f"Target classification failed ({exc}); assuming "
+                          "'ip'. Pass the type explicitly to override.")
+    if target_type not in workflow_manager.phases:
+        notifier.error(f"Unknown target type: '{target_type}'.",
+                       hint="one of: " + ", ".join(types))
+        return
+
+    phases = workflow_manager.get_phases(target_type)
+    status = session.knowledge_base.get("status", {})
+    try:
+        nxt = workflow_manager.decide_next(target_type)
+        failure = ""
+    except Exception as exc:                          # loud, not swallowed
+        nxt, failure = None, f"{type(exc).__name__}: {exc}"
+
+    table = Table(title=f"[bold]Legacy workflow — {target_type}[/]",
+                  border_style="white")
+    table.add_column("#", style="dim", no_wrap=True)
+    table.add_column("Phase", style="cyan", no_wrap=True)
+    table.add_column("State", style="white")
+    table.add_column("Executor", style="dim")
+    registered = workflow_manager.registered_phases()
+    for index, phase in enumerate(phases, start=1):
+        status_key = STATUS_KEY_MAP.get(phase)
+        if status_key is None:
+            state = "not tracked"
+        else:
+            state = "attempted" if status.get(status_key) else "pending"
+        executor = "registered" if phase in registered else "none"
+        marker = " <- next" if phase == nxt else ""
+        table.add_row(str(index), phase + marker, state, executor)
+    _sh.console.print(table)
+    if failure:
+        notifier.error(f"decide_next failed: {failure}")
+    elif nxt:
+        notifier.info(f"Legacy engine would run '{nxt}' next (scored from "
+                      "findings, threat intel, history, calibration).")
+    else:
+        notifier.info("Legacy engine has no pending phase for this target "
+                      "type.")
+    if nxt and nxt not in registered and sub == "show":
+        notifier.warn(f"'{nxt}' has no registered executor, so the legacy "
+                      "engine could not execute it: this chain is inspectable, "
+                      "not live. `run`/`suggest` (next_moves) drive the "
+                      "engagement.")
+
+
 COMMANDS = {
     "help": cmd_help,
+    "workflow": cmd_workflow,
     "config": cmd_config,
     "tool": cmd_tool,
     "setup": cmd_setup,

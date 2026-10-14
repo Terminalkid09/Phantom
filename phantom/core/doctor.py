@@ -240,6 +240,32 @@ def _c2_operator_auth_check() -> Check:
                       "c2.mtls=true or generate an API token")
 
 
+def _auto_persist_grant_check() -> Check:
+    """The passive side effect: a check-in can queue persistence by itself.
+
+    `c2.auto_persist` (default ON, owner decision Q-1) makes a beacon's FIRST
+    check-in queue a `persist` task with no operator action — a real change to
+    the target triggered by a PASSIVE event. The audit asked for consent to be
+    explicit rather than implied by a default; it stays ON, so it is reported
+    here (with the exact way to revoke the grant) and recorded on listener
+    start. Nobody should learn about it from the beacon's traffic.
+    """
+    from phantom.utils import config as cfg
+    try:
+        on = cfg.get_bool("c2.auto_persist", True, env="PHANTOM_AUTO_PERSIST")
+    except Exception as exc:
+        return Check("auto-persist", "warn", f"config unreadable: {exc}")
+    if on:
+        return Check("auto-persist", "warn",
+                     "ON: the first beacon check-in queues persistence "
+                     "automatically",
+                     hint="revoke the grant per engagement with "
+                          "c2.auto_persist=false or PHANTOM_AUTO_PERSIST=0 "
+                          "(the decision is written to the audit chain)")
+    return Check("auto-persist", "pass",
+                 "OFF: check-in is register-only (grant revoked)")
+
+
 def _c2d_capabilities_check() -> Check:
     """C-3/D-2: which surfaces the Go data plane does NOT port.
 
@@ -256,11 +282,16 @@ def _c2d_capabilities_check() -> Check:
     if backend != "go":
         return Check("c2d-capabilities", "pass",
                      "python data plane (full surface)")
-    gaps = "task policy (capability/grant), /s/android stager"
+    # The task policy, result retention and the hash-chained audit trail were
+    # PORTED (the audit's D-2/A-2 gaps), so the remaining difference is only
+    # the Android stager — which the Go listener answers 501 for, honestly.
+    gaps = "/s/android stager"
     return Check("c2d-capabilities", "warn",
-                 f"go data plane: {gaps} stay in Python (answered 501)",
-                 hint="audit trail and replay persistence ARE ported; see "
-                      "GET /api/v1/capabilities on the listener")
+                 f"go data plane: {gaps} stays in Python (answered 501); "
+                 f"task policy + retention + audit chain are ported",
+                 hint="run the Python listener for that route; see "
+                      "GET /api/v1/capabilities on the listener, and "
+                      "docs/c2d.md for what the Go plane does cover")
 
 
 def _secrets_at_rest_check() -> Check:
@@ -612,6 +643,20 @@ def _drivers_check() -> Check:
         return Check("drivers", "warn", detail,
                      hint=f"id collides with a built-in and is ignored: "
                           f"{', '.join(collisions)}")
+    # binary contract: a driver that PINS its binary and whose binary no
+    # longer matches is refused at run time, so say it here rather than
+    # letting the planner discover it mid-engagement
+    try:
+        from phantom.automation.runtime import driver_contract as dc
+        broken = [r["id"] for r in dc.verify_drivers()
+                  if r.get("pinned") and not r.get("verified")]
+    except Exception:
+        broken = []
+    if broken:
+        return Check(
+            "drivers", "warn", detail,
+            hint=f"pinned binary does not match (the broker refuses them): "
+                 f"{', '.join(broken[:6])}")
     unapproved = [r["id"] for r in rows if not r.get("approved")]
     if unapproved:
         return Check(
@@ -661,7 +706,8 @@ def run_doctor(net: bool = False) -> DoctorReport:
     """Run the checks and return the report (never raises)."""
     fns: List[CheckFn] = [
         _python_check, _core_deps_check, _toolchain_check, _ad_tools_check,
-        _data_dir_check, _config_check, _c2_hardening_check, _toolbelt_check,
+        _data_dir_check, _config_check, _c2_hardening_check,
+        _auto_persist_grant_check, _toolbelt_check,
         _external_services_check, _drivers_check,
         _c2_operator_auth_check, _c2_front_check,
         _c2_backend_check, _c2d_capabilities_check, _secrets_at_rest_check,

@@ -66,6 +66,17 @@ class RawReport:
     identity_field: Optional[Dict[str, Any]] = None
     # chronological narrative: findings + actions + failures + noise + C2
     timeline: List[Dict[str, Any]] = field(default_factory=list)
+    # P1 per-phase artifacts: when this report covers ONE stage of a run,
+    # these say which stage it is and how it ended. A single-stage goal
+    # (identity, deliver…) is the ladder of length 1, so the same fields
+    # describe it. All empty on the end-of-run report, which spans them all.
+    phase: str = ""
+    phase_index: int = 0
+    phase_total: int = 0
+    phase_ok: Optional[bool] = None
+    # P0 engagement outcome for the phase / run this report covers.
+    outcome: str = ""
+    outcome_label: str = ""
 
     @classmethod
     def from_agent(cls, agent) -> "RawReport":
@@ -205,6 +216,12 @@ class RawReport:
             "goal": self.goal,
             "started": self.started,
             "ended": self.ended,
+            "phase": self.phase,
+            "phase_index": self.phase_index,
+            "phase_total": self.phase_total,
+            "phase_ok": self.phase_ok,
+            "outcome": self.outcome,
+            "outcome_label": self.outcome_label,
             "opsec_spent": round(self.opsec_spent, 2),
             "actions": self.actions,
             "failures": self.failures,
@@ -236,9 +253,15 @@ class RawReport:
             f"# Phantom Raw Report — {self.target}",
             "",
             f"**Goal:** {self.goal}  ",
+            *([f"**Phase:** {self.phase} "
+               f"({self.phase_index}/{self.phase_total}"
+               + (" — satisfied" if self.phase_ok else " — not satisfied")
+               + ")  "] if self.phase else []),
             f"**Started:** {self.started}  ",
             f"**Ended:** {self.ended or '-'}  ",
             f"**OPSEC spent:** {round(self.opsec_spent, 2)}  ",
+            *([f"**Outcome:** {self.outcome_label or self.outcome}  "]
+              if self.outcome else []),
             "",
             "## Summary",
             "",

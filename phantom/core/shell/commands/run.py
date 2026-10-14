@@ -543,12 +543,21 @@ def cmd_map(shell, arg: str):
 def cmd_install(shell, arg: str):
     """install <tool> — install a missing tool in the current backend
     environment (apt / brew / choco / pip, auto-selected; WSL on
-    Windows). Shows the live output."""
+    Windows). Asks first and shows the exact command; `deps install` asks
+    the same way. Then shows the live output."""
     tool = arg.strip().lower()
     if not tool:
         notifier.usage("install", "<tool>", "e.g. install hydra")
         return
     from phantom.core.executor import install_tool
+
+    # Consent, in the same shape as `deps install`: this runs a package
+    # MANAGER on the operator's machine. Before it ran one with no question
+    # at all, while the sibling command asked — two doors, two policies.
+    from phantom.core.shell.ui import ask_to_install
+    if not ask_to_install(tool, _install_preview(tool)):
+        notifier.info(f"{tool} was NOT installed — nothing was run.")
+        return
     notifier.status(f"Installing {tool}... (this can take a while)")
     res = install_tool(tool)
     out = (res.get("output") or "").strip()
@@ -560,6 +569,31 @@ def cmd_install(shell, arg: str):
         _sh.console.print(out[-1500:])
     else:
         notifier.info(f"Command used: {res.get('command', '')}")
+
+
+def _install_preview(tool: str) -> list:
+    """The command THIS machine would run, for the confirmation prompt.
+
+    The toolchain can name the exact argv on the current environment; when it
+    cannot (the WSL / elevation routes are chosen inside
+    `executor.install_tool`), the install HINT is shown instead — the point is
+    that the operator sees what is about to run, never a blank "install?"
+    """
+    try:
+        from phantom.utils import toolchain as tc
+        cmd = tc.install_command(tool, tc.detect_env())
+        if cmd:
+            return list(cmd)
+    except Exception:
+        pass
+    try:
+        from phantom.core.executor import tool_install_hint
+        hint = str(tool_install_hint(tool) or "").strip()
+        if hint:
+            return [hint]
+    except Exception:
+        pass
+    return [tool]
 
 
 def cmd_scan_diff(shell, arg: str):

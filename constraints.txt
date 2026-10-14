@@ -1,0 +1,49 @@
+# constraints.txt — the VERIFIED version set, pinned.
+#
+# Why this file exists
+# --------------------
+# requirements.txt carries FLOORS (>=) on purpose: it is what CI and the
+# installers use, and it must accept a range so a security patch upstream is
+# not blocked by a stale pin. The cost of that choice is that two installs a
+# month apart can produce different environments, and a red build caused by
+# an upstream minor release reads as a product regression.
+#
+# This file is the other half: the exact versions the suite has been verified
+# against. It is OPT-IN, so nothing changes for CI or for the one-line
+# installers — but an operator who wants the verified tree reproduces it with
+#
+#     pip install -r requirements.txt -r requirements-dev.txt -c constraints.txt
+#
+# Regenerate after a deliberate upgrade:
+#     python -m pip freeze | grep -iE '^(rich|requests|...)='
+# and re-run the suite before committing the new numbers.
+#
+# NOTE: a constraint may only NARROW a requirement, never widen it. Every pin
+# below satisfies the floor declared in requirements.txt / requirements-dev.txt.
+
+# ── runtime (requirements.txt) ────────────────────────────────────────────
+rich==14.3.2
+requests==2.32.3
+python-nmap==0.7.1
+scapy==2.7.0
+reportlab==4.2.0
+python-whois==0.9.6
+dnspython==2.8.0
+python-dotenv==1.2.3
+aiohttp==3.13.3
+cryptography==44.0.3
+mysql-connector-python==26.7.0
+psycopg2-binary==2.9.10
+phonenumbers==9.0.22
+
+# ── test & development (requirements-dev.txt) ────────────────────────────
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-timeout==2.4.0
+pytest-cov==5.0.0
+pytest-xdist==3.8.0
+pytest-mock==3.13.0
+PyYAML==6.0.3
+bandit==1.7.5
+ruff==0.6.8
+mypy==2.2.0

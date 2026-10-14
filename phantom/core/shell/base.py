@@ -1,10 +1,16 @@
 """PhantomShell: the interactive manual shell (loop + infrastructure).
 
-The 36 ``do_*`` commands live in :mod:`phantom.core.shell.commands` as plain
+The ``do_*`` commands live in :mod:`phantom.core.shell.commands` as plain
 ``handler(shell, arg)`` functions and are wired here dynamically, so
 ``cmd.Cmd`` keeps working (help, completion, precmd) with zero
 per-command boilerplate. Everything a command needs from the shell
 (module registry, aliases, profiles, plugins) stays on this class.
+
+This docstring used to state a fixed command count, and was wrong (it named
+a number the registry had long outgrown): a count in prose is a claim nothing
+checks. It does not state one anymore — the registry IS the count:
+``phantom.core.shell.registry.command_names()``.
+(`tests/test_core_help.py` keeps it that way.)
 """
 from __future__ import annotations
 
@@ -302,8 +308,12 @@ class PhantomShell(cmd.Cmd):
             candidates = [session.target] if session.target else []
             try:
                 candidates += session.list_saved()
-            except Exception:
-                pass
+            except Exception as exc:
+                # Best-effort completion: a broken store must not break the
+                # tab key, but it must not disappear either.
+                from phantom.utils.failure_taxonomy import record
+                record("shell.complete_set", exc, best_effort=True,
+                       detail="target salvati non elencabili")
             return [c for c in candidates if c.startswith(text)]
         return []
 
@@ -410,8 +420,10 @@ class PhantomShell(cmd.Cmd):
             from phantom.core.knowledge import session_wm
             if session_wm().has_any(fact):
                 return ""
-        except Exception:
-            return ""
+        except Exception as exc:
+            from phantom.utils.failure_taxonomy import record
+            record("shell.existing_fact_hint", exc, best_effort=True,
+                   detail=f"hint per {module_name} non calcolabile")
         return fact
 
     def complete_use(self, text: str, line: str, begidx: int, endidx: int) -> list:

@@ -21,7 +21,7 @@ EXPECTED = {
     "c2", "malleable", "ad", "wordlists", "export", "guardrails",
     "deps", "llm", "social",
     "help", "config", "setup", "coverage", "doctor", "experience",
-    "why", "tool",
+    "why", "tool", "workflow",
     "back", "exit", "quit",
 }
 

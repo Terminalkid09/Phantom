@@ -7,8 +7,24 @@ from rich.console import Console
 
 console = Console()
 
-def main():
-    parser = argparse.ArgumentParser(description="Phantom offensive Security Framework")
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI surface, in ONE place.
+
+    Factored out of :func:`main` so it can be INTROSPECTED: the README claims a
+    set of flags, and `tests/test_readme_contract.py` compares that set with
+    this parser. The two used to live in different worlds — the README
+    documented `--agent` and `--no-stealth`, which never existed, and `--agent`
+    was even SWALLOWED silently (`parse_known_args` puts unknown options in
+    `extra`, where nothing looked at them).
+
+    ``allow_abbrev=False`` closes the back door on that: argparse otherwise
+    resolves any unambiguous PREFIX, so `--agent` was accepted as `--agents`
+    (with no value, i.e. the default — a typo that changes nothing AND says
+    nothing). Now it falls through to :func:`main`'s unknown-option refusal.
+    """
+    parser = argparse.ArgumentParser(
+        description="Phantom offensive Security Framework",
+        allow_abbrev=False)
     parser.add_argument("--profile",
                         help="Load engagement profile at startup (manual shell)")
     parser.add_argument("--c2", action="store_true", help="Launch Phantom C2 interface instead of the AUTO-MODE shell")
@@ -67,9 +83,11 @@ def main():
     parser.add_argument("--supervise", action="store_true",
                         help="auto-mode: keep the run alive WITHOUT anybody "
                              "watching — a crash mid-engagement relaunches it "
-                             "from its checkpoint (bounded by the same "
-                             "persisted counter; Ctrl+C is a stop, never a "
-                             "relaunch)")
+                             "from its checkpoint, and so does a run that "
+                             "ended cleanly WITHOUT reaching its goal "
+                             "(`completed` != goal reached); both are bounded "
+                             "by the same persisted counter, and Ctrl+C is a "
+                             "stop, never a relaunch")
     parser.add_argument("--max-restarts", dest="max_restarts", type=int,
                         default=3, metavar="N",
                         help="auto-mode --supervise: automatic relaunches "
@@ -123,7 +141,24 @@ def main():
     parser.add_argument("--doctor", action="store_true",
                         help="diagnostics only: python, tools, docker, WSL, "
                              "LLM transport — installs nothing")
+    return parser
+
+
+def main():
+    parser = build_parser()
     args, extra = parser.parse_known_args()
+    # `parse_known_args` exists so `--auto <t1> <t2>` can take extra TARGETS.
+    # Anything else left over that looks like a flag is an option this entry
+    # point does not have: refusing it is the difference between "`--agent` did
+    # nothing" and "`--agent` does not exist, here is what does".
+    unknown = sorted({tok for tok in extra if tok.startswith("-")})
+    if unknown:
+        from phantom.utils.notifier import notifier
+        notifier.error("unknown option(s): " + ", ".join(unknown))
+        notifier.info("`phantom --help` lists every flag this entry point "
+                      "accepts; extra non-flag arguments after `--auto` are "
+                      "treated as targets.")
+        sys.exit(2)
 
     if args.doctor:
         from phantom.utils.setup_wizard import doctor
@@ -233,12 +268,27 @@ def main():
                 if kind != "launch":
                     notifier.info(f"supervisor: {kind} {payload}")
 
+            def _outcome(result) -> str:
+                """The engagement outcome the run itself reported.
+
+                `run_auto_mode` returns its envelope (`outcome`, `label`,
+                `goal_reached`, per-target tokens). The supervisor needs it
+                to tell an engagement that is DONE from one that stopped
+                cleanly having got nowhere: the second kind is unattended
+                work, not a finished engagement.
+                """
+                try:
+                    return str((result or {}).get("outcome") or "")
+                except Exception:
+                    return ""
+
             _summary = supervise(
                 _launch,
                 resume=args.resume,
                 max_restarts=args.max_restarts,
                 counter_path=_resume_counter,
                 on_event=_announce,
+                outcome_of=_outcome,
             )
             notifier.info(
                 f"auto-mode supervised: {_summary['attempts']} attempt(s), "
@@ -315,6 +365,29 @@ def build_service_command(args, targets) -> list:
     return command
 
 
+#: audit kinds for boot-level service definitions. Deliberately the SAME
+#: strings as `phantom.automation.decision_audit.KIND_SERVICE_*` (one
+#: vocabulary, pinned by tests/test_service_unit_safety.py), without importing
+#: the automation package just to open the CLI.
+KIND_INSTALLED = "service_unit_installed"
+KIND_REMOVED = "service_unit_removed"
+
+
+def _audit_service(event: str, **fields) -> None:
+    """Record a boot-level service change. Never raises.
+
+    Writing (or deleting) a service definition outlives the process and can
+    start code at boot: it belongs in the tamper-evident trail next to the
+    decisions, not only in scrollback. Best-effort by construction — an audit
+    sink must never make the operator lose the action itself.
+    """
+    try:
+        from phantom.automation import decision_audit
+        decision_audit.record(event, **fields)
+    except Exception:
+        pass
+
+
 def run_service_command(args, targets) -> int:
     """Print, install or remove the OS service definition for this run.
 
@@ -326,10 +399,10 @@ def run_service_command(args, targets) -> int:
     `phantom --auto <t> --print-service systemd > unit.service` produces a
     file that can be dropped straight into the unit directory.
     """
-    from phantom.utils.service_units import (KINDS, default_name, host_kind,
-                                             install_service, plan_service,
-                                             service_path, supported,
-                                             uninstall_service)
+    from phantom.utils.service_units import (KINDS, default_name, file_digest,
+                                             host_kind, install_service,
+                                             plan_service, service_path,
+                                             supported, uninstall_service)
     from phantom.utils.notifier import notifier
     from phantom.utils.paths import project_root
 
@@ -358,6 +431,9 @@ def run_service_command(args, targets) -> int:
     if action == "uninstall":
         try:
             path = service_path(kind, unit_name, user=user)
+            # hash the file WHILE it is still there, so the removal is
+            # verifiable against what the install reported
+            before_digest = file_digest(path)
             removed = uninstall_service(path)
         except ValueError as exc:
             # a hostile `--service-name` reaches this branch first: refusing
@@ -365,8 +441,14 @@ def run_service_command(args, targets) -> int:
             # directory
             notifier.error(str(exc))
             return 2
+        _audit_service(KIND_REMOVED, format=kind, name=unit_name, path=path,
+                       digest=before_digest, user=user)
         if removed:
             notifier.success(f"service definition removed: {path}")
+            if before_digest:
+                notifier.info(f"the removed file's sha256 was "
+                              f"{before_digest[:16]}… (compare it with what "
+                              f"--install-service reported)")
         else:
             notifier.warn(f"nothing to remove: {path}")
         if kind == "schtasks":
@@ -408,7 +490,14 @@ def run_service_command(args, targets) -> int:
     except (OSError, ValueError) as exc:
         notifier.error(f"cannot write {plan['path']}: {exc}")
         return 2
+    _audit_service(KIND_INSTALLED, format=kind, name=unit_name, path=path,
+                   digest=plan.get("digest", ""),
+                   content_digest=plan.get("content_digest", ""), user=user)
     notifier.success(f"service definition written: {path}")
+    # WHAT was written, in a form the operator can check later: the invocation
+    # digest identifies the exact command line, the content digest the bytes.
+    notifier.info(f"this invocation: sha256 {plan.get('digest', '')[:16]}… "
+                  f"— the same values are in the decision audit log")
     notifier.info(f"activate it: {plan['hint']}")
     notifier.info("the run it starts is supervised and resumes the newest "
                   "checkpoint; its restart budget is the persisted one, so a "

@@ -636,6 +636,7 @@ export default function NetworkMap({ standalone }: { standalone?: boolean }) {
             const isRec = (n.meta?.ip || '') === recommendedIp
             return (
               <div key={n.id} role="button" tabIndex={0}
+                aria-label={`Device ${n.label} (${n.meta?.ip || 'no address'}) — open details`}
                 onClick={() => setSelected(n)}
                 onKeyDown={(e) => { if (e.key === 'Enter') setSelected(n) }}
                 className={`text-left rounded-lg border p-3 transition-colors group relative cursor-pointer
@@ -729,8 +730,8 @@ export default function NetworkMap({ standalone }: { standalone?: boolean }) {
             >
               <Route size={13} /> Attack Paths {chains.length > 0 && `(${chains.length})`}
             </button>
-            <button onClick={load} className="p-2 rounded text-text-secondary hover:text-text-primary hover:bg-surface-hover">
-              <RefreshCw size={14} />
+            <button onClick={load} aria-label="Reload the network map" className="p-2 rounded text-text-secondary hover:text-text-primary hover:bg-surface-hover">
+              <RefreshCw size={14} aria-hidden="true" />
             </button>
           </div>
         </div>
@@ -741,7 +742,7 @@ export default function NetworkMap({ standalone }: { standalone?: boolean }) {
           <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
             <Network size={13} className="text-phantom-cyan" /> Network Map
           </h2>
-          <button onClick={load} className="text-text-dim hover:text-text-primary"><RefreshCw size={13} /></button>
+          <button onClick={load} aria-label="Reload the network map" className="text-text-dim hover:text-text-primary"><RefreshCw size={13} aria-hidden="true" /></button>
         </div>
       )}
 
@@ -757,6 +758,8 @@ export default function NetworkMap({ standalone }: { standalone?: boolean }) {
         <div ref={containerRef} className={`relative overflow-hidden bg-surface rounded-lg border border-surface-border flex-shrink-0 ${standalone ? 'min-h-[420px] h-[52%]' : 'flex-1'}`}>
           <svg
             ref={svgRef}
+            role="img"
+            aria-label="Network topology map: discovered devices and their connections"
             width="100%" height="100%" viewBox={`0 0 ${width} ${height}`}
             className="w-full h-full select-none"
             style={{ cursor: dragging ? 'grabbing' : 'grab' }}
@@ -859,16 +862,16 @@ export default function NetworkMap({ standalone }: { standalone?: boolean }) {
 
           {/* Zoom controls */}
           <div className="absolute top-3 right-3 flex flex-col gap-1">
-            <button title="Zoom in" onClick={(e) => {
+            <button title="Zoom in" aria-label="Zoom in" onClick={(e) => {
               const rect = svgRef.current?.getBoundingClientRect()
               if (rect) zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, 1.25)
             }} className="w-7 h-7 rounded bg-surface border border-surface-border text-text-secondary hover:text-text-primary text-sm leading-none">+</button>
-            <button title="Zoom out" onClick={(e) => {
+            <button title="Zoom out" aria-label="Zoom out" onClick={(e) => {
               const rect = svgRef.current?.getBoundingClientRect()
               if (rect) zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, 1 / 1.25)
             }} className="w-7 h-7 rounded bg-surface border border-surface-border text-text-secondary hover:text-text-primary text-sm leading-none">−</button>
-            <button title="Reset view" onClick={resetView} className="w-7 h-7 rounded bg-surface border border-surface-border text-text-secondary hover:text-text-primary flex items-center justify-center">
-              <Maximize2 size={11} />
+            <button title="Reset view" aria-label="Reset the map view" onClick={resetView} className="w-7 h-7 rounded bg-surface border border-surface-border text-text-secondary hover:text-text-primary flex items-center justify-center">
+              <Maximize2 size={11} aria-hidden="true" />
             </button>
           </div>
 

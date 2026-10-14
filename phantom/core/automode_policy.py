@@ -236,8 +236,17 @@ def callback_preflight(targets, goal: str, notifier=notifier) -> None:
     `notifier` is injectable so the orchestrator can hand in its own
     announcer (tests replace automode.notifier wholesale).
     """
-    if goal not in ("beacon", "deliver", "complete_kill_chain",
-                    "post_exploit", "deep"):
+    # The callback-dependent goal set is DECLARED ONCE, in
+    # engagement_outcome.CALLBACK_GOALS, and consumed here and by the
+    # orchestrator's fail-closed gate. A goal added there is preflighted and
+    # gated; the two can no longer drift apart.
+    try:
+        from phantom.automation.engagement_outcome import needs_callback
+        _callback_bound = needs_callback(goal)
+    except Exception:
+        _callback_bound = goal in ("beacon", "deliver",
+                                  "complete_kill_chain", "post_exploit", "deep")
+    if not _callback_bound:
         return
     # Materialise ONCE. This function walks `targets` and then compares
     # len(bad) against len(targets): given a generator the first walk exhausts

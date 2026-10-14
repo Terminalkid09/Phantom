@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from typing import Optional
 
 from rich.console import Console
 
@@ -46,9 +47,77 @@ def write_agent_reports(agent, profile: str, out_root: str, target: str):
     from phantom.automation.reporting import RawReport, ClientReport, ReportWriter
     raw = RawReport.from_agent(agent)
     raw.ended = _dt.now().isoformat(timespec="seconds")
+    # P0: the end-of-run report states the ENGAGEMENT outcome, so "completed"
+    # in the job lifecycle and "reached nothing" in the outcome can never be
+    # read as the same thing.
+    try:
+        from phantom.automation.engagement_outcome import (
+            derive_target_outcome, outcome_label)
+        _tok = derive_target_outcome(
+            getattr(agent, "goal", "") or "",
+            getattr(agent, "result", None) or {})
+        raw.outcome = _tok
+        raw.outcome_label = outcome_label(_tok)
+    except Exception:
+        pass
     tdir = os.path.join(out_root, safe_target_dir(target))
     return tdir, ReportWriter(tdir).write(
         raw, ClientReport.from_agent(agent, profile))
+
+
+def write_phase_report(agent, profile: str, out_root: str, stage: str,
+                       index: int = 0, total: int = 0,
+                       ok: Optional[bool] = None):
+    """Write the report for ONE stage of a run, as it ends.
+
+    The requirement is explicit: an artifact at the end of EVERY phase of
+    whatever goal, so a run that only reached `identity` produces a phase
+    report exactly like the five-stage `deep` ladder does. Files land under
+    ``<out_root>/phases/<NN>_<stage>/`` so the ladder reads in order and a
+    later stage can never overwrite an earlier one.
+
+    Returns the paths dict, or {} when it could not be written. NEVER raises:
+    a finished phase must not die because an artifact failed. If ``out_root``
+    is empty (a direct `run_autonomous` call with no engagement directory)
+    nothing is written — silently, because there is nowhere to write.
+    """
+    if not out_root:
+        return {}
+    try:
+        from datetime import datetime as _dt
+        from phantom.automation.engagement_outcome import (
+            derive_target_outcome, outcome_label)
+        from phantom.automation.reporting import (
+            ClientReport, RawReport, ReportWriter)
+        raw = RawReport.from_agent(agent)
+        raw.ended = _dt.now().isoformat(timespec="seconds")
+        raw.phase = stage
+        raw.phase_index = int(index or 0)
+        raw.phase_total = int(total or 0)
+        raw.phase_ok = None if ok is None else bool(ok)
+        # The phase outcome is judged on THIS stage's own terminal fact, so a
+        # satisfied stage is `completed_goal` and an unsatisfied one is
+        # `partial`/`completed_without_goal` — never silently "success".
+        try:
+            _wm = getattr(agent, "wm", None)
+            _res = {
+                "goal_reached": bool(ok),
+                "actions_taken": len(getattr(_wm, "actions_taken", []) or []),
+                "failures": len(getattr(_wm, "failures", []) or []),
+            }
+        except Exception:
+            _res = {"goal_reached": bool(ok)}
+        _tok = derive_target_outcome(
+            getattr(agent, "goal", "") or stage, _res)
+        raw.outcome = _tok
+        raw.outcome_label = outcome_label(_tok)
+        tdir = os.path.join(out_root, "phases",
+                            f"{int(index or 0):02d}_{safe_target_dir(stage) or 'phase'}")
+        return ReportWriter(tdir).write(
+            raw, ClientReport.from_agent(agent, profile))
+    except Exception as exc:
+        notifier.warn(f"Report di fase non scritto ({stage}): {exc}")
+        return {}
 
 
 def print_report_paths(paths: dict) -> None:

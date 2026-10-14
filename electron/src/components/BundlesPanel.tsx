@@ -84,6 +84,7 @@ export default function BundlesPanel() {
         <div className="flex items-center gap-2">
           <button
             onClick={() => void refresh()}
+            aria-label="Refresh the bundle list"
             className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-surface-card border border-surface-border text-xs text-text-secondary hover:text-text-primary"
           >
             <RefreshCw size={12} /> Refresh
@@ -91,6 +92,7 @@ export default function BundlesPanel() {
           <button
             onClick={() => void exportNow()}
             disabled={busy}
+            aria-busy={busy}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-phantom-cyan/15 text-phantom-cyan text-xs hover:bg-phantom-cyan/25 disabled:opacity-50"
           >
             <Download size={12} /> Export current engagement
@@ -110,6 +112,7 @@ export default function BundlesPanel() {
         <input
           value={importName}
           onChange={(e) => setImportName(e.target.value)}
+          aria-label="Bundle name or absolute path to import"
           placeholder="bundle name (e.g. phantom_1720000000.pm) or absolute path"
           className="flex-1 max-w-md px-3 py-1.5 rounded bg-surface-card border border-surface-border text-xs text-text-primary outline-none focus:border-phantom-cyan/50"
         />
@@ -127,15 +130,16 @@ export default function BundlesPanel() {
           No bundles yet. Export the current engagement or close the app once (auto-export on quit).
         </div>
       ) : (
-        <div className="rounded-lg border border-surface-border overflow-hidden">
+        <div className="rounded-lg border border-surface-border overflow-hidden"
+          role="region" aria-live="polite" aria-label="Session bundles">
           <table className="w-full text-xs">
             <thead className="bg-surface-card text-text-dim">
               <tr>
-                <th className="text-left px-3 py-2 font-medium">Bundle</th>
-                <th className="text-left px-3 py-2 font-medium">Target</th>
-                <th className="text-left px-3 py-2 font-medium">Saved</th>
-                <th className="text-left px-3 py-2 font-medium">Size</th>
-                <th className="px-3 py-2" />
+                <th scope="col" className="text-left px-3 py-2 font-medium">Bundle</th>
+                <th scope="col" className="text-left px-3 py-2 font-medium">Target</th>
+                <th scope="col" className="text-left px-3 py-2 font-medium">Saved</th>
+                <th scope="col" className="text-left px-3 py-2 font-medium">Size</th>
+                <th scope="col" className="px-3 py-2" />
               </tr>
             </thead>
             <tbody>
@@ -149,6 +153,7 @@ export default function BundlesPanel() {
                     <button
                       onClick={() => void importBundle(b.name)}
                       disabled={busy}
+                      aria-label={`Import bundle ${b.name}`}
                       className="px-2 py-1 rounded bg-phantom-cyan/10 text-phantom-cyan text-[10px] hover:bg-phantom-cyan/20 disabled:opacity-40"
                     >
                       import

@@ -236,6 +236,38 @@ class TestNoSilentLoss(unittest.TestCase):
             self.assertEqual(data["session"]["target"], "bob@corp.com")
         self._run(check)
 
+    def test_a_results_only_engagement_is_persisted(self):
+        """`session.results` is durable output too (audit §6.5.4).
+
+        The gate used to look at target + notes + findings only, so an
+        engagement whose single result was, say, a scan was NOT written: the
+        operator closed the shell and it was gone.
+        """
+        def check(tmp):
+            session.target = ""
+            reset_wm(target="")
+            session.results = {"scan": {"open_ports": [22, 443]}}
+            try:
+                written = AS.auto_export()
+            finally:
+                session.results = {}
+            self.assertIsNotNone(written, "results-only engagement was dropped")
+            self.assertIn("latest.pm", os.listdir(tmp))
+            data = read_bundle(os.path.join(tmp, "latest.pm"))
+            self.assertIn("scan", data["session"]["results"])
+        self._run(check)
+
+    def test_history_alone_is_not_content(self):
+        """Every typed command lands in history; it must not force a bundle."""
+        def check(tmp):
+            session.history = ["[10:00:00] show session"]
+            try:
+                self.assertIsNone(AS.auto_export())
+            finally:
+                session.history = []
+            self.assertEqual(os.listdir(tmp), [])
+        self._run(check)
+
     def test_a_failed_export_is_announced_not_swallowed(self):
         def check(tmp):
             session.target = "bob@corp.com"

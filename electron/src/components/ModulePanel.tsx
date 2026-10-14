@@ -264,11 +264,11 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
           <p className="text-xs text-text-dim mt-0.5">State-aware · edit · run-group · run-all · preflight</p>
         </div>
         <div className="flex gap-1">
-          <button onClick={handlePreflight} className="p-2 rounded text-text-secondary hover:text-text-primary hover:bg-surface-hover" title="Preflight: check tools">
-            <Wrench size={14} />
+          <button onClick={handlePreflight} className="p-2 rounded text-text-secondary hover:text-text-primary hover:bg-surface-hover" title="Preflight: check tools" aria-label="Preflight: check the tools this module needs">
+            <Wrench size={14} aria-hidden="true" />
           </button>
-          <button onClick={load} className="p-2 rounded text-text-secondary hover:text-text-primary hover:bg-surface-hover" title="Refresh commands">
-            <RefreshCw size={14} />
+          <button onClick={load} className="p-2 rounded text-text-secondary hover:text-text-primary hover:bg-surface-hover" title="Refresh commands" aria-label="Refresh this module's commands">
+            <RefreshCw size={14} aria-hidden="true" />
           </button>
         </div>
       </div>
@@ -299,6 +299,7 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
                   <button
                     onClick={() => handleInstallTool(m.tool)}
                     disabled={installing[m.tool]?.busy}
+                    aria-label={`Install the missing tool ${m.tool}`}
                     className="ml-1.5 px-1.5 py-0.5 rounded bg-phantom-green/20 text-phantom-green hover:bg-phantom-green/30 disabled:opacity-50 transition-colors"
                   >
                     {installing[m.tool]?.busy ? '...' : 'Install'}
@@ -321,7 +322,10 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
           <Loader2 size={14} className="text-phantom-magenta animate-spin" />
           <span className="text-phantom-magenta font-medium">Running: {batchGroup}</span>
           <span className="text-text-dim">({batchCompleted}/{batchTotal})</span>
-          <div className="flex-1 h-1.5 bg-surface-border rounded-full overflow-hidden">
+          <div className="flex-1 h-1.5 bg-surface-border rounded-full overflow-hidden"
+            role="progressbar" aria-label={`Group execution progress: ${batchGroup}`}
+            aria-valuemin={0} aria-valuemax={batchTotal || 0}
+            aria-valuenow={batchCompleted}>
             <div className="h-full bg-phantom-magenta rounded-full transition-all duration-300"
               style={{ width: batchTotal ? `${(batchCompleted / batchTotal) * 100}%` : '0%' }} />
           </div>
@@ -353,6 +357,7 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
                 {group.commands.length > 1 && (
                   <button onClick={() => runGroup(group.name, group.commands)}
                     disabled={anyRunning || !effTarget}
+                    aria-label={`Run the group ${group.name}`}
                     className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-phantom-green/20 text-phantom-green hover:bg-phantom-green/30 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
                     <Layers size={10} /> Run Group
                   </button>
@@ -366,6 +371,7 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
                 const batchSkip = batchResult?.error?.startsWith('skipped:')
                 return (
                   <button key={command} onClick={() => setSelected(command)}
+                    aria-pressed={selected === command}
                     title={item.runnable ? command : `CLI-only: ${item.reason || 'run in the Phantom shell'}`}
                     className={`w-full text-left px-3 py-2 text-[11px] font-mono border-l-2 transition-colors break-words ${
                       selected === command
@@ -394,19 +400,23 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
               <span className="text-[10px] uppercase tracking-wider text-text-dim">Selected command</span>
               <button onClick={startEdit} disabled={!selected || anyRunning}
                 className="flex items-center gap-1 text-[10px] text-text-dim hover:text-phantom-cyan transition-colors disabled:opacity-30"
-                title="Edit command inline before running">
-                <Pencil size={11} /> Edit
+                title="Edit command inline before running"
+                aria-label="Edit the selected command inline before running it">
+                <Pencil size={11} aria-hidden="true" /> Edit
               </button>
             </div>
             {editing ? (
               <div className="flex gap-2">
                 <input type="text" value={editValue} onChange={(e) => setEditValue(e.target.value)}
                   onKeyDown={(e) => { if (e.key === 'Enter') confirmEdit(); if (e.key === 'Escape') setEditing(false) }}
+                  aria-label="Edit the command to run"
                   className="flex-1 bg-surface border border-phantom-cyan rounded px-3 py-2 text-xs font-mono text-text-primary focus:outline-none"
                   autoFocus />
                 <button onClick={confirmEdit}
+                  aria-label="Confirm the edited command"
                   className="px-3 py-2 rounded bg-phantom-cyan/20 text-phantom-cyan text-xs font-medium">✓</button>
                 <button onClick={() => setEditing(false)}
+                  aria-label="Cancel editing the command"
                   className="px-3 py-2 rounded bg-surface-border text-text-secondary text-xs font-medium">✗</button>
               </div>
             ) : (
@@ -425,6 +435,7 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
                 type="text"
                 value={targetOverride}
                 onChange={(e) => setTargetOverride(e.target.value)}
+                aria-label="Execution target for this panel (defaults to the session target)"
                 placeholder={session.target || 'target override'}
                 title="Explicit execution target for this panel (defaults to the session target — auto-mode rewrites it mid-run)"
                 className="w-36 bg-surface border border-surface-border rounded px-2 py-2 text-[11px] font-mono text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-cyan"
@@ -453,7 +464,8 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
                 </span>
               )}
             </div>
-            <pre className="flex-1 overflow-auto p-3 text-xs leading-5 font-mono text-text-primary whitespace-pre-wrap">
+            <pre className="flex-1 overflow-auto p-3 text-xs leading-5 font-mono text-text-primary whitespace-pre-wrap"
+              role="log" aria-live="polite" aria-label="Command output">
               {output || 'Command output will appear here.'}
             </pre>
           </div>

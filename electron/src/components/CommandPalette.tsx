@@ -93,54 +93,78 @@ export default function CommandPalette() {
       className="fixed inset-0 z-50 bg-black/60 flex items-start justify-center pt-[15vh]"
       onClick={(e) => { if (e.target === overlayRef.current) setOpen(false) }}
     >
-      <div className="w-[600px] max-h-[480px] bg-surface-card border border-surface-border rounded-xl shadow-2xl overflow-hidden">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="command-palette-title"
+        className="w-[600px] max-h-[480px] bg-surface-card border border-surface-border rounded-xl shadow-2xl overflow-hidden"
+      >
+        <h2 id="command-palette-title" className="sr-only">Command palette</h2>
         {/* Search input */}
         <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-border">
-          <Search size={17} className="text-text-dim flex-shrink-0" />
+          <Search size={17} aria-hidden="true" className="text-text-dim flex-shrink-0" />
+          <label htmlFor="command-palette-input" className="sr-only">
+            Search commands, beacons, services and credentials
+          </label>
           <input
+            id="command-palette-input"
             ref={inputRef}
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder="Search commands, beacons, services, creds..."
+            aria-label="Search commands, beacons, services and credentials"
+            aria-controls="command-palette-results"
+            aria-expanded={results.length > 0}
+            aria-activedescendant={results[selected] ? `command-palette-option-${selected}` : undefined}
             className="flex-1 bg-transparent text-sm text-text-primary placeholder-text-dim outline-none"
             autoComplete="off"
             spellCheck={false}
           />
           <kbd className="text-[10px] px-1.5 py-0.5 rounded bg-surface border border-surface-border text-text-dim font-mono">
-            <Command size={10} className="inline mr-0.5" />K
+            <Command size={10} aria-hidden="true" className="inline mr-0.5" />K
           </kbd>
         </div>
 
         {/* Results */}
-        <div className="overflow-auto max-h-[360px]">
+        <div
+          id="command-palette-results"
+          role="listbox"
+          aria-label="Search results"
+          className="overflow-auto max-h-[360px]"
+        >
           {query.length < 2 ? (
-            <div className="p-6 text-center text-xs text-text-dim">
-              <Zap size={24} className="mx-auto mb-2 text-text-dim" />
+            <div role="status" aria-live="polite" className="p-6 text-center text-xs text-text-dim">
+              <Zap size={24} aria-hidden="true" className="mx-auto mb-2 text-text-dim" />
               <p>Type to search across all modules, beacons, and session data.</p>
               <p className="mt-1 text-text-dim">Try "nmap", "445", "beacon", "creds"...</p>
             </div>
           ) : loading ? (
-            <div className="p-6 text-center text-xs text-text-dim animate-pulse">Searching...</div>
+            <div role="status" aria-live="polite" className="p-6 text-center text-xs text-text-dim animate-pulse">Searching...</div>
           ) : results.length === 0 ? (
-            <div className="p-6 text-center text-xs text-text-dim">No results for "{query}"</div>
+            <div role="status" aria-live="polite" className="p-6 text-center text-xs text-text-dim">No results for "{query}"</div>
           ) : (
             results.map((r, i) => (
               <button
                 key={i}
+                id={`command-palette-option-${i}`}
+                role="option"
+                aria-selected={i === selected}
+                aria-label={`${r.label} — ${r.source === 'module' ? `use ${r.action}` :
+                   r.source === 'c2' ? 'C2 Dashboard' : 'Session'}`}
                 onClick={() => execute(r)}
                 className={`w-full text-left px-4 py-2.5 flex items-center gap-3 transition-colors text-sm
                   ${i === selected ? 'bg-phantom-magenta/10' : 'hover:bg-surface-hover'}`}
               >
                 <SourceBadge source={r.source} type={r.type} />
                 <span className="flex-1 text-text-primary truncate">{r.label}</span>
-                <span className="text-[10px] text-text-dim flex-shrink-0">
+                <span aria-hidden="true" className="text-[10px] text-text-dim flex-shrink-0">
                   {r.source === 'module' ? `use ${r.action}` :
                    r.source === 'c2' ? 'C2 Dashboard' :
                    'Session'}
                 </span>
-                {i === selected && <CornerDownLeft size={13} className="text-phantom-magenta flex-shrink-0" />}
+                {i === selected && <CornerDownLeft size={13} aria-hidden="true" className="text-phantom-magenta flex-shrink-0" />}
               </button>
             ))
           )}
@@ -169,7 +193,7 @@ function SourceBadge({ source, type }: { source: string; type: string }) {
     result: 'result', mode: 'mode',
   }
   return (
-    <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium flex-shrink-0 ${colors[source] || 'bg-surface-border text-text-dim'}`}>
+    <span aria-label={`source ${source}`} className={`text-[10px] px-1.5 py-0.5 rounded border font-medium flex-shrink-0 ${colors[source] || 'bg-surface-border text-text-dim'}`}>
       {labels[type] || type}
     </span>
   )

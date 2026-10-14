@@ -38,8 +38,12 @@ def cmd_ad(shell, arg: str):
     try:
         from phantom.core.ad_graph import ingest_from_wm
         g = ingest_from_wm(session_wm())
-    except Exception:
-        pass
+    except Exception as exc:
+        # An ingest failure used to render an EMPTY graph with no explanation,
+        # which reads as "no AD facts" rather than "the ingest broke".
+        from phantom.utils.failure_taxonomy import record
+        record("ad.ingest_wm", exc, best_effort=True,
+               detail="il grafo AD salta i fact già noti della sessione")
     parts = arg.strip().split()
     sub = parts[0].lower() if parts else "tree"
 
@@ -464,18 +468,14 @@ def _ask_per_service(service: str, url: str) -> bool:
 
 
 def _ask_to_install(tool: str, cmd) -> bool:
-    """Ask the operator, in the shell, before running a package manager.
+    """Ask the operator before running a package manager (deps install path).
 
-    Defaults to NO on anything other than an explicit yes, and treats a
-    non-interactive shell as a no: an automated run must never install software
-    on the operator's machine just because a scan wanted a tool.
+    Kept as the name this module's call sites and tests use; the policy itself
+    lives in `phantom.core.shell.ui.ask_to_install` because the `install`
+    command asks the SAME question — two doors, one policy.
     """
-    from rich.prompt import Confirm
-    try:
-        return bool(Confirm.ask(
-            "Install " + tool + "?  ($ " + " ".join(cmd) + ")", default=False))
-    except Exception:
-        return False
+    from phantom.core.shell.ui import ask_to_install
+    return ask_to_install(tool, cmd)
 
 
 COMMANDS = {

@@ -450,13 +450,19 @@ phantom.auto <target>                # same, via the AUTO-MODE shell entry point
 phantom.auto                         # interactive AUTO-MODE shell (multi-target
                                      #   list, flags, dry-plan, launch, resume)
 phantom --c2                         # same as phantom.c2
-phantom                              # manual core shell
+phantom                              # AUTO-MODE shell (default); type `manual`
+                                     #   inside it for the module shell
+phantom --manual                     # open the MANUAL module shell directly
 phantom -y <...>                     # run without confirmation prompts
 phantom --auto --aggressive <target> # Force aggressive exploitation
-phantom --auto --no-stealth <target> # Disable stealth scanning
+phantom --auto --stealth <target>    # Max-OPSEC (paranoid) mode
+phantom --auto --speed <target>      # Exploit the first viable opening (faster,
+                                     #   same noise budget)
 phantom --auto <target> --plan       # Dry-run: show plan, don't execute
 phantom --auto <target> -a3          # 3 parallel sub-agents
-phantom --auto <target> --agent      # Full autonomous planner mode
+phantom --auto <target> --reason stealth_first
+                                     # Reasoning objective: balanced (default),
+                                     #   stealth_first, evidence_first, force_first
 phantom --auto <target> --llm        # + optional LLM hypothesis advisor (local GGUF, or remote via PHANTOM_LLM_BACKEND)
 phantom --auto <target> --experience # + cross-engagement learning memory (default: run-only)
 phantom --auto <target> --llm --evolution # + SELF-IMPROVEMENT: stable uncovered failure patterns
@@ -484,6 +490,37 @@ phantom --auto 192.168.1.0/24        # CIDR input = senior network triage FIRST:
                                      #   -> the agent pool assaults the richest hosts,
                                      #   never a random slice of the range
 ```
+
+**Complete flag reference** — the table above is the common path; every flag
+this entry point accepts is listed here, and `tests/test_readme_contract.py`
+compares this list with `phantom/main.py` (both directions) so a documented flag
+always exists and an existing flag is always documented.
+
+| Flag | Purpose |
+|:---|:---|
+| `--auto [targets]` | run the kill chain now, or open the AUTO-MODE shell with no target |
+| `--manual` | open the MANUAL module shell (the same thing `manual` does inside the AUTO shell) |
+| `--c2` | open the C2 shell (`phantom.c2`) |
+| `--profile NAME` | load an engagement profile at startup |
+| `--stealth` / `--aggressive` / `--speed` | OPSEC posture: paranoid, loud+fast, first-viable-opening |
+| `--reason PROFILE` | reasoning objective: `balanced`, `stealth_first`, `evidence_first`, `force_first` |
+| `--identity-active` | dedicated consent for ACTIVE identity probes (reset enumeration, SMTP verify) |
+| `--goal GOAL` | terminal goal (default `deliver`) |
+| `--profile-auto NAME` | target profile (default `enterprise`) |
+| `--agents N` (`-a`) | sub-agent count: `-a` (auto) or `-a2` |
+| `--cell-loop` / `--cell-stages G1,G2` | cell roster (always on) / constrain it to these goals |
+| `--oM` / `--only-markdown` | learning mode: markdown proposals instead of authored code |
+| `--plan` | dry-run: show the plan, execute nothing |
+| `--verbose` | add the live reasoning trace to the action trace |
+| `--llm` / `--experience` / `--evolution` / `--beta` | optional advisor · cross-engagement memory · self-improvement PRs · load machine-authored capabilities |
+| `--resume CHECKPOINT` / `--resume-latest` | resume a checkpoint / the newest one, unattended |
+| `--supervise` / `--max-restarts N` | keep the run alive across crashes (bounded relaunches) |
+| `--print-service [kind]` | print the OS service definition for THIS invocation (writes nothing) |
+| `--install-service [kind]` | write that definition (activation is a separate, printed command) |
+| `--uninstall-service [kind]` | remove it |
+| `--service-name NAME` / `--service-system` | unit name / system-level unit instead of per-user |
+| `--setup [wsl]` / `--doctor` | guided setup / diagnostics only (installs nothing) |
+| `-y` / `--yes` | run mode sequences without confirmation prompts |
 
 **Target classes & platform branches** — the planner classifies every input
 (and every target *discovered* mid-run) and applies a class doctrine:
@@ -726,9 +763,10 @@ DIRECTLY through it (`beacon_via_rce`) — no reverse-shell detour.
   - **Graph mining**: tagged posts, commenters and follower counts mined from the profile's own embedded JSON (ld+json / rehydration blobs) — every handle becomes a pivot lead with its evidence source
   - **Username variants**: `mario.rossi` → `mario_rossi`, `mariorossi`, `mario.rossi1`... probed on the same platform
   - **Wayback snapshots**: ex-public profiles often leak the OLD public bio (real name, emails, linked handles) via the CDX archive
-  - **Search dorks**: DuckDuckGo queries (no API key) across platform/leak/code sites
+  - **Search dorks**: DuckDuckGo queries (no API key) across platform/leak/code sites — by the **handle AND by the real name** once a run has found one (a person is looked up by their name as much as by their handle), and scoped to the operator's choice below
   - **Cross-account correlation**: avatar-hash equality and bio-similarity scoring between platforms prove two different handles are the same person (confidence 0.85 avatar / 0.65 bio)
   - Bounded (≤ 20 network calls), every lead carries its evidence (`variant_probe`, `wayback:<ts>`, `avatar_match:<platform>`, `ddg_dork`)
+- **Operator OSINT scope** (`--platform` on `auto`, and the checkbox in the Auto-Mode panel) — a username is not a person: the same handle on another network is very often somebody else, and a namesake inside the identity graph sends the whole chain (DM, follow, phish) at a stranger. So the operator says where the handle belongs: **`--platform instagram`** (or tiktok/x/github/telegram) **pins** the pass to that one network — nothing else is fetched and the social graph is built from that account alone; **`--platform other`** **excludes** those five and searches everywhere else, reporting every correspondence it finds. Either way a `RECON_SCOPE` line records the decision. A pinned run also shows the profile preview (avatar, bio, follower counts) for one confirmation *before* launch. Empty = auto: every platform is probed and cross-scored by the identity-confidence gate below. The scope is stated in the Auto-Mode panel, in `--plan`, and in the `/api/automode/plan` dry run, so a preview can never disagree with the run. The scope, every dork hit and every wayback snapshot are recorded as **findings** (`recon_scope` / `search_hit` / `wayback`), so the operator sees them in the live stream, the knowledge base and the report — not just in a string.
 - **Identity-confidence gate** (`identity_conf` findings) — the wrong-person guardrail on cross-platform pivots: every candidate found on another platform is scored into **CONFIRMED** (avatar hash equality, cross-link, same email/phone visible — proofs a username collision cannot fake), **PROBABLE** (weak signals agreeing: name + interests), or **UNRELATED** (same handle alone — deliberately weak, the exact trap this closes). The target ledger honors the tiers: PROBABLE/UNRELATED handles can never become actionable pivots (read-only recon only) unless `--aggressive` explicitly accepts the wrong-person risk. Weak-signal sums are mathematically capped below CONFIRMED — coincidences can never add up to proof.
 - **Persistent social state** (`data/social_state.json`, `0600`) — multi-day engagements span several phantom sessions, so the time-sensitive social facts live on disk — including the **two-stage conversation ledger**: which opener landed, whether the target replied, and whether the held link was already sent and are re-evaluated against **wall-clock time** on every start: the persona warmup clock (a fresh identity ages 72h before its first cold contact — 6h under `--aggressive`; the countdown is idempotent and never resets on re-run) and the follow-request ledger (a follow sent yesterday is still pending today; an accept recorded while phantom was closed is picked up on restart, `wait_follow` reloads the ledger mid-wait). Corrupt/missing file = empty state, never a crash.
 - **Hardened-target surface mapping** (`surface_map` capability + automatic escalation) — when a port scan sees NO open services on a domain target (CDN/WAF-blind perimeter), the agent escalates once from port enumeration to **asset enumeration**: Certificate Transparency hosts (dev/test/legacy/VPN/SSO names, risk-scored), Wayback endpoints (admin panels, APIs, backups), JS-referenced API routes and cloud hosts, mail topology (SPF/DMARC spoofability, M365/GWS fingerprint), SSO/OIDC portals (Okta/Auth0/Azure AD tenants), VPN gateway fingerprints (Fortinet/Ivanti/Pulse/SonicWall/Cisco), DNS misconfigs (AXFR, DKIM). Every asset carries a 0..1 risk score the planner ranks into real attack paths.
@@ -972,7 +1010,13 @@ irm https://raw.githubusercontent.com/Terminalkid09/Phantom/main/install/install
 curl -fsSL https://raw.githubusercontent.com/Terminalkid09/Phantom/main/install/install.sh | sh
 ```
 
-Both installers: download the repo tarball from `main` (integrity-checked), install into `%LOCALAPPDATA%\Phantom` / `~/.phantom`, create a private venv, write the `phantom` / `phantom.c2` / `phantom.auto` launchers into the **user** PATH. **No admin, no registry beyond HKCU, nothing silent** — re-running refreshes in place.
+Both installers: download the repo tarball and install only what a run needs (the `phantom` package, `setup.py`, `MANIFEST.in`, `requirements.txt` — not `docs/`, `tests/`, the Electron app or `data/`) into `%LOCALAPPDATA%\Phantom` / `~/.phantom`, create a private venv, write the `phantom` / `phantom.c2` / `phantom.auto` launchers into the **user** PATH. **No admin, no registry beyond HKCU, nothing silent** — re-running refreshes in place.
+
+They install the **`dev`** branch (the line these docs describe, v3.0.0); `PHANTOM_BRANCH=main` installs the released line instead, and `PHANTOM_FULL_TREE=1` restores the old whole-tree copy.
+
+**Integrity, stated honestly:** the download is verified to be a gzip/tar archive of the expected branch that actually contains `phantom/main.py`, `requirements.txt` and `setup.py` — three checks that a truncated download or a captive-portal HTML page fails. It is **not** a signed release and there is no published checksum for a branch tarball, so for provenance fetch a tag and read the commit: `git clone --branch v2.0.0 https://github.com/Terminalkid09/Phantom`.
+
+Package paths: `pip install -e .` and `pip install -r requirements.txt` install the **same** dependency set, because `setup.py` reads `requirements.txt` instead of keeping a second copy (`tests/test_dependency_manifests.py` pins it).
 
 After installing, the guided setup walks you through the toolbox:
 
@@ -1031,7 +1075,7 @@ Phantom ships with a **React + TypeScript Electron desktop application** designe
 Electron (React + Vite + TypeScript)
         │  HTTP + Ctrl+K Command Palette
         ▼
-Python API Server  (localhost:9876, 45+ endpoints)
+Python API Server  (localhost:9876, 98 route registrations)
         │
         ├─ phantom.core.automode   → auto-mode kill chain
         ├─ phantom.core.c2_server   → C2 listener + beacon control
@@ -1202,9 +1246,9 @@ Every PoC runs in an isolated subprocess with a hard timeout and fails softly on
 ## Project Structure
 
 ```
-phantom/
+phantom/                        # repository root
 ├── _run_c2.py                  # Standalone C2 REST server (no shell)
-├── phantom/
+├── phantom/                    # the Python package
 │   ├── core/                   # Shell, C2 server, session, automode, knowledge
 │   ├── modules/                # 12 manual pentest modules
 │   ├── automation/             # Autonomous agent, planner, stealth, anomaly engine
@@ -1239,7 +1283,7 @@ phantom/
 │   └── bt_scan.h               # Bluetooth scanning
 ├── electron/                   # React + Vite + TypeScript desktop app
 ├── data/                       # Sessions, cache, certs, wordlists
-├── tests/                      # 74 test files
+├── tests/                      # 365 test files
 ├── Dockerfile                  # Multi-stage Kali-based build
 ├── docker-compose.yml          # One-command deployment
 └── .env.example                # External API template
@@ -1255,4 +1299,4 @@ Phantom is intended for authorized penetration testing and educational purposes 
 
 ## Author
 
-**Terminalkid09** — [GitHub](https://github.com/Terminalkid09)
+**Terminalkid09** — [GitHub](https://github.com/Terminalkid09)

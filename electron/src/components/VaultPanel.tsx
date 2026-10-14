@@ -60,7 +60,9 @@ export default function VaultPanel({ standalone }: { standalone?: boolean }) {
   }
 
   return (
-    <div className={`flex flex-col gap-3 ${standalone ? 'h-full p-4' : ''}`}>
+    <div
+      className={`flex flex-col gap-3 ${standalone ? 'h-full p-4' : ''}`}
+      role="region" aria-label="Credential Vault">
       {standalone && (
         <div className="flex items-center justify-between">
           <h1 className="text-lg font-bold text-text-primary flex items-center gap-2">
@@ -68,10 +70,12 @@ export default function VaultPanel({ standalone }: { standalone?: boolean }) {
           </h1>
           <div className="flex gap-1.5">
             <button onClick={() => setAdding(!adding)}
+              aria-expanded={adding} aria-controls="vault-add-form"
               className="px-3 py-1.5 rounded bg-phantom-yellow/20 text-phantom-yellow text-xs font-medium flex items-center gap-1.5 hover:bg-phantom-yellow/30">
               <Plus size={12} /> Add Entry
             </button>
-            <button onClick={load} className="p-1.5 rounded text-text-secondary hover:text-text-primary hover:bg-surface-hover">
+            <button onClick={load} aria-label="Refresh vault entries"
+              className="p-1.5 rounded text-text-secondary hover:text-text-primary hover:bg-surface-hover">
               <RefreshCw size={14} />
             </button>
           </div>
@@ -85,19 +89,22 @@ export default function VaultPanel({ standalone }: { standalone?: boolean }) {
           </h2>
           <div className="flex gap-1">
             <button onClick={() => setAdding(!adding)}
+              aria-expanded={adding} aria-controls="vault-add-form"
               className="text-[10px] px-2 py-0.5 rounded bg-phantom-yellow/20 text-phantom-yellow hover:bg-phantom-yellow/30">
               <Plus size={10} className="inline mr-0.5" />Add
             </button>
-            <button onClick={load} className="text-text-dim hover:text-text-primary"><RefreshCw size={13} /></button>
+            <button onClick={load} aria-label="Refresh vault entries"
+              className="text-text-dim hover:text-text-primary"><RefreshCw size={13} /></button>
           </div>
         </div>
       )}
 
       {/* Search */}
-      <div className="flex gap-2">
+      <div className="flex gap-2" role="search">
         <div className="flex-1 relative">
-          <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-dim" />
+          <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-dim" aria-hidden="true" />
           <input type="text" value={search} onChange={(e) => setSearch(e.target.value)}
+            aria-label="Filter vault entries by target, username or service"
             placeholder="Filter by target, username, service..."
             className="w-full bg-surface border border-surface-border rounded pl-8 pr-3 py-2 text-xs text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-yellow" />
         </div>
@@ -105,20 +112,26 @@ export default function VaultPanel({ standalone }: { standalone?: boolean }) {
 
       {/* Add form */}
       {adding && (
-        <div className="bg-surface border border-phantom-yellow/30 rounded-lg p-3 space-y-2">
+        <div id="vault-add-form" role="group" aria-label="New vault entry"
+          className="bg-surface border border-phantom-yellow/30 rounded-lg p-3 space-y-2">
           <div className="flex gap-2">
             <input type="text" value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })}
+              aria-label="Username"
               placeholder="Username" className="flex-1 bg-surface-card border border-surface-border rounded px-2.5 py-1.5 text-xs text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-yellow" />
             <input type="text" value={form.service} onChange={(e) => setForm({ ...form, service: e.target.value })}
+              aria-label="Service (ssh, smb, http)"
               placeholder="Service (ssh, smb, http...)" className="w-40 bg-surface-card border border-surface-border rounded px-2.5 py-1.5 text-xs text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-yellow" />
           </div>
           <div className="flex gap-2">
             <input type="text" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })}
+              aria-label="Password"
               placeholder="Password" className="flex-1 bg-surface-card border border-surface-border rounded px-2.5 py-1.5 text-xs font-mono text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-yellow" />
             <input type="text" value={form.hash} onChange={(e) => setForm({ ...form, hash: e.target.value })}
+              aria-label="Hash (NTLM, SHA256)"
               placeholder="Hash (NTLM, SHA256...)" className="flex-1 bg-surface-card border border-surface-border rounded px-2.5 py-1.5 text-xs font-mono text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-yellow" />
           </div>
           <input type="text" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })}
+            aria-label="Notes (pivot, domain admin)"
             placeholder="Notes (pivot, domain admin...)" className="w-full bg-surface-card border border-surface-border rounded px-2.5 py-1.5 text-xs text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-yellow" />
           <div className="flex gap-2">
             <button onClick={add} className="flex-1 py-1.5 rounded bg-phantom-yellow/20 text-phantom-yellow text-xs font-medium hover:bg-phantom-yellow/30">Save to Vault</button>
@@ -128,7 +141,8 @@ export default function VaultPanel({ standalone }: { standalone?: boolean }) {
       )}
 
       {/* Entries */}
-      <div className="flex-1 overflow-auto space-y-2">
+      <div className="flex-1 overflow-auto space-y-2" role="list"
+        aria-label="Stored credentials" aria-live="polite">
         {entries.length === 0 ? (
           <div className={`text-xs text-text-dim ${standalone ? 'p-8 text-center' : 'p-4 text-center'}`}>
             <Lock size={28} className="mx-auto mb-2 text-text-dim" />
@@ -139,7 +153,8 @@ export default function VaultPanel({ standalone }: { standalone?: boolean }) {
           entries.map((e) => {
             const badge = typeBadge(e.type)
             return (
-              <div key={e.id} className="bg-surface border border-surface-border rounded-lg p-3">
+              <div key={e.id} role="listitem"
+                className="bg-surface border border-surface-border rounded-lg p-3">
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
                     <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${badge.bg} ${badge.text}`}>{badge.label}</span>
@@ -159,10 +174,14 @@ export default function VaultPanel({ standalone }: { standalone?: boolean }) {
                     <code className="text-xs font-mono text-text-primary bg-surface-card px-2 py-0.5 rounded">
                       {showPassword[e.id] ? e.password : '••••••••'}
                     </code>
-                    <button onClick={() => toggleShow(e.id)} className="text-text-dim hover:text-text-primary">
+                    <button onClick={() => toggleShow(e.id)}
+                      aria-label={showPassword[e.id] ? 'Hide password' : 'Show password'}
+                      aria-pressed={!!showPassword[e.id]}
+                      className="text-text-dim hover:text-text-primary">
                       {showPassword[e.id] ? <EyeOff size={12} /> : <Eye size={12} />}
                     </button>
-                    <button onClick={() => copyToClipboard(e.password)} className="text-text-dim hover:text-phantom-cyan" title="Copy">
+                    <button onClick={() => copyToClipboard(e.password)} className="text-text-dim hover:text-phantom-cyan" title="Copy"
+                      aria-label="Copy password to clipboard">
                       <Copy size={12} />
                     </button>
                   </div>
@@ -172,7 +191,8 @@ export default function VaultPanel({ standalone }: { standalone?: boolean }) {
                   <div className="flex items-center gap-2 mt-1">
                     <Hash size={12} className="text-text-dim" />
                     <code className="text-[10px] font-mono text-text-secondary truncate flex-1">{e.hash}</code>
-                    <button onClick={() => copyToClipboard(e.hash)} className="text-text-dim hover:text-phantom-cyan" title="Copy hash">
+                    <button onClick={() => copyToClipboard(e.hash)} className="text-text-dim hover:text-phantom-cyan" title="Copy hash"
+                      aria-label="Copy hash to clipboard">
                       <Copy size={12} />
                     </button>
                   </div>

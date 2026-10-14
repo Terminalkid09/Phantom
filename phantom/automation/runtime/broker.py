@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from phantom.automation.runtime import approval as _approval
 from phantom.automation.runtime.drivers import _driver_adapter
+from phantom.automation.runtime.manifest import MAX_TIMEOUT as _MAX_TIMEOUT
 
 
 @dataclass
@@ -83,16 +84,57 @@ class ExecutionBroker:
             if is_identity_target(classify_target(target)):
                 return True                 # scope gates machines, not people
             return bool(is_in_scope(target, self.scope_list))
-        except Exception:
-            return True                     # never fail-open on a broken check?
+        except Exception as exc:
+            # FAIL CLOSED. A scope check that cannot RUN is not a pass: the
+            # previous `return True` turned a broken scope engine into an
+            # implicit authorization for every target, which is the one
+            # direction this gate must never fail in. The failure is now a
+            # typed, observable event instead of a silent yes.
+            from phantom.utils.failure_taxonomy import record
+            record("broker._scope_ok", exc, detail=f"target={target}")
+            return False
 
     def _availability_ok(self, driver: Any) -> bool:
         if self.toolchain is None:
             return True
         try:
             return bool(self.toolchain.has(getattr(driver, "tool", "")))
-        except Exception:
+        except Exception as exc:
+            # Availability is informational (the tool may be on the remote
+            # host), so a broken probe stays permissive ON PURPOSE — but it
+            # is recorded with a category rather than vanishing.
+            from phantom.utils.failure_taxonomy import record
+            record("broker._availability_ok", exc, best_effort=True,
+                   detail=f"tool={getattr(driver, 'tool', '')}")
             return True
+
+    def _binary_contract_ok(self, driver: Any) -> bool:
+        """The declared binary must be the declared binary.
+
+        ``_binary_matches`` already stops a manifest that names one tool and
+        runs another. This catches SUBSTITUTION: the name resolves, and the
+        program behind it is not the one that was reviewed. It only bites
+        when the manifest PINS a hash (``binary_sha256``); an unpinned
+        manifest is unchecked, not failed, and that is reported as such.
+
+        A verified violation is an EVENT (``driver_contract_violation``),
+        never a silent skip or a plain "tool unavailable".
+        """
+        try:
+            from phantom.automation.runtime.driver_contract import (
+                record_violation, verify_binary)
+            check = verify_binary(driver)
+        except Exception as exc:
+            # a broken VERIFIER must not brick every driver, but the fact
+            # that the check did not run is itself recorded
+            from phantom.utils.failure_taxonomy import record
+            record("broker._binary_contract_ok", exc, best_effort=True,
+                   detail=f"capability={getattr(driver, 'id', '')}")
+            return True
+        if check.ok:
+            return True
+        record_violation(driver, check, where="broker.preflight")
+        return False
 
     def _inputs_ok(self, driver: Any, slots: Dict[str, Any]) -> List[str]:
         missing: List[str] = []
@@ -107,6 +149,23 @@ class ExecutionBroker:
     def preflight(self, driver: Any, target: str = "",
                   slots: Optional[Dict[str, Any]] = None,
                   source: str = "operator-local") -> BrokerDecision:
+        """Run the checks and AUDIT a refusal here, not only in :meth:`run`.
+
+        Most callers ask first and never proceed (the planner checks and
+        drops the move), so a refusal that was only recorded by ``run`` left
+        no trace in the engagement record. The refusal is now recorded at the
+        point the decision is made — exactly once, because ``run`` no longer
+        re-emits a refusal it inherited.
+        """
+        decision = self._preflight(driver, target=target, slots=slots,
+                                   source=source)
+        if not decision.allowed:
+            self._emit(driver, target, decision, ok=False)
+        return decision
+
+    def _preflight(self, driver: Any, target: str = "",
+                   slots: Optional[Dict[str, Any]] = None,
+                   source: str = "operator-local") -> BrokerDecision:
         reasons: List[str] = []
 
         # 1. cancellation
@@ -148,6 +207,18 @@ class ExecutionBroker:
         if not self._availability_ok(driver):
             reasons.append(f"tool {getattr(driver, 'tool', '?')} is unavailable")
 
+        # 5b. binary contract. Availability asks "is there an executable by
+        #     that name?"; the contract asks "is it the right one?". Ordered
+        #     after availability so a missing tool is still reported as a
+        #     missing tool, and before inputs so an integrity failure is
+        #     never masked by an unrelated missing argument.
+        if not self._binary_contract_ok(driver):
+            from phantom.automation.runtime.driver_contract import \
+                CONTRACT_VIOLATION
+            reasons.append(
+                f"{CONTRACT_VIOLATION}: {getattr(driver, 'id', '')} does not "
+                f"match its pinned binary digest")
+
         # 6. required inputs
         missing = self._inputs_ok(driver, sources)
         if missing:
@@ -173,7 +244,7 @@ class ExecutionBroker:
         decision = self.preflight(driver, target=target, slots=slots,
                                   source=source)
         if not decision.allowed:
-            self._emit(driver, target, decision, ok=False)
+            # the refusal was already audited by preflight
             return BrokerResult(False, decision, error="; ".join(
                 decision.reasons))
         if runner is None:
@@ -181,8 +252,7 @@ class ExecutionBroker:
             # caller's back. A real caller injects the executor.
             return BrokerResult(False, decision, error="no runner injected")
 
-        seconds = int(timeout if timeout is not None
-                      else getattr(driver, "timeout", 60) or 60)
+        seconds = self._timeout_for(driver, timeout)
         try:
             result = runner(decision.command, seconds)
         except Exception as exc:  # noqa: BLE001 — a crashed runner is a result
@@ -190,6 +260,30 @@ class ExecutionBroker:
         ok, output = _split_runner(result)
         self._emit(driver, target, decision, ok=ok)
         return BrokerResult(ok, decision, output=output)
+
+    def _timeout_for(self, driver: Any, requested: Optional[int]) -> int:
+        """The timeout actually granted: the manifest's value is a CAP.
+
+        ``run`` used to let a caller OVERRIDE the declared timeout, which made
+        the manifest's ``timeout`` decorative: a driver reviewed to finish in
+        30s could be held for 10 minutes by a caller that simply asked for
+        more. A caller may now only TIGHTEN it — the declared value is the
+        ceiling, clamped to the schema maximum so a leniently parsed manifest
+        (``parse_driver`` alone does not enforce ranges) still cannot outlive
+        the policy.
+        """
+        try:
+            declared = int(getattr(driver, "timeout", 60) or 60)
+        except (TypeError, ValueError):
+            declared = 60
+        declared = max(1, min(declared, _MAX_TIMEOUT))
+        if requested is None:
+            return declared
+        try:
+            asked = int(requested)
+        except (TypeError, ValueError):
+            return declared
+        return max(1, min(asked, declared))
 
     def _emit(self, driver: Any, target: str, decision: BrokerDecision,
               ok: bool) -> None:
