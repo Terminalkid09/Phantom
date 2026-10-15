@@ -1387,10 +1387,10 @@ class C2Shell(cmd.Cmd):
             if detected.known and not is_kernel_compatible(detected.platform,
                                                           platform):
                 notifier.warn(
-                    f"Target rilevato come {detected.platform} "
-                    f"({detected.os_name}) ma stai costruendo un artefatto "
-                    f"{platform}: famiglie di kernel diverse (PE/ELF/Mach-O). "
-                    f"Se il target è quello, l'eseguibile non partirà.")
+                    f"Target detected as {detected.platform} "
+                    f"({detected.os_name}) but you are building a "
+                    f"{platform} artefact: different kernel families (PE/ELF/Mach-O). "
+                    f"If that is the target, the executable will not start.")
         except Exception:
             pass
 
@@ -1499,11 +1499,11 @@ class C2Shell(cmd.Cmd):
             notifier.info("No target set. Run the command manually or set target first with 'set target <ip>'")
 
     def do_telegram(self, arg):
-        """telegram — Avvia il bot Telegram per gestire beacon da mobile"""
+        """telegram — Start the Telegram bot to manage beacons from mobile"""
         try:
             from phantom.modules.telegram import run
             run()
-            notifier.success("Telegram bot avviato in background. /start su @your_bot")
+            notifier.success("Telegram bot started in the background. /start on @your_bot")
         except Exception as e:
             notifier.error(f"Telegram bot: {e}")
 
@@ -1534,15 +1534,15 @@ def run_c2(preferred_beacon: Optional[str] = None):
             if resolved:
                 shell.active_beacon = resolved
                 notifier.success(
-                    f"Handoff: sessione beacon attiva ({resolved})")
-                notifier.info("Comandi digitati -> beacon. "
-                              "'beacon-help' per i comandi, "
-                              "'back' per tornare al C2 globale.")
+                    f"Handoff: beacon session active ({resolved})")
+                notifier.info("Typed commands -> beacon. "
+                              "'beacon-help' for the commands, "
+                              "'back' to return to the global C2.")
             else:
                 notifier.warn(
-                    f"Beacon {preferred_beacon} non trovato dopo "
-                    f"{_HANDOFF_WAIT_SECONDS:.0f}s di attesa. "
-                    "Usa 'beacons' e 'interact <id>'.")
+                    f"Beacon {preferred_beacon} not found after "
+                    f"{_HANDOFF_WAIT_SECONDS:.0f}s of waiting. "
+                    "Use 'beacons' and 'interact <id>'.")
         # Telegram is opt-in: start it explicitly with `telegram`.
         # Entering C2 must not spawn background services or emit configuration alerts.
         shell.cmdloop()

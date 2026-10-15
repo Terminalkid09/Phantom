@@ -2,10 +2,10 @@
 RCE Deployer: Intelligently execute commands on target based on detected services.
 Reads scan XML to determine available RCE vectors (SSH, HTTP, SMB, etc).
 
-Pipeline credenziali (unificata per tutti i servizi):
-  1. Estrai credenziali da Nmap (script output) -> test rapido -> se valide, usa quelle
-  2. Se non presenti, prova default credentials -> test rapido -> se valide, usa quelle
-  3. Se tutto fallisce -> chiedi manualmente all'utente -> test rapido -> se valide procedi
+Credential pipeline (unified across all services):
+  1. Pull credentials from Nmap (script output) -> quick test -> if valid, use them
+  2. If none are present, try default credentials -> quick test -> if valid, use them
+  3. If all of that fails -> ask the operator -> quick test -> if valid, proceed
 """
 
 import os
@@ -258,7 +258,7 @@ def parse_scan_results(scan_results: dict) -> Tuple[List[Dict], Dict, List[Dict]
 
 def _extract_credentials_from_output(script_id: str, output: str, service: str) -> List[Dict]:
     """
-    Analizza l'output degli script Nmap per estrarre credenziali.
+    Parse the Nmap script output to extract credentials.
     Supporta script come: mysql-enum, smb-enum-users, ftp-anon, ecc.
     """
     creds: List[Dict] = []
@@ -376,7 +376,7 @@ def detect_rce_vectors(ports: List[Dict]) -> List[Dict]:
 # Restituisce True se le credenziali sono valide.
 
 def _verify_ssh(target: str, port: int, username: str, password: str) -> Optional[bool]:
-    """Verifica credenziali SSH via sshpass + echo OK. Restituisce None se il tool manca.
+    """Check SSH credentials via sshpass + echo OK. Returns None when the tool is missing.
 
     Tries the modern defaults first: the legacy KEX/host-key options that
     unlock Metasploitable2-era servers BREAK auth against modern OpenSSH
@@ -417,7 +417,7 @@ def _verify_ssh(target: str, port: int, username: str, password: str) -> Optiona
 
 
 def _verify_smb(target: str, port: int, username: str, password: str) -> bool:
-    """Verifica credenziali SMB via smbclient su IPC$."""
+    """Check SMB credentials via smbclient against IPC$."""
     if not _have_tool("smbclient"):
         return False
     try:
@@ -436,7 +436,7 @@ def _verify_smb(target: str, port: int, username: str, password: str) -> bool:
 
 
 def _verify_ftp(target: str, port: int, username: str, password: str) -> bool:
-    """Verifica credenziali FTP via ftplib (solo login, nessuna operazione)."""
+    """Check FTP credentials via ftplib (login only, no further action)."""
     try:
         from ftplib import FTP, error_perm
         ftp = FTP(timeout=5)
@@ -449,7 +449,7 @@ def _verify_ftp(target: str, port: int, username: str, password: str) -> bool:
 
 
 def _verify_tomcat(target: str, port: int, username: str, password: str) -> bool:
-    """Verifica credenziali Tomcat via HTTP GET su /manager/text/list."""
+    """Check Tomcat credentials via an HTTP GET on /manager/text/list."""
     try:
         import requests
         url = f"http://{target}:{port}/manager/text/list"
@@ -472,7 +472,7 @@ def _verify_tomcat(target: str, port: int, username: str, password: str) -> bool
 
 
 def _verify_mysql(target: str, port: int, username: str, password: str) -> bool:
-    """Verifica credenziali MySQL (solo connessione, nessuna query)."""
+    """Check MySQL credentials (connect only, no query)."""
     try:
         import mysql.connector
         conn = mysql.connector.connect(
@@ -501,7 +501,7 @@ def _verify_mysql(target: str, port: int, username: str, password: str) -> bool:
 
 
 def _verify_postgresql(target: str, port: int, username: str, password: str) -> bool:
-    """Verifica credenziali PostgreSQL (solo connessione)."""
+    """Check PostgreSQL credentials (connect only)."""
     try:
         import psycopg2
         conn = psycopg2.connect(
@@ -541,7 +541,7 @@ _METHOD_TO_SERVICE = {
 
 
 def _check_tool(tool: str) -> bool:
-    """Verifica se un tool di sistema e installato. Se manca, propone l'installazione (solo su Linux)."""
+    """Check whether a system tool is installed; when it is missing, offer the install (Linux only)."""
     import shutil
     import os
     
@@ -574,15 +574,15 @@ def ask_credentials(
     nmap_creds: Optional[List[Dict]] = None,
 ) -> Optional[Dict]:
     """
-    Pipeline unificata per ottenere credenziali valide per un dato servizio:
+    Unified pipeline to obtain valid credentials for a given service:
 
-        1. nmap_creds  -> test rapido -> se valide, usa quelle
-        2. default     -> test rapido -> se valide, usa quelle
-        3. manuale     -> test rapido -> se valide, procedi
+        1. nmap_creds  -> quick test -> if valid, use them
+        2. default     -> quick test -> if valid, use them
+        3. manual      -> quick test -> if valid, proceed
 
     Returns:
-        Dict con {"username": str, "password": str, "source": str}
-        None se l'utente cancella o se tutto fallisce.
+        Dict with {"username": str, "password": str, "source": str}
+        None when the operator cancels or everything fails.
     """
     # Metodi che non richiedono credenziali
     if method == "http_cmd_injection":
@@ -677,7 +677,7 @@ def ask_credentials(
 
 
 def _ask_manual(method: str, target: str, port: int) -> Optional[Dict]:
-    """Richiesta manuale semplice per metodi senza verifier."""
+    """Simple manual request for methods with no verifier."""
     console.print(f"  [yellow]Enter credentials for {method} on {target}:{port}[/]")
     username = input("  Username: ").strip()
     password = input("  Password: ").strip()
@@ -694,8 +694,8 @@ def brute_force_ssh(
     target: str, port: int, creds_list: List[Tuple[str, str]]
 ) -> Optional[Tuple[str, str]]:
     """
-    Prova una lista di credenziali SSH usando _verify_ssh.
-    Restituisce (username, password) alla prima coppia valida, None altrimenti.
+    Try a list of SSH credentials using _verify_ssh.
+    Returns (username, password) for the first valid pair, None otherwise.
     """
     for username, password in creds_list:
         if _verify_ssh(target, port, username, password) is True:
@@ -707,8 +707,8 @@ def brute_force_credentials(
     method: str, target: str, port: int, creds_list: List[Tuple[str, str]]
 ) -> Optional[Tuple[str, str]]:
     """
-    Wrapper generico: prova una lista di credenziali sul servizio specificato.
-    Restituisce (username, password) se trova una coppia valida, None altrimenti.
+    Generic wrapper: try a list of credentials against the given service.
+    Returns (username, password) when it finds a valid pair, None otherwise.
     """
     verifier = _VERIFIERS.get(method)
     if not verifier:
@@ -858,8 +858,8 @@ def deploy_beacon_via_tomcat(
     target: str, port: int, username: str, password: str, dropper: str
 ) -> Tuple[bool, str]:
     """
-    Deploy beacon via Tomcat WAR upload con JSP shell.
-    Richiede credenziali di manager.
+    Deploy the beacon via Tomcat WAR upload with a JSP shell.
+    Requires manager credentials.
     """
     console.print(f"\n  [*] Deploying beacon via Tomcat to {target}:{port}")
     console.print(f"      Username: {username}")
@@ -1069,13 +1069,13 @@ def execute_http_rce(
 
 def deploy_beacon(target: str, dropper: str) -> bool:
     """
-    Flusso principale di deploy beacon:
+    Main beacon deploy flow:
 
-    1. Parsing scan XML (porte, OS, credenziali da Nmap)
-    2. Rilevamento vettori RCE disponibili
-    3. Selezione del vettore da parte dell'utente
-    4. Pipeline credenziali unificata (nmap -> default -> manuale)
-    5. Esecuzione del deploy con il dropper
+    1. Parse the scan XML (ports, OS, Nmap credentials)
+    2. Detect the available RCE vectors
+    3. The operator selects the vector
+    4. Unified credential pipeline (nmap -> default -> manual)
+    5. Run the deploy with the dropper
     """
     ports, os_info, found_creds = parse_scan_xml(target)
 
@@ -1169,13 +1169,13 @@ def deploy_beacon(target: str, dropper: str) -> bool:
 # =============================================================================
 
 def auto_select_vector(vectors: List[Dict], os_info: Dict, aggressive: bool = False) -> Optional[Dict]:
-    """Seleziona automaticamente il miglior vettore RCE.
+    """Automatically select the best RCE vector.
     
-    Priorità:
-      - Se OS è Windows → SMB (psexec/wmiexec)
-      - Se OS è Linux → SSH (se credenziali disponibili)
-      - Altrimenti → primo vettore con priorità più alta
-      - In modalità aggressiva → prova anche HTTP command injection
+    Priority:
+      - If the OS is Windows → SMB (psexec/wmiexec)
+      - If the OS is Linux → SSH (when credentials are available)
+      - Otherwise → the first vector with the highest priority
+      - In aggressive mode → also try HTTP command injection
     """
     os_name = os_info.get("name", "").lower() if os_info else ""
     is_windows = any(k in os_name for k in ("windows", "microsoft", "win"))
@@ -1198,12 +1198,12 @@ def auto_select_vector(vectors: List[Dict], os_info: Dict, aggressive: bool = Fa
 
 
 def auto_try_credentials(method: str, target: str, port: int, nmap_creds: Optional[List[Dict]] = None) -> Optional[Dict]:
-    """Pipeline automatica senza interazione utente.
+    """    Automatic pipeline with no user interaction.
     
-    Prova solo:
-      1. Credenziali da Nmap
+    It only tries:
+      1. Credentials from Nmap
       2. Default credentials
-      Non chiede mai input manuale.
+      It never asks for manual input.
     """
     service = _METHOD_TO_SERVICE.get(method)
     if not service:
@@ -1236,15 +1236,15 @@ def auto_try_credentials(method: str, target: str, port: int, nmap_creds: Option
 
 def auto_deploy_beacon(target: str, dropper: str, aggressive: bool = False) -> bool:
     """
-    Versione completamente automatica di deploy_beacon.
-    Nessuna interazione utente — decide tutto da sola.
+    Fully automatic version of deploy_beacon.
+    No user interaction — it decides everything on its own.
 
     Scope discipline: a target outside the configured engagement scope is
     refused before any credential test or deploy attempt.
 
     Returns:
-        True se beacon deployato con successo
-        False altrimenti
+        True when the beacon was deployed successfully
+        False otherwise
     """
     from phantom.core.session import session
     from phantom.core.scope import is_in_scope

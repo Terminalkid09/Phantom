@@ -140,8 +140,8 @@ class TestPayloadModulePlatform:
         finally:
             notifier.warn = original
         assert platform == "linux" and arch == "x64"
-        assert "non rilevato" in os_string or "Unknown" in os_string
-        assert any("non rilevato" in w for w in warns), warns
+        assert "not detected" in os_string or "Unknown" in os_string
+        assert any("not detected" in w for w in warns), warns
 
     def test_the_hint_helper_shares_the_classification(self):
         from phantom.modules.payload import _os_to_payload_hint

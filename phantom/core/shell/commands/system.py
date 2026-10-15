@@ -810,12 +810,12 @@ def cmd_run_diff(shell, arg: str):
         return
     _sh.console.print(format_report(d), markup=False)
     if d.progressed and not d.regressed:
-        notifier.success("Il secondo run è andato oltre il primo.")
+        notifier.success("The second run went beyond the first.")
     elif d.regressed and not d.progressed:
-        notifier.warn("Il secondo run ha REGREDITO: niente di nuovo, "
-                      "conoscenza o terreno persi.")
+        notifier.warn("The second run REGRESSED: nothing new, "
+                      "knowledge or ground lost.")
     elif d.regressed:
-        notifier.warn("Risultato misto: nuove conoscenze E regressioni.")
+        notifier.warn("Mixed result: new knowledge AND regressions.")
 
 
 def cmd_why(shell, arg: str):

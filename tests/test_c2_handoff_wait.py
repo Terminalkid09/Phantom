@@ -5,7 +5,7 @@ listener up and hands the operator a shell already pointed at that beacon) is
 satisfied — but only because the AGENT blocks on ``_await_beacon()`` before
 the handoff is called. That leaves the other door unguarded: any caller (or a
 future one) that hands off on ``beacon_established`` while the registration is
-still landing lands in the ``Beacon <id> non trovato`` branch and silently
+still landing lands in the ``Beacon <id> not found`` branch and silently
 gets the GLOBAL C2 context instead of the beacon the run just established.
 
 So ``run_c2`` now resolves the id through ``_await_beacon_id``: a bounded wait

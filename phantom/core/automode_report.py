@@ -116,7 +116,7 @@ def write_phase_report(agent, profile: str, out_root: str, stage: str,
         return ReportWriter(tdir).write(
             raw, ClientReport.from_agent(agent, profile))
     except Exception as exc:
-        notifier.warn(f"Report di fase non scritto ({stage}): {exc}")
+        notifier.warn(f"Phase report not written ({stage}): {exc}")
         return {}
 
 
@@ -138,7 +138,7 @@ def write_swarm_summary(summary: dict, out_root: str, target: str) -> dict:
         with open(path, "w", encoding="utf-8") as fh:
             _json.dump(clean, fh, indent=2, default=str)
     except OSError as exc:
-        notifier.warn(f"Swarm summary non salvato: {exc}")
+        notifier.warn(f"Swarm summary not saved: {exc}")
         return {}
     return {"summary": path}
 
@@ -159,29 +159,29 @@ def print_swarm_tail(result: dict, summary: dict, out_root: str,
             f"{k}={'✔' if st.get(k) else '—'}" for k in
             ("deliver", "post_exploit", "ad", "crack", "lateral"))
         notifier.success(
-            f"Swarm deep completato (⏱ {elapsed}): "
+            f"Swarm deep complete (⏱ {elapsed}): "
             f"{done}/{len(tasks)} task, beacon={result.get('beacon_established')}, "
-            f"persistenza={result.get('persistence_installed')}, "
+            f"persistence={result.get('persistence_installed')}, "
             f"system/root={result.get('system_privilege')}, "
             f"AD creds={result.get('ad_creds')}, "
             f"cracked={result.get('cracked_hashes')}, "
             f"lateral={result.get('lateral_movements')}, "
-            f"azioni={result.get('actions_taken')}")
+            f"actions={result.get('actions_taken')}")
         notifier.info(f"Stage ladder: {ladder}")
     else:
         notifier.success(
-            f"Swarm {goal} completo (⏱ {elapsed}): {done}/{len(tasks)} task, "
+            f"Swarm {goal} complete (⏱ {elapsed}): {done}/{len(tasks)} task, "
             f"beacon={result.get('beacon_established')}, "
-            f"persistenza={result.get('persistence_installed')}, "
+            f"persistence={result.get('persistence_installed')}, "
             f"creds={result.get('creds_found')}, "
-            f"azioni={result.get('actions_taken')}")
-    notifier.info(f"⏱ Tempo totale engagement: {elapsed}.")
+            f"actions={result.get('actions_taken')}")
+    notifier.info(f"⏱ Total engagement time: {elapsed}.")
     if result.get("beacon_established"):
-        notifier.info("Nessun handoff automatico dallo swarm: apri 'c2' -> "
-                      "'beacons' per prendere in carico i callback.")
+        notifier.info("No automatic handoff from the swarm: open 'c2' -> "
+                      "'beacons' to take charge of the callbacks.")
     else:
-        notifier.warn("Nessun beacon stabilito: niente handoff. "
-                      "Usa 'c2' -> 'beacons' per monitorare callback")
+        notifier.warn("No beacon established: nothing to hand off. "
+                      "Use 'c2' -> 'beacons' to monitor callbacks")
 
 
 def print_agent_single_tail(result: dict, paths: dict, agent, goal: str,
@@ -197,25 +197,25 @@ def print_agent_single_tail(result: dict, paths: dict, agent, goal: str,
             f"{k}={'✔' if st.get(k) else '—'}" for k in
             ("deliver", "post_exploit", "ad", "crack", "lateral"))
         notifier.success(
-            f"Deep engagement completato (⏱ {elapsed}): "
+            f"Deep engagement complete (⏱ {elapsed}): "
             f"beacon={result.get('beacon_established')}, "
-            f"persistenza={result.get('persistence_installed')}, "
+            f"persistence={result.get('persistence_installed')}, "
             f"system/root={result.get('system_privilege')}, "
             f"AD creds={result.get('ad_creds')}, "
             f"cracked={result.get('cracked_hashes')}, "
             f"lateral={result.get('lateral_movements')}, "
-            f"azioni={result.get('actions_taken')}")
+            f"actions={result.get('actions_taken')}")
         notifier.info(f"Stage ladder: {ladder}")
     else:
         notifier.success(
-            f"Deliver completo (⏱ {elapsed}): beacon={result.get('beacon_established')}, "
-            f"persistenza={result.get('persistence_installed')}, "
+            f"Deliver complete (⏱ {elapsed}): beacon={result.get('beacon_established')}, "
+            f"persistence={result.get('persistence_installed')}, "
             f"creds={result.get('creds_found')}, "
             f"victim_ips={result.get('victim_ips')}, "
-            f"ipotesi={result.get('hypotheses')} "
-            f"({result.get('hypotheses_confirmed')} confermate), "
-            f"azioni={result.get('actions_taken')}")
-    notifier.info("Report (raw operatore + client sanificato):")
+            f"hypotheses={result.get('hypotheses')} "
+            f"({result.get('hypotheses_confirmed')} confirmed), "
+            f"actions={result.get('actions_taken')}")
+    notifier.info("Report (raw operator + sanitized client):")
     print_report_paths(paths)
     # end-of-run LEARNING receipt: what this run recorded and what the
     # next one will do differently (the visible half of the loop)
@@ -224,11 +224,11 @@ def print_agent_single_tail(result: dict, paths: dict, agent, goal: str,
         notifier.info(experience_receipt(agent.experience))
     except Exception:
         pass
-    notifier.info(f"⏱ Tempo totale engagement: {elapsed}.")
+    notifier.info(f"⏱ Total engagement time: {elapsed}.")
     notifier.info(
         f"Checkpoint: {os.path.join(out_root, 'checkpoint.json')} — "
-        "riprendi con `auto <target> --resume <file>` o condividi "
-        "con `export-session` (.pm)")
+        "resume with `auto <target> --resume <file>` or share it "
+        "with `export-session` (.pm)")
     return elapsed
 
 
@@ -239,10 +239,10 @@ def print_campaign_tail(campaign: dict, per_target: dict, cpaths: dict,
     stops when the last agent finishes, not when the reports are written).
     Returns the elapsed string."""
     notifier.success(
-        f"Campaign completata (⏱ {elapsed}): {campaign.get('beacons')} beacon, "
-        f"{campaign.get('persistent')} persistenti, "
+        f"Campaign complete (⏱ {elapsed}): {campaign.get('beacons')} beacon(s), "
+        f"{campaign.get('persistent')} persistent, "
         f"{campaign.get('compromised_creds')} creds.")
-    notifier.info(f"⏱ Tempo totale campagna: {elapsed}.")
+    notifier.info(f"⏱ Total campaign time: {elapsed}.")
     notifier.info("Report (per-target + campaign):")
     for k, p in {**per_target, **cpaths}.items():
         console.print(f"  [cyan]{k}[/]: {p}")

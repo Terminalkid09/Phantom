@@ -99,9 +99,9 @@ def callback_plausibility(target: str, advertised_host: str) -> tuple:
 
 def get_lhost() -> str:
     """
-    Rileva l'IP locale (LHOST). Priorità:
-    1. session.lhost (se impostato manualmente)
-    2. dummy socket verso 8.8.8.8
+    Detect the local IP (LHOST). Priority:
+    1. session.lhost (when set manually)
+    2. dummy socket towards 8.8.8.8
     3. hostname fallback
     """
     from phantom.core.session import session

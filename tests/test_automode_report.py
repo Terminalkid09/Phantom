@@ -85,7 +85,7 @@ class TestSwarmTail(unittest.TestCase):
                 patch.object(rep.notifier, "warn") as m_warn:
             rep.print_swarm_tail(self._result(), {"tasks": []}, "/tmp", 0,
                                  "footprint")
-        self.assertTrue(any("niente handoff" in str(c.args[0])
+        self.assertTrue(any("nothing to hand off" in str(c.args[0])
                             for c in m_warn.call_args_list))
 
     def test_beacon_points_the_operator_at_c2(self):
@@ -120,8 +120,8 @@ class TestAgentSingleTail(unittest.TestCase):
                 "/out")
         self.assertIn("h ", elapsed)  # epoch-0 start = a big duration
         suc_text = " ".join(str(c.args[0]) for c in m_suc.call_args_list)
-        self.assertIn("Deliver completo", suc_text)
-        self.assertIn("azioni=7", suc_text)
+        self.assertIn("Deliver complete", suc_text)
+        self.assertIn("actions=7", suc_text)
         self.assertIn("r.md", buf.getvalue())  # paths go to the console
         texts = [str(c.args[0]) for c in m_info.call_args_list]
         self.assertTrue(any("checkpoint.json" in t for t in texts))

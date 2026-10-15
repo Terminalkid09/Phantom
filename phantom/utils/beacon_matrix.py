@@ -1,7 +1,7 @@
 """beacon_matrix.py — the feature × OS × arch × transport GRID, in ONE place.
 
-The audit's finding was precise: "Build/artefatto corretti per 4 OS; la verifica
-è per build, non per feature. Nessuna griglia feature × OS × arch × transport."
+The audit's finding was precise: "Correct build/artefact for 4 OSes; the check
+is per build, not per feature. No feature × OS × arch × transport grid."
 The CI jobs proved a binary was produced; they said nothing about WHICH
 capabilities that binary carries on WHICH platform, so a whole feature could
 silently become Windows-only (exactly what happened before

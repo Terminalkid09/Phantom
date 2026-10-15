@@ -31,7 +31,7 @@ def install_dependencies(dependencies, manager="apt"):
     - Avoids sudo if running as root
     - Returns True on success, False otherwise
     """
-    console.print(f"[yellow][?] Dipendenze mancanti: {', '.join(dependencies)}[/]")
+    console.print(f"[yellow][?] Missing dependencies: {', '.join(dependencies)}[/]")
 
     # Inside Docker: auto-install without prompting
     if _in_container():
@@ -49,10 +49,10 @@ def install_dependencies(dependencies, manager="apt"):
         # Interactive: ask the user. Declining is NOT a hang or a dead end:
         # we print what is missing and how to install it later, and return
         # False so callers can skip the step gracefully.
-        choice = _safe_choice("Vuoi installarle automaticamente ora? [y/N]: ")
+        choice = _safe_choice("Install them automatically now? [y/N]: ")
         if choice != 'y':
             console.print(
-                "[yellow][!] Installazione saltata. Puoi installarle dopo con:")
+                "[yellow][!] Installation skipped. You can install them later with:")
             if manager == 'apt':
                 console.print(f"    sudo apt-get install -y {' '.join(dependencies)}")
             else:
@@ -70,7 +70,7 @@ def install_dependencies(dependencies, manager="apt"):
     if manager == 'apt':
         # Update package lists first (bounded: a slow mirror must not hang)
         try:
-            console.print("[cyan][*] Aggiornamento lista pacchetti (apt-get update)...[/]")
+            console.print("[cyan][*] Refreshing package lists (apt-get update)...[/]")
             upd_cmd = prefix + ["apt-get", "update"]
             subprocess.run(upd_cmd, check=False, timeout=_UPDATE_TIMEOUT)
         except subprocess.TimeoutExpired:
@@ -82,19 +82,19 @@ def install_dependencies(dependencies, manager="apt"):
     else:
         cmd = prefix + [manager, "install", "-y"] + dependencies
 
-    console.print(f"[cyan][*] Esecuzione: {' '.join(cmd)}[/]")
+    console.print(f"[cyan][*] Running: {' '.join(cmd)}[/]")
     try:
         subprocess.run(cmd, check=True, timeout=_INSTALL_TIMEOUT)
-        console.print("[green][+] Installazione completata.[/]")
+        console.print("[green][+] Installation complete.[/]")
         return True
     except subprocess.TimeoutExpired:
-        console.print("[red][!] Installazione scaduta dopo "
-                      f"{_INSTALL_TIMEOUT}s. Rilancia il comando o installa "
-                      "manualmente.[/]")
+        console.print("[red][!] Installation timed out after "
+                      f"{_INSTALL_TIMEOUT}s. Re-run the command or install "
+                      "manually.[/]")
         return False
     except subprocess.CalledProcessError as e:
-        console.print("[red][!] Installazione fallita. Controlla i nomi dei pacchetti o installa manualmente.[/]")
-        console.print(f"[red][!] Comando eseguito: {' '.join(cmd)}\n[red][!] Exit: {getattr(e, 'returncode', 'unknown')}[/]")
+        console.print("[red][!] Installation failed. Check the package names or install manually.[/]")
+        console.print(f"[red][!] Command run: {' '.join(cmd)}\n[red][!] Exit: {getattr(e, 'returncode', 'unknown')}[/]")
         return False
 
 def _wsl_cmd(args: list) -> list:
@@ -309,7 +309,7 @@ def _mark_deps_ready(platform):
 
 
 def check_build_env(platform, arch="x64"):
-    """Verifica dipendenze in base alla piattaforma e propone fix automatico."""
+    """Check dependencies for the platform and offer an automatic fix."""
     if _deps_ready(platform):
         return True
 
@@ -461,12 +461,12 @@ def check_build_env(platform, arch="x64"):
                     _mark_deps_ready(platform)
                 else:
                     console.print(
-                        "[yellow][!] Toolchain non pronta — il build del beacon "
-                        f"per {platform} sarà saltato. Puoi riprovare con "
-                        f"'deploy-agent' dopo l'installazione dei pacchetti.[/]")
+                        "[yellow][!] Toolchain not ready — the beacon build "
+                        f"for {platform} will be skipped. You can retry with "
+                        f"'deploy-agent' after installing the packages.[/]")
                 return ok
             else:
-                console.print(f"[red][!] Dipendenze mancanti: {', '.join(runtime_needed)}. Installale manualmente.[/]")
+                console.print(f"[red][!] Missing dependencies: {', '.join(runtime_needed)}. Install them manually.[/]")
                 return False
         # Only static libs missing — not an issue for dynamic linking
         _mark_deps_ready(platform)

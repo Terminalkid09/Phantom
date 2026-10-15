@@ -43,7 +43,7 @@ def cmd_ad(shell, arg: str):
         # which reads as "no AD facts" rather than "the ingest broke".
         from phantom.utils.failure_taxonomy import record
         record("ad.ingest_wm", exc, best_effort=True,
-               detail="il grafo AD salta i fact già noti della sessione")
+               detail="the AD graph skips facts the session already knows")
     parts = arg.strip().split()
     sub = parts[0].lower() if parts else "tree"
 

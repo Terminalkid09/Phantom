@@ -225,9 +225,9 @@ def main():
             if not _decision.ok:
                 notifier.warn(f"--resume-latest: {_decision.reason}")
                 return
-            notifier.info(f"--resume-latest: riprendo "
+            notifier.info(f"--resume-latest: resuming "
                           f"{_decision.checkpoint} "
-                          f"(tentativo {_decision.attempt})")
+                          f"(attempt {_decision.attempt})")
             args.resume = _decision.checkpoint
             _resume_counter = counter_path_for(_decision.checkpoint)
         def _launch(checkpoint: str):

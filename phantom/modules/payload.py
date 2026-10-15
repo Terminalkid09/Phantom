@@ -875,10 +875,10 @@ class PayloadModule(BaseModule):
         if answer is None or not answer.known:
             answer = assumed_linux("no os signal")
             notifier.warn(
-                f"OS del target non rilevato: uso il default "
-                f"{answer.platform}/{answer.arch} — se il target è "
-                f"Windows/macOS compila l'artefatto giusto (es. "
-                f"`generate windows`) o esegui un os_detect.")
+                f"Target OS not detected: using the default "
+                f"{answer.platform}/{answer.arch} — if the target is "
+                f"Windows/macOS build the right artefact (e.g. "
+                f"`generate windows`) or run an os_detect.")
         return answer.os_name, answer.arch, answer.platform
 
     def _suggest_payload(self, arch: str, platform: str) -> str:
