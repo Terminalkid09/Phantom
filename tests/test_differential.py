@@ -1,11 +1,25 @@
-"""Tests for the universal differential analysis engine."""
+"""Tests for the universal differential analysis engine.
+
+No test here opens a socket any more. The HTTP probe tests used to fire real
+mutations at 10.0.0.1 / 192.0.2.1 (unroutable placeholders) and then assert
+the result was a list: ~110 seconds of TCP timeouts that could only pass while
+the network failed in the expected direction, and that said nothing about the
+probes. The transport is patched now, so the assertions are about what the
+probes ARE; the live-transport side of this engine is covered by
+``tests/test_integration_realtime.py``, which talks to a real HTTP server.
+"""
+import itertools
 import unittest
+from unittest import mock
+
 from phantom.automation.belief import WorldModel
+from phantom.automation.exploit import differential as differential_mod
 from phantom.automation.exploit.differential import (
     DifferentialEngine,
     BaselineResponse,
     ProbeResult,
     ConfirmedAnomaly,
+    HTTP_PROBES,
     RAW_PROBES,
     run_differential_analysis,
 )
@@ -109,35 +123,90 @@ class TestDifferentialEngine(unittest.TestCase):
                              severity="high", score=0.7, signals=["test"])
         self.assertIn(a.severity, valid_severities)
 
-    def test_http_endpoint_probes_populated(self):
-        """HTTP probes method runs without crash (requires network for real results)."""
+    def test_http_probes_build_candidates_against_a_readable_baseline(self):
+        """A baseline we could read produces the full mutation battery.
+
+        The previous version of this test fired ~27 real probes at 10.0.0.1
+        (an unroutable address) and then asserted `isinstance(results, list)`:
+        83 seconds of TCP timeouts to prove a method returns a list. The
+        transport is a fake socket now, so the assertions are about the
+        probes' content instead of the network's mood.
+        """
         baseline = BaselineResponse(host="10.0.0.1", port=80, protocol="tcp",
-                                    service="http", raw=b"HTTP/1.0 200 OK\r\n\r\n",
+                                    service="http",
+                                    raw=b"HTTP/1.0 200 OK\r\n\r\n",
                                     status=200, size=100, timing=0.05, ok=True)
-        # Without a real HTTP server, _http_probes returns empty (no panic)
-        results = self.engine._http_probes("10.0.0.1", 80, baseline,
-                                           ["/", "/admin", "/login"])
-        self.assertIsInstance(results, list, "_http_probes must return a list")
-        # When host is unreachable, results are naturally empty
-        # In CI with real HTTP target, results would be > 0
+        # A FRESH socket per connection: one shared MagicMock would hand the
+        # canned reply to the first probe only, and the rest of the battery
+        # would read EOF (`_send_recv` swallows it into an empty reply), so
+        # the test would fail on its own plumbing instead of on the code.
+        # `chain` + `repeat` gives each socket one reply and then EOF forever.
+        def _fake_socket():
+            sock = mock.MagicMock()
+            sock.recv.side_effect = itertools.chain(
+                [b"HTTP/1.0 200 OK\r\n\r\nok"], itertools.repeat(b""))
+            return sock
 
-    def test_http_probes_on_unreachable_host(self):
-        """HTTP probes on unreachable host returns empty list, not crash."""
-        baseline = BaselineResponse(host="192.0.2.1", port=80, protocol="tcp",
-                                    service="http", raw=b"", status=0,
-                                    size=0, timing=0, ok=True)
-        results = self.engine._http_probes("192.0.2.1", 80, baseline, ["/"])
-        self.assertEqual(results, [])
+        with mock.patch.object(differential_mod, "_tcp_connect",
+                               side_effect=lambda *a, **k: _fake_socket()):
+            results = self.engine._http_probes("10.0.0.1", 80, baseline,
+                                               ["/login"])
 
-    def test_http_probes_logic_with_valid_endpoints(self):
-        """HTTP probes structures are correct even with empty results."""
+        self.assertTrue(results, "a readable baseline must produce probes")
+        self.assertEqual({r.cls.split("/")[0] for r in results},
+                         set(HTTP_PROBES),
+                         "every probe family must be exercised")
+        for probe in results:
+            text = probe.payload.decode("latin-1")
+            self.assertNotIn("{PATH}", text)
+            self.assertNotIn("{PAYLOAD}", text)
+            self.assertNotIn("{HOST}", text)
+            self.assertIn("Host: 10.0.0.1", text)
+            # a REQUEST, not just a request target: without the method the
+            # server answers 400 and the engine reads that as a finding
+            self.assertTrue(text.startswith("GET "), text[:40])
+            self.assertIn("\r\n", text)
+            self.assertNotIn("\\r\\n", text)   # the literal-text bug, pinned
+            self.assertEqual(probe.status, 200)  # parsed from the fake reply
+
+    def test_http_probes_refuse_a_baseline_they_cannot_read(self):
+        """An unusable baseline fires NO probe: fail closed on every shape.
+
+        This replaces `test_http_probes_on_unreachable_host`, which reached
+        for 192.0.2.1:80 and asserted the result was empty — it passed only
+        while that address stayed unreachable. On a host whose egress goes
+        through a transparent proxy the loop produced 27 candidates and the
+        test failed: a contract scored by the network. The contract (refuse,
+        and do not even open a socket) is asserted directly now.
+        """
+        cases = (
+            None,
+            # no status: bytes came back but nothing parsed as a response
+            BaselineResponse(host="192.0.2.1", port=80, protocol="tcp",
+                             service="http", raw=b"", status=0, size=0,
+                             timing=0, ok=True),
+            # explicitly not ok
+            BaselineResponse(host="192.0.2.1", port=80, protocol="tcp",
+                             service="http", raw=b"", status=200, size=0,
+                             timing=0, ok=False),
+        )
+        for baseline in cases:
+            with mock.patch.object(differential_mod, "_tcp_connect") as connect:
+                results = self.engine._http_probes("192.0.2.1", 80, baseline,
+                                                   ["/"])
+            self.assertEqual(results, [])
+            connect.assert_not_called()
+
+    def test_http_probes_without_a_server_return_empty(self):
+        """A readable baseline whose connection cannot be made: no probes."""
         baseline = BaselineResponse(host="10.0.0.1", port=80, protocol="tcp",
                                     service="http", raw=b"", status=200,
                                     size=100, timing=0.05, ok=True)
-        # Verifies the method signature and logic work as expected
-        # Real HTTP results require a running server
-        results = self.engine._http_probes("10.0.0.1", 80, baseline, ["/login"])
-        self.assertIsInstance(results, list)
+        with mock.patch.object(differential_mod, "_tcp_connect",
+                               return_value=None):
+            results = self.engine._http_probes("10.0.0.1", 80, baseline,
+                                               ["/login"])
+        self.assertEqual(results, [])
 
     def test_raw_probes_for_smb(self):
         """SMB raw probe mutations exist (function not crash)."""

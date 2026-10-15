@@ -15,6 +15,8 @@ import pytest
 
 from phantom.core.session import session
 from phantom.modules import suggest
+from phantom.modules.handler import HandlerModule
+from phantom.modules.payload import PayloadModule
 
 _TOOL_VERIFY = {
     "curl": ("--version", 0),
@@ -43,8 +45,47 @@ def _reset():
     session.knowledge_base["creds_found"] = []
 
 
+# Tools that are not worth looking up: the shell plumbing is the OS's job.
+_SHELL_TERMS = frozenset(("grep", "echo", "jq", "sh", "bash", "nc", "tee"))
+
+# A suggestion written as a shell LOOP (`for p in admin login api; do curl
+# ...`) is executed by the shell: the leading token is a keyword, the tool to
+# look up is inside the loop.
+_SHELL_KEYWORDS = frozenset(("for", "while", "until", "if", "then", "case"))
+
+# Verbs the operator types INTO a Phantom shell — `reverse 10.0.0.1 4444`,
+# `deploy`, `generate linux`, `bind 4444`, `listen --port 8443`, emitted by
+# `payload_suggestion_group()` / `handler_suggestion_group()`. They are not
+# binaries and can never be on PATH: looking them up is a category error, and
+# it is what made this file report `bind`/`generate`/`listen`/`reverse` as
+# "tools not installed". Derived from the shells' own `do_*` methods instead
+# of a hand-kept list, so it cannot drift from the code that emits them.
+_INTERACTIVE_VERBS = frozenset(
+    name[3:] for cls in (PayloadModule, HandlerModule)
+    for name in dir(cls) if name.startswith("do_"))
+
+
 def _first_token(cmd):
-    return cmd.strip().split()[0].lstrip("sudo")
+    """The binary a command line invokes, `sudo`-aware.
+
+    `lstrip("sudo")` was a character-SET strip, not a prefix strip: it turned
+    `searchsploit` into `earchsploit`, `sqlmap` into `qlmap`, `sshpass` into
+    `hpass`, `openssl` into `penssl` and `deploy` into `eploy`, and returned
+    "" for every `sudo nmap ...` suggestion — which is the most common shape
+    in this very file. The guard below was therefore checking names no binary
+    can have, on a list of commands it never managed to parse correctly.
+    """
+    parts = cmd.strip().split()
+    if not parts:
+        return ""
+    if parts[0] in ("sudo", "doas"):
+        rest = parts[1:]
+        # `sudo -u user tool ...`: the option's VALUE is a token too, so step
+        # over the pair instead of reporting "-u" as a missing binary.
+        if len(rest) >= 2 and rest[0] in ("-u", "-g", "-p", "-C", "--user"):
+            rest = rest[2:]
+        return rest[0] if rest else ""
+    return parts[0]
 
 
 @pytest.fixture(autouse=True)
@@ -89,8 +130,17 @@ def test_every_generated_command_has_real_tool_on_path():
     missing = []
     for cmd in cmds:
         tool = _first_token(cmd)
-        if tool in ("grep", "echo", "jq", "sh", "bash", "nc", "tee"):
+        if not tool:
             continue
+        if tool in _SHELL_TERMS or tool in _SHELL_KEYWORDS:
+            continue
+        if tool in _INTERACTIVE_VERBS:
+            continue
+        if tool.startswith("-"):
+            # A token that starts with a dash is a parsing failure, never a
+            # missing binary: failing here keeps a mangled name out of the
+            # "not installed" list, where it would read as an environment gap.
+            pytest.fail(f"could not name the binary in {cmd!r}")
         if shutil.which(tool) is None:
             missing.append((tool, cmd))
     if missing:
@@ -103,13 +153,20 @@ def test_installed_tools_parse_their_generated_flags():
     """Syntax-level validation only: run the tool's own version/help probe.
     This proves the toolchain can execute; it never touches a target."""
     checked = 0
+    probed = set()
     for cmd in _collect_commands():
         tool = _first_token(cmd)
-        if tool not in _TOOL_VERIFY:
+        # One probe per TOOL, not per suggestion: `curl` alone appears in ~260
+        # of the 294 commands, so this loop used to spawn ~260 `--version`
+        # processes and spend most of the file's runtime re-proving the same
+        # binary launches. The assertion is "this tool executes", which the
+        # first sighting already establishes.
+        if tool not in _TOOL_VERIFY or tool in probed:
             continue
         args, _ = _TOOL_VERIFY[tool]
         if shutil.which(tool) is None:
             continue
+        probed.add(tool)
         try:
             subprocess.run([tool, args], capture_output=True,
                            timeout=10)
