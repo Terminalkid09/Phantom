@@ -253,7 +253,7 @@ def _print_hits(data: dict):
 
 
 def cmd_craft(shell, arg: str):
-    """craft <ipgrab|reel|image|pixel|beacon|hits|wait> — build a
+    """craft <ipgrab|reel|image|pixel|beacon|kits|hits|wait> — build a
     social lure and get it ready to paste, then watch for the target.
 
       craft ipgrab [label]            plain click-tracking link
@@ -278,6 +278,11 @@ def cmd_craft(shell, arg: str):
       craft idn <domain>              Will a homograph/IDN domain actually
                                       display as the brand? (punycode
                                       verdict, with evidence)
+      craft kits                      the lure page kits that exist — what
+                                      each one targets, needs and captures
+                                      (`tracker.skin` selects one; an
+                                      unknown value used to fall through
+                                      to the youtube page in silence)
       craft aitm <login-url>          ENTERPRISE (opt-in): AiTM reverse
                                       proxy — serves the REAL login page
                                       and captures credentials AND the
@@ -422,6 +427,16 @@ def cmd_craft(shell, arg: str):
         _sh.console.print(f"    paste: {rdr.get('paste')}")
         _sh.console.print(f"    cost: {rdr.get('cost')}")
         _sh.console.print(f"\n  [dim]{matrix.get('truth')}[/]")
+    elif sub == "kits":
+        # The registry is the answer to "which kit is in use?":
+        # `tracker.skin` accepted any string, and an unknown one rendered the
+        # default page silently, so the operator's choice and the plan could
+        # disagree without a word.
+        out = _craft.craft_kits()
+        if "error" in out:
+            notifier.error(out["error"])
+            if out.get("hint"):
+                notifier.info(out["hint"])
     elif sub == "aitm":
         upstream = parts[1] if len(parts) > 1 else ""
         out = _craft.craft_aitm(upstream)

