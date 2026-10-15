@@ -116,7 +116,7 @@ class TestDerivationIsConservative(unittest.TestCase):
         self.assertNotEqual(token, "completed_goal")
 
     def test_no_result_at_all_does_not_invent_success(self):
-        self.assertEqual(derive_target_outcome("deliver"), 
+        self.assertEqual(derive_target_outcome("deliver"),
                          "completed_without_goal")
 
     def test_missing_facts_are_surfaced_only_when_the_run_marks_them(self):
@@ -222,7 +222,10 @@ class TestFailClosedPreflight(unittest.TestCase):
         import phantom.core.automode as am
         from phantom.core.session import session
         session.target = ""
-        session.scope = []
+        # A DECLARED scope: this test is about the LISTENER gate, and with no
+        # scope at all the (correctly) fail-closed scope preflight refuses a
+        # network run before the listener question is ever asked.
+        session.scope = ["10.0.0.0/24"]
         n = self._quiet(am)
         result = {"beacon_established": False, "actions_taken": 2,
                   "services_enumerated": 2, "goal_reached": True}
@@ -243,7 +246,9 @@ class TestFailClosedPreflight(unittest.TestCase):
         import phantom.core.automode as am
         from phantom.core.session import session
         session.target = ""
-        session.scope = []
+        # see above: the run needs an authorized scope before the listener
+        # override is the thing being tested
+        session.scope = ["10.0.0.0/24"]
         n = self._quiet(am)
 
         def _cfg(key, default=None, env=None):

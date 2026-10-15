@@ -6,7 +6,7 @@ Completa kill chain autonoma: enumeration → exploit → post-exploitation.
 import os
 import time
 import threading
-from typing import Callable, Optional, List
+from typing import Any, Callable, Dict, List, Optional
 
 from rich.console import Console
 from phantom.core.session import session, KB_STATUS_DEFAULT
@@ -26,6 +26,7 @@ from phantom.core.automode_policy import (  # noqa: E402
     apply_range_policy as _apply_range_policy,
     expand_targets as _expand_targets,
     extract_networks as _extract_networks,
+    scope_preflight as _scope_preflight,
     triage_targets as _triage_targets,
     warn_missing_scope as _warn_missing_scope,
 )
@@ -86,14 +87,14 @@ def _announce_outcome(goal: str, outcome: str, target: str, result,
     label = _outcome_label(outcome)
     missing = _missing_goal_facts(goal, result or {})
     if outcome == "completed_goal":
-        notifier.success(f"Esito [{target}]: {label} — obiettivo "
-                         f"'{goal}' raggiunto.")
+        notifier.success(f"Outcome [{target}]: {label} — goal "
+                         f"'{goal}' reached.")
     elif outcome in ("partial", "completed_without_goal"):
-        gap = f" Fact mancanti: {', '.join(missing)}." if missing else ""
-        notifier.warn(f"Esito [{target}]: {label} — obiettivo '{goal}' NON "
-                      f"raggiunto.{gap}")
+        gap = f" Missing facts: {', '.join(missing)}." if missing else ""
+        notifier.warn(f"Outcome [{target}]: {label} — goal '{goal}' NOT "
+                      f"reached.{gap}")
     else:
-        notifier.error(f"Esito [{target}]: {label} — goal '{goal}'.")
+        notifier.error(f"Outcome [{target}]: {label} — goal '{goal}'.")
     if on_event is not None:
         try:
             on_event("outcome", {"outcome": outcome, "label": label,
@@ -108,6 +109,30 @@ def _callback_preflight(targets, goal: str) -> None:
     THIS module's notifier: the orchestrator owns the announcer."""
     from phantom.core.automode_policy import callback_preflight
     return callback_preflight(targets, goal, notifier=notifier)
+
+
+def _blocked_preflight(goal: str, resolved: List[str], message: str,
+                       hint: str, on_event) -> Dict[str, Any]:
+    """The ONE refusal shape for a run stopped BEFORE it starts.
+
+    A prerequisite that is knowable up front (no C2 listener for a
+    callback-bound goal, no scope for network targets) refuses the run and
+    reports `blocked_preflight`, so the operator reads "blocked before start
+    (prerequisite missing)" instead of a goal that merely looks like it
+    failed. Two callers share this shape on purpose: a second copy is how
+    the outcome vocabulary drifts apart again.
+    """
+    notifier.error(message, hint=hint)
+    for _t in resolved:
+        _announce_outcome(goal, "blocked_preflight", _t, {}, on_event)
+    return {
+        "goal": goal,
+        "outcome": "blocked_preflight",
+        "label": _outcome_label("blocked_preflight"),
+        "goal_reached": False,
+        "targets": {t: "blocked_preflight" for t in resolved},
+        "reached": [], "partial": [], "failed": list(resolved),
+    }
 
 
 def _experience_enabled(explicit: Optional[bool] = None) -> bool:
@@ -337,7 +362,7 @@ def _merge_results_to_session(agent, target: str) -> dict:
     try:
         return merge_agent_into_session(agent, target) or {}
     except Exception as exc:            # pragma: no cover - defensive
-        notifier.warn(f"Core sync fallita ({target}): {exc}")
+        notifier.warn(f"Core sync failed ({target}): {exc}")
         return {}
 
 
@@ -524,9 +549,9 @@ def _ensure_c2_listener(server=None) -> bool:
     # servers on one port fight for the bind and the beacons see random
     # failures. The operator runs `c2d` instead; the protocol is identical.
     if str(cfg.get("c2.transport_backend", "python") or "python").strip().lower() == "go":
-        notifier.warn("c2.transport_backend=go: il listener Python NON viene "
-                      "avviato — lancia il data plane Go (`c2d`) così i due non "
-                      "si contendono la porta")
+        notifier.warn("c2.transport_backend=go: the Python listener is NOT "
+                      "started — run the Go data plane (`c2d`) so the two do "
+                      "not fight over the port")
         return False
     if not cfg.get("c2.listener_auto_start", True):
         notifier.warn("c2.listener_auto_start is off and no C2 listener is "
@@ -537,21 +562,22 @@ def _ensure_c2_listener(server=None) -> bool:
     bind_host = listener_bind_host()
     if not _probe_bind(bind_host, port):
         if bind_host != "127.0.0.1" and _probe_bind("127.0.0.1", port):
-            notifier.warn(f"C2 bind {bind_host}:{port} non disponibile qui "
-                          f"— fallback loopback 127.0.0.1:{port} (solo lab "
-                          f"locale: i beacon remoti non rientrano)")
+            notifier.warn(f"C2 bind {bind_host}:{port} is not available here "
+                          f"— falling back to loopback 127.0.0.1:{port} "
+                          f"(local lab only: remote beacons cannot reach it)")
             bind_host = "127.0.0.1"
         else:
-            notifier.warn(f"C2 listener non avviabile su {bind_host}:{port} "
-                          f"(porta occupata?) — proseguo senza listener")
+            notifier.warn(f"C2 listener cannot start on {bind_host}:{port} "
+                          f"(port already in use?) — continuing without a "
+                          f"listener")
             return False
-    notifier.status(f"Avvio listener C2 su {bind_host}:{port} "
-                    f"(HTTPS/mTLS auto; dial {dial_host})")
+    notifier.status(f"Starting C2 listener on {bind_host}:{port} "
+                    f"(HTTPS/mTLS auto; beacons dial {dial_host})")
     try:
         srv.start(host=bind_host, port=port, use_ssl=True)
         return True
     except Exception as exc:
-        notifier.warn(f"Auto-start listener C2 fallito: {exc}")
+        notifier.warn(f"C2 listener auto-start failed: {exc}")
         return False
 
 
@@ -635,7 +661,7 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
     if not resolved and session.target:
         resolved = _expand_targets([session.target], scope_list=scope_list)
     if not resolved:
-        notifier.error("Nessun target specificato. Usa: auto <target> [target2, ...]")
+        notifier.error("No target given. Use: auto <target> [target2, ...]")
         return
 
     # senior network triage: a CIDR/subnet input gets host
@@ -683,11 +709,21 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
     # a beacon-bound goal is only as good as the callback the target can
     # make: name an implausible endpoint BEFORE burning the engagement
     _callback_preflight(resolved, goal)
+    # A-6: auto-mode FAILS CLOSED without a scope. The prerequisite is
+    # knowable NOW, so a real run is refused BEFORE the listener starts and
+    # before anything is deployed — the same fail-closed treatment the
+    # callback preflight gets, and the outcome says `blocked_preflight`. The
+    # dry run only warns and still prints the plan: reading a plan is not an
+    # engagement, and refusing it would leave the operator with no way to
+    # inspect what a run WOULD do.
     if not scope_list:
-        # A-6: auto-mode FAILS CLOSED without a scope (the
-        # agent gate refuses unless the operator explicitly
-        # opted out) — the notice explains why up front.
-        _warn_missing_scope(resolved)
+        _scope_verdict = _scope_preflight(resolved, scope_list=scope_list)
+        if not _scope_verdict.ok:
+            if not plan:
+                return _blocked_preflight(goal, resolved,
+                                          _scope_verdict.message,
+                                          _scope_verdict.hint, on_event)
+            _warn_missing_scope(resolved)
 
     if plan:
         # the dry run must not read as unscoped while a pinned scope is set:
@@ -709,14 +745,14 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                 t, goal, profile, aggressive, stealth, speed)
             console.print(f"\n[bold cyan]{t}[/] ({tt}, {chain} chain)")
             if not p.steps:
-                console.print("  [dim](goal già soddisfatto o nessun percorso)[/]")
+                console.print("  [dim](goal already satisfied, or no path)[/]")
             else:
                 for i, s in enumerate(p.steps, 1):
                     console.print(
                         f"  {i}. [white]{s.capability.id}[/] "
                         f"[dim](cost {s.capability.opsec_cost}, "
                         f"{s.capability.stealth_level})[/] — {s.reason}")
-        notifier.info("Dry-run completato: nessuna azione eseguita.")
+        notifier.info("Dry run complete: no action was executed.")
         return
 
     # Fully automatic kill chain: the C2 listener must be up BEFORE any
@@ -730,26 +766,18 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
             and not _listenerless_allowed():
         # P0 FAIL-CLOSED. A callback-bound goal with no listener can only
         # deploy beacons that have nowhere to check in: the run would work
-        # the whole chain and end on a late "nessun beacon stabilito". The
+        # the whole chain and end on a late "no beacon established". The
         # prerequisite is knowable NOW, so the run refuses BEFORE the deploy
         # and names the cause — the job lifecycle says `failed`, the
         # engagement outcome says `blocked_preflight`.
-        notifier.error(
-            f"Nessun listener C2 e goal '{goal}' dipende dal callback: run "
-            f"rifiutato PRIMA di deployare (nessun engagement sprecato).",
-            hint="avvia il listener (`c2` -> listener start) o libera "
-                 "c2.bind/porta; se intendi avviarlo a mano dopo, imposta "
-                 "c2.allow_listenerless=true (o PHANTOM_ALLOW_LISTENERLESS=1)")
-        for _t in resolved:
-            _announce_outcome(goal, "blocked_preflight", _t, {}, on_event)
-        return {
-            "goal": goal,
-            "outcome": "blocked_preflight",
-            "label": _outcome_label("blocked_preflight"),
-            "goal_reached": False,
-            "targets": {t: "blocked_preflight" for t in resolved},
-            "reached": [], "partial": [], "failed": list(resolved),
-        }
+        return _blocked_preflight(
+            goal, resolved,
+            f"no C2 listener and goal '{goal}' depends on a callback: the "
+            f"run is refused BEFORE deploying (no engagement wasted).",
+            "start the listener (`c2` -> listeners start) or free "
+            "c2.bind/port; to start it by hand afterwards set "
+            "c2.allow_listenerless=true (or PHANTOM_ALLOW_LISTENERLESS=1)",
+            on_event)
 
     started_wall = time.time()
     out_root = resume or _report_out_dir()
@@ -762,12 +790,11 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
         # the lab (no proof, no authoring, no beta load) — surface early.
         _note = []
         if evolution and not llm:
-            _note.append("--evolution richiede --llm (l'author è l'LLM): "
-                         "flag ignorata")
+            _note.append("--evolution requires --llm (the author IS the "
+                         "LLM): flag ignored")
         if beta:
-            _note.append("--beta: le capability dalle PR auto-evolution "
-                         "aperte verranno caricate dopo il gate (lab "
-                         "incluso)")
+            _note.append("--beta: capabilities from the open auto-evolution "
+                         "PRs are loaded after the gate (lab included)")
         for n in _note:
             notifier.warn(n)
 
@@ -781,9 +808,9 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                 emit=lambda _kind, **d: notifier.info(
                     f"[beta] {d.get('detail', _kind)}"))
             if _b.checked == 0:
-                notifier.info("[beta] nessuna PR auto-evolution aperta")
+                notifier.info("[beta] no open auto-evolution PR")
         except Exception as _exc:
-            notifier.warn(f"[beta] load fallito: {_exc}")
+            notifier.warn(f"[beta] load failed: {_exc}")
 
     # ONE goal table decides the engine (goals.GOALS: facts + chain +
     # engine): --engine swarm is honored for goals that DECLARE a
@@ -825,7 +852,7 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
             notifier.info(
                 "Core sync: " + ", ".join(
                     f"{k}={v}" for k, v in sorted(_merged.items())) +
-                " (visibili ora anche nel core manuale)")
+                " (now visible in the manual core too)")
         _print_agent_single_tail(result, paths, agent, goal,
                                  started_wall, out_root)
         # P0: the PROCESS finished — say whether the GOAL finished with it.
@@ -842,8 +869,8 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
             elif on_event is not None:
                 on_event("handoff", {"beacon_id": beacon_id})
         else:
-            notifier.warn("Nessun beacon stabilito: niente handoff. "
-                          "Usa 'c2' -> 'beacons' per monitorare callback")
+            notifier.warn("No beacon established: nothing to hand off. "
+                          "Use 'c2' -> 'beacons' to monitor callbacks")
         return _derive_engagement(goal, {resolved[0]: _outcome})
 
     if engine == "swarm":
@@ -890,5 +917,5 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
         elif on_event is not None:
             on_event("handoff", {"beacon_id": first_beacon})
     else:
-        notifier.info("Nessun beacon stabilito. Usa 'c2' per monitorare.")
+        notifier.info("No beacon established. Use 'c2' to monitor.")
     return _derive_engagement(goal, _per_outcome)

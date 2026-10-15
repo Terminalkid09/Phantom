@@ -148,12 +148,80 @@ class TestScopeAndCallbackPreflight(unittest.TestCase):
         with patch.object(pol.notifier, "warn") as m_warn:
             pol.warn_missing_scope(["10.0.0.5"])
         m_warn.assert_called_once()
-        self.assertIn("NESSUNO SCOPE", m_warn.call_args.args[0])
+        self.assertIn("no scope declared", m_warn.call_args.args[0])
+        # the remedy names a command that EXISTS in the shell that shows it
+        self.assertIn("scope add <cidr>", m_warn.call_args.args[0])
 
     def test_identity_targets_alone_need_no_scope(self):
         with patch.object(pol.notifier, "warn") as m_warn:
             pol.warn_missing_scope(["mario.rossi@gmail.com"])
         m_warn.assert_not_called()
+
+class TestScopePreflightRefusesBeforeTheRun(unittest.TestCase):
+    """A-6, the FAILURE half.
+
+    The warning told the operator a network run without a scope would be
+    refused, but nothing refused it: the listener started, the session dir
+    and the checkpoint were written, and the run ended on a late "out of
+    scope" that read like the goal had simply failed. The preflight is the
+    counterpart of `callback_preflight` — knowable now, so refused now.
+    """
+
+    @staticmethod
+    def _optout(allowed):
+        return patch("phantom.core.scope.unscoped_allowed",
+                     return_value=allowed)
+
+    def test_network_targets_without_scope_are_refused(self):
+        with self._optout(False):
+            v = pol.scope_preflight(["10.0.0.5"], scope_list=[])
+        self.assertFalse(v.ok)
+        self.assertIn("no engagement scope", v.message)
+        self.assertEqual(v.network_targets, ("10.0.0.5",))
+
+    def test_the_refusal_names_a_command_that_exists_in_the_shell(self):
+        with self._optout(False):
+            v = pol.scope_preflight(["10.0.0.5"], scope_list=[])
+        self.assertIn("scope add <cidr>", v.hint)
+        self.assertIn("PHANTOM_ALLOW_UNSCOPED=1", v.hint)
+
+    def test_a_declared_scope_passes(self):
+        with self._optout(False):
+            v = pol.scope_preflight(["10.0.0.5"], scope_list=["10.0.0.0/24"])
+        self.assertTrue(v.ok)
+
+    def test_the_documented_optout_passes(self):
+        with self._optout(True):
+            v = pol.scope_preflight(["10.0.0.5"], scope_list=[])
+        self.assertTrue(v.ok)
+
+    def test_identity_targets_need_no_scope_at_all(self):
+        with self._optout(False):
+            v = pol.scope_preflight(["mario.rossi@gmail.com"], scope_list=[])
+        self.assertTrue(v.ok)
+
+    def test_a_broken_optout_check_never_blocks_the_run(self):
+        """This check exists to SAVE an engagement, never to become a new
+        way for a launch to fail."""
+        with patch("phantom.core.scope.unscoped_allowed",
+                   side_effect=RuntimeError("boom")):
+            v = pol.scope_preflight(["10.0.0.5"], scope_list=[])
+        self.assertTrue(v.ok)
+
+    def test_run_auto_mode_returns_blocked_preflight(self):
+        """End to end: the orchestrator reports the documented outcome
+        instead of "finished without reaching the goal"."""
+        from phantom.core import automode
+        with self._optout(False), \
+                patch.object(automode, "_callback_preflight"), \
+                patch.object(automode, "_ensure_c2_listener") as m_listener:
+            out = automode.run_auto_mode(targets=["10.0.0.5"],
+                                         goal="deliver",
+                                         on_event=lambda *a, **k: None)
+        m_listener.assert_not_called()
+        self.assertIsInstance(out, dict)
+        self.assertEqual(out.get("outcome"), "blocked_preflight")
+        self.assertFalse(out.get("goal_reached"))
 
     def test_non_beacon_goals_are_never_preflighted(self):
         rec = Mock()

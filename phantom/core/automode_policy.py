@@ -17,7 +17,8 @@ SUBJECT and are never filtered by the machine scope list.
 from __future__ import annotations
 
 import ipaddress
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 from rich.console import Console
 
@@ -131,22 +132,22 @@ def apply_range_policy(networks: List[str], resolved: List[str],
     verdict = range_policy_verdict(networks, resolved, raw,
                                    force_network, plan)
     if verdict == "discovery_only":
-        notifier.info("Network scope: discovery-only di default "
-                      "(host vivi + ranking, nessun engagement).")
+        notifier.info("Network scope: discovery-only by default "
+                      "(live hosts + ranking, no engagement).")
         for t in resolved[:20]:
             console.print(f"  [cyan]{t}[/]")
         if len(resolved) > 20:
-            console.print(f"  [dim]... +{len(resolved) - 20} altri "
-                          f"(vedi network map)[/]")
-        notifier.info("Per ingaggiare: riesegui con host espliciti "
-                      "oppure --force-network (full engagement, loud).")
+            console.print(f"  [dim]... +{len(resolved) - 20} more "
+                          f"(see the network map)[/]")
+        notifier.info("To engage: re-run with explicit hosts, or "
+                      "--force-network (full engagement, loud).")
         return False
     if networks and force_network:
         notifier.warn(
-            f"FORCE-NETWORK attivo: engagement completo su {len(resolved)} "
-            f"host ({', '.join(resolved[:5])}"
-            f"{', ...' if len(resolved) > 5 else ''}). Scansioni, exploit "
-            f"e brute force gireranno su tutta la rete.")
+            f"FORCE-NETWORK is on: full engagement across {len(resolved)} "
+            f"host(s) ({', '.join(resolved[:5])}"
+            f"{', ...' if len(resolved) > 5 else ''}). Scans, exploits "
+            f"and brute force will run across the whole range.")
     return True
 
 
@@ -172,18 +173,18 @@ def triage_targets(raw: List[str], networks: List[str],
     # assault pool and the network map always see the same truth.
     from phantom.core.netmap import triage_networks
     notifier.info(
-        f"Network triage: host discovery su {', '.join(networks)}...")
+        f"Network triage: host discovery on {', '.join(networks)}...")
     tri = triage_networks(networks)
     ranked = [r["ip"] for r in tri.get("ranked", [])]
     if not ranked:
         notifier.warn(
-            "Nessun host esposto rilevato o nmap assente: espansione "
-            "CIDR classica (host a caso nella rete)")
+            "No exposed host detected, or nmap is missing: plain CIDR "
+            "expansion (random hosts in the range)")
         return resolved
     alive_n = len(tri.get("hosts", []))
     notifier.success(
-        f"Host discovery: {alive_n} vivi, ordinati per "
-        f"superficie d'attacco (top: {', '.join(ranked[:5])})")
+        f"Host discovery: {alive_n} alive, ranked by "
+        f"attack surface (top: {', '.join(ranked[:5])})")
     explicit = [
         t.strip()
         for tok in raw for t in tok.split(",")
@@ -196,29 +197,101 @@ def triage_targets(raw: List[str], networks: List[str],
     return explicit + ranked
 
 
-def warn_missing_scope(resolved: List[str]) -> None:
-    """Fail-loud when network targets run without an engagement scope.
+def _network_targets(resolved: List[str]) -> List[str]:
+    """The machine-class targets in a resolved list.
 
-    A-6: auto-mode FAILS CLOSED without a scope (the agent gate refuses
-    unless the operator explicitly opted out), so this is no longer a
-    silent warn-and-continue — but the operator is told WHY up front.
+    Identity targets (email/username/phone) are the engagement SUBJECT and
+    never need a network scope — the same rule `expand_targets` applies when
+    it filters, so the preflight and the gate cannot disagree about which
+    targets a scope is even supposed to authorize.
     """
     try:
         from phantom.automation.guidance.targets import (
             classify_target,
             is_identity_target,
         )
-        net_targets = [t for t in resolved
-                       if not is_identity_target(classify_target(t))]
+        return [t for t in resolved if not is_identity_target(classify_target(t))]
     except Exception:
-        net_targets = list(resolved)
-    if net_targets:
-        notifier.warn(
-            "NESSUNO SCOPE impostato su target di rete: l'auto-mode "
-            "rifiuterà i target finché non imposti 'set scope "
-            "<cidr,...>' (o scope_list). Per un lab dichiara "
-            "l'eccezione con PHANTOM_ALLOW_UNSCOPED=1 — un typo nel "
-            "target o un CIDR largo colpiscono davvero.")
+        return list(resolved or [])
+
+
+@dataclass(frozen=True)
+class ScopePreflight:
+    """Verdict of the pre-run scope check.
+
+    ``ok`` False means the run must NOT start: with no scope declared the
+    per-target gate refuses every remote target anyway, so starting only
+    burns an engagement (listener started, session dir and checkpoint
+    written) and ends on a late "out of scope" that reads like the goal
+    simply failed.
+    """
+
+    ok: bool
+    message: str = ""
+    hint: str = ""
+    network_targets: Tuple[str, ...] = field(default_factory=tuple)
+
+
+def scope_preflight(resolved: List[str], *,
+                    scope_list: Optional[List[str]] = None) -> ScopePreflight:
+    """Refuse a network-target run with NO scope, BEFORE it starts.
+
+    The counterpart of `callback_preflight`: the prerequisite is knowable
+    NOW, so the run is refused up front and the outcome is
+    `blocked_preflight` — not "finished without reaching the goal".
+
+    Three ways this passes, in order: the targets are identity-only (no
+    machine is touched, so a machine scope is not the right question); the
+    operator declared a scope; or the operator explicitly opted out with
+    `engagement.allow_unscoped` / `PHANTOM_ALLOW_UNSCOPED=1` — the SAME
+    switch the desktop API and the per-target gate honour (A-6), so the
+    three can never disagree about what unscoped means.
+
+    Failing to READ the opt-out never blocks the run: this check exists to
+    save an engagement, never to become a new way for a launch to fail.
+    """
+    network = _network_targets(resolved)
+    if not network:
+        return ScopePreflight(True)
+    if scope_list:
+        return ScopePreflight(True, network_targets=tuple(network))
+    try:
+        from phantom.core.scope import unscoped_allowed
+        if unscoped_allowed():
+            return ScopePreflight(True, network_targets=tuple(network))
+    except Exception:
+        return ScopePreflight(True, network_targets=tuple(network))
+    return ScopePreflight(
+        False,
+        message=(f"no engagement scope and {len(network)} network target(s), "
+                 f"so auto-mode refuses every remote target and this run is "
+                 f"refused BEFORE it starts."),
+        hint=("declare the authorized range with `scope add <cidr>` in "
+              "AUTO-MODE (or `set scope <cidr>` in the core shell); for a "
+              "lab/CTF declare the exception with PHANTOM_ALLOW_UNSCOPED=1"),
+        network_targets=tuple(network))
+
+
+def warn_missing_scope(resolved: List[str]) -> None:
+    """Announce (without blocking) that a network run has no scope.
+
+    Used by the DRY RUN, which must still print the plan: reading a plan is
+    not an engagement. The failure path is `scope_preflight`, which refuses
+    before the run starts — this only explains why the run WILL be refused,
+    and it warns even when the operator has opted out, because an override
+    the operator cannot see is how an engagement quietly runs with less
+    protection than it was sold with.
+    """
+    network = _network_targets(resolved)
+    if not network:
+        return
+    notifier.warn(
+        f"no scope declared and {len(network)} network target(s): "
+        "auto-mode refuses every remote target until the scope is declared. "
+        "Declare the authorized range with `scope add <cidr>` in AUTO-MODE "
+        "(or `set scope <cidr>` in the core shell); for a lab declare the "
+        "exception with PHANTOM_ALLOW_UNSCOPED=1 — a typo in the target or "
+        "a wide CIDR hits for real.")
 
 
 def callback_preflight(targets, goal: str, notifier=notifier) -> None:
@@ -227,7 +300,7 @@ def callback_preflight(targets, goal: str, notifier=notifier) -> None:
     The beacon's endpoint is compiled from `c2.host`. When the target
     cannot dial it (unset host, 0.0.0.0, loopback, or a private endpoint
     against an external target) the deploy SUCCEEDS and the beacon never
-    checks in — the operator then reads a late "nessun beacon stabilito"
+    checks in — the operator then reads a late "no beacon established"
     with no cause. This is the most common real-deploy failure, so it is
     named up front (warn when some targets are affected, error when none
     can work). Never blocks the run: a tunnel may exist that we cannot
@@ -272,11 +345,10 @@ def callback_preflight(targets, goal: str, notifier=notifier) -> None:
         if not ok:
             bad.append((t, reason))
     for t, reason in bad:
-        notifier.warn(f"Callback implausibile per {t}: {reason}")
+        notifier.warn(f"Implausible callback for {t}: {reason}")
     if bad and len(bad) == len(list(targets)):
         notifier.error(
-            "Nessun target può chiamare il C2: i beacon si deployerebbero "
-            "ma non rientrerebbero MAI.",
-            hint="imposta c2.host all'indirizzo operatore raggiungibile dal "
-                 "target (o fai port-forward) — `doctor --net` verifica il "
-                 "listener")
+            "No target can call the C2: the beacons would deploy but would "
+            "NEVER check in.",
+            hint="set c2.host to the operator address the target can reach "
+                 "(or port-forward) — `doctor --net` verifies the listener")
