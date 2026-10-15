@@ -31,6 +31,9 @@ from phantom.automation.guidance.commands import Registry, make_registry
 from phantom.automation.guidance.dynamics import DynCommandBuilder
 from phantom.automation.guidance.stealth import StealthEngine, StealthConfig
 from phantom.automation.guidance.threatmodel import BlueTeamModel
+from phantom.automation.phases import (
+    CROSS_PHASE_ANY, CROSS_PHASE_LEARNED,
+)
 from phantom.automation.planner import Planner, Plan, PlanStep
 from phantom.automation.reasoning import ReasoningEngine
 from phantom.automation.enterprise import EnterpriseBrain
@@ -894,8 +897,11 @@ class AutonomousAgent:
     # engine lane comes after the id-specific engines.
     #
     # `phase` is the owning kill-chain phase (phantom.automation.phases);
-    # "any" marks a cross-phase channel, "learned" the machine-authored
-    # lane (capabilities with no phase of their own). Handler names are
+    # CROSS_PHASE_ANY marks a cross-phase channel, CROSS_PHASE_LEARNED the
+    # machine-authored lane (capabilities with no phase of their own). Both
+    # are DECLARED in phantom.automation.phases and imported above, not
+    # spelled out as literals here: a lane that only exists as a string no
+    # test can recognise is a contract no test can check. Handler names are
     # resolved on the agent at dispatch time.
     _CHANNEL_ROUTES: Tuple[Tuple[str, Callable[[Any], bool], str], ...] = (
         # post-exploitation capabilities execute through the beacon channel
@@ -951,7 +957,7 @@ class AutonomousAgent:
         # building a command must stay pure (the chain preview builds every
         # candidate's command, and a live socket probe there is a bug), and
         # `run_engine` gives the engine a timeout and a short TTL cache.
-        ("any",      lambda cap: getattr(cap, "exec_class", "") == "in_process_engine"
+        (CROSS_PHASE_ANY, lambda cap: getattr(cap, "exec_class", "") == "in_process_engine"
                                 and getattr(cap, "engine", None) is not None,
          "_execute_engine_capability"),
         # A-2: a LEARNED capability carries NO in-process adapter/interpreter
@@ -959,11 +965,11 @@ class AutonomousAgent:
         # contribution — preconditions, adapter and interpreter — runs in the
         # task worker, and findings come back as JSON data. This must be
         # handled BEFORE make_command(), which by design has no adapter here.
-        ("learned",  lambda cap: cap.id.startswith("learned.")
+        (CROSS_PHASE_LEARNED, lambda cap: cap.id.startswith("learned.")
                                 and bool(getattr(cap, "source_module", "")),
          "_execute_learned_capability"),
         # everything else is a shell command (the only place commands exist)
-        ("any",      lambda cap: True,
+        (CROSS_PHASE_ANY, lambda cap: True,
          "_execute_command_capability"),
     )
 

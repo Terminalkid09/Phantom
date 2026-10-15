@@ -30,6 +30,23 @@ PHASE_ORDER = (
     "report",
 )
 
+# Two channel routes in the agent's registry belong to NO single kill-chain
+# phase and carry a LANE label instead:
+#
+#   CROSS_PHASE_ANY      the generic in-process engine lane and the default
+#                        shell-command lane (whatever the category is);
+#   CROSS_PHASE_LEARNED  capabilities authored by the learner, which have no
+#                        phase of their own.
+#
+# They live here, in the package that owns the phase vocabulary, because
+# before they were declared the two labels existed only as string literals in
+# agent.py plus a comment — nothing could tell a lane apart from a typo, and
+# the only contract test that compared routes against the phase list skipped
+# on every run.
+CROSS_PHASE_ANY = "any"
+CROSS_PHASE_LEARNED = "learned"
+CROSS_PHASE_LANES = (CROSS_PHASE_ANY, CROSS_PHASE_LEARNED)
+
 # capability id -> owning phase. Keep in sync with each phase's
 # capabilities.py — this is the planner-facing index.
 _CAPABILITY_PHASE: Dict[str, str] = {
@@ -131,6 +148,16 @@ _CAPABILITY_PHASE: Dict[str, str] = {
 def phase_of(capability_id: str) -> Optional[str]:
     """The phase that owns a capability id, or None for unknown ids."""
     return _CAPABILITY_PHASE.get(capability_id)
+
+
+def is_channel_phase(label: str) -> bool:
+    """May a channel route claim `label` as its phase?
+
+    True for the kill-chain phases and for the cross-phase lanes, False for
+    everything else — so a renamed or misspelt phase ("reconn", "osint2")
+    is caught instead of quietly becoming a lane of its own.
+    """
+    return label in PHASE_ORDER or label in CROSS_PHASE_LANES
 
 
 def capabilities_of(phase: str) -> List[str]:

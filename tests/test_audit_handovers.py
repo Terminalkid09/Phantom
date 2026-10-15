@@ -71,7 +71,7 @@ class TestCallbackPreflightHandlesIterators(unittest.TestCase):
         note = self._run((t for t in ["10.0.0.5", "10.0.0.6"]))
         self.assertTrue(note.error.called,
                         "the all-affected error must fire for an iterator")
-        self.assertIn("Nessun target", note.error.call_args[0][0])
+        self.assertIn("No target", note.error.call_args[0][0])
 
     def test_a_list_behaves_the_same(self):
         note = self._run(["10.0.0.5", "10.0.0.6"])
@@ -157,13 +157,27 @@ class TestTheDispatchRegistryIsOrdered(unittest.TestCase):
             self.assertTrue(handler)
 
     def test_the_phases_are_real_phases(self):
+        """Every channel route names a phase the package actually declares.
+
+        This test was silently skipping on EVERY run since it was written: it
+        asked for `phases.PHASES`, an export that never existed here (the
+        package publishes `PHASE_ORDER`), and turned the missing attribute
+        into `skipTest`. A route naming a phase that does not exist would have
+        stayed green for as long as nobody looked at the skip list.
+        """
         from phantom.automation.agent import AutonomousAgent
         from phantom.automation import phases
-        known = set(getattr(phases, "PHASES", ()) or ())
-        if not known:
-            self.skipTest("no PHASES export to compare against")
+        known = set(getattr(phases, "PHASE_ORDER", ()) or ())
+        self.assertTrue(known, "phantom.automation.phases.PHASE_ORDER is "
+                               "missing or empty; there is nothing to "
+                               "compare the routes against")
+        self.assertTrue(phases.CROSS_PHASE_LANES,
+                        "the cross-phase lanes must be declared, not implied")
         for phase, _match, _handler in AutonomousAgent._CHANNEL_ROUTES:
-            self.assertIn(phase, known, phase)
+            self.assertTrue(
+                phases.is_channel_phase(phase),
+                f"{phase!r} is neither a kill-chain phase nor a declared "
+                f"cross-phase lane {tuple(phases.CROSS_PHASE_LANES)}")
 
     def test_every_handler_exists_on_the_class(self):
         from phantom.automation.agent import AutonomousAgent
