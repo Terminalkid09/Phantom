@@ -22,21 +22,22 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
+from phantom.core import auto_help
 from phantom.core.session import session
 from phantom.utils.notifier import notifier
 
 console = Console()
 
-_GOALS = ("deep", "deliver", "complete_kill_chain", "footprint", "beacon",
-          "creds", "identity", "post_exploit", "ad", "crack", "lateral",
-          "cleanup")
-_PROFILES = ("smb", "enterprise", "cloud", "financial", "government", "mobile")
-# goals.engine_for honors "swarm" only for goals that declare a swarm chain;
-# anything else falls back to the agent path with a printed note.
-_ENGINES = ("agent", "swarm")
+# ONE vocabulary, declared in auto_help and consumed BOTH by the validation in
+# `do_flags` and by the text `help` prints — so the shell can never validate
+# against a list it does not document, or document one it does not accept.
+_GOALS = auto_help.GOALS
+_PROFILES = auto_help.PROFILES
+_ENGINES = auto_help.ENGINES
 
 
 # ── banner / dashboard / status ────────────────────────────────────────────
@@ -59,21 +60,61 @@ def build_auto_banner() -> str:
 """
 
 
-def _elapsed() -> str:
-    started = getattr(session, "engagement_started", None)
-    if not started:
-        return "0s"
-    try:
-        secs = max(0, int((datetime.now() - datetime.fromisoformat(started)).total_seconds()))
-    except Exception:
-        return "0s"
-    h, rem = divmod(secs, 3600)
+def _fmt_secs(secs: float) -> str:
+    """Compact human duration (shared by the engagement clock and a run)."""
+    total = max(0, int(secs))
+    h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
     if h:
         return f"{h}h {m}m"
     if m:
         return f"{m}m {s}s"
     return f"{s}s"
+
+
+def _elapsed() -> str:
+    """Age of the ENGAGEMENT.
+
+    Deliberately labelled `eng` wherever it is shown: it comes from
+    `session.engagement_started`, which the manual shell sets once and this
+    shell never resets, so it keeps running across sessions. Shown next to a
+    run that took 0s (which happens), an unlabelled timer reads as broken.
+    """
+    started = getattr(session, "engagement_started", None)
+    if not started:
+        return "0s"
+    try:
+        secs = (datetime.now() - datetime.fromisoformat(started)).total_seconds()
+    except Exception:
+        return "0s"
+    return _fmt_secs(secs)
+
+
+def _active_flags(flags: Dict[str, Any]) -> List[str]:
+    """The mode flags that are ON, in registry order.
+
+    Derived, never hand-listed: the status bar and the dashboard each
+    re-typed a subset of the flags and both had already lost `force_network`
+    — an operator could widen the engagement to a whole range and the
+    persistent bar would still read "default".
+    """
+    return [key for key in auto_help.BOOL_KEYS if flags.get(key)]
+
+
+def _scope_text(limit: int = 3) -> str:
+    """The declared scope, compacted onto one line of status.
+
+    The scope is shown in every frame because its ABSENCE is what refuses a
+    network run: the old bar hid it, so the one fact that explained the
+    refusal was the one fact the operator could not see.
+    """
+    scope = list(getattr(session, "scope", None) or [])
+    if not scope:
+        return "[yellow]none — network targets are refused[/]"
+    shown = ", ".join(scope[:limit])
+    if len(scope) > limit:
+        shown += f", +{len(scope) - limit} more"
+    return shown
 
 
 def _separator() -> str:
@@ -92,14 +133,14 @@ def pr_budget_left(st) -> int:
 
 def _dashboard(targets: List[str], flags: Dict[str, Any]) -> Panel:
     tgt = ", ".join(targets) if targets else "—"
-    active = [k for k in ("aggressive", "stealth", "speed", "llm",
-                          "experience", "evolution") if flags.get(k)]
+    active = _active_flags(flags)
     parts = [f"[bold cyan]Targets:[/] [yellow]{tgt}[/]"]
     parts.append(f"[bold white]Goal:[/] {flags.get('goal')}")
     parts.append(f"[bold white]Profile:[/] {flags.get('profile')}")
+    parts.append(f"[bold white]Scope:[/] {_scope_text()}")
     parts.append(f"[bold white]Agents:[/] {flags.get('agents') or 'auto'}")
-    parts.append(f"[bold white]Flags:[/] {', '.join(active) or 'default'}")
-    parts.append(f"[bold green]⏱ {_elapsed()}[/]")
+    parts.append(f"[bold white]Flags:[/] {', '.join(active) or 'none active'}")
+    parts.append(f"[bold green]⏱ eng {_elapsed()}[/]")
     return Panel(
         "   ".join(parts),
         title="[bold]Phantom Auto-Mode Status[/]",
@@ -107,30 +148,53 @@ def _dashboard(targets: List[str], flags: Dict[str, Any]) -> Panel:
     )
 
 
-def _status_bar(targets: List[str], flags: Dict[str, Any]) -> str:
+def _status_bar(targets: List[str], flags: Dict[str, Any],
+                run_secs: str = "") -> str:
+    """One persistent line: what the run is ABOUT.
+
+    Target count, goal, profile, scope, the mode flags that are on, the
+    agent count and the two clocks. The goal was the only configuration
+    this line used to carry: the profile — which picks the chain and the
+    difficulty — and the scope — whose absence refuses the run — were
+    visible only on the dashboard at startup, i.e. before either could have
+    changed.
+    """
     n = len(targets)
     tgt = f"{n} target(s)" if n else "no targets"
-    active = [k for k in ("aggressive", "stealth", "speed", "llm",
-                          "experience", "evolution") if flags.get(k)]
-    flags_txt = (" · ".join(active) if active else "default")
-    agents = f"-a{flags.get('agents')}" if flags.get("agents") else "-a"
+    active = _active_flags(flags)
+    flags_txt = " · ".join(active) if active else "no mode flags"
+    agents = f"-a{flags.get('agents')}" if flags.get("agents") else "-a(auto)"
+    run = f" [dim]·[/] [green]run {run_secs}[/]" if run_secs else ""
     return (f"[bold cyan]▚ PHANTOM.AUTO[/] [dim]|[/] [yellow]{tgt}[/] "
-            f"[dim]·[/] {flags.get('goal')} [dim]·[/] {flags_txt} [dim]·[/] "
-            f"[bold white]{agents}[/] [dim]·[/] [bold green]⏱ {_elapsed()}[/]")
+            f"[dim]·[/] goal [white]{flags.get('goal')}[/] "
+            f"[dim]·[/] profile [white]{flags.get('profile')}[/] "
+            f"[dim]·[/] [dim]scope {_scope_text(limit=2)}[/] "
+            f"[dim]·[/] {flags_txt} [dim]·[/] [bold white]{agents}[/] "
+            f"[dim]·[/] [bold green]⏱ eng {_elapsed()}[/]{run}")
 
 
 def _context_hint(targets: List[str], has_run: bool) -> str:
+    """The faded line that answers "what do I type now?".
+
+    It names the NEXT move for the state the operator is actually in, and
+    the scope requirement is the one it used to omit: with targets but no
+    scope the run will be refused, and the hint offered `plan → launch` as
+    if that would work.
+    """
     hints = []
+    scoped = bool(getattr(session, "scope", None))
     if not targets:
         hints.append("targets add <email|username|ip|domain>")
-        hints.append("scope add <cidr>")
+        hints.append("scope add <cidr>  (required for network targets)")
     elif not has_run:
+        if not scoped:
+            hints.append("scope add <cidr>  (required for network targets)")
         hints.append("plan → launch")
         hints.append("resume <checkpoint|.pm>")
     else:
         hints.append("status")
         hints.append("export <file>.pm")
-    hints.append("help")
+    hints.append("help <command>")
     hints.append("manual")
     hints.append("c2")
     hints.append("back")
@@ -146,23 +210,31 @@ class AutoShell(cmd.Cmd):
     def __init__(self):
         super().__init__()
         self.targets: List[str] = []
-        self.flags: Dict[str, Any] = {
-            "aggressive": False, "stealth": False, "speed": False,
-            "agents": 0, "goal": "deliver", "profile": "enterprise",
-            "llm": False, "verbose": False, "experience": False,
-            "evolution": False,
-            # Scope-changing controls. `force_network` turns a CIDR into a
-            # full-range engagement and `engine` picks agent vs swarm; both
-            # were reachable only from the CLI, so the REPL could not run
-            # either -- and `_announce_guardrails` read a flag that could
-            # never be set, i.e. a guard that could not fire.
-            "force_network": False, "engine": "agent",
-        }
+        # Built FROM the registry (auto_help.FLAGS): a flag cannot exist in
+        # the shell without being documented, nor be documented without
+        # existing. `force_network`/`engine` were reachable only from the CLI
+        # until the REPL got them; `force_profile` was the same gap and is now
+        # closed the same way, so an operator who knows the IP really IS the
+        # phone can say so instead of being silently overruled.
+        self.flags: Dict[str, Any] = auto_help.default_flags()
+        self._run_started = 0.0
         self.events: Dict[str, List[Dict[str, Any]]] = {}
         self.has_run = False
         self._intr_count = 0
         self._last_intr = 0.0
         self._last_line = ""
+
+    def _run_duration(self) -> str:
+        """How long the CURRENT (or last) run took — not the engagement age.
+
+        Two clocks, two labels: the engagement started whenever the operator
+        opened the first shell (possibly yesterday), the run started when
+        `launch` was typed. Showing only the first left a 0s delivery next to
+        a "24h 56m" timer, which reads as a bug.
+        """
+        if not self._run_started:
+            return ""
+        return _fmt_secs(time.monotonic() - self._run_started)
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -184,7 +256,8 @@ class AutoShell(cmd.Cmd):
             self._last_line = line.strip()
             try:
                 console.print(_separator())
-                console.print(_status_bar(self.targets, self.flags))
+                console.print(_status_bar(self.targets, self.flags,
+                                          self._run_duration()))
                 console.print(_context_hint(self.targets, self.has_run))
             except Exception:
                 pass
@@ -328,73 +401,78 @@ class AutoShell(cmd.Cmd):
 
     # ── flags ─────────────────────────────────────────────────────────────
 
-    _BOOL_KEYS = ("aggressive", "stealth", "speed", "llm", "verbose",
-                  "experience", "evolution", "force_network")
+    #: Derived from the registry (auto_help.BOOL_KEYS): a flag cannot be
+    #: validated here unless it is also documented, and the reverse.
+    _BOOL_KEYS = auto_help.BOOL_KEYS
+
+    def _flag_table(self) -> Table:
+        """Every flag with its current value AND the values it accepts.
+
+        The `Accepts` column is the point: the accepted values used to appear
+        only AFTER a wrong one was typed, so the question "what can I put
+        here?" was answered by making a mistake first.
+        """
+        table = Table(title="Auto-Mode Flags", border_style="cyan")
+        table.add_column("Flag", style="cyan", no_wrap=True)
+        table.add_column("Value", style="white", no_wrap=True)
+        table.add_column("Accepts", style="yellow")
+        table.add_column("What it does", style="dim")
+        for key, value, accepts, help_text in auto_help.flag_rows(self.flags):
+            table.add_row(key, value, accepts, help_text)
+        return table
 
     def do_flags(self, arg: str):
-        """flags | flags <key> <value> - show/change run flags
-        keys: aggressive|stealth|speed|llm|verbose|experience|evolution|
-        force_network (on/off), agents (N), goal (<choices>),
-        profile (<choices>), engine (agent|swarm)
+        """flags | flags <key> <value> - show or change the run flags
 
-        experience: cross-engagement learning memory. OFF (default) means
-        the experience engine learns WITHIN this run only; ON persists the
+        `flags` with no value lists every key with its CURRENT value and the
+        values it accepts, so "what can I put here?" is never answered by an
+        error. `help flags` prints the same table.
+
+        experience: cross-engagement learning memory. OFF (default) means the
+        experience engine learns WITHIN this run only; ON persists the
         cause->repair cases to data/ so the next engagement starts smarter.
-        evolution: self-improvement — stable uncovered failure patterns
-        spawn a background authoring sub-agent that opens a reviewable PR
-        (requires llm on + lab reachable; max 2 PRs/day)."""
+        evolution: self-improvement — stable uncovered failure patterns spawn
+        a background authoring sub-agent that opens a reviewable PR (requires
+        llm on + lab reachable; max 2 PRs/day).
+        force_profile: keep the profile you chose even when it contradicts
+        the target class (the operator may know that this IP IS the phone).
+        """
         parts = arg.split()
         if not parts:
-            table = Table(title="Auto-Mode Flags", border_style="cyan")
-            table.add_column("Flag")
-            table.add_column("Value")
-            for k, v in self.flags.items():
-                if k in self._BOOL_KEYS:
-                    table.add_row(k, "on" if v else "off")
-                elif k == "agents":
-                    table.add_row(k, "auto" if not v else str(v))
-                else:
-                    table.add_row(k, str(v))
-            console.print(table)
+            console.print(self._flag_table())
+            console.print("[dim]`help flags` prints this table too; "
+                          "`flags <key> <value>` sets one.[/]")
             return
         key, value = parts[0].lower(), " ".join(parts[1:]).strip()
-        if key not in self.flags:
-            notifier.error(f"Unknown flag: {key} (see `flags`)")
+        spec = auto_help.flag_by_key(key)
+        if spec is None:
+            notifier.unknown("flag", key, options=auto_help.flag_keys(),
+                             hint="run `flags` for every key and its values")
             return
         if not value:
-            notifier.error(f"Usage: flags {key} <value>")
+            notifier.usage("flags", f"{key} <value>",
+                           hint=f"{key} accepts {spec.accepts()}")
             return
-        if key in self._BOOL_KEYS:
-            val = value.lower() in ("on", "true", "1", "yes")
-            if value.lower() not in ("on", "off", "true", "false", "1", "0", "yes", "no"):
-                notifier.error(f"flags {key} accepts on/off")
-                return
-            self.flags[key] = val
-        elif key == "agents":
-            try:
-                n = int(value)
-                if n < 0:
-                    raise ValueError
-                self.flags["agents"] = n
-            except ValueError:
-                notifier.error("flags agents expects 0 (auto) or N >= 1")
-                return
-        elif key == "goal":
-            if value not in _GOALS:
-                notifier.error(f"goal must be one of: {', '.join(_GOALS)}")
-                return
-            self.flags["goal"] = value
-        elif key == "profile":
-            if value not in _PROFILES:
-                notifier.error(f"profile must be one of: {', '.join(_PROFILES)}")
-                return
-            self.flags["profile"] = value
-        elif key == "engine":
-            if value.lower() not in _ENGINES:
-                notifier.error(f"engine must be one of: {', '.join(_ENGINES)}")
-                return
-            self.flags["engine"] = value.lower()
-        notifier.success(f"flags {key} = {self.flags[key]}")
+        if not spec.valid(value):
+            if spec.kind == "choice":
+                notifier.unknown(f"value for `flags {key}`", value,
+                                 options=list(spec.choices),
+                                 hint=f"accepted: {spec.accepts()}")
+            else:
+                notifier.error(f"flags {key} does not accept '{value}'.",
+                               hint=f"accepted: {spec.accepts()}")
+            return
+        if spec.kind == "bool":
+            self.flags[key] = value.lower() in ("on", "true", "1", "yes")
+        elif spec.kind == "int":
+            self.flags[key] = int(value)
+        else:
+            self.flags[key] = value.lower()
+        notifier.success(
+            f"flags {key} = {spec.render(self.flags[key])}")
+        if key == "force_profile" and self.flags[key]:
+            notifier.info("The profile/target coherence check is now OFF for "
+                          "this shell: `profile` is used as typed.")
 
     # ── plan (dry run) ────────────────────────────────────────────────────
 
@@ -426,6 +504,13 @@ class AutoShell(cmd.Cmd):
             evolution=bool(self.flags["evolution"]),
             engine=self.flags["engine"],
             force_network=bool(self.flags["force_network"]),
+            # `force_profile` reaches `run_auto_mode` from here too: the CLI
+            # had `--force-profile` and the orchestrator honoured it, but the
+            # REPL could not set it, so `flags profile mobile` on an IP was
+            # silently overruled and the warning pointed at a flag the
+            # operator had no way to type. Same gap `force_network`/`engine`
+            # had (see tests/test_autoshell_scope_flags.py).
+            force_profile=bool(self.flags["force_profile"]),
         )
 
     def do_review(self, arg: str):
@@ -475,6 +560,7 @@ class AutoShell(cmd.Cmd):
         if not self._announce_guardrails():
             return
         self.has_run = True
+        self._run_started = time.monotonic()
         console.print(f"[cyan]─ Launching AUTO-MODE on: {', '.join(self.targets)} ─[/]")
         run_auto_mode(targets=self.targets, on_event=self._on_event,
                       handoff_c2=True, **self._run_kwargs())
@@ -529,6 +615,7 @@ class AutoShell(cmd.Cmd):
             return
         from phantom.core.automode import run_auto_mode
         self.has_run = True
+        self._run_started = time.monotonic()
         console.print(f"[cyan]─ Resuming from: {path} ─[/]")
         run_auto_mode(targets=self.targets, resume=cp_path,
                       on_event=self._on_event, handoff_c2=True,
@@ -889,35 +976,47 @@ class AutoShell(cmd.Cmd):
     do_quit = do_exit
 
     def do_help(self, arg: str):
-        if arg.strip():
-            super().do_help(arg)
+        """help [command] - list every command, or one command in detail
+
+        Rendered from `auto_help`'s registry — the same one `flags` validates
+        against — so `help` cannot describe a command set the shell does not
+        have, and `help <command>` shows the accepted VALUES instead of a
+        placeholder. The table this replaces was hand-written, and had already
+        drifted: its `flags` row listed the keys but not their values, and had
+        lost `verbose` and `evolution`, which `flags` itself prints.
+        """
+        name = arg.strip().lower()
+        if name:
+            spec = auto_help.by_name(name)
+            if spec is None:
+                super().do_help(arg)
+                return
+            self._print_command_help(spec)
             return
         table = Table(title="Phantom Auto-Mode Commands", border_style="cyan")
-        table.add_column("Command")
+        table.add_column("Command", style="cyan", no_wrap=True)
         table.add_column("Description")
-        rows = [
-            ("targets", "List targets | add <t[,t...]> | rm <t>"),
-            ("scope", "List scope | add <cidr> | rm <cidr>"),
-            ("flags", "Show/change run flags (aggressive, stealth, speed, agents, goal, profile, llm, experience, force_network, engine)"),
-            ("plan", "Dry-run the planned kill chain (executes nothing)"),
-            ("review", "Show the self-improvement status: authored patterns, budgets, learned capabilities, beta PRs"),
-            ("launch", "Run the autonomous kill chain on the current targets"),
-            ("resume", "Continue from a checkpoint.json or an imported .pm"),
-            ("status", "Per-target event summary of the last run"),
-            ("export", "Export the engagement to a portable <file>.pm"),
-            ("import", "Restore an engagement from a <file>.pm"),
-            ("manual", "Enter the MANUAL module shell on this engagement"),
-            ("c2 [<beacon>]", "Enter the C2 Control Plane (optionally straight into a beacon)"),
-            ("handoff", "Show the beacons this run handed over | take [<id>] to open one"),
-            ("guardrails", "Show the safety controls for this engagement | enable/disable <key>"),
-            ("context", "Show target, scope, flags, run state and pending beacons"),
-            ("workspace", "List the surfaces of this engagement and how to reach them"),
-            ("back", "Leave AUTO-MODE"),
-        ]
-        for c, d in rows:
-            table.add_row(c, d)
+        for category, specs in auto_help.grouped():
+            table.add_row(f"[bold]{category}[/]", "")
+            for spec in specs:
+                # escape(): a usage string like `guardrails [list | why | ...]`
+                # is DATA, and rich would swallow the bracket as a style tag —
+                # the same trap the guardrail manifest hit with "[env]".
+                table.add_row(escape("  " + spec.usage),
+                              escape(spec.description))
         console.print(table)
-        console.print("[dim]Type 'help <command>' for details.[/]")
+        console.print("[dim]Type 'help <command>' for the details — every "
+                      "flag's accepted values included.[/]")
+
+    def _print_command_help(self, spec) -> None:
+        """`help <command>`: usage, what it does, and (for flags) values."""
+        body = f"[bold cyan]{escape(spec.usage)}[/]\n{escape(spec.description)}"
+        if spec.detail:
+            body += f"\n\n[dim]{escape(spec.detail)}[/]"
+        console.print(Panel(body, title=f"[bold]help: {spec.name}[/]",
+                            border_style="cyan"))
+        if spec.name == "flags":
+            console.print(self._flag_table())
 
     def default(self, line: str):
         notifier.error(f"Unknown command: {line}")
