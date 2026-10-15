@@ -357,6 +357,11 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
                 {group.commands.length > 1 && (
                   <button onClick={() => runGroup(group.name, group.commands)}
                     disabled={anyRunning || !effTarget}
+                    title={!effTarget
+                      ? 'No target: set the session target, or type one in the field on the right'
+                      : anyRunning
+                        ? 'A run is already in progress — wait for it to finish, or stop it'
+                        : `Run all commands in ${group.name}`}
                     aria-label={`Run the group ${group.name}`}
                     className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-phantom-green/20 text-phantom-green hover:bg-phantom-green/30 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
                     <Layers size={10} /> Run Group
@@ -425,8 +430,19 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
               </div>
             )}
             <div className="flex gap-2 mt-3">
+              {/* The button said "Run via backend" even while it was DISABLED, so
+                  the operator's only question ("why can I not run this?") had
+                  no answer anywhere on the panel. */}
               <button onClick={run} disabled={!selected || !effTarget || anyRunning || !selectedRunnable}
-                title={selectedItem && !selectedItem.runnable ? `CLI-only: ${selectedItem.reason || 'run in the Phantom shell'}` : 'Run via backend'}
+                title={!selected
+                  ? 'Select a command first'
+                  : !selectedRunnable
+                    ? `CLI-only: ${selectedItem?.reason || 'run it in the Phantom shell'}`
+                    : !effTarget
+                      ? 'No target: set the session target, or type one in the field on the right'
+                      : anyRunning
+                        ? 'A run is already in progress — wait for it to finish, or stop it'
+                        : 'Run via backend'}
                 className="flex-1 px-3 py-2 rounded bg-phantom-cyan/20 text-phantom-cyan text-xs font-semibold hover:bg-phantom-cyan/30 disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-2">
                 {running ? <Loader2 size={13} className="animate-spin" /> : <CirclePlay size={13} />}
                 {running ? 'Running...' : 'Run Selected'}
@@ -440,6 +456,12 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
                 title="Explicit execution target for this panel (defaults to the session target — auto-mode rewrites it mid-run)"
                 className="w-36 bg-surface border border-surface-border rounded px-2 py-2 text-[11px] font-mono text-text-primary placeholder-text-dim focus:outline-none focus:border-phantom-cyan"
               />
+              {!effTarget && selected && (
+                <p className="w-full text-[10px] text-phantom-yellow mt-2">
+                  Nothing to run against yet: set the session target, or type one
+                  in the field on the right.
+                </p>
+              )}
               {batchRunning && (
                 <button onClick={() => setBatchRunning(false)}
                   className="px-3 py-2 rounded bg-phantom-error/20 text-phantom-error text-xs font-semibold hover:bg-phantom-error/30 flex items-center gap-2">

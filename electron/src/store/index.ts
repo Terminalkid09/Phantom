@@ -407,6 +407,12 @@ export const useStore = create<PhantomStore>((set, get) => ({
   pushToast: (t) => {
     const id = Math.random().toString(36).substring(2, 9)
     set((s) => ({ toasts: [...s.toasts, { ...t, id }] }))
+    // An ERROR is not dismissed on a timer. The operator may be looking at
+    // another panel when it fires — panels stay mounted, so failures happen
+    // off-screen — and a refusal that disappears after five seconds is
+    // indistinguishable from nothing having happened. Informational toasts
+    // still expire; errors wait for the operator (or for the X button).
+    if (t.type === 'error') return
     setTimeout(() => {
       set((s) => ({ toasts: s.toasts.filter(toast => toast.id !== id) }))
     }, 5000)

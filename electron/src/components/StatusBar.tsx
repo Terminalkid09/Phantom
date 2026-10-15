@@ -18,7 +18,10 @@ export default function StatusBar() {
       <div className="flex items-center gap-4">
         {/* The timer ticks every second: announcing it would flood a screen
             reader, so it is readable but not a live region. */}
-        <span aria-label={`Elapsed time ${elapsed}`}>⏱ {elapsed}</span>
+        <span
+          title="Time since this window opened — not the engagement clock (that one starts when a run does)"
+          aria-label={`Window open for ${elapsed}`}
+        >⏱ {elapsed}</span>
 
         {autoMode.running && autoMode.steps[autoMode.current_step] && (
           <span
@@ -28,6 +31,32 @@ export default function StatusBar() {
           >
             <span className="w-1.5 h-1.5 rounded-full bg-phantom-magenta animate-pulse" aria-hidden="true" />
             Auto-Mode: {autoMode.steps[autoMode.current_step].name}
+          </span>
+        )}
+
+        {/* The run's POSTURE, not just its current step. The profile and goal
+            decide which chain executes — a `mobile` profile and an `identity`
+            goal run a different kill chain than `enterprise`/`deliver` — and
+            from any panel other than Auto-Mode they were shown nowhere, so
+            the same run appeared to differ by tab. */}
+        {autoMode.running && (
+          <span
+            role="status"
+            aria-live="polite"
+            aria-label={`Auto-Mode posture: profile ${autoMode.profile}, goal ${autoMode.goal}, engine ${autoMode.engine}, mode ${autoMode.mode}`}
+            className="flex items-center gap-1.5"
+          >
+            <span className="text-text-dim">profile</span>
+            <span className="text-phantom-cyan">{autoMode.profile}</span>
+            <span className="text-text-dim">goal</span>
+            <span className="text-phantom-cyan">{autoMode.goal}</span>
+            <span className="text-text-dim">{autoMode.mode} · {autoMode.engine}</span>
+            {autoMode.forceNetwork && (
+              <span
+                className="text-phantom-yellow"
+                title="Force network: the whole range is engaged, not only discovered"
+              >force-network</span>
+            )}
           </span>
         )}
 

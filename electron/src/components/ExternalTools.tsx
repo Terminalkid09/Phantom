@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { CheckCircle2, Download, RefreshCw, Terminal, Wrench } from 'lucide-react'
-import { requestApi } from '@/hooks/useApi'
+import { requestApi, apiError } from '@/hooks/useApi'
 
 /**
  * External tools (`deps` in the CLI, /api/toolchain here).
@@ -29,12 +29,24 @@ export default function ExternalTools() {
   const [loading, setLoading] = useState(false)
   const [busy, setBusy] = useState('')
   const [msg, setMsg] = useState('')
+  const [error, setError] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
     try {
       const res = await requestApi('GET', '/api/toolchain')
-      setData((res?.data ?? null) as Toolchain | null)
+      // A failed read answers with an ERROR ENVELOPE, not a Toolchain. Storing
+      // it and then reading `data.missing.length` threw and blanked the panel,
+      // and because `data` was no longer null the "Loading the tool report…"
+      // line stayed up forever. Only a well-formed report becomes data.
+      const body = res?.data as Partial<Toolchain> | null | undefined
+      if (res?.status === 200 && body && Array.isArray(body.missing)) {
+        setData(body as Toolchain)
+        setError('')
+      } else {
+        setData(null)
+        setError(apiError(res))
+      }
     } finally {
       setLoading(false)
     }
@@ -48,7 +60,11 @@ export default function ExternalTools() {
     try {
       const res = await requestApi('POST', '/api/toolchain', { tool, confirm: true })
       const d = (res?.data ?? {}) as { ok?: boolean; message?: string }
-      setMsg(d.message || (d.ok ? `${tool} installed` : `${tool} not installed`))
+      // A failed request used to read "${tool} not installed", which hides WHY
+      // (refused without confirmation, no package manager, sudo required).
+      setMsg(res?.status === 200
+        ? (d.message || (d.ok ? `${tool} installed` : `${tool} not installed`))
+        : `Install request failed: ${apiError(res)}`)
       await load()
     } finally {
       setBusy('')
@@ -74,7 +90,13 @@ export default function ExternalTools() {
         </div>
       </div>
 
-      {!data && <p className="text-[10px] text-text-dim">Loading the tool report…</p>}
+      {!data && !error && <p className="text-[10px] text-text-dim">Loading the tool report…</p>}
+
+      {error && (
+        <p className="text-[10px] text-phantom-error" role="status" aria-live="polite">
+          Could not read the toolchain report: {error}
+        </p>
+      )}
 
       {data && data.missing.length === 0 && (
         <p className="text-[10px] text-phantom-green flex items-center gap-1">
@@ -83,7 +105,7 @@ export default function ExternalTools() {
       )}
 
       <div className="space-y-2" role="region" aria-live="polite" aria-label="Missing tools">
-        {data?.missing.map((row) => (
+        {data?.missing?.map((row) => (
           <div key={row.tool} className="flex items-start justify-between gap-3">
             <div className="min-w-0">
               <p className="text-xs font-medium text-text-primary">

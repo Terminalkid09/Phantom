@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '@/store'
-import { useApi, useApiError } from '@/hooks/useApi'
+import { useApi, useApiError, apiError as apiErrorText } from '@/hooks/useApi'
 import ExternalTools from '@/components/ExternalTools'
 import {
   Settings, Cpu, Server, Shield, Key, Eye, EyeOff,
@@ -32,6 +32,10 @@ export default function SettingsPanel() {
     if (res.status === 200 && res.data) {
       const d = res.data as { keys: Record<string, KeyInfo> }
       setApiKeys(d.keys || {})
+    } else {
+      // A failed read left the panel on its empty state ("No key registry
+      // available"), which blames the build for what is a failed request.
+      pushToast({ title: 'Could not load API keys', description: apiErrorText(res), type: 'warning' })
     }
   }
 
@@ -59,11 +63,19 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
       setApiToken(d.token)
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
+    } else {
+      apiError(res, 'Rotate the C2 API token')
     }
   }
 
   const handleToggleMtls = async () => {
     const res = await api('POST', '/api/c2/config/mtls-toggle')
+    // The answer used to be discarded: a refusal (token missing, listener not
+    // running, build without the endpoint) looked like a button that does
+    // nothing, because the follow-up poll just re-rendered the OLD state.
+    if (res.status !== 200) {
+      apiError(res, 'Toggle mTLS')
+    }
     pollC2()
   }
 
@@ -88,11 +100,17 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
   }
 
   const [guardrails, setGuardrails] = useState<GuardrailManifest | null>(null)
+  const [guardrailsError, setGuardrailsError] = useState('')
 
   const loadGuardrails = async () => {
     const res = await api('GET', '/api/guardrails')
     if (res.status === 200 && res.data) {
       setGuardrails(res.data as GuardrailManifest)
+      setGuardrailsError('')
+    } else {
+      // Without this the section sat on "Loading the manifest…" forever, and
+      // a failed read was indistinguishable from a slow one.
+      setGuardrailsError(apiErrorText(res))
     }
   }
 
@@ -116,17 +134,27 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
     if (res.status === 200 && res.data) {
       const d = res.data as { kind: string; details: string }
       setSettings({ backend_type: (d.kind || 'none') as typeof settings.backend_type })
+    } else {
+      // Silent before: a failed probe left the select on whatever it was on,
+      // and the operator read that as "detection found the same thing".
+      apiError(res, 'Detect the backend')
     }
   }
 
   const saveBackend = async () => {
-    await api('POST', '/api/backend/config', {
+    const res = await api('POST', '/api/backend/config', {
       kind: settings.backend_type,
       distro: settings.wsl_distro,
       host: settings.ssh_host,
       port: settings.ssh_port,
       user: settings.ssh_user,
     })
+    // "Backend configuration saved." was printed regardless of the answer:
+    // a refused write reported success. Only claim what the backend accepted.
+    if (res.status !== 200) {
+      apiError(res, 'Save backend configuration')
+      return
+    }
     setSaved(true)
     setTimeout(() => setSaved(false), 2500)
   }
@@ -239,8 +267,14 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
             Refresh
           </button>
           <div className="space-y-2">
-            {!guardrails && (
+            {!guardrails && !guardrailsError && (
               <p className="text-[10px] text-text-dim">Loading the manifest…</p>
+            )}
+            {!guardrails && guardrailsError && (
+              <p className="text-[10px] text-phantom-error" role="status" aria-live="polite">
+                Could not read the guardrail manifest: {guardrailsError}
+                {' — '}the protection level of this engagement is unknown until it loads.
+              </p>
             )}
             {guardrails?.guards.map((g) => {
               const toggleable = guardrails.toggleable.includes(g.key)

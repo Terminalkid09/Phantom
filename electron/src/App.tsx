@@ -22,7 +22,7 @@ import SocialGraphPanel from '@/components/SocialGraphPanel'
 import { ToastContainer } from '@/components/Toast'
 
 export default function App() {
-  const { activeTab, elapsed, setElapsed, setSettings, capabilities, setCapabilities } = useStore()
+  const { activeTab, setActiveTab, elapsed, setElapsed, setSettings, capabilities, setCapabilities } = useStore()
   const [backendError, setBackendError] = useState<string | null>(null)
   useApi(true)
 
@@ -114,6 +114,15 @@ export default function App() {
   // Feature-gating: drop the panels whose component this build does not expose
   const visible = panels.filter((p) => capabilities[componentForTab(p.id)])
   const active = visible.find((p) => p.id === activeTab) ?? visible[0]
+  // Capability gating can HIDE the tab the store still points at (a build
+  // that does not expose C2 or auto-mode). The panel below then falls back to
+  // a different entry while the sidebar keeps highlighting the OLD one — or
+  // highlights nothing at all — so the navigation and the content disagreed
+  // about where the operator was. Point the store at what is rendered.
+  const activeId = active?.id
+  useEffect(() => {
+    if (activeId && activeId !== activeTab) setActiveTab(activeId)
+  }, [activeId, activeTab, setActiveTab])
 
   if (backendError) {
     return (
@@ -160,7 +169,7 @@ export default function App() {
         {/* Panel content — all panels mounted, only the active one visible */}
         <main
           id="main"
-          aria-label={`Phantom panel: ${active.id}`}
+          aria-label={`Phantom panel: ${active?.id ?? 'none'}`}
           className="flex-1 overflow-auto min-h-0"
         >
           {visible.map((p) => (

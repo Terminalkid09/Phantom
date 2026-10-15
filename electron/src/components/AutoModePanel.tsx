@@ -1146,7 +1146,7 @@ export default function AutoModePanel() {
           <div className="bg-surface-card border border-surface-border rounded-lg flex-1 flex flex-col min-h-0 relative">
             {/* Global Progress Bar */}
             {autoMode.running && (
-              <div role="progressbar" aria-label="Kill chain progress" aria-valuemin={0} aria-valuemax={Math.max(1, autoMode.steps.length - 1)} aria-valuenow={Math.max(0, autoMode.current_step)} className="absolute top-0 left-0 h-1 bg-phantom-magenta transition-all duration-500 rounded-tl-lg" 
+              <div role="progressbar" aria-label="Kill chain progress" aria-valuemin={0} aria-valuemax={Math.max(1, autoMode.steps.length - 1)} aria-valuenow={Math.max(0, autoMode.current_step)} className="absolute top-0 left-0 h-1 bg-phantom-magenta transition-all duration-500 rounded-tl-lg"
                    style={{ width: `${Math.max(5, (autoMode.current_step / Math.max(1, autoMode.steps.length - 1)) * 100)}%` }} />
             )}
             <div className="px-3 py-2 border-b border-surface-border flex items-center justify-between">
