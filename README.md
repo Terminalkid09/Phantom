@@ -76,7 +76,7 @@ auto                              # enter the AUTO-MODE shell (same as bare `pha
 manual                            # the manual module core, on this engagement
 targets add bob@corp.com,10.0.0.5 # multi-target list (add/rm/list)
 scope add corp.com                # authorized targets
-flags                             # show/change flags (aggressive, stealth, speed, agents, goal, profile, llm, experience)
+flags                             # every flag with its value AND accepted values (aggressive, stealth, speed, agents, goal, profile, llm, verbose, experience, evolution, force_network, force_profile, engine)
 
 # --profile models the DEFENDER stack the chain plans against:
 #   smb | enterprise | cloud | financial | government | mobile
@@ -175,6 +175,11 @@ craft aitm <login-url>  # ENTERPRISE, opt-in (phishing.aitm=true): an
                         #   after the second factor (that is what beats
                         #   plain MFA). Needs a domain with TLS in front;
                         #   fails against FIDO2/passkeys and pinned clients
+craft kits              # the lure page KITS that exist: what each one is
+                        #   for, what it needs and what it captures.
+                        #   `tracker.skin` selects one, and an unknown value
+                        #   is REPORTED (`using 'youtube'`) instead of being
+                        #   silently rendered as some other kit
 craft hits <code>       # every hit/open/cred/session + device, browser, geo
 craft sessions <code>   # sessions taken by an AiTM mount (cookies = the
                         #   logged-in browser, MFA already satisfied)
@@ -200,6 +205,11 @@ the logged-in session (MFA already answered). It is **off by default**
 wired to the auto-mode: it is credential theft against a live service, so it
 stays an operator decision on a contracted engagement. It does not defeat
 phishing-resistant MFA (FIDO2/passkeys) or certificate-pinned clients.
+Before it mounts, the infrastructure behind the lure is checked — a public
+URL that resolves, HTTPS in front (a `Secure`/`SameSite=None` relay cookie is
+dropped on plain HTTP, so it breaks *after* the credentials), a redirect and
+brand that are not still the shipped placeholder. A blocker refuses the mount
+instead of producing a relay that cannot work.
 
 **Honest limitation:** no image can install a beacon with zero interaction —
 that is 0-day territory, not a tool feature. What Phantom ships is the
@@ -568,7 +578,7 @@ load at the next start (regret-bounded [0.5x, 1.5x]).
 ```
 AUTO > targets add bob@corp.com,10.0.0.5   # multi-target list (core shell holds one)
 AUTO > scope add corp.com                   # authorized targets
-AUTO > flags aggressive on                  # per-run flags: aggressive|stealth|speed|agents|goal|profile|llm|experience
+AUTO > flags aggressive on                  # per-run flags: aggressive|stealth|speed|agents|goal|profile|llm|verbose|experience|evolution|force_network|force_profile|engine
 AUTO > plan                                 # dry-run the planned chain (executes nothing)
 AUTO > launch                               # run the chain; beacon -> C2 handoff
 AUTO > resume checkpoint.json               # continue from a checkpoint or an imported .pm
@@ -1283,7 +1293,7 @@ phantom/                        # repository root
 │   └── bt_scan.h               # Bluetooth scanning
 ├── electron/                   # React + Vite + TypeScript desktop app
 ├── data/                       # Sessions, cache, certs, wordlists
-├── tests/                      # 365 test files
+├── tests/                      # 368 test files
 ├── Dockerfile                  # Multi-stage Kali-based build
 ├── docker-compose.yml          # One-command deployment
 └── .env.example                # External API template

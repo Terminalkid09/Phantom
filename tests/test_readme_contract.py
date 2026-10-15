@@ -113,7 +113,7 @@ class TestTheCountedClaimsAreReal(unittest.TestCase):
         text = _readme()
         match = re.search(r"tests/\s*#\s*(\d+) test files", text)
         self.assertIsNotNone(match, "the project tree must state a test count")
-        real = len(list((_ROOT / "tests").glob("test_*.py")))  # 353 at the
+        real = len(list((_ROOT / "tests").glob("test_*.py")))  # 368 at the
                                                               # time of writing
         self.assertEqual(int(match.group(1)), real,
                          "the README test count is stale")

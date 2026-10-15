@@ -6,6 +6,69 @@ All notable changes to Phantom.
 
 ## [Unreleased] — current development (v3.0.0 line)
 
+### Reliability — the operator can see what a command actually did
+
+The same failure shape ran through the shells, the auto-mode, the lure layer
+and the desktop app: a value that was accepted but never checked, or a result
+that was never read, so a refusal and a slow operation looked identical and the
+reason existed only in the code.
+
+- **AUTO-MODE `help` and `flags` now share one registry (`core/auto_help.py`).**
+  The help table was hand-written and `flags`' docstring carried literal
+  placeholders (`goal (<choices>)`) while the 12 goals and 6 profiles sat as
+  constants in the same file; the `flags` help row had already lost `verbose`
+  and `evolution`, which the flags table itself printed. `flags profile` with
+  no value answered `Usage: flags profile <value>` — the accepted values
+  appeared only after typing a wrong one. One registry now feeds both the
+  validation and the text: `help` lists every command with its accepted
+  values, `flags` shows each key's value AND what it accepts, and a test pins
+  the registry to the shell in both directions.
+- **The AUTO-MODE REPL gained `force_profile`**, and the status bar and
+  dashboard DERIVE the active flags instead of re-typing a subset — both had
+  already lost `force_network`, so a whole-range engagement could be armed
+  while the persistent bar still read "default". The bar carries the profile
+  and the scope (whose absence is what refuses a network run) and separates
+  the engagement clock from the run clock.
+- **A scopeless network run is refused BEFORE it starts.** The warning said
+  auto-mode fails closed without an engagement scope, but nothing refused it:
+  the listener started, the session dir and checkpoint were written, and the
+  chain ended on a late "out of scope" that reads like a failed goal. It now
+  reports `blocked_preflight`; identity-only targets, a declared scope and the
+  documented `PHANTOM_ALLOW_UNSCOPED=1` opt-out all pass, and an unreadable
+  opt-out never blocks.
+- **`tracker.skin` is validated against a kit registry (`social/kits.py`).**
+  It was a free-form string: `youube` fell through to the YouTube page in
+  silence, so the operator believed they had picked a kit they had not.
+  `craft kits` lists what exists, and an unknown value is reported.
+- **`social/infra.py` preflights the lure infrastructure** before a lure is
+  handed over: a public URL that resolves, HTTPS in front (a `Secure` /
+  `SameSite=None` relay cookie is dropped on plain HTTP, and the relay then
+  breaks AFTER the credentials are typed), a redirect and brand that are not
+  still the shipped placeholder. `craft aitm` refuses to mount on a blocker.
+  Advisory by design: a check that cannot be evaluated reports nothing rather
+  than inventing a verdict.
+- **Electron: success was assumed from a request that had failed.** "Backend
+  configuration saved." printed regardless of the answer; the mTLS toggle
+  discarded its response and re-rendered the old state; a failed toolchain read
+  was stored as if it were a toolchain (`data.missing.length` threw, blanking
+  the panel while "Loading…" stayed up forever); the Run buttons were disabled
+  with no explanation anywhere; capability gating could hide the tab the store
+  still pointed at, leaving the sidebar and the content disagreeing. Error
+  toasts no longer expire on a 5s timer — panels stay mounted, so failures fire
+  off-screen.
+- **Two correctness bugs found while making the tests real.**
+  `exploit/differential` wrote its probes with a double escape, so the wire
+  carried the literal text `\r\n` and `\x00` instead of the bytes: a server read
+  one malformed request line, and the verdict was decided by a probe the target
+  never understood. And the cross-phase lane contract test **skipped on every
+  run** — it asked for `phases.PHASES`, an export that never existed (the
+  package publishes `PHASE_ORDER`), and turned the missing attribute into
+  `skipTest`; it now asserts the export and checks the routes.
+- **The remaining operator-facing CLI text is English** (C2 handoff, the
+  Telegram bot's command surface, build-helper prompts, the RCE deployer's
+  credential dialogs, the swarm profile/target refusal, `run-diff` verdicts,
+  the payload OS fallback). Text only — no control flow or meaning changed.
+
 ### Security & reliability — per-endpoint pins, real CI, scope hardening, audit
 
 - **Per-endpoint certificate pins.** A fallback ladder whose rungs are
