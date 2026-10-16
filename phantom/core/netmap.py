@@ -29,6 +29,34 @@ def _run(cmd: List[str], timeout: float = 60.0) -> str:
         return ""
 
 
+def _tool_argv(name: str) -> Optional[List[str]]:
+    """Resolve an external tool to an argv PREFIX (empty list = absent).
+
+    Native PATH first; when the binary is not there, route through the WSL
+    toolbox (`wsl -d kali-linux <tool>`), which is where the operator stack
+    actually lives on a Windows box — the same bridge the manual executor
+    and the credential verifiers already use.
+
+    Discovery used to call `shutil.which()` directly, so on Windows `nmap`
+    and `arp-scan` looked ABSENT while they sat one command away in the
+    Kali distro: the sweep silently degraded to an ICMP ping, and every
+    host whose firewall drops echo requests — the Windows default, phones,
+    IoT — was invisible on the map. A missing tool must not be mistaken for
+    an empty network.
+    """
+    path = shutil.which(name)
+    if path:
+        return [path]
+    if os.name != "nt":
+        return []
+    try:
+        from phantom.automation.runtime.toolchain import _wsl_which
+        wrapper = _wsl_which(name)
+    except Exception:
+        return []
+    return wrapper.split() if wrapper else []
+
+
 def _local_cidrs() -> List[str]:
     """Best-effort list of local subnets (IPv4) to sweep."""
     cidrs: List[str] = []
@@ -261,6 +289,11 @@ def _mac_vendor(mac: str) -> str:
     m = (mac or "").lower().replace("-", ":")
     if not m or m.count(":") != 5:
         return ""
+    # broadcast / null MACs are infrastructure artefacts, not devices: the
+    # locally-administered bit is set on ff:ff:…, so the privacy-MAC shortcut
+    # below would label the broadcast address "Randomized (privacy MAC)".
+    if m in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
+        return ""
     first = int(m.split(":")[0], 16)
     if first & 0x02:
         # locally-administered bit set: randomized MAC (modern phones,
@@ -270,6 +303,69 @@ def _mac_vendor(mac: str) -> str:
         if m.startswith(prefix):
             return vendor
     return ""
+
+
+def _local_nets() -> List[Any]:
+    """The subnets we are directly attached to (empty on failure)."""
+    nets: List[Any] = []
+    for cidr in _local_cidrs():
+        try:
+            nets.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError:
+            continue
+    return nets
+
+
+def _in_subnets(ip: str, nets: List[Any]) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in nets)
+
+
+def _arp_cache_hosts(cidrs: List[str]) -> List[Dict[str, str]]:
+    """Devices the OS already knows at L2, inside the scanned subnets.
+
+    The neighbour (ARP) table is the ONE discovery source that still
+    answers for a host whose firewall drops ICMP: the machine has talked
+    to it seconds ago and its MAC is right there. It costs nothing, needs
+    no tool and no privilege — so it is a source here, not only the
+    enrichment lookup it used to be.
+    """
+    try:
+        nets = [ipaddress.ip_network(c, strict=False) for c in cidrs]
+    except ValueError:
+        return []
+    out: List[Dict[str, str]] = []
+    for ip, info in _arp_table().items():
+        # only our own L2 segment: an off-subnet entry is the router's MAC,
+        # never proof that the far host itself exists
+        if not any(_in_subnets(ip, [net]) for net in nets):
+            continue
+        # the sweep's own network/broadcast addresses show up in the cache
+        # with a broadcast MAC — they are not devices
+        addr = ipaddress.ip_address(ip)
+        if any(addr in (net.network_address, net.broadcast_address)
+               for net in nets):
+            continue
+        host: Dict[str, str] = {"ip": ip, "source": "arp-cache"}
+        if info.get("mac"):
+            host["mac"] = info["mac"]
+        if info.get("vendor"):
+            host["vendor"] = info["vendor"]
+        out.append(host)
+    return out
+
+
+def _arp_cache_alive(ips: List[str]) -> List[str]:
+    """Subset of `ips` whose MAC is still in the neighbour cache."""
+    if not ips:
+        return []
+    nets = _local_nets()
+    cache = _arp_table()
+    return [ip for ip in ips
+            if cache.get(ip, {}).get("mac") and _in_subnets(ip, nets)]
 
 
 def _reverse_dns(ip: str, timeout: float = 1.5) -> str:
@@ -401,7 +497,9 @@ def check_hosts_alive(hosts: List[Dict[str, Any]], timeout: float = 8.0,
     hammers the network; ``force=True`` for an explicit re-check (right
     after a scan / on operator demand). Never raises: a host we cannot
     reach is marked dead, a missing ping binary degrades to optimistic
-    (keeps the map usable on stripped systems).
+    (keeps the map usable on stripped systems), and a host that only
+    filters ICMP is rescued by its MAC still sitting in the neighbour
+    cache — the map must not call a device that is right there "offline".
     """
     if not hosts:
         return {}
@@ -443,6 +541,14 @@ def check_hosts_alive(hosts: List[Dict[str, Any]], timeout: float = 8.0,
             for h in hosts:
                 if h.get("ip"):
                     result[h["ip"]] = True
+    # ICMP is not reachability: Windows with its default firewall, phones
+    # and IoT devices drop echo requests while being reachable. A MAC in the
+    # neighbour cache for a host on OUR subnet proves it is up, so a ping
+    # miss is corrected before the alive flag is written.
+    dead = [h.get("ip", "") for h in hosts
+            if h.get("ip") and not result.get(h.get("ip"))]
+    for ip in _arp_cache_alive(dead):
+        result[ip] = True
     stamp = datetime.utcnow().isoformat(timespec="seconds")
     for h in hosts:
         ip = h.get("ip", "")
@@ -467,9 +573,12 @@ def discover_network(target: Optional[str] = None,
             time.time() - _LAST_SCAN.get("at", 0) < 60:
         return dict(_LAST_SCAN.get("data", {}))
     started = time.time()
-    if target and "/" in target:
+    if target:
+        # a bare IP is ONE host, not the /24 around it: an operator who
+        # scopes the scan to 192.168.1.6 must not sweep the whole network
         try:
-            cidrs = [str(ipaddress.ip_network(target, strict=False))]
+            spec = target if "/" in target else f"{target}/32"
+            cidrs = [str(ipaddress.ip_network(spec, strict=False))]
         except ValueError:
             cidrs = _local_cidrs()
     else:
@@ -477,21 +586,34 @@ def discover_network(target: Optional[str] = None,
 
     hosts: List[Dict[str, str]] = []
     method = ""
-    arp_scan = shutil.which("arp-scan")
-    nmap = shutil.which("nmap")
+    arp_scan = _tool_argv("arp-scan")
+    nmap = _tool_argv("nmap")
 
     for cidr in cidrs:
         if arp_scan and not hosts:
-            out = _run([arp_scan, "--localnet"], timeout=timeout)
+            out = _run([*arp_scan, "--localnet"], timeout=timeout)
             hosts = _parse_arp_scan(out)
             method = "arp-scan" if hosts else ""
         if nmap and not hosts:
-            out = _run([nmap, "-sn", "-PR", cidr], timeout=timeout)
+            # ARP probe first (answers even when ICMP is filtered), plus a
+            # TCP ping on the ports a live device is most likely to hold
+            out = _run([*nmap, "-sn", "-PR",
+                        "-PS22,80,443,445,139,3389,8080,5555", cidr],
+                       timeout=timeout)
             hosts = _parse_nmap_sn(out)
             method = "nmap -sn" if hosts else ""
         if not hosts:
             hosts = _ping_sweep(cidr, timeout=timeout)
             method = "ping sweep" if hosts else method
+
+    # Last, the L2 truth: a device the sweeps could not reach but the
+    # neighbour table still holds is on this network RIGHT NOW — that is the
+    # exact case of a host that filters ICMP (Windows default firewall).
+    known = {h.get("ip") for h in hosts}
+    extra = [h for h in _arp_cache_hosts(cidrs) if h.get("ip") not in known]
+    if extra:
+        hosts.extend(extra)
+        method = f"{method} + arp-cache" if method else "arp-cache"
 
     # dedupe by IP
     seen: set = set()
