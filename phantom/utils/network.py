@@ -397,10 +397,30 @@ def c2_endpoint_status(host: str = "") -> C2Endpoint:
 
     lhost = host
     lport = 0
+    if not lhost:
+        # An EXPLICIT operator override must reach the artefact. This path
+        # used to read `session.lhost` only, so it silently ignored
+        # PHANTOM_C2_HOST and a configured `c2.front` — the disposable
+        # redirector the front feature exists to put in the binary — while
+        # the auto-mode path answered the SAME question through
+        # get_c2_endpoint(). Two artefacts, two endpoints, and the one
+        # `generate` had just built could never check in.
+        lhost = str(os.getenv("PHANTOM_C2_HOST", "")).strip()
+        if not lhost:
+            try:
+                front = get_c2_front()
+            except Exception:
+                front = None
+            if front:
+                lhost = str(front[0] or "")
+                try:
+                    lport = int(front[1] or 0)
+                except (TypeError, ValueError):
+                    lport = 0
     try:
         from phantom.core.session import session
         lhost = lhost or str(getattr(session, "lhost", "") or "")
-        lport = int(getattr(session, "lport", 0) or 0)
+        lport = lport or int(getattr(session, "lport", 0) or 0)
     except Exception:
         pass
     if not lhost:
