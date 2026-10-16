@@ -54,6 +54,29 @@ class TestServiceRoles(unittest.TestCase):
         self.assertEqual(roles.get("445"), "windows-remote")
         self.assertEqual(roles.get("3306"), "database")
 
+    def test_a_phone_device_channel_is_worked_not_just_classified(self):
+        """ADB over Wi-Fi is a control channel, not a label.
+
+        The role table already knew port 5555, but the rule that turns a
+        role into a next step had no branch for it: a phone with ADB open
+        registered `role=android` and proposed identity work only, leaving
+        the one mobile entry a network scan can find unused.
+        """
+        wm = _wm(services=[(5555, "adb", "")])
+        ReasoningEngine().run(wm)
+        roles = {f.key: f.value["role"] for f in wm.find("service_role")}
+        self.assertEqual(roles.get("5555"), "android")
+        caps = {h.capability_id for h in wm.hypotheses}
+        self.assertIn("service_exploit", caps)
+
+    def test_other_device_control_ports_are_worked_too(self):
+        """DevTools / Termux / lockdown ports are device channels as well."""
+        for port in (9222, 8022, 62078):
+            wm = _wm(services=[(port, "", "")])
+            ReasoningEngine().run(wm)
+            roles = {f.key: f.value["role"] for f in wm.find("service_role")}
+            self.assertEqual(roles.get(str(port)), "device-debug")
+
 
 class TestADInference(unittest.TestCase):
 

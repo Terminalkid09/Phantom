@@ -49,6 +49,16 @@ _AD_PORTS = {"88", "389", "636", "3268", "3269", "464"}
 _WINDOWS_PORTS = {"135", "139", "445", "3389", "5985", "5986"}
 _LINUX_PORTS = {"22", "111", "2049"}
 _ANDROID_PORTS = {"5555"}
+# Device-control channels a PERSONAL DEVICE exposes when a feature was
+# turned on (Wi-Fi debugging, remote DevTools, terminal, Wi-Fi sync).
+# A phone is not "ports or nothing": these are the ports an operator can
+# actually work when one is reachable, so they are classified as their own
+# role rather than left to fall through the role table unnoticed.
+_DEVICE_PORTS = {"9222",      # Chrome/WebView DevTools (CDP)
+                 "8022",      # Termux sshd
+                 "62078",     # iOS lockdown / Wi-Fi sync (usbmuxd)
+                 "1716",      # KDE Connect
+                 "8384"}      # Syncthing GUI
 _DNS_PORTS = {"53"}
 _FTP_PORTS = {"21"}
 _SNMP_PORTS = {"161", "162"}
@@ -72,6 +82,8 @@ for _p in _LINUX_PORTS:
     _ROLE_BY_PORT[_p] = "unix-remote"
 for _p in _ANDROID_PORTS:
     _ROLE_BY_PORT[_p] = "android"
+for _p in _DEVICE_PORTS:
+    _ROLE_BY_PORT[_p] = "device-debug"
 for _p in _DNS_PORTS:
     _ROLE_BY_PORT[_p] = "dns"
 for _p in _FTP_PORTS:
@@ -427,6 +439,24 @@ class ReasoningEngine:
                     "redis_info" if port == "6379" else "version_detect",
                     f"database on {port}: check auth state and version",
                     cost=0.8, priority=0.7)))
+            elif role in ("android", "device-debug"):
+                # A phone's exposed device channel is the ONE mobile entry a
+                # network scan can find, and the role table already
+                # recognised the port — but this branch did not exist, so the
+                # engine registered `role=android` and proposed NOTHING: a
+                # phone with ADB open planned OSINT only, which is the "social
+                # only" gap. Debug channels are worked, not fingerprinted.
+                what = "ADB over Wi-Fi" if role == "android" else "device debug channel"
+                out.append((None, self._hyp(
+                    "service_exploit",
+                    f"{what} on {port}: the device exposes a control channel "
+                    f"— connect and check for an authorised host / access",
+                    cost=1.5, priority=0.8)))
+                out.append((None, self._hyp(
+                    "http_probe",
+                    f"device control plane on {port}: fingerprint the device "
+                    f"surface (model, build, endpoints)",
+                    cost=0.5, priority=0.65)))
             elif role == "active-directory":
                 out.append((None, self._hyp(
                     "version_detect",
