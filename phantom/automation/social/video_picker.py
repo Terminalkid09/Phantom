@@ -102,11 +102,14 @@ def topic_for(text: str) -> str:
 def _default_search(query: str) -> List[Dict[str, str]]:
     """yt-dlp search: real, current, on-topic results. Never raises."""
     try:
-        from phantom.core.executor import execute_quiet
+        from phantom.core.executor import execute_quiet, quote_arg
+        # the template carries TABs, and a backslash inside an f-string
+        # expression is a SyntaxError on 3.10: build the strings first
+        fmt = "%(id)s\t%(title)s\t%(channel)s"
+        search = "ytsearch3:" + query
         res = execute_quiet(
             "yt-dlp --no-warnings --skip-download --no-playlist "
-            f"--print '%(id)s\\t%(title)s\\t%(channel)s' "
-            f"'ytsearch3:{query}' 2>/dev/null",
+            f"--print {quote_arg(fmt)} {quote_arg(search)}",
             timeout=40)
         rows = []
         for line in (res.stdout or "").splitlines():

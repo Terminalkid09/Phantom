@@ -69,6 +69,17 @@ MAX_NODES = 500
 MAX_EDGES = 2000
 
 
+_UNCONFIRMED_STATES = ("missing", "unknown")
+"""States that are NOT a claim that an account exists.
+
+`missing` = we looked and it was not there; `unknown` = the platform answered
+with a shell we cannot read (or the fetch failed). Both are facts about the
+PROBE, and a node carrying either one must not read as "this account exists" —
+that is what turned an email address into an instagram profile and Instagram's
+universal app shell into seven variant accounts (live evidence, 2026-10-16).
+"""
+
+
 def _norm(value: str) -> str:
     return re.sub(r"\s+", "", str(value or "").strip().lower().lstrip("@"))
 
@@ -431,6 +442,13 @@ class SocialGraph:
         for node in list(self.nodes.values())[:limit]:
             mark = f"{node.kind:<7}"
             extra = f" platform={node.platform}" if node.platform else ""
+            # the two states that change what the operator can do: an absent
+            # profile (do not build a chain on it) and a private one (the DM
+            # needs a follow first). Showing neither made an absence read
+            # exactly like a confirmed account.
+            state = str(node.attrs.get("state", "") or "")
+            if state in ("missing", "private", "unknown"):
+                extra += f" state={state}"
             out.append(f"    {mark} {node.label or node.key} "
                        f"conf={node.confidence:.2f} "
                        f"proofs={len(self.proofs(node.key))}{extra}")
@@ -685,9 +703,20 @@ def graph_from_recon(results: Sequence[Any], *,
         platform = getattr(result, "platform", "") or ""
         if not username:
             continue
+        state = getattr(result, "state", "") or ""
+        # An ABSENT profile is an outcome of a PROBE, not an account, and
+        # `unknown` is a page we could not read at all. Either one used to
+        # become a 0.70-confidence node whose `platform` attribute read as
+        # "this handle exists on instagram" — live evidence: an email address
+        # came back as an instagram profile, and seven variant "accounts" were
+        # nothing but Instagram's universal app shell. The node is kept (its
+        # search/wayback leads still need a subject to attach to) but it no
+        # longer claims existence: 0.25 and the state travels with it.
+        absent = state in _UNCONFIRMED_STATES
         subject = g.add_handle(username, platform=platform,
-                               source=f"recon:{platform}", confidence=0.7,
-                               state=getattr(result, "state", ""),
+                               source=f"recon:{platform}",
+                               confidence=0.25 if absent else 0.7,
+                               state=state or "unknown",
                                full_name=getattr(result, "full_name", ""))
         if subject is None:
             continue
@@ -814,8 +843,11 @@ def graph_from_wm(wm: Any, *, graph: Optional[SocialGraph] = None) -> SocialGrap
         if not username:
             continue
         platform = str(value.get("platform", "") or "")
+        state = str(value.get("state", "") or "")
         node = g.add_handle(username, platform=platform, source="session",
-                            confidence=0.7, state=value.get("state", ""),
+                            confidence=(0.25 if state in _UNCONFIRMED_STATES
+                                        else 0.7),
+                            state=state,
                             full_name=value.get("full_name", ""),
                             followers=value.get("followers", ""),
                             private=bool(value.get("private")))

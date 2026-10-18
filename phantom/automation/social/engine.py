@@ -75,24 +75,15 @@ _PROFILE_URLS = {
     "snapchat": "https://www.snapchat.com/add/{u}",
 }
 
-# strings that prove the profile EXISTS and is PRIVATE (per platform)
-_PRIVATE_MARKERS = {
-    "instagram": ["this account is private", "account is private",
-                  "the link you followed may be broken"],
-    "tiktok": ["this account is private", "account is private"],
-    "x": ["these posts are protected", "posts are protected",
-          "this account is private"],
-    "reddit": ["this community is private"],
-}
-
-# strings that prove the account does NOT exist (per platform)
-_NOT_FOUND_MARKERS = {
-    "instagram": ["sorry, this page isn't available", "page isn't available"],
-    "tiktok": ["couldn't find this account", "can't find this account"],
-    "x": ["this account doesn't exist", "account doesn't exist"],
-    "github": ["not found"],
-    "reddit": ["that's odd", "page not found"],
-}
+# strings that prove the profile EXISTS and is PRIVATE (per platform).
+# ONE source of truth: these used to be a second, diverging copy here — the
+# copies disagreed with recon.py on the SAME platforms (this one called a
+# real Telegram page "private" and treated an i18n bundle string as proof a
+# TikTok account was gone), so profile_recon and deep_recon could return
+# different verdicts for the same handle. The verified tables live in recon.
+from phantom.automation.social.recon import (      # noqa: E402
+    _NOT_FOUND_MARKERS, _PRIVATE_MARKERS, _PUBLIC_MARKERS, _UNREADABLE,  # noqa: F401
+)
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +356,10 @@ class SocialEngine:
             elif target_type == "email":
                 domain = target.split("@")[-1]
                 res = execute_quiet(
-                    f"theHarvester -d {domain} -b all -f /dev/null 2>/dev/null",
+                    # no `-f /dev/null`: theHarvester would try to WRITE a
+                    # report to that path (on Windows: a drive-relative
+                    # `\dev\null`), and the parser below reads stdout anyway
+                    f"theHarvester -d {domain} -b all",
                     timeout=120)
                 for line in (res.stdout or "").splitlines():
                     if "@" in line and "EMAILS" not in line and line.strip():
@@ -467,11 +461,12 @@ class SocialEngine:
             # even when no platform ever displayed it
             queries = [target] + self._email_variants()
             try:
-                from phantom.core.executor import execute_quiet
+                from phantom.core.executor import execute_quiet, quote_arg
                 for q in queries:
                     res = execute_quiet(
-                        f"curl -s -m 20 -H 'Accept: application/json' "
-                        f"'{api}/lookup?q={q}'", timeout=30)
+                        f"curl -s -m 20 -H "
+                        f"{quote_arg('Accept: application/json')} "
+                        f"{quote_arg(f'{api}/lookup?q={q}')}", timeout=30)
                     out = (res.stdout or "").strip()
                     if not out.startswith("{"):
                         continue
@@ -496,13 +491,14 @@ class SocialEngine:
 
         if hibp_key and target_type in ("email", "username"):
             try:
-                from phantom.core.executor import execute_quiet
+                from phantom.core.executor import execute_quiet, quote_arg
                 account = target if target_type == "email" else target
+                url = ("https://haveibeenpwned.com/api/v3/breachedaccount/"
+                       f"{account}?truncateResponse=false")
                 res = execute_quiet(
-                    f"curl -s -m 20 -H 'hibp-api-key: {hibp_key}' "
-                    f"-H 'User-Agent: Phantom' "
-                    f"'https://haveibeenpwned.com/api/v3/breachedaccount/"
-                    f"{account}?truncateResponse=false'", timeout=30)
+                    f"curl -s -m 20 -H {quote_arg('hibp-api-key: ' + hibp_key)} "
+                    f"-H {quote_arg('User-Agent: Phantom')} "
+                    f"{quote_arg(url)}", timeout=30)
                 out = (res.stdout or "").strip()
                 if out.startswith("["):
                     import json
@@ -641,15 +637,26 @@ class SocialEngine:
                 urls = [u for u in urls if u[0] in url_platforms]
             best_private = None
             for p, url in urls:
+                from phantom.core.executor import quote_arg
+                ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "Chrome/125.0 Safari/537.36")
                 res = execute_quiet(
-                    f"curl -s -L -m 15 -A 'Mozilla/5.0 (Windows NT 10.0; "
-                    f"Win64; x64) Chrome/125.0 Safari/537.36' '{url}'",
+                    f"curl -s -L -m 15 -A {quote_arg(ua)} {quote_arg(url)}",
                     timeout=25)
                 html = (res.stdout or "")[:200000]
                 low = html.lower()
                 if any(m in low for m in _NOT_FOUND_MARKERS.get(p, [])):
                     continue  # no account on this platform
                 private = any(m in low for m in _PRIVATE_MARKERS.get(p, []))
+                if not private and (p in _UNREADABLE
+                                    or (not _PUBLIC_MARKERS.get(p)
+                                        and len(html) <= 2000)):
+                    # a shell for every handle (or a stub page) proves
+                    # nothing about THIS account: skip instead of guessing.
+                    # A page carrying a PRIVATE marker is not a shell: it is
+                    # the platform stating this account exists and is closed
+                    # (`this account is private`), so it is read, not skipped.
+                    continue
                 bio = self._extract_bio(html, p)
                 link = self._extract_link(bio)
                 handles = self._extract_handles(bio)

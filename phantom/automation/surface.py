@@ -46,9 +46,9 @@ _HOST_RE = re.compile(
 
 def _fetch(url: str, timeout: float = 15.0) -> str:
     try:
-        from phantom.core.executor import execute_quiet
+        from phantom.core.executor import execute_quiet, quote_arg
         res = execute_quiet(
-            f"curl -s -L -m {int(timeout)} -A '{_UA}' '{url}'",
+            f"curl -s -L -m {int(timeout)} -A {quote_arg(_UA)} {quote_arg(url)}",
             timeout=timeout + 10)
         return (res.stdout or "")[:500000]
     except Exception:

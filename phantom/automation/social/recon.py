@@ -150,31 +150,102 @@ def _primary_for(scope: str, platform: str) -> str:
 
 # private / missing markers per platform (page-level, pre-login)
 _PRIVATE_MARKERS = {
-    "instagram": ("page not found", "sorry, this page isn't available",
-                  "login • instagram", "this account is private",
-                  "sign up to see photos"),
-    "tiktok": ("couldn't find this account", "account banned"),
-    "x": ("this account doesn’t exist", "this account doesn't exist",
-          "nothing to see here"),
-    "github": ("not found", "404"),
-    "reddit": ("\"is_suspended\": true", "\"error\": 404",
-               "page not found"),
-    "telegram": ("if you have telegram, you can contact",
-                 "send message", "view in telegram"),  # t.me public → absent = missing
+    "instagram": ("this account is private", "sign up to see photos"),
+    # GitHub has no private-profile PAGE: a profile with no activity renders
+    # the same public shell. "404" lived here and matched a real profile
+    # (every GitHub page embeds 404 in assets), so a real account was voted
+    # `private`.
+    "github": (),
+    "tiktok": (),
+    "x": (),
+    "reddit": (),
+    # t.me has no private page either: these strings were PRESENCE markers
+    # (verified 2026-10-16: they appear on a real handle's page), which is why
+    # a real Telegram account used to be voted `private`.
+    "telegram": (),
 }
 _NOT_FOUND_MARKERS = {
     "instagram": ("page not found", "sorry, this page isn't available"),
-    "tiktok": ("couldn't find this account",),
-    "x": ("this account doesn’t exist", "this account doesn't exist"),
-    "github": ("404 “this is not the web page you are looking for”",
+    # "couldn't find this account" is an i18n BUNDLE string: it is present in
+    # every TikTok page, real or not (verified), so it proved nothing.
+    "tiktok": (),
+    # Verified against a handle that cannot exist: X answers with
+    # "user profile not found" in the title and "hmm...this page doesn't
+    # exist" in the body. The old marker carried a typographic apostrophe the
+    # page never matched, so a non-existent account was voted `public`.
+    "x": ("user profile not found", "this page doesn", "doesn\u2019t exist",
+          "the account may be private, deleted"),
+    "github": ("404 \u201cthis is not the web page you are looking for\u201d",
                "not found"),
     "reddit": ("\"error\": 404",),
-    "telegram": ("you can contact",),  # actually PRESENT; handled below
+    "telegram": ("you can contact",),  # verified: absent handle only
 }
+# POSITIVE evidence that the fetched page really is the account's profile.
+# A LARGE page is not evidence: Instagram and TikTok answer EVERY path with
+# the same multi-hundred-KB JavaScript shell (verified 2026-10-16 — a handle
+# that cannot exist returned the byte-identical shell), so `len(html) > 2000`
+# used to declare `public conf=1.00` for accounts that do not exist, and the
+# graph grew by seven variant "accounts" that were nothing but that shell.
+_PUBLIC_MARKERS = {
+    "instagram": (),
+    "tiktok": (),
+    "github": ('itemprop="name"', 'id="user-profile-frame"', "vcard-fullname"),
+    "telegram": ("tgme_page_title", "tgme_page_photo", "view in telegram"),
+    "reddit": ('"total_karma"', '"is_employee"', '"comment_karma"'),
+}
+# Platforms whose page is a shell for EVERY handle: no marker can confirm a
+# profile, so the honest verdict is `unknown` — "we could not read it" — and
+# the graph claims nothing.
+_UNREADABLE = {"instagram", "tiktok"}
+
+
+def _has_public_evidence(platform: str, low_html: str) -> bool:
+    """True when the page carries a marker only a real profile has."""
+    return any(m in low_html for m in _PUBLIC_MARKERS.get(platform, ()))
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _HANDLE_RE = re.compile(r"@([A-Za-z0-9._]{3,30})")
 _URL_RE = re.compile(r"(?:https?://)([A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:/[^\s\"'<>]*)?)")
+
+# A raw page is NOT a list of people. Scanning it for `@token` mints CSS
+# at-rules and JS pragma comments as circle members: live evidence
+# (2026-10-16) — the identity graph of a real Instagram profile carried the
+# handle `media` with EIGHT confirming proofs (that is `@media`, the CSS
+# at-rule), and `__pure` on X (that is `/** @__PURE__ */`). A false lead is
+# worse than no lead: the graph's whole value is that its nodes are people.
+_CSS_AT_RULES = {
+    "media", "supports", "import", "charset", "keyframes", "font-face",
+    "layer", "namespace", "page", "container", "property", "scope",
+    "starting-style", "apply", "tailwind", "screen", "viewport", "charset",
+}
+_JUNK_TOKENS = {
+    "pure", "private", "public", "abstract", "type", "param", "license",
+    "flow", "ts-check", "ts-ignore", "ts-expect-error", "jsx", "deprecated",
+    "example", "example.com", "media.css", "gmail.com", "outlook.com",
+}
+# A handle never ends in one of these: `@media.css`, `@x.js`, `@site.com`
+# are URLs, file names and mail domains, not accounts.
+_HANDLE_TAIL_JUNK = {
+    "js", "mjs", "cjs", "css", "scss", "less", "map", "json", "xml", "html",
+    "htm", "png", "jpg", "jpeg", "gif", "svg", "webp", "avif", "ico", "mp4",
+    "webm", "woff", "woff2", "ttf", "otf", "com", "net", "org", "it", "io",
+    "co", "uk", "dev", "info", "biz", "edu", "gov",
+}
+
+
+def _is_real_handle(handle: str) -> bool:
+    """Can this `@token` plausibly be a social handle at all?
+
+    Rejects the two shapes that provably pollute the graph: CSS/JS
+    directives, and URL/file/mail fragments. Anything else passes — the
+    check is deliberately about SHAPE, not about guessing who is a person.
+    """
+    h = (handle or "").strip().strip("._").lower()
+    if len(h) < 3 or h in _CSS_AT_RULES or h in _JUNK_TOKENS:
+        return False
+    if h.rsplit(".", 1)[-1] in _HANDLE_TAIL_JUNK:
+        return False
+    return True
 
 
 # ── result model ─────────────────────────────────────────────────────────────
@@ -261,6 +332,20 @@ class ReconResult:
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+def _q(arg: str) -> str:
+    """Quote ONE argument for the shell line this module builds.
+
+    These fetches go through `execute_quiet`, which runs the line with
+    `shell=True`: `sh` on POSIX, cmd.exe on Windows. cmd.exe has NO
+    single-quote quotes — see `executor.quote_arg` for the live evidence (an
+    existing Instagram account reported `missing` because every fetch died
+    with rc=3 "URL malformed"). One wrong quote made the whole passive-recon
+    surface lie.
+    """
+    from phantom.core.executor import quote_arg
+    return quote_arg(arg)
+
+
 def _fetch(url: str, timeout: float = 15.0, ua: str = "",
            cookies: str = "") -> str:
     """Bounded curl GET returning the body (never raises).
@@ -278,9 +363,9 @@ def _fetch(url: str, timeout: float = 15.0, ua: str = "",
         if cookies:
             safe = re.sub(r"[^A-Za-z0-9._~+/%=&*\-; ]", "", str(cookies))[:4000]
             if safe.strip():
-                header = f" -H 'Cookie: {safe.strip()}'"
+                header = f" -H {_q('Cookie: ' + safe.strip())}"
         res = execute_quiet(
-            f"curl -s -L -m {int(timeout)} -A '{agent}'{header} '{url}'",
+            f"curl -s -L -m {int(timeout)} -A {_q(agent)}{header} {_q(url)}",
             timeout=timeout + 10)
         return (res.stdout or "")[:400000]
     except Exception:
@@ -400,14 +485,17 @@ def _state_vote(username: str, platform: str, jar=None) -> Tuple[str, float, str
     url = _PROFILE_URLS.get(platform, "").format(u=username)
     if not url:
         return "unknown", 0.0, ""
-    votes: List[str] = []          # public | private | missing
+    votes: List[str] = []          # public | private | missing | unknown
     best_html = ""
     cookies = _jar_for(url, jar or {})
     for i in range(2):
         html = _fetch(url, timeout=15.0, ua=_UAS[i % len(_UAS)],
                       cookies=cookies)
         if not html:
-            votes.append("missing")
+            # A failed fetch is NOT a missing account: `missing` is a claim
+            # about the world and here we did not read the world at all
+            # (timeout, TLS, block). Saying so keeps the graph honest.
+            votes.append("unknown")
             continue
         low = html.lower()
         best_html = best_html or html
@@ -415,6 +503,14 @@ def _state_vote(username: str, platform: str, jar=None) -> Tuple[str, float, str
             votes.append("missing")
         elif any(m in low for m in _PRIVATE_MARKERS.get(platform, ())):
             votes.append("private")
+        elif _PUBLIC_MARKERS.get(platform):
+            # a platform whose real page carries identifiable structure:
+            # correct evidence earns `public`, its absence means we did not
+            # read a profile — never a size-based guess
+            votes.append("public" if _has_public_evidence(platform, low)
+                         else "unknown")
+        elif platform in _UNREADABLE:
+            votes.append("unknown")
         elif len(html) > 2000:
             votes.append("public")
         else:
@@ -423,8 +519,23 @@ def _state_vote(username: str, platform: str, jar=None) -> Tuple[str, float, str
             time.sleep(random.uniform(0.8, 2.0))   # human pacing, not bot cadence
     if not votes:
         return "unknown", 0.0, best_html
-    state = max(set(votes), key=votes.count)
-    conf = votes.count(state) / len(votes)
+    # Deterministic aggregation. The old `max(set(votes), key=votes.count)`
+    # leaned on set iteration order whenever the vote split 1-1, so the SAME
+    # two pages could return `private` in one process and `unknown` in the
+    # next one (string hashes are seeded per process). Ties now resolve by
+    # evidence precedence: a page that stated a fact about the account
+    # (`private` marker, `missing` marker, public structure) beats one we
+    # could not read at all, and confidence stays honest at 1/len(votes).
+    counts = {v: votes.count(v) for v in votes}
+    top = max(counts.values())
+    winners = [v for v, c in counts.items() if c == top]
+    if len(winners) > 1:
+        for fact in ("private", "missing", "public"):
+            if fact in winners:
+                winners = [fact]
+                break
+    state = winners[0]
+    conf = counts[state] / len(votes)
     return state, conf, best_html
 
 
@@ -540,14 +651,16 @@ def _mine_graph(username: str, platform: str, html: str,
             text = str(node)
         for h in _HANDLE_RE.findall(text):
             h = h.rstrip("._")
-            if len(h) >= 3 and h.lower() != username.lower() and h not in seen:
+            if (_is_real_handle(h) and len(h) >= 3
+                    and h.lower() != username.lower() and h not in seen):
                 seen.add(h)
                 result.leads.append(Lead("commenter", h, platform,
                                          ev, 0.55))
     # tagged handles: anywhere in page mentioning @others on tag pages
     for h in _HANDLE_RE.findall(html or "")[:60]:
         h = h.rstrip("._")
-        if (len(h) >= 3 and h.lower() != username.lower()
+        if (_is_real_handle(h) and len(h) >= 3
+                and h.lower() != username.lower()
                 and h not in seen and not h.startswith("instagram")
                 and not h.startswith("tiktok")):
             seen.add(h)
@@ -597,6 +710,10 @@ def _second_hop(primary: "ReconResult", platform: str, jar) -> List["Lead"]:
         except Exception:
             continue
         if not html:
+            continue
+        if st not in ("public", "private"):
+            # a shell/unreadable page tells us nothing about the circle:
+            # mining it only manufactures handles
             continue
         second = ReconResult(username=handle, platform=platform,
                              state=st, state_confidence=cf)
@@ -657,7 +774,7 @@ def _wayback_snapshots(username: str, platform: str) -> List[Lead]:
                                   f"wayback:{ts}", 0.6))
             for h in _HANDLE_RE.findall(body[:60000])[:6]:
                 h = h.rstrip("._")
-                if len(h) >= 3 and h.lower() != username.lower():
+                if _is_real_handle(h) and h.lower() != username.lower():
                     leads.append(Lead("account_link", h, platform,
                                       f"wayback:{ts}", 0.5))
             if leads:
@@ -947,7 +1064,10 @@ def deep_recon(username: str, platform: str = "",
             if p == platform:
                 continue
             st, cf, h2 = _state_vote(username, p, jar)
-            if st == "missing":
+            if st in ("missing", "unknown"):
+                # `unknown` = the platform served a shell we cannot read (or
+                # the fetch failed). A node built on it would claim an account
+                # nobody saw, and the graph's value is that its nodes are real.
                 continue
             r = ReconResult(username=username, platform=p, state=st,
                             state_confidence=cf)
