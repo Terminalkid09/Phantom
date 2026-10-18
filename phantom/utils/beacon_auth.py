@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -110,9 +111,63 @@ def _mtls_paths(cert_directory: Optional[str] = None) -> dict[str, str]:
     }
 
 
+def server_cert_covers_host(cert_path: str, host: str) -> bool:
+    """Does this server certificate actually name the host clients dial?
+
+    Hostname verification happens on the CLIENT, not here: schannel
+    (WinHTTP, the Windows beacon transport) compares the certificate's SAN
+    list against the URL host and aborts the handshake BEFORE any HTTP
+    request. The listener then sees a connection that dies mid-TLS with no
+    request line — the live symptom of 2026-10-16, where the beacon pinned
+    the served certificate (pin matched) and still never checked in: the
+    file had been generated for host ``0.0.0.0`` (SAN: localhost only) and
+    every later run REUSED it, so a beacon dialing ``127.0.0.1`` failed the
+    name check on its own side.
+
+    ``0.0.0.0`` / empty ``host`` mean bind-all: they say nothing about the
+    name a client dials, so the only honest check is that ``localhost`` is
+    present (the historical contract of a bind-all certificate).
+    """
+    try:
+        from cryptography import x509
+
+        with open(cert_path, "rb") as handle:
+            cert = x509.load_pem_x509_certificate(handle.read())
+        try:
+            san = cert.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName).value
+        except x509.ExtensionNotFound:
+            return False
+    except Exception:
+        return False
+    want = (host or "").strip().lower()
+    if not want or want == "0.0.0.0":
+        want = "localhost"
+    dns_names = {str(n).lower() for n in san.get_values_for_type(x509.DNSName)}
+    if want in dns_names:
+        return True
+    try:
+        import ipaddress
+
+        ip = ipaddress.ip_address(want)
+    except ValueError:
+        return False
+    return ip in san.get_values_for_type(x509.IPAddress)
+
+
 def ensure_mtls_material(cert_directory: Optional[str] = None,
                          host: str = "localhost") -> dict[str, str]:
-    """Create a private CA and server certificate for an mTLS listener."""
+    """Create a private CA and server certificate for an mTLS listener.
+
+    Reuse rule (live defect 2026-10-16): the CA is generated once and kept
+    forever, but the SERVER certificate is regenerated from that CA whenever
+    the existing one does not cover ``host``. Reusing it blindly meant a
+    certificate born for ``0.0.0.0`` (SAN: localhost only) kept being served
+    to beacons dialing ``127.0.0.1``; schannel aborts such a handshake
+    client-side (SAN mismatch) before any HTTP request, so the beacon spun
+    forever and the listener logged nothing. The CA survives, so every
+    already-issued client certificate stays valid.
+    """
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
@@ -143,7 +198,19 @@ def ensure_mtls_material(cert_directory: Optional[str] = None,
             handle.write(ca_cert.public_bytes(serialization.Encoding.PEM))
         _secure_file(paths["ca_key"])
 
-    if not (os.path.exists(paths["server_cert"]) and os.path.exists(paths["server_key"])):
+    _server_missing = not (os.path.exists(paths["server_cert"])
+                           and os.path.exists(paths["server_key"]))
+    if (not _server_missing and host and host != "0.0.0.0"
+            and not server_cert_covers_host(paths["server_cert"], host)):
+        # reuse is only safe when the certificate still names the host
+        # clients dial — see the reuse rule in the docstring
+        logging.getLogger("phantom").warning(
+            "mTLS server certificate does not cover host %r "
+            "(SAN mismatch would abort the handshake): regenerating it "
+            "from the existing CA. The CA is untouched, so issued client "
+            "certificates stay valid.", host)
+        _server_missing = True
+    if _server_missing:
         with open(paths["ca_key"], "rb") as handle:
             ca_key = serialization.load_pem_private_key(handle.read(), password=None)
         with open(paths["ca_cert"], "rb") as handle:

