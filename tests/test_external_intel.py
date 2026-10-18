@@ -169,7 +169,11 @@ class TestCapabilityWiring(unittest.TestCase):
         from phantom.automation.guidance.stealth import (
             StealthEngine, StealthConfig)
         from phantom.automation.planner import Planner
-        wm = WorldModel(target="10.0.0.5", target_type="ip")
+        # external_recon is for PUBLIC sources: on a private address the
+        # planner must not offer it (the query would leak the LAN address
+        # and could only return "not found"). The fallback contract is about
+        # public hosts, so this test uses one.
+        wm = WorldModel(target="8.8.8.8", target_type="ip")
         planner = Planner(make_registry(), StealthEngine(wm, StealthConfig()))
         plan = planner.plan(
             wm, goal="footprint",
