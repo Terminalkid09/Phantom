@@ -600,7 +600,18 @@ class C2State:
                     except Exception:
                         pass
                 os_type = info.get("os", "").lower()
-                method = "runkey" if "windows" in os_type else "systemd"
+                if "windows" in os_type:
+                    method = "runkey"
+                elif "linux" in os_type or "android" in os_type:
+                    method = "systemd"
+                else:
+                    # The command queued below is the bare `persist`, and the
+                    # beacon resolves its own native default: naming a
+                    # concrete method for a beacon that never reported an OS
+                    # (transport harness, telemetry without an `OS:` line)
+                    # put a false claim into the operator log and into the
+                    # immutable audit chain.
+                    method = "unknown"
                 # Review-4: the shortcut stays (owner decision Q-1) but is now
                 # an explicit engagement grant instead of an unconditional
                 # side effect: `c2.auto_persist=false` (or
@@ -651,6 +662,13 @@ class C2State:
                         logger.info(f"Beacon session resumed: {beacon_id} (gap {int(gap)}s)")
                 info["last_seen"] = now
                 self.beacons[beacon_id].update(info)
+                # A beacon marked exited can come BACK (persistence relaunch,
+                # a fresh dropper run, the same build replaying). The check-in
+                # itself proves it is alive: leaving status="exited" makes the
+                # UI report a live, task-serving beacon as EXITED for ever.
+                if self.beacons[beacon_id].get("status") == "exited":
+                    self.beacons[beacon_id]["status"] = "active"
+                    self.beacons[beacon_id].pop("exited_at", None)
 
     def queue_task(self, beacon_id: str, command: str) -> str:
         # P1-1: the task policy validates the string through the explicit
@@ -1319,6 +1337,14 @@ async def handle_checkin(request: web.Request, pre_body: Optional[str] = None) -
         c2_state.update_beacon(beacon_id, info)
 
         pending = c2_state.get_pending_tasks(beacon_id)
+        # Delivery visibility: a task that is leased but never executed is
+        # invisible from the operator side (it just stays "sent"). One line
+        # per delivered batch names the tasks the beacon actually received.
+        if pending:
+            logger.info(
+                "check-in %s: delivering %d task(s): %s",
+                beacon_id, len(pending),
+                ", ".join(str(t.get("command", "?"))[:60] for t in pending))
         response_data = json.dumps({"tasks": pending})
         # Seal with the key THIS beacon derives, or the tasks never open.
         encrypted_response = encrypt_for_beacon(response_data, beacon_id)
@@ -2038,13 +2064,27 @@ class C2Server:
             self.use_ssl = use_ssl
         # Re-create SSL context if use_ssl changed. Never silently downgrade
         # a requested HTTPS/mTLS listener to plaintext.
+        # Both refusals below are RAISED, not logged-and-returned: `start()`'s
+        # contract (see the handshake comment) is "started only when the site
+        # actually accepted the bind; RuntimeError otherwise", and returning
+        # quietly broke it — the caller printed a green "Started HTTP
+        # listener" tick while no thread existed and no port was open. Live
+        # evidence (2026-10-16, mTLS on): `listeners start 9443 127.0.0.1
+        # false` announced success, the status footer said STOPPED, and
+        # `generate` warned that nothing was listening — three surfaces, two
+        # of them lying.
         if use_mtls() and not self.use_ssl:
-            logger.error("mTLS requires HTTPS; listener was not started")
-            return
+            msg = ("mTLS is required (PHANTOM_MTLS_REQUIRED=1): start the "
+                   "listener over HTTPS, or turn mTLS off first")
+            logger.error(msg)
+            raise RuntimeError(msg)
         self.ssl_context = self._get_ssl_context()
         if self.use_ssl and self.ssl_context is None:
-            logger.error("HTTPS listener refused: TLS material is unavailable")
-            return
+            msg = ("HTTPS listener refused: TLS material is unavailable "
+                   "(generate it with `listeners start` once, or check "
+                   "`certs status`)")
+            logger.error(msg)
+            raise RuntimeError(msg)
         self.thread = threading.Thread(target=self._start_server, daemon=True)
         # Handshake: the thread signals the event after the bind attempt, so
         # start() returns knowing the truth — "started" only when the site
