@@ -116,7 +116,11 @@ class TestTheLoopIsResident:
                 "an exit that is not the EX/MG protocol answer"
 
     def test_the_protocol_answers_are_still_recognised(self, source):
-        assert r"\x01\x02EX" in source
+        # EX is SPLIT on purpose: a C++ \x escape eats every following hex
+        # digit, so "\x01\x02EX" would be 0x01, 0x2E ('.'), 'X' - the kill
+        # sentinel never matched (live bug, 2026-10-18). MG is unaffected
+        # because 'M' is not a hex digit.
+        assert r'"\x01\x02" "EX"' in source
         assert r"\x01\x02MG" in source
 
 

