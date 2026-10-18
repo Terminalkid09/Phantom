@@ -106,15 +106,22 @@ def cmd_set(shell, arg: str):
 
 
 def cmd_show(shell, arg: str):
-    """show session | show scope | show mode"""
+    """show [session] | show scope | show mode | show knowledge
+
+    A bare `show` prints the session table — the usage line has always
+    said so, and refusing it made the most obvious invocation the one
+    that errored. `show mode` is the read side of `set mode`, which had
+    no way to read the value back.
+    """
     arg = arg.strip().lower()
-    if arg == "session":
+    if arg in ("", "session"):
         from phantom.core import executor
         from rich.table import Table
         table = Table(title="Current session")
         table.add_column("Field", style="cyan")
         table.add_column("Value")
         table.add_row("Target", session.target or "—")
+        table.add_row("Mode", session.mode or "—")
         table.add_row("Scope", ", ".join(session.scope) if session.scope else "—")
         table.add_row("Timeout", f"{executor.TIMEOUT_SECONDS}s")
         table.add_row("Active wordlist", session.active_wordlist or "—")
@@ -128,6 +135,12 @@ def cmd_show(shell, arg: str):
             _sh.console.print(f"[cyan]Scope: {', '.join(session.scope)}[/]")
         else:
             notifier.warn("No scope defined.")
+    elif arg == "mode":
+        if session.mode:
+            _sh.console.print(f"[cyan]Mode: {session.mode}[/]")
+        else:
+            notifier.warn("No mode set.")
+            notifier.info("set one with: set mode recon|osint|web|exploit|full|deliver")
     elif arg == "knowledge":
         from phantom.core.knowledge import knowledge_summary, session_wm
         from rich.table import Table

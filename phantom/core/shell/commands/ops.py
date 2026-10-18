@@ -378,6 +378,7 @@ def cmd_social(shell, arg: str):
     if sub == "graph":
         from phantom.automation.social import social_graph as sg
         from phantom.core.knowledge import session_wm
+        from phantom.automation.guidance.kit import store_social_markers
         graph = sg.SocialGraph()
         if "--run" in parts:
             from phantom.automation.social.recon import deep_recon, session_jar
@@ -393,10 +394,27 @@ def cmd_social(shell, arg: str):
             ok, lines = deep_recon(handle, jar=jar or None, graph=graph)
             for line in lines:
                 if line.startswith(("SOCIAL_GRAPH:", "SAME_PERSON:",
-                                    "GRAPH_PIVOT:", "POST_TOPIC:")):
+                                    "GRAPH_PIVOT:", "POST_TOPIC:",
+                                    "RECON_STATE:")):
                     Console().print("  " + line)
+            # PERSIST what the run found, not just what it printed. The
+            # per-item markers are the recon's real output (auto mode turns
+            # them into findings); filtering them out of the console and
+            # dropping them meant the offline `social graph` right after a
+            # successful --run answered "empty", and --json/--graphml
+            # exported that emptiness.
+            try:
+                stored = store_social_markers("\n".join(lines), session_wm())
+            except Exception:
+                stored = []
+            if stored:
+                notifier.info(f"{len(stored)} finding(s) stored — "
+                              f"`social graph` now shows them offline")
             if not ok:
                 notifier.error("deep recon failed (see the lines above)")
+            # render/export from the SESSION view, so this command and the
+            # next one cannot disagree about what was learned
+            graph = sg.graph_from_wm(session_wm(), graph=graph)
         else:
             graph = sg.graph_from_wm(session_wm())
         if "--json" in parts:

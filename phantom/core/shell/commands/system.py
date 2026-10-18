@@ -925,16 +925,29 @@ def cmd_back(shell, arg: str):
     notifier.warn("Already at main shell.")
 
 
+def _ask(prompt: str, default: str = "") -> str:
+    """Read a line from stdin, tolerating a CLOSED stdin.
+
+    `exit` at the end of a piped session (`phantom --manual < commands.txt`)
+    used to die with an EOFError traceback: a script driving a clean run saw
+    a crash on the way out. EOF means "no answer", so the default stands.
+    """
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        return default
+
+
 def cmd_exit(shell, arg: str):
     """exit - Exit Phantom, optionally save current session and generate professional report"""
     if session.target:
-        note = input("\n[?] Add a final manual note for the report? (empty to skip): ").strip()
+        note = _ask("\n[?] Add a final manual note for the report? (empty to skip): ")
         if note:
             session.add_note(note)
 
-        confirm = input("[?] Save session and generate professional report? [y/N]: ").strip().lower()
+        confirm = _ask("[?] Save session and generate professional report? [y/N]: ").lower()
         if confirm == "y":
-            name = input("[?] Report/Session name (default: auto): ").strip() or "auto"
+            name = _ask("[?] Report/Session name (default: auto): ") or "auto"
             session.save(name)
             # Generate professional markdown report with full context
             from phantom.modules.report import ReportModule

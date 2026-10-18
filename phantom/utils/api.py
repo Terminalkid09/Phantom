@@ -253,7 +253,10 @@ def shodan_lookup(ip: str, api_key: str = "") -> Dict[str, Any]:
             url = f"https://api.shodan.io/shodan/host/{ip}?key={api_key}"
             provider = "shodan"
         else:
-            url = f"{SHODAN_INTERNETDB}/{ip}"
+            # SHODAN_INTERNETDB already ends in "/": appending another one
+            # produced "https://internetdb.shodan.io//1.2.3.4", which the
+            # service answers with 404 — a silent "no data" for every host.
+            url = f"{SHODAN_INTERNETDB}{ip}"
             provider = "shodan_internetdb"
         resp = provider_contract.http_get(provider, url, timeout=10)
         resp.raise_for_status()

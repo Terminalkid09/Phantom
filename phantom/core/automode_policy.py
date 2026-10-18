@@ -331,9 +331,16 @@ def callback_preflight(targets, goal: str, notifier=notifier) -> None:
     except TypeError:
         return
     try:
-        from phantom.utils import config as cfg
         from phantom.utils.network import callback_plausibility, get_c2_endpoint
-        advertised = cfg.get_str("c2.host", "") or get_c2_endpoint()[0]
+        # The DERIVED endpoint, not the raw config value: `c2.host` in
+        # config.json is often the legacy 127.0.0.1 default, and
+        # `get_c2_endpoint()` is what every artefact builder embeds (it
+        # ignores a loopback value from the file and honours
+        # PHANTOM_C2_HOST). Reading the config directly made this preflight
+        # disagree with the beacon it was checking: the run was refused as
+        # "no target can call the C2" while the binary would have carried a
+        # routable address.
+        advertised = str(get_c2_endpoint()[0] or "")
     except Exception:
         return
     bad = []
