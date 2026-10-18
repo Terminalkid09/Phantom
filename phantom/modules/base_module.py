@@ -162,12 +162,36 @@ class BaseModule(cmd.Cmd):
             return False
         cmd = cmds[0]
         console.print(f"[dim]# {cmd}[/]")
-        res = execute_quiet(cmd, session.target, timeout=120)
+        budget = self.quiet_timeout_seconds(cmd)
+        if budget > 300:
+            # silence reads as a hang: say up front how long this may take
+            print(f"[quiet] long-running command: killed after "
+                  f"{budget // 60} min if it has not finished (a full-port "
+                  f"sweep of a firewalled host measured >46 min on this LAN). "
+                  f"Ctrl-C stops it; `run` without --quiet lets it continue.")
+        res = execute_quiet(cmd, session.target, timeout=budget)
         if res.stdout:
             print(res.stdout.rstrip())
         if res.stderr:
             print(res.stderr.rstrip())
+        # A killed command is not a finished one. Without this line the
+        # operator — or the script reading the pipe — sees a partial sweep and
+        # reads it as the whole answer ("0 services" on a host that has some).
+        if getattr(res, "timed_out", False):
+            print(f"[quiet] TIMED OUT after {budget}s: the output above is "
+                  f"PARTIAL, not a result. Re-run interactively (`run`, "
+                  f"without --quiet) to extend or background it.")
         return True
+
+    # A --quiet run is a one-shot: it may not sit on a command forever.
+    # Modules whose top suggestion is inherently slow override the hook — a
+    # full-port nmap sweep is minutes, not seconds, and the flat 120 s that
+    # used to be hardcoded killed that sweep mid-flight.
+    quiet_timeout_default = 120
+
+    def quiet_timeout_seconds(self, cmd: str) -> int:
+        """Seconds a --quiet command may run before it is killed."""
+        return self.quiet_timeout_default
 
     def do_run(self, arg: str):
         """run [--quiet] — EXECUTE the module flow (interactive selection).

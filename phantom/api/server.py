@@ -2197,6 +2197,13 @@ async def craft_sessions_get(request: web.Request) -> web.Response:
 
 # ── Network mapping ──────────────────────────────────────────────────────────
 
+# How many discovered devices the visual map carries. The cap exists because
+# the graph is hand-laid, not physics-based: past a few dozen nodes it stops
+# being a map and becomes a hairball. 12 was too tight for a normal home LAN
+# (phones, IoT, laptops, a guest) and, combined with recency-blind ordering,
+# it hid the devices the operator had just scanned for.
+_MAP_MAX_HOSTS = 64
+
 @routes.post("/api/network/scan")
 async def network_scan(request: web.Request) -> web.Response:
     """Discover live hosts on the local network / a CIDR and seed the
@@ -3036,6 +3043,17 @@ async def network_map_get(_request: web.Request) -> web.Response:
     creds = [f for f in wm_findings if f.kind == "creds"]
     vulns = [f for f in wm_findings if f.kind in ("vuln", "hunt_anomaly", "exploit_plan")]
 
+    def _last_seen(finding) -> str:
+        v = finding.value if isinstance(finding.value, dict) else {}
+        return str(v.get("last_seen", "") or "")
+
+    # The map renders a bounded slice of the hosts, so the ORDER decides what
+    # is visible. Insertion order (what this was) meant a device discovered
+    # weeks ago kept its slot forever and a phone that had just answered the
+    # sweep was dropped off the end — the operator rescanned and the new
+    # device "did not appear". Freshest first.
+    hosts.sort(key=_last_seen, reverse=True)
+
     target = session.target or ""
     # NO placeholder node for the session target: a bare bubble whose label
     # was the raw target IP used to appear next to the real device and kept
@@ -3053,7 +3071,7 @@ async def network_map_get(_request: web.Request) -> web.Response:
         except Exception:
             target_ip = target
 
-    for h in hosts[:12]:
+    for h in hosts[:_MAP_MAX_HOSTS]:
         v = h.value if isinstance(h.value, dict) else {}
         hid = f"host_{h.key}"
         hostname = str(v.get("hostname") or "")
@@ -3136,6 +3154,10 @@ async def network_map_get(_request: web.Request) -> web.Response:
         "services": len(services),
         "beacons": n_beacons,
         "topology": topology,
+        # truncation is REPORTED, never silent: a map that quietly shows 12 of
+        # 20 devices reads exactly like a network with 12 devices
+        "hosts_total": len(hosts),
+        "hosts_shown": min(len(hosts), _MAP_MAX_HOSTS),
     })
 
 

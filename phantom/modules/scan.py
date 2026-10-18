@@ -93,6 +93,29 @@ class ScanModule(BaseModule):
         }
         return self._with_suggestions(groups, self.suggest_commands())
 
+    # A full-port sweep is 65535 probes, and against a host whose firewall
+    # DROPs instead of REJECTs nmap retries every one of them. MEASURED on
+    # this LAN (2026-10-16/17): `nmap -sV -sC -p- 192.168.1.18` against a
+    # fully firewalled host COMPLETED in 13 552 s (~3 h 46 m) with all 65535
+    # ports filtered. The scan writes the XML host entry only when the host
+    # finishes, so a kill mid-sweep yields an EMPTY file, not a partial one:
+    # the flat 120 s --quiet budget used to kill exactly that scan and the
+    # run then reported "0 services" on a host that has some. The ceiling is
+    # a safety net, not a target — a completed scan returns immediately —
+    # so it sits 60% above the worst measurement on purpose.
+    FULL_SWEEP_QUIET_TIMEOUT = 21600
+
+    def quiet_timeout_seconds(self, cmd: str) -> int:
+        """Give a full-port sweep its own budget, everything else the default.
+
+        `-p-` and `--top-ports` are whole-port-space scans; a single-port
+        probe or a version query keeps the short leash so a hung command
+        cannot stall a scripted run.
+        """
+        if "-p-" in cmd or "--top-ports" in cmd or "-p 1-" in cmd:
+            return self.FULL_SWEEP_QUIET_TIMEOUT
+        return self.quiet_timeout_default
+
     def _execute_flow(self, _):
         """Show preview, let user edit, then execute selected commands."""
         if not session.target:

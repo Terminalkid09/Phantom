@@ -24,6 +24,27 @@ def _is_safe_target(target: str) -> bool:
     return bool(re.match(r'^[@a-zA-Z0-9._\-/:]+$', target))
 
 
+def quote_arg(arg: str) -> str:
+    """Quote ONE argument for a command LINE that runs under `shell=True`.
+
+    The shell is not the same everywhere: on Windows it is cmd.exe, which has
+    NO single-quote quotes. `curl -A 'Mozilla/5.0 (X11)' 'https://x/'` reached
+    curl as four arguments and died with rc=3 "URL malformed", so every social
+    fetch returned "" and every profile was duly reported `missing` — live
+    evidence (2026-10-16): an existing Instagram account was declared absent
+    while a direct fetch of the same URL returned 586 KB containing the handle.
+
+    POSIX gets `shlex.quote`; Windows gets the CommandLineToArgvW quoting
+    cmd.exe hands to the program. Callers that build a shell LINE around
+    interpolated values must use this, not hand-written quotes.
+    """
+    if os.name == "nt":
+        from phantom.utils.service_units import quote_windows_arg
+        return quote_windows_arg(str(arg))
+    import shlex
+    return shlex.quote(str(arg))
+
+
 _WSL_REDIRECT_RE = None  # lazy compile
 
 
@@ -41,13 +62,94 @@ def _wrap_wsl_redirects(cmd: str) -> str:
     # already wrapped or nothing Linux-specific to protect
     if "sh -c" in cmd or not _WSL_REDIRECT_RE.search(cmd):
         return cmd
-    parts = cmd.split(" ", 3)          # wsl, -d, <distro>, <rest>
-    if len(parts) < 4:
+    # prefix = `wsl` plus ITS OWN options (`-d <distro>`, `-u root`, `-e`).
+    # Slicing a fixed three tokens silently pushed `-u root` INSIDE the quoted
+    # command on `wsl -d <distro> -u root <tool>` lines — the elevation became
+    # an argument to the tool instead of to wsl.
+    parts = cmd.split()
+    i = 1
+    while i < len(parts) and parts[i].startswith("-"):
+        flag = parts[i]
+        i += 1
+        if flag in ("-d", "--distribution", "-u", "--user"):
+            i += 1                      # the option's value
+    if i >= len(parts):
         return cmd
-    prefix, rest = " ".join(parts[:3]), parts[3]
+    prefix, rest = " ".join(parts[:i]), " ".join(parts[i:])
     # double any double quotes already present, then quote the Linux argv
     escaped = rest.replace('"', '\\"')
     return f'{prefix} sh -c "{escaped}"'
+
+
+# Privilege/wrapper prefixes a command may START with: `sudo nmap -sV x` runs
+# nmap, through sudo. Resolving the wrapper as "the tool" answers a question
+# nobody asked — and on Windows 11, which ships a (disabled) sudo.exe, it
+# answers it WRONGLY: `sudo ...` looked like a native binary, so the WSL
+# bridge declined to touch it and cmd.exe ran Windows' own sudo, which prints
+# "Sudo is disabled on this computer" instead of scanning anything.
+_WRAPPER_PREFIXES = frozenset({"sudo", "doas", "env", "nohup", "time",
+                               "command", "stdbuf", "nice", "ionice"})
+
+# The subset that means "run this with more privilege". On the WSL side the
+# bridge expresses it as `-u root` instead of keeping the word: see
+# `_rewrite_wsl`.
+_PRIVILEGE_PREFIXES = frozenset({"sudo", "doas"})
+
+
+def is_comment(cmd: str) -> bool:
+    """True when the line is a shell COMMENT — a documented no-op.
+
+    Adapters use `# <reason>` to say "this step does not apply here"
+    instead of inventing a command that would fail (see
+    `guidance/kit.py:_version_adapter`). Running it as a program made the
+    reason itself the failure ("tool '#' not installed"), so both the
+    tool check and the executor treat it as nothing to do.
+    """
+    return str(cmd or "").lstrip().startswith("#")
+
+
+def _command_head(cmd: str) -> tuple:
+    """``(prefix, tool, rest)`` for a shell command line.
+
+    ``prefix`` holds the wrapper words (`"sudo"`, `"sudo env"`, otherwise
+    `""`), ``tool`` the real binary, ``rest`` everything after it. Spelling
+    of `rest` is preserved because only split indices are used — quoting and
+    redirections reach the child exactly as written.
+    """
+    tokens = cmd.split()
+    idx = 0
+    while idx < len(tokens):
+        if tokens[idx] in _WRAPPER_PREFIXES:
+            idx += 1
+            continue
+        # a flag that FOLLOWS a wrapper belongs to it (`sudo -n nmap ...`),
+        # not to the command being wrapped
+        if idx > 0 and tokens[idx].startswith("-"):
+            idx += 1
+            continue
+        break
+    if idx >= len(tokens):
+        return "", "", ""
+    prefix = " ".join(tokens[:idx])
+    tool = tokens[idx]
+    parts = cmd.split(None, idx + 1)
+    rest = parts[idx + 1] if len(parts) > idx + 1 else ""
+    return prefix, tool, rest
+
+
+def _win_paths_to_wsl(cmd: str) -> str:
+    """`C:\\dir\\file` -> `/mnt/c/dir/file` for a line about to run in WSL.
+
+    WSL reaches the Windows filesystem through `/mnt/<drive>`. A Linux tool
+    handed a Windows path does not fail loudly: it writes a file whose NAME
+    is that literal string, and the Windows side then parses an `-oX` output
+    that is not where it asked. Only absolute drive paths are touched —
+    `host:port`, `http://` and CLI flags have no separator after the colon.
+    """
+    def _sub(m: "re.Match") -> str:
+        return f"/mnt/{m.group(1).lower()}/{m.group(2).replace(chr(92), '/')}"
+
+    return re.sub(r"(?<![\w/])([A-Za-z]):[\\/]([^\s'\"]*)", _sub, cmd)
 
 
 def _rewrite_wsl(cmd: str) -> str:
@@ -61,13 +163,15 @@ def _rewrite_wsl(cmd: str) -> str:
     """
     if os.name != "nt":
         return cmd
-    tool = cmd.split()[0] if cmd.split() else ""
+    prefix, tool, rest = _command_head(cmd)
+    if not tool:
+        return cmd
     # Tools already native on Windows must keep running natively: WSL interop
     # lists Windows exes inside the distro (via /mnt/c), so a naive WSL probe
     # "finds" docker.exe and rewrites it into a Linux invocation that dies
     # with execvpe() failure. Only route through WSL when the tool is NOT on
     # the Windows PATH.
-    if tool and shutil.which(tool) is not None:
+    if shutil.which(tool) is not None:
         return cmd
     # The deploy line chains WSL-side tools with shell syntax:
     #   setsid sshpass ... ssh ... "... </dev/null >/dev/null 2>&1 &"
@@ -93,11 +197,28 @@ def _rewrite_wsl(cmd: str) -> str:
         from phantom.automation.runtime.toolchain import _wsl_which
         wrapper = _wsl_which(tool) if tool else None
         if wrapper:
-            # wrapper is "wsl -d <distro> <tool>" or "wsl -e <tool>"
-            parts = wrapper.split()
-            distro_prefix = " ".join(parts[:3])   # wsl -d <distro>
-            rest = cmd.split(" ", 1)[1] if " " in cmd else ""
-            return f"{distro_prefix} {cmd.split()[0]} {rest}"
+            # wrapper is "wsl -e <tool>" or "wsl -d <distro> <tool>": only the
+            # DISTRO part is reusable. Re-appending the tool the wrapper
+            # already names produced `wsl -e nmap nmap -sV ...`.
+            wparts = wrapper.split()
+            if wparts[:2] == ["wsl", "-d"] and len(wparts) >= 3:
+                distro, distro_prefix = wparts[2], f"wsl -d {wparts[2]}"
+            else:
+                distro, distro_prefix = "", "wsl -e"
+            if any(w in _PRIVILEGE_PREFIXES for w in prefix.split()):
+                # `sudo` is a Linux habit that dies twice on this host: the
+                # native sudo.exe is disabled (Windows 11) and the distro's
+                # sudo wants a PASSWORD the child process has no tty to ask
+                # for (default user is uid 1000). WSL can run a command as
+                # root directly — the same elevation `install_tool` already
+                # uses — so the intent survives and nothing prompts.
+                distro_prefix = (f"wsl -d {distro} -u root" if distro
+                                 else "wsl -u root -e")
+                prefix = ""
+            # the wrapper words stay in FRONT of the tool: inside the distro
+            # `env`/`nohup`/`time` mean exactly what the command says
+            line = " ".join(p for p in (distro_prefix, prefix, tool, rest) if p)
+            return _win_paths_to_wsl(line)
     except Exception:
         pass
     return cmd
@@ -167,7 +288,8 @@ def install_tool(tool: str, timeout: int = 420) -> dict:
     def _run(cmdline: str, t: int = timeout) -> dict:
         try:
             proc = subprocess.run(cmdline, shell=True, capture_output=True,
-                                  text=True, timeout=t)
+                                  text=True, encoding="utf-8",
+                                  errors="replace", timeout=t)
             return {"ok": proc.returncode == 0, "command": cmdline,
                     "output": ((proc.stdout or "") + (proc.stderr or ""))[-4000:]}
         except subprocess.TimeoutExpired:
@@ -243,8 +365,21 @@ def install_tool(tool: str, timeout: int = 420) -> dict:
 
 
 def _is_tool_installed(cmd: str) -> bool:
-    """Check if the primary tool in the command string is installed."""
-    tool = cmd.split()[0] if cmd.split() else ""
+    """Check if the primary tool in the command string is installed.
+
+    "Primary tool" means the real binary, not a privilege wrapper: on a
+    Windows box `sudo nmap ...` used to resolve `sudo` (Windows ships a
+    disabled sudo.exe), report "installed", and then hand the raw line to
+    cmd.exe — the scan never ran. `_command_head` skips the wrappers.
+
+    A shell COMMENT is not a missing tool: some adapters degrade to
+    `# …` as a documented no-op when the step cannot apply (e.g.
+    `version_detect` with no known open port). Reading `#` as the binary
+    name turned that no-op into "refused: tool '#' not installed".
+    """
+    if is_comment(cmd):
+        return True
+    _prefix, tool, _rest = _command_head(cmd)
     if not tool:
         return True
     if shutil.which(tool) is not None:
@@ -305,23 +440,17 @@ def _hide_windows_sudo() -> None:
         pass
 
 
-# Privilege/wrapper prefixes a command may start with: `sudo nmap ...`
-# needs nmap, not sudo — checking the wrapper would report a false positive
-# (or miss the real dependency).
-_WRAPPER_PREFIXES = frozenset({"sudo", "doas", "env", "nohup", "time",
-                               "command", "stdbuf", "nice", "ionice"})
-
-
+# `_WRAPPER_PREFIXES` (defined with `_command_head` above) is the single list
+# of privilege/wrapper words: `sudo nmap ...` needs nmap, not sudo — checking
+# the wrapper would report a false positive (or miss the real dependency).
 def _tools_from_commands(commands) -> set:
     """Binary names invoked by a flat list of command strings."""
     tools = set()
     for cmd in (commands or []):
-        parts = str(cmd).split()
-        idx = 0
-        while idx < len(parts) and parts[idx] in _WRAPPER_PREFIXES:
-            idx += 1
-        first = parts[idx] if idx < len(parts) else ""
-        if first and not first.startswith(("#", "$", "echo")):
+        # ONE unwrapping rule for the whole module: the wrapper words are not
+        # the binary here either (see `_command_head`).
+        _prefix, first, _rest = _command_head(str(cmd))
+        if first and not first.startswith(("#", "$")) and first != "echo":
             tools.add(first)
     return tools
 
@@ -526,6 +655,28 @@ class RunStatus:
         }
 
 
+def _to_cmd_redirects(cmd: str) -> str:
+    """Translate POSIX `/dev/null` redirects for cmd.exe (no-op elsewhere).
+
+    Not cosmetic: cmd.exe parses `2>/dev/null` as a redirect to the path
+    ``\\dev\\null``, fails with "path not found" and runs NOTHING. Verified on
+    this host: ``cmd /c "echo hi 2>/dev/null"`` exits 1 with no output. Every
+    template carrying a POSIX redirect was therefore silently skipped on
+    Windows — the yt-dlp video picker, theHarvester, the suggested
+    `ssh-keyscan ... 2>/dev/null`, `searchsploit ... 2>/dev/null`.
+    `ssh -o UserKnownHostsFile=/dev/null` is an ARGUMENT, not a redirect, and
+    is deliberately left intact by the anchor on `>`.
+    """
+    if os.name != "nt":
+        return cmd
+    for posix, win in (("&>/dev/null", ">NUL 2>&1"),
+                       ("2>/dev/null", "2>NUL"),
+                       ("1>/dev/null", "1>NUL"),
+                       (">/dev/null", ">NUL")):
+        cmd = cmd.replace(posix, win)
+    return cmd
+
+
 def run_command(cmd: str, target_ip: str = "", status=None) -> str:
     """
     Run a shell command with interactive timeout.
@@ -540,6 +691,10 @@ def run_command(cmd: str, target_ip: str = "", status=None) -> str:
         k = kill definitively
     Returns combined stdout+stderr as string.
     """
+    if is_comment(cmd):
+        console.print(f"[dim]{cmd.strip()}[/]")
+        return ""
+
     if target_ip and session.scope and not is_in_scope(target_ip, session.scope):
         console.print(f"[red][!] Command blocked: {target_ip} is out of scope.[/]")
         if status is not None:
@@ -553,12 +708,24 @@ def run_command(cmd: str, target_ip: str = "", status=None) -> str:
         return ""
 
     if not _is_tool_installed(cmd):
-        tool = cmd.split()[0] if cmd.split() else "Unknown"
+        _p, _tool, _r = _command_head(cmd)
+        tool = _tool or "Unknown"
         console.print(f"[yellow][!] Tool '{tool}' not installed. Skipping.[/]")
         console.print(f"    [dim]Install with: sudo apt install {tool}[/]")
         if status is not None:
             status.refused_command(cmd, f"tool '{tool}' not installed")
         return ""
+
+    # WSL toolbox: this manual path used to hand the line straight to cmd.exe,
+    # so on Windows `sudo nmap -sV ...` resolved the (disabled) native
+    # sudo.exe and every module-powered scan died with "Sudo is disabled on
+    # this computer" — the quiet/agent path and the network mapper already
+    # bridged through the distro, the interactive one never did.
+    _hide_windows_sudo()
+    cmd = _rewrite_wsl(cmd)
+    if os.name == "nt" and cmd.startswith("wsl "):
+        cmd = _wrap_wsl_redirects(cmd)
+    cmd = _to_cmd_redirects(cmd)
 
     console.print(f"\n  [dim]$ {cmd}[/]")
     session.add_history(cmd)
@@ -574,6 +741,14 @@ def run_command(cmd: str, target_ip: str = "", status=None) -> str:
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,  # Prevents child from stealing stdin from parent
             text=True,
+            # DECODE, do not die: `text=True` alone picks the LOCALE codec
+            # (cp1252 here), and any UTF-8 byte in a tool's output killed the
+            # reader thread with UnicodeDecodeError — the line vanished and a
+            # traceback landed in the operator's console. Live evidence
+            # (2026-10-16): five of them during one `social graph --run`, each
+            # one a page-body chunk the recon never saw.
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
 
@@ -761,6 +936,13 @@ def execute_quiet(
     if target_ip and not _is_safe_target(target_ip):
         return QuietResult(cmd=cmd, error=f"unsafe target chars: {target_ip}", returncode=-1)
 
+    if is_comment(cmd):
+        # a documented no-op: nothing to run, nothing to fail. Reported as
+        # a successful command with the reason as its output so the step's
+        # postcondition check stays honest (it will simply observe nothing).
+        return QuietResult(cmd=cmd, stdout=cmd.lstrip().lstrip("#").strip(),
+                           returncode=0)
+
     if check_tool and not _is_tool_installed(cmd):
         tool = cmd.split()[0] if cmd.split() else "Unknown"
         return QuietResult(cmd=cmd, error=f"tool '{tool}' not installed", returncode=-1)
@@ -774,6 +956,7 @@ def execute_quiet(
     # evaluated by the Linux shell they were written for.
     if os.name == "nt" and cmd.startswith("wsl "):
         cmd = _wrap_wsl_redirects(cmd)
+    cmd = _to_cmd_redirects(cmd)
     session.add_history(cmd)
 
     try:
@@ -789,6 +972,12 @@ def execute_quiet(
                 stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
                 text=True,
+                # locale codec (cp1252) on Windows makes every UTF-8 byte in a
+                # tool's output a UnicodeDecodeError in the reader thread: the
+                # output disappears and the operator gets a traceback. Decode
+                # with replacement and keep the bytes that do decode.
+                encoding="utf-8",
+                errors="replace",
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
         else:
@@ -799,6 +988,8 @@ def execute_quiet(
                 stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 start_new_session=True,
             )
     except OSError as e:
@@ -849,6 +1040,14 @@ def execute_quiet_bg(cmd: str, target_ip: str = "") -> "BackgroundProcess":
     if not _is_tool_installed(cmd):
         raise FileNotFoundError(f"tool '{cmd.split()[0] if cmd.split() else '?'}' not installed")
 
+    # same bridge as run_command/execute_quiet: the background spawner used to
+    # hand POSIX lines (`sudo nmap ...`, `... 2>/dev/null`) straight to cmd.exe
+    _hide_windows_sudo()
+    cmd = _rewrite_wsl(cmd)
+    if os.name == "nt" and cmd.startswith("wsl "):
+        cmd = _wrap_wsl_redirects(cmd)
+    cmd = _to_cmd_redirects(cmd)
+
     session.add_history(cmd)
     process = subprocess.Popen(
         cmd,
@@ -857,6 +1056,9 @@ def execute_quiet_bg(cmd: str, target_ip: str = "") -> "BackgroundProcess":
         stderr=subprocess.STDOUT,
         stdin=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",   # a locale codec turns any UTF-8 byte into a
+                            # UnicodeDecodeError and the output is lost
         bufsize=1,
     )
     return BackgroundProcess(cmd, process)

@@ -168,6 +168,12 @@ _LAST_SCAN: Dict[str, Any] = {}
 # network facts, not engagement facts. The WorldModel is per-engagement and
 # reset on target change, so the map keeps a small JSON side-store that is
 # re-seeded into the WM whenever needed.
+#
+# It is a CACHE with an expiry, not an inventory: every consumer shows a
+# bounded slice of it, so an entry that never expires eventually evicts the
+# device the operator is actually looking for.
+
+HOST_STORE_TTL_DAYS = 7
 
 import json as _json
 
@@ -180,8 +186,32 @@ def _hosts_store_path() -> str:
         return ""
 
 
+def _host_age_days(host: Dict[str, Any]) -> float:
+    """Days since this entry was last seen. Unknown/unparseable = 0 (fresh).
+
+    0 for "unknown" is deliberate and conservative: an entry with no timestamp
+    is never treated as stale, because a store that drops entries it cannot
+    date is worse than one that keeps them.
+    """
+    stamp = str(host.get("last_seen", "") or "")
+    if not stamp:
+        return 0.0
+    try:
+        seen = datetime.fromisoformat(stamp)
+    except (ValueError, TypeError):
+        return 0.0
+    return max(0.0, (datetime.utcnow() - seen).total_seconds() / 86400.0)
+
+
 def save_discovered_hosts(hosts: List[Dict[str, str]]) -> None:
-    """Persist discovered devices to disk (merge by IP, newest wins)."""
+    """Persist discovered devices to disk (merge by IP, newest wins).
+
+    Entries older than ``HOST_STORE_TTL_DAYS`` are dropped here. The store is a
+    cache of what the network looks like, not an inventory: without a TTL a
+    device that left the network weeks ago kept its place forever, and the map
+    has a finite number of places (see ``/api/network-map``) — so a stale
+    laptop was crowding out the phone that had just been discovered.
+    """
     path = _hosts_store_path()
     if not path:
         return
@@ -197,23 +227,31 @@ def save_discovered_hosts(hosts: List[Dict[str, str]]) -> None:
                 merged = dict(existing.get(h["ip"], {}))
                 merged.update({k: v for k, v in h.items() if v})
                 existing[h["ip"]] = merged
+        fresh = [h for h in existing.values()
+                 if _host_age_days(h) <= HOST_STORE_TTL_DAYS]
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            _json.dump(list(existing.values()), f, indent=2)
+            _json.dump(fresh, f, indent=2)
     except Exception:
         pass
 
 
 def load_discovered_hosts() -> List[Dict[str, str]]:
-    """Return previously discovered devices from disk (empty if none)."""
+    """Return previously discovered devices, most recently seen first."""
     path = _hosts_store_path()
     if not path:
         return []
     try:
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
-                return [h for h in _json.load(f) or []
+                rows = [h for h in _json.load(f) or []
                         if isinstance(h, dict) and h.get("ip")]
+            # newest first: every consumer (the map, the exposure ranking)
+            # shows a bounded slice, and the operator cares about the device
+            # that answered seconds ago more than the one from last week
+            rows.sort(key=lambda h: str(h.get("last_seen", "") or ""),
+                      reverse=True)
+            return rows
     except Exception:
         pass
     return []
