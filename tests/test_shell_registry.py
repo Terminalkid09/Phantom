@@ -62,3 +62,33 @@ def test_unknown_command_does_not_raise():
 def test_quit_delegates_to_exit_help():
     shell = PhantomShell()
     assert shell.do_quit.__doc__ == shell.do_exit.__doc__
+
+
+def test_show_defaults_to_the_session_and_reads_the_mode(monkeypatch):
+    """A bare `show` must print the session (its own usage line says so),
+    and `show mode` must read back what `set mode` wrote."""
+    from phantom.core.shell.commands import session as sess_cmds
+    from phantom.core.session import session
+    from phantom.utils.notifier import notifier
+
+    refusals = []
+    monkeypatch.setattr(notifier, "usage",
+                        staticmethod(lambda *a, **k: refusals.append(a)))
+
+    class FakeConsole:
+        def __init__(self):
+            self.out = []
+
+        def print(self, *a, **k):
+            self.out.append(" ".join(str(x) for x in a))
+
+    fake = FakeConsole()
+    monkeypatch.setattr(sess_cmds._sh, "console", fake)
+    session.mode = "recon"
+
+    sess_cmds.cmd_show(None, "")
+    assert refusals == [], "bare `show` was refused as invalid arguments"
+
+    sess_cmds.cmd_show(None, "mode")
+    assert refusals == [], "`show mode` is advertised but unimplemented"
+    assert "recon" in "\n".join(fake.out)

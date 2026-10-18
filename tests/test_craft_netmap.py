@@ -479,3 +479,146 @@ class TestCraftApi(unittest.TestCase):
         self.assertGreater(ranked[0]["score"], ranked[1]["score"])
         self.assertEqual(ranked[0]["risk"], "CRITICAL")
         self.assertEqual(ranked[0]["open_ports"][0]["service"], "ssh")
+
+
+class TestHostStore(unittest.TestCase):
+    """The discovered-host store is a CACHE, not an inventory.
+
+    Without an expiry a device that left the network kept its slot forever,
+    and every consumer (map, exposure ranking) shows a bounded slice — so the
+    stale laptop crowded out the phone that had just answered. Live evidence:
+    the map listed 14 devices of which the /32 targets were unreachable and
+    the list was served from a store written days earlier.
+    """
+
+    def setUp(self):
+        self._saved = os.environ.get("PHANTOM_DATA_DIR")
+        self._tmp = tempfile.mkdtemp(prefix="phantom-hoststore-")
+        os.environ["PHANTOM_DATA_DIR"] = self._tmp
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("PHANTOM_DATA_DIR", None)
+        else:
+            os.environ["PHANTOM_DATA_DIR"] = self._saved
+
+    @staticmethod
+    def _stamp(days_ago: float) -> str:
+        from datetime import datetime, timedelta
+        return (datetime.utcnow() - timedelta(days=days_ago)).isoformat()
+
+    def test_age_of_an_undated_entry_is_zero(self):
+        """No timestamp must not read as 'ancient': dropping undated entries
+        would throw away devices we simply have not dated yet."""
+        from phantom.core.netmap import _host_age_days
+        self.assertEqual(_host_age_days({}), 0.0)
+        self.assertEqual(_host_age_days({"last_seen": ""}), 0.0)
+        self.assertEqual(_host_age_days({"last_seen": "not-a-date"}), 0.0)
+
+    def test_age_counts_days_since_last_seen(self):
+        from phantom.core.netmap import _host_age_days
+        self.assertAlmostEqual(
+            _host_age_days({"last_seen": self._stamp(3)}), 3.0, places=1)
+
+    def test_ttl_is_a_positive_bound(self):
+        from phantom.core.netmap import HOST_STORE_TTL_DAYS
+        self.assertGreater(HOST_STORE_TTL_DAYS, 0)
+
+    def test_save_drops_stale_entries(self):
+        from phantom.core.netmap import (HOST_STORE_TTL_DAYS, load_discovered_hosts,
+                                         save_discovered_hosts)
+        save_discovered_hosts([
+            {"ip": "10.0.0.1", "hostname": "ancient",
+             "last_seen": self._stamp(HOST_STORE_TTL_DAYS + 5)},
+        ])
+        self.assertEqual(load_discovered_hosts(), [])
+
+    def test_save_keeps_fresh_entries_and_merges_by_ip(self):
+        from phantom.core.netmap import load_discovered_hosts, save_discovered_hosts
+        save_discovered_hosts([{"ip": "10.0.0.2", "vendor": "Samsung",
+                                "last_seen": self._stamp(0.1)}])
+        # a later sweep of the same device adds fields without losing the old
+        save_discovered_hosts([{"ip": "10.0.0.2", "hostname": "phone",
+                                "last_seen": self._stamp(0.0)}])
+        rows = load_discovered_hosts()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["vendor"], "Samsung")
+        self.assertEqual(rows[0]["hostname"], "phone")
+
+    def test_load_returns_most_recent_first(self):
+        from phantom.core.netmap import load_discovered_hosts, save_discovered_hosts
+        save_discovered_hosts([
+            {"ip": "10.0.0.3", "last_seen": self._stamp(4)},
+            {"ip": "10.0.0.4", "last_seen": self._stamp(0.5)},
+            {"ip": "10.0.0.5", "last_seen": self._stamp(2)},
+        ])
+        self.assertEqual([h["ip"] for h in load_discovered_hosts()],
+                         ["10.0.0.4", "10.0.0.5", "10.0.0.3"])
+
+
+class TestNetworkMapEndpoint(unittest.TestCase):
+    """`/api/network-map` serves a BOUNDED slice: what it shows must be the
+    freshest devices, and what it hides must be reported.
+
+    Live evidence (2026-10-16): the panel rendered 14 devices of which the two
+    /32 targets were not among the ones actually re-scanned, and nothing in
+    the payload said a device had been left out.
+    """
+
+    def setUp(self):
+        self._saved = os.environ.get("PHANTOM_DATA_DIR")
+        self._tmp = tempfile.mkdtemp(prefix="phantom-mapend-")
+        os.environ["PHANTOM_DATA_DIR"] = self._tmp
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("PHANTOM_DATA_DIR", None)
+        else:
+            os.environ["PHANTOM_DATA_DIR"] = self._saved
+
+    @staticmethod
+    def _scenario(coro):
+        return asyncio.run(coro)
+
+    def _seed(self, pairs):
+        from phantom.core.knowledge import reset_wm
+        from phantom.core.netmap import seed_worldmodel
+        reset_wm(target="")
+        seed_worldmodel([{"ip": ip, "hostname": f"dev{n}", "last_seen": seen}
+                         for n, (ip, seen) in enumerate(pairs)])
+
+    def _map(self):
+        async def scenario():
+            client = TestClient(TestServer(create_app()))
+            await client.start_server()
+            try:
+                token = c2_crypto.get_api_token()
+                resp = await client.get(
+                    "/api/network-map",
+                    headers={"Authorization": f"Bearer {token}"})
+                self.assertEqual(resp.status, 200)
+                return await resp.json()
+            finally:
+                await client.close()
+
+        return self._scenario(scenario())
+
+    def test_hosts_come_back_freshest_first(self):
+        self._seed([("10.0.0.1", "2026-01-01T00:00:00"),
+                    ("10.0.0.2", "2026-03-01T00:00:00"),
+                    ("10.0.0.3", "2026-02-01T00:00:00")])
+        data = self._map()
+        ips = [n["meta"]["ip"] for n in data["nodes"] if n["type"] == "host"]
+        self.assertEqual(ips, ["10.0.0.2", "10.0.0.3", "10.0.0.1"])
+        self.assertEqual(data["hosts_total"], 3)
+        self.assertEqual(data["hosts_shown"], 3)
+
+    def test_truncation_is_reported_and_keeps_the_freshest(self):
+        import phantom.api.server as srv
+        self._seed([(f"10.0.0.{i}", f"2026-01-0{i}T00:00:00") for i in range(1, 5)])
+        with patch.object(srv, "_MAP_MAX_HOSTS", 2):
+            data = self._map()
+        self.assertEqual(data["hosts_total"], 4)
+        self.assertEqual(data["hosts_shown"], 2)
+        ips = [n["meta"]["ip"] for n in data["nodes"] if n["type"] == "host"]
+        self.assertEqual(ips, ["10.0.0.4", "10.0.0.3"])

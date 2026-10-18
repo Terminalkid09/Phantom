@@ -172,21 +172,31 @@ class TestStateVote(unittest.TestCase):
             return recon._state_vote("mario.rossi", "instagram")
 
     def test_private_consensus(self):
-        state, conf, _ = self._run(["<html>login \u2022 instagram</html>"] * 2)
+        # what the platform says for a closed account (the old sample
+        # "login • instagram" was the logged-out wall, which proves nothing:
+        # live-verified 2026-10-16, a real and a fake handle get the same one)
+        state, conf, _ = self._run(
+            ["<html>This Account is Private</html>"] * 2)
         self.assertEqual(state, "private")
         self.assertEqual(conf, 1.0)
 
     def test_flaky_response_resolved_by_vote(self):
-        # first fetch private page, second a real public page: vote splits
+        # first fetch shows the private marker, second only the shell: the
+        # vote splits 1-1, the observed fact wins deterministically, and a
+        # byte count alone never turns the shell into `public`
         state, conf, _ = self._run(
             ["<html>sign up to see photos</html>",
              "<html>" + "x" * 3000 + "</html>"])
-        self.assertIn(state, ("public", "private"))
+        self.assertEqual(state, "private")
         self.assertEqual(conf, 0.5)
 
     def test_missing(self):
+        # an empty fetch is "we could not read the world", NOT "the account
+        # is gone": `missing` is a claim about the world and this vote
+        # refuses to make it from a timeout/block (2026-10-16 fix; the wire
+        # evidence lives in test_social_state_and_handles)
         state, conf, _ = self._run(["", ""])
-        self.assertEqual(state, "missing")
+        self.assertEqual(state, "unknown")
 
 
 class TestDeepReconMarkers(unittest.TestCase):

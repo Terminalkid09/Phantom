@@ -247,6 +247,24 @@ class TestScopePreflightRefusesBeforeTheRun(unittest.TestCase):
             pol.callback_preflight(["8.8.8.8"], "deliver", notifier=rec)
         rec.error.assert_called_once()
 
+    def test_the_preflight_checks_the_endpoint_the_beacon_would_embed(self):
+        """A legacy `c2.host: 127.0.0.1` in config.json must not shadow the
+
+        derived endpoint. Every artefact builder embeds `get_c2_endpoint()`
+        (which ignores that loopback default and honours PHANTOM_C2_HOST);
+        reading the raw config here made the preflight refuse a run whose
+        beacon would have carried a routable address.
+        """
+        rec = Mock()
+        with patch("phantom.utils.config.get_str", return_value="127.0.0.1"), \
+                patch("phantom.utils.network.get_c2_endpoint",
+                      return_value=("192.168.1.155", 8080)), \
+                patch("phantom.utils.network.callback_plausibility",
+                      return_value=(True, "")) as m_plausible:
+            pol.callback_preflight(["192.168.1.18"], "deliver", notifier=rec)
+        self.assertEqual(m_plausible.call_args.args[1], "192.168.1.155")
+        rec.error.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

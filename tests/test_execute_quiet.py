@@ -47,6 +47,19 @@ class TestExecuteQuiet(unittest.TestCase):
         self.assertIn("not installed", (r.error or ""))
         self.assertEqual(r.returncode, -1)
 
+    def test_a_comment_is_a_no_op_not_a_missing_tool(self):
+        """Adapters degrade to `# <reason>` when a step cannot apply
+
+        (e.g. `version_detect` with no known open port). Live on 2026-10-17
+        that no-op reached the executor as a program: "refused: tool '#'
+        not installed" — the reason for doing nothing became a failure.
+        """
+        r = execute_quiet("# no open services known yet — run scan_tcp first")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("scan_tcp", r.combined)
+        self.assertNotIn("not installed", (r.error or ""))
+
     def test_timeout_kills(self):
         r = execute_quiet(self._py("import time; time.sleep(30)"), timeout=0.5)
         self.assertTrue(r.timed_out)

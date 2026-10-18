@@ -80,8 +80,12 @@ class TestAuthedFetch(unittest.TestCase):
                                    cookies="sessionid=abc123; x='INJECT'; y=$HOME")
         self.assertEqual(out, "ok")
         # quote-breaking and variable expansion neutralized (the inert
-        # WORDS may remain — they cannot break out of the header value)
-        self.assertIn("-H 'Cookie: sessionid=abc123; x=INJECT; y=HOME'",
+        # WORDS may remain — they cannot break out of the header value);
+        # the expectation quotes the value with the SAME shell-aware helper
+        # the code uses: cmd.exe has no single-quote quotes, so pinning
+        # `'...'` here asserted a POSIX-only world (live defect 2026-10-16)
+        from phantom.core.executor import quote_arg
+        self.assertIn(f"-H {quote_arg('Cookie: sessionid=abc123; x=INJECT; y=HOME')}",
                       seen["cmd"])
         self.assertNotIn("$(", seen["cmd"])
         self.assertNotIn("`", seen["cmd"])

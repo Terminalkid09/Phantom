@@ -37,10 +37,10 @@ class TestEngine(unittest.TestCase):
         ext.shodan_lookup = lambda ip, api_key="": {
             "ports": [22, 443], "hostnames": ["web.example.com"]}
         try:
-            out = xi.external_intel_engine(self._wm("10.0.0.9"), {})
+            out = xi.external_intel_engine(self._wm("93.184.216.34"), {})
         finally:
             ext.shodan_lookup = saved
-        self.assertIn("SHODAN: host=10.0.0.9 port=22", out)
+        self.assertIn("SHODAN: host=93.184.216.34 port=22", out)
         self.assertIn("HOSTNAME: host=web.example.com source=shodan", out)
 
     def test_domain_uses_crtsh(self):
@@ -62,10 +62,29 @@ class TestEngine(unittest.TestCase):
         saved = ext.shodan_lookup
         ext.shodan_lookup = boom
         try:
-            out = xi.external_intel_engine(self._wm("10.0.0.9"), {})
+            out = xi.external_intel_engine(self._wm("93.184.216.34"), {})
         finally:
             ext.shodan_lookup = saved
         self.assertTrue(out.startswith("#"))  # comment, not a crash
+
+    def test_a_private_target_never_leaves_the_lan(self):
+        """Asking Shodan/bgpview about 192.168.x.y can only leak the
+
+        operator's internal address to a third party and return nothing:
+        observed live on 2026-10-17 (double-slash 404 + "no findings").
+        """
+        from phantom.utils import api as ext
+        calls = []
+        saved = (ext.shodan_lookup, ext.bgp_lookup)
+        ext.shodan_lookup = lambda *a, **k: calls.append("shodan") or {}
+        ext.bgp_lookup = lambda *a, **k: calls.append("bgp") or {}
+        try:
+            out = xi.external_intel_engine(self._wm("192.168.1.18"), {})
+        finally:
+            ext.shodan_lookup, ext.bgp_lookup = saved
+        self.assertEqual(calls, [])
+        self.assertTrue(out.startswith("#"))
+        self.assertIn("private", out)
 
 
 class TestInterp(unittest.TestCase):
