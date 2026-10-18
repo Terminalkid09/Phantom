@@ -276,7 +276,7 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
                 {' — '}the protection level of this engagement is unknown until it loads.
               </p>
             )}
-            {guardrails?.guards.map((g) => {
+            {guardrails?.guards?.map((g) => {
               const toggleable = guardrails.toggleable.includes(g.key)
               const off = !g.enabled
               const overridden = guardrails.overrides.includes(g.key)

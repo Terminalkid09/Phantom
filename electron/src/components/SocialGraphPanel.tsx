@@ -190,14 +190,14 @@ export default function SocialGraphPanel() {
       </div>
 
       <div className="flex-1 overflow-auto p-3 space-y-3" role="region" aria-label="Identity graph contents">
-        {(stats?.same_person_groups.length ?? 0) > 0 && (
+        {(stats?.same_person_groups?.length ?? 0) > 0 && (
           <section className="rounded border border-emerald-500/30 bg-emerald-500/5 p-2">
             <div className="flex items-center gap-1 text-[11px] text-emerald-200">
               <UserCheck size={12} /> Same person, proven
               <span className="text-text-dim">— converging proofs, not co-occurrence</span>
             </div>
             <ul className="mt-1 space-y-0.5">
-              {stats?.same_person_groups.map((group, i) => (
+              {stats?.same_person_groups?.map((group, i) => (
                 <li key={i} className="text-[11px] font-mono text-emerald-100/90">
                   {group.map(id => id.split(':').slice(1).join(':')).join('  ==  ')}
                 </li>
@@ -263,11 +263,11 @@ export default function SocialGraphPanel() {
           </section>
         )}
 
-        {(payload?.pivots.length ?? 0) > 0 && (
+        {(payload?.pivots?.length ?? 0) > 0 && (
           <section className="rounded border border-white/10 p-2">
             <div className="text-[11px] text-text-secondary">Widening order (confidence, then proofs)</div>
             <ul className="mt-1 space-y-0.5">
-              {payload?.pivots.slice(0, 8).map(node => (
+              {payload?.pivots?.slice(0, 8).map(node => (
                 <li key={node.id} className="text-[11px] font-mono text-text">
                   {node.kind} <span className="text-cyan-200">{node.label}</span>
                   <span className="text-text-dim"> {Math.round(node.confidence * 100)}%</span>

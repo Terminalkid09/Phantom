@@ -198,7 +198,10 @@ export default function NetworkMap({ standalone }: { standalone?: boolean }) {
       setData(d)
       // keep the selected node fresh across reloads
       if (selected) {
-        const fresh = d.nodes.find((n) => n.id === selected.id)
+        // a 200 whose body is not a map (an error envelope, a proxy page)
+        // must not throw here — the panel renders `nodes` defensively, and
+        // this line used to be the first thing to assume the shape
+        const fresh = (d.nodes ?? []).find((n) => n.id === selected.id)
         setSelected(fresh || null)
       }
     }
@@ -709,7 +712,7 @@ export default function NetworkMap({ standalone }: { standalone?: boolean }) {
           <div className="flex items-center gap-2">
             <button
               onClick={handleProbe}
-              disabled={probing || (data?.nodes.length || 0) === 0}
+              disabled={probing || (data?.nodes?.length || 0) === 0}
               className={`px-2.5 py-1.5 rounded text-xs flex items-center gap-1.5 transition-colors
                 ${vuln?.recommended ? 'bg-phantom-yellow/20 text-phantom-yellow hover:bg-phantom-yellow/30' : 'bg-surface text-text-secondary border border-surface-border hover:border-phantom-yellow/50 hover:text-phantom-yellow'}`}
             >

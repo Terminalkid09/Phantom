@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useStore, componentForTab } from '@/store'
+import { useAppVersion } from '@/hooks/useAppVersion'
 import {
   Radio, Target, Bot, FileText, Settings, Terminal,
   Globe, Wifi, Search, Shield, AlertTriangle,
@@ -57,6 +58,7 @@ const SECTIONS = [
 
 export default function Sidebar() {
   const { activeTab, setActiveTab, beacons, autoMode, capabilities } = useStore()
+  const version = useAppVersion()
   const nLive = beacons.filter((b) => b.status === 'LIVE').length
   // Feature-gating: hide the nav entries whose component is not exposed
   const sections = SECTIONS
@@ -138,7 +140,9 @@ export default function Sidebar() {
 
       {/* Footer */}
       <div className="px-4 py-2 border-t border-surface-border flex-shrink-0">
-        <span className="text-[9px] text-text-dim">v3.7.3 · Electron</span>
+        <span className="text-[9px] text-text-dim">
+          {version ? `v${version} · Electron` : 'Electron'}
+        </span>
       </div>
     </div>
   )

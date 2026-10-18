@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useStore, componentForTab } from '@/store'
 import { useApi } from '@/hooks/useApi'
+import { useAppVersion } from '@/hooks/useAppVersion'
 import Sidebar from '@/components/Sidebar'
 import StatusBar from '@/components/StatusBar'
 import C2Dashboard from '@/components/C2Dashboard'
@@ -19,11 +20,13 @@ import BundlesPanel from '@/components/BundlesPanel'
 import LearningPanel from '@/components/LearningPanel'
 import AdGraphPanel from '@/components/AdGraphPanel'
 import SocialGraphPanel from '@/components/SocialGraphPanel'
+import ErrorBoundary from '@/components/ErrorBoundary'
 import { ToastContainer } from '@/components/Toast'
 
 export default function App() {
   const { activeTab, setActiveTab, elapsed, setElapsed, setSettings, capabilities, setCapabilities } = useStore()
   const [backendError, setBackendError] = useState<string | null>(null)
+  const version = useAppVersion()
   useApi(true)
 
   // Surface backend lifecycle failures instead of a silent dead UI
@@ -162,7 +165,7 @@ export default function App() {
             PHANTOM
           </span>
           <span className="ml-2 text-xs text-text-dim">
-            v3.0.0
+            {version ? `v${version}` : ''}
           </span>
         </div>
 
@@ -178,7 +181,10 @@ export default function App() {
               aria-hidden={p.id === active.id ? undefined : true}
               className={p.id === active.id ? 'h-full' : 'hidden'}
             >
-              {p.node}
+              {/* One panel's bad data must not blank the whole window: every
+                  panel is mounted at boot, so without this boundary a single
+                  throw unmounts the entire tree. */}
+              <ErrorBoundary label={p.id}>{p.node}</ErrorBoundary>
             </div>
           ))}
         </main>
