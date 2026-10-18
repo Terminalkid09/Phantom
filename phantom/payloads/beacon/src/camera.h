@@ -429,9 +429,12 @@ inline bool grab_frame(std::vector<uint8_t>& pixels, int& w, int& h,
                                     int R = (298 * C + 409 * E + 128) >> 8;
                                     int G = (298 * C - 100 * D - 208 * E + 128) >> 8;
                                     int B = (298 * C + 516 * D + 128) >> 8;
-                                    if (R < 0) R = 0; if (R > 255) R = 255;
-                                    if (G < 0) G = 0; if (G > 255) G = 255;
-                                    if (B < 0) B = 0; if (B > 255) B = 255;
+                                    if (R < 0) R = 0;
+                                    if (R > 255) R = 255;
+                                    if (G < 0) G = 0;
+                                    if (G > 255) G = 255;
+                                    if (B < 0) B = 0;
+                                    if (B > 255) B = 255;
                                     unsigned char* px = tmp.data() + ((size_t)yy * ww + xx) * 4;
                                     px[0] = (unsigned char)B; px[1] = (unsigned char)G; px[2] = (unsigned char)R; px[3] = 255;
                                 }
