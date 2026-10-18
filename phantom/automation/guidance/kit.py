@@ -621,6 +621,24 @@ def _effective_target(wm: WorldModel) -> str:
     return _bare_host(_resolve_target_address(wm))
 
 
+def _external_intel_applicable(wm: WorldModel) -> bool:
+    """Public sources cannot know a private/reserved address.
+
+    Querying Shodan/bgpview/crt.sh about an RFC1918 host can only return
+    "not found", and the query itself leaks the operator's LAN address to
+    third parties (observed 2026-10-17: 192.168.1.18 was sent to Shodan and
+    bgpview for nothing). Keep `external_recon` plannable only for public
+    IPs and for names; the engine keeps its own guard for direct callers.
+    """
+    host = _effective_target(wm)
+    try:
+        import ipaddress
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        return bool(host)
+
+
+
 def _effective_url(wm: WorldModel) -> str:
     """Full normalized URL for HTTP tooling (scheme://host[:port][/path]).
 
@@ -4012,7 +4030,8 @@ CAPABILITIES = [
         external_intel_interp,
         exec_class="in_process_engine", engine=external_intel_engine,
         opsec_cost=0.1, detection_risk=0.0, stealth_level="passive",
-        timeout=45, preconditions=[_has_network_host()],
+        timeout=45, preconditions=[_has_network_host(),
+                                   _external_intel_applicable],
         banner="external intel", tools=[]),
 
     # Passive phone / geolocation intel: OFFLINE metadata (the phonenumbers
