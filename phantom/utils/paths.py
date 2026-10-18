@@ -33,7 +33,14 @@ def certs_exist() -> bool:
 
 
 def sessions_dir() -> str:
-    return os.path.join(data_dir(), "sessions")
+    """Directory for saved sessions.
+
+    ``PHANTOM_SESSIONS_DIR`` lets tests and packaged launchers redirect just
+    the session store (including the ``_auto.json`` live-session mirror)
+    without moving certs, reports or wordlists.
+    """
+    override = os.getenv("PHANTOM_SESSIONS_DIR", "").strip()
+    return override or os.path.join(data_dir(), "sessions")
 
 
 def reports_dir() -> str:

@@ -122,6 +122,23 @@ def _isolate_c2_engagement_state(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_sessions_dir(tmp_path_factory, monkeypatch):
+    """Keep session snapshots out of the operator's real data dir.
+
+    ``create_app`` mirrors the live session to ``data/sessions/_auto.json``
+    on every mutation and on shutdown. Without this, app-level tests leave
+    test targets/notes in the file the desktop app restores at boot (and a
+    shutdown from an unrelated test overwrites a real engagement). Only the
+    session store is redirected; certs, reports and wordlists stay put.
+
+    The directory comes from the session-scoped factory, not ``tmp_path``:
+    several CLI tests assert that their own ``tmp_path`` stays empty.
+    """
+    sessions = tmp_path_factory.mktemp("sessions")
+    monkeypatch.setenv("PHANTOM_SESSIONS_DIR", str(sessions))
+
+
+@pytest.fixture(autouse=True)
 def _stop_leaked_servers():
     """Tear down any server a test left running (best-effort, never fails)."""
     # snapshot the config module's cached state so a test that repoints

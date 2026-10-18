@@ -175,6 +175,14 @@ class TestNoGlobalOverwrite(unittest.TestCase):
         from phantom.core import session as session_mod
         from unittest.mock import patch
 
+        # The automode route mirrors the live session to
+        # data/sessions/_auto.json. Keep the write in a throwaway data dir
+        # so the suite never leaves the operator's session pointing at a
+        # test target.
+        saved_data_dir = os.environ.get("PHANTOM_DATA_DIR")
+        tmp_data = tempfile.mkdtemp(prefix="phantom-swarm-session-")
+        os.environ["PHANTOM_DATA_DIR"] = tmp_data
+
         async def scenario():
             from aiohttp.test_utils import TestClient, TestServer
             from phantom.utils import c2_crypto
@@ -214,8 +222,14 @@ class TestNoGlobalOverwrite(unittest.TestCase):
             self.assertEqual(session_mod.session.target,
                              "ORIG-OPERATOR-TARGET")
         finally:
+            if saved_data_dir is None:
+                os.environ.pop("PHANTOM_DATA_DIR", None)
+            else:
+                os.environ["PHANTOM_DATA_DIR"] = saved_data_dir
             session_mod.session.target = ""
             session_mod.session.scope = []
+            import shutil
+            shutil.rmtree(tmp_data, ignore_errors=True)
 
 
 class TestScopedSuggest(unittest.TestCase):

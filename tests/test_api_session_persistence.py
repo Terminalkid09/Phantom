@@ -51,6 +51,15 @@ class TestApiSessionPersistence(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        # Do not leak this test's fixture target into a later test that
+        # creates an app and persists the (global) live session on cleanup.
+        session.target = ""
+        session.scope = []
+        session.lhost = ""
+        session.lport = 0
+        session.notes = []
+        session.history = []
+        session.active_wordlist = ""
 
     @staticmethod
     def _scenario(coro):

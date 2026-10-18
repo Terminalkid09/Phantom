@@ -367,6 +367,15 @@ class TestOrchestratorStopPause(SecurityHardenBase):
 class TestHtmlInjection(SecurityHardenBase):
     """F-24: report HTML bodies must escape angle brackets."""
 
+    # The report route mirrors the live session to data/sessions/_auto.json.
+    # Keep that write (and the generated report) in the test's temp tree
+    # instead of the operator's real one.
+    _ISOLATE = SecurityHardenBase._ISOLATE + ("PHANTOM_DATA_DIR",)
+
+    def setUp(self):
+        super().setUp()
+        os.environ["PHANTOM_DATA_DIR"] = self._tmp
+
     @staticmethod
     def _scenario(coro):
         return asyncio.run(coro)
