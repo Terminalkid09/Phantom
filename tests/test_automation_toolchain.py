@@ -96,6 +96,7 @@ class TestToolGatingInAgent(unittest.TestCase):
     def _agent(self, installed):
         return AutonomousAgent(
             target=TARGET, target_type="ip", profile="enterprise",
+            scope_list=[TARGET],
             on_event=lambda k, d: self.events.append((k, d)),
             runtime=StealthRuntime(
                 StealthEngine(WorldModel(target=TARGET),

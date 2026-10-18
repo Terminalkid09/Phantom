@@ -591,6 +591,11 @@ class TestNetworkMapEndpoint(unittest.TestCase):
         async def scenario():
             client = TestClient(TestServer(create_app()))
             await client.start_server()
+            # `create_app` may restore a persisted engagement target; this
+            # test measures host ordering/truncation, not the target aura.
+            from phantom.core import session as session_mod
+            saved_target = session_mod.session.target
+            session_mod.session.target = ""
             try:
                 token = c2_crypto.get_api_token()
                 resp = await client.get(
@@ -599,6 +604,7 @@ class TestNetworkMapEndpoint(unittest.TestCase):
                 self.assertEqual(resp.status, 200)
                 return await resp.json()
             finally:
+                session_mod.session.target = saved_target
                 await client.close()
 
         return self._scenario(scenario())

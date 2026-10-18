@@ -430,6 +430,7 @@ NON_HEADER_FILES: Mapping[str, str] = {
     "reflective_loader_bootstrap.asm": "reflective loader bootstrap (Windows)",
     "syscalls.asm": "syscall stubs (Windows)",
     "test_checkin.cpp": "standalone protocol test, not part of the beacon",
+    "test_anti.cpp": "standalone anti-step probe, not part of the beacon",
     "test_net.cpp": "standalone transport test, not part of the beacon",
     "test_transport.cpp": "standalone transport test, not part of the beacon",
 }

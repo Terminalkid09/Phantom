@@ -377,11 +377,15 @@ class TestReconIngest:
                 return "public", 0.9, html
             return "missing", 0.0, ""
 
+        original_vote = R._state_vote
         R._state_vote = fake_vote
-        graph = SG.SocialGraph()
-        ok, lines = R.deep_recon("jane", "instagram", variants=False,
-                                 wayback=False, search=False,
-                                 second_hop=False, graph=graph)
+        try:
+            graph = SG.SocialGraph()
+            ok, lines = R.deep_recon("jane", "instagram", variants=False,
+                                     wayback=False, search=False,
+                                     second_hop=False, graph=graph)
+        finally:
+            R._state_vote = original_vote
         assert ok
         summary = [l for l in lines if l.startswith("SOCIAL_GRAPH:")]
         assert summary and "nodes=" in summary[0]
@@ -404,6 +408,7 @@ class TestReconIngest:
         def boom(*_a, **_k):
             raise RuntimeError("graph exploded")
 
+        original_vote = R._state_vote
         R._state_vote = fake_vote
         original = SG.graph_from_recon
         try:
@@ -413,6 +418,7 @@ class TestReconIngest:
                                      second_hop=False)
         finally:
             SG.graph_from_recon = original
+            R._state_vote = original_vote
         assert ok and any(l.startswith("RECON_STATE:") for l in lines)
 
     def test_merging_two_graphs_keeps_edges_and_raises_confidence(self):
