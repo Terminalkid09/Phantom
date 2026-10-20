@@ -470,10 +470,31 @@ class C2Shell(cmd.Cmd):
                 notifier.error(f"Ambiguous id '{bid}' — {len(matches)} matches. Use more characters.")
                 return
             entry = matches[0]
-            console.print(Panel(
+            connect = entry.get("connect") if isinstance(entry.get("connect"), dict) else {}
+            bind = entry.get("bind") if isinstance(entry.get("bind"), dict) else {}
+            listener_alive = entry.get("listener_alive")
+            lines = [
                 entry.get("command", ""),
+                "",
+                f"Payload ID:        {entry.get('id', 'Unknown')}",
+                f"Platform:          {entry.get('platform', 'unknown')}",
+                f"Description:       {entry.get('description', '')}",
+                f"Source:            {entry.get('source', 'unknown')}",
+                f"Created:           {entry.get('created_at', 'Unknown')}",
+                f"Last generated:    {entry.get('last_generated_at', entry.get('created_at', 'Unknown'))}",
+                f"Target:            {entry.get('target') or 'not recorded'}",
+                f"Profile:           {entry.get('profile') or 'default'}",
+                f"Beacon calls:      {connect.get('url') or 'not recorded (legacy entry)'}",
+                f"Listener bind:     {bind.get('url') or 'not recorded (legacy entry)'}",
+                f"Listener alive:    {listener_alive if listener_alive is not None else 'not recorded'}",
+                f"Artifact:          {entry.get('artifact_path') or 'not recorded'}",
+                f"SHA256:            {entry.get('artifact_sha256') or 'not recorded'}",
+                f"Size:              {entry.get('artifact_size') if entry.get('artifact_size') is not None else 'not recorded'}",
+                f"Token fingerprint: {entry.get('token_fingerprint') or 'not recorded'}",
+            ]
+            console.print(Panel(
+                "\n".join(lines),
                 title=f"[bold]{entry.get('platform', 'unknown').upper()}[/] — {entry.get('description', '')}",
-                subtitle=f"Created: {entry.get('created_at', 'Unknown')}  |  Source: {entry.get('source', 'unknown')}",
                 border_style="magenta",
             ))
             return
@@ -481,6 +502,8 @@ class C2Shell(cmd.Cmd):
         table = Table(title="Compiled Payload History", border_style="magenta")
         table.add_column("ID", style="cyan", no_wrap=True)
         table.add_column("Platform", style="green")
+        table.add_column("Beacon calls", style="yellow", overflow="fold")
+        table.add_column("Listener bind", style="dim", overflow="fold")
         table.add_column("Description", style="white")
         table.add_column("Source", style="dim")
         table.add_column("Created", style="yellow")
@@ -489,9 +512,13 @@ class C2Shell(cmd.Cmd):
         for entry in reversed(history):
             cmd = entry.get("command", "")
             preview = (cmd[:60] + "...") if len(cmd) > 63 else cmd
+            connect = entry.get("connect") if isinstance(entry.get("connect"), dict) else {}
+            bind = entry.get("bind") if isinstance(entry.get("bind"), dict) else {}
             table.add_row(
                 entry.get("id", "")[:8] + "...",
                 entry.get("platform", "unknown"),
+                connect.get("url") or "legacy",
+                bind.get("url") or "legacy",
                 entry.get("description", ""),
                 entry.get("source", ""),
                 entry.get("created_at", ""),
@@ -499,7 +526,8 @@ class C2Shell(cmd.Cmd):
             )
 
         console.print(table)
-        console.print("[dim]Use 'payloads <full-id>' to view the complete dropper command.[/dim]")
+        console.print("[dim]Use 'payloads <id>' to view the full command and "
+                      "persisted endpoint provenance.[/dim]")
 
     def do_audit(self, arg):
         """audit [verify|tail N] - inspect the immutable C2 audit log.
@@ -1451,6 +1479,13 @@ class C2Shell(cmd.Cmd):
         host, port, use_ssl = endpoint.host, endpoint.port, endpoint.use_ssl
         for problem in endpoint.warnings():
             notifier.warn(problem)
+        if str(host or "").strip() in ("0.0.0.0", "::", "[::]"):
+            notifier.error(
+                "Refusing to build an artefact whose callback is "
+                f"{endpoint.url}: 0.0.0.0 is a listener bind address, not a "
+                "reachable target. Set `lhost <LAN-or-public-IP>` (or use "
+                "127.0.0.1 for a local-only test) and generate again.")
+            return
         notifier.info(f"This artefact will call back to {endpoint.url}")
         
         # Compile and generate dropper
@@ -1500,7 +1535,78 @@ class C2Shell(cmd.Cmd):
         }
 
         console.print(Panel(dropper, title=f"[bold {style_map.get(platform, 'white')}]{title_map.get(platform, 'Dropper')} ({arch})[/]", border_style=style_map.get(platform, "white")))
-        add_custom_beacon(platform, dropper, f"Custom C++ Beacon ({arch})", source="c2_shell")
+
+        # Persist the endpoint BEFORE the command scrolls away. The command
+        # itself contains the URL, but payload history used to store only the
+        # command/description/source/date: months later there was no explicit
+        # answer to "which IP:port was this beacon built for?".  Store both
+        # halves separately: `connect` is what the target dials, `bind` is
+        # what the listener binds (0.0.0.0 is valid ONLY for the latter).
+        import hashlib
+        from phantom.utils.c2_crypto import get_payload_token
+
+        connect = {
+            "host": host,
+            "port": int(port),
+            "scheme": "https" if use_ssl else "http",
+            "url": endpoint.url,
+        }
+        bind = {
+            "host": endpoint.bind_host,
+            "port": endpoint.bind_port,
+            "scheme": ("https" if (endpoint.listener_ssl
+                                   if endpoint.listener_alive else use_ssl)
+                       else "http"),
+            "url": endpoint.bind_url,
+        }
+        artifact_sha256 = None
+        artifact_size = None
+        try:
+            artifact_size = os.path.getsize(beacon_path)
+            digest = hashlib.sha256()
+            with open(beacon_path, "rb") as artifact:
+                for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            artifact_sha256 = digest.hexdigest()
+        except (OSError, TypeError):
+            pass
+        token = get_payload_token()
+        token_fingerprint = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+        entry = None
+        try:
+            entry = add_custom_beacon(
+                platform, dropper, f"Custom C++ Beacon ({arch})",
+                source="c2_shell",
+                connect=connect,
+                bind=bind,
+                listener_alive=endpoint.listener_alive,
+                artifact_path=str(beacon_path),
+                artifact_sha256=artifact_sha256,
+                artifact_size=artifact_size,
+                token_fingerprint=token_fingerprint,
+                profile=malleable_profile,
+                target=str(session.target or "") or None,
+            )
+        except Exception as exc:
+            notifier.warn(f"Payload generated but provenance could not be "
+                          f"saved: {exc}")
+
+        if entry:
+            console.print(Panel(
+                "\n".join([
+                    f"[bold]Payload ID:[/] {entry.get('id', '')}",
+                    f"[bold]Beacon calls:[/] {connect['url']}",
+                    f"[bold]Listener bind:[/] {bind['url']}",
+                    f"[bold]Artifact:[/] {beacon_path}",
+                    f"[bold]SHA256:[/] {artifact_sha256 or 'unavailable'}",
+                    f"[bold]Token fingerprint:[/] {token_fingerprint}",
+                ]),
+                title="[bold cyan]Payload provenance (persisted)[/]",
+                border_style="cyan",
+            ))
+            console.print("[dim]Read it again later with: payloads "
+                          f"{entry.get('id', '')[:8]}[/dim]")
 
         # Say it BEFORE the paste: under the strict mTLS default this dropper
         # cannot fetch its payload (see builder.stager_mtls_conflict for the

@@ -144,10 +144,12 @@ class PersonaState:
         return f"warmup: {int(left / 60.0)}m remaining (persona too fresh to DM)"
 
     # ── follow requests ───────────────────────────────────────────────
-    def follow_sent(self, handle: str, platform: str = "") -> None:
+    def follow_sent(self, handle: str, platform: str = "",
+                    delivered: int = 1, note: str = "") -> None:
         self._data["follows"][handle] = {
             "platform": platform, "sent_at": self._now(),
             "accepted": False, "accepted_at": None,
+            "delivered": int(delivered), "note": note,
         }
         self._save()
 

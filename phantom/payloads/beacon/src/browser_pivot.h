@@ -41,7 +41,7 @@ namespace browser_pivot {
 
 inline void pivot_relay(SOCKET a, SOCKET b, std::shared_ptr<std::atomic<bool>> running) {
     char buf[8192];
-    while (running) {
+    while (!running->load()) {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(a, &fds);
@@ -238,6 +238,21 @@ private:
             // needs (the socket and the stop flag). Capturing it made clang
             // fail the macOS build with -Werror,-Wunused-lambda-capture.
             std::thread([clientSock, stop_flag = this->stop_flag]() {
+                // Accepted sockets inherit the listener's non-blocking mode;
+                // put the client back in blocking mode with a timeout so the
+                // request read cannot race the client (same defect fixed in
+                // proxy.h on 2026-10-19).
+#ifdef _WIN32
+                u_long blocking = 0;
+                ioctlsocket(clientSock, FIONBIO, &blocking);
+                DWORD rcvto = 15000;
+                setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvto, sizeof(rcvto));
+#else
+                int fl = fcntl(clientSock, F_GETFL, 0);
+                if (fl != -1) fcntl(clientSock, F_SETFL, fl & ~O_NONBLOCK);
+                timeval rcvto{15, 0};
+                setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, &rcvto, sizeof(rcvto));
+#endif
                 char req[4096];
                 int n = recv(clientSock, req, sizeof(req) - 1, 0);
                 if (n <= 0) { closesocket(clientSock); return; }

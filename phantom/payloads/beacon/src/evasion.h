@@ -496,8 +496,13 @@ inline void patch_etw() {
 
     if (!pAddr) return;
 
-    // ret 0x14
+    // x64: EtwEventWrite is a normal function -> "xor eax,eax; ret"
+    // x86: __stdcall -> "ret 0x14"
+#if defined(_M_X64) || defined(__x86_64__)
+    unsigned char patch[3] = {0x33, 0xC0, 0xC3};
+#else
     unsigned char patch[3] = {0xC2, 0x14, 0x00};
+#endif
 
     DWORD oldProtect;
     SIZE_T patchSize = sizeof(patch);

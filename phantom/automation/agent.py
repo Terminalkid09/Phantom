@@ -469,6 +469,9 @@ class AutonomousAgent:
         # missing attribute means "never stop" so bare constructions in
         # tests need no setup
         self._stop_event = stop_event
+        # one hard deadline for every social human-wait in this run; reset at
+        # the start of run() so a reused agent object cannot inherit it.
+        self._social_run_deadline: Optional[float] = None
 
     # ------------------------------------------------------------- plumbing
 
@@ -2698,6 +2701,21 @@ class AutonomousAgent:
             pass
         return 30.0 if self.speed else 600.0
 
+    def _social_run_budget(self) -> float:
+        """Hard ceiling for ALL human waits in one agent run (default 15m).
+
+        The per-capability timeout bounds one sleep, but an engagement can run
+        several waits (harvest + follow accept + retries) and the old 600s
+        horizon multiplied across them. This is the non-destructive deadline:
+        when it is spent, the current capability returns with an explicit
+        event and the chain continues instead of blocking the terminal.
+        """
+        try:
+            v = float(os.getenv("PHANTOM_SOCIAL_RUN_BUDGET", "").strip())
+            return max(0.0, v)
+        except (TypeError, ValueError):
+            return 900.0
+
     def _new_social_findings(self, cap, lines, slots) -> bool:
         """True when interpreting `lines` yields a finding the world does
         not already hold (used to break the wait loop on first contact)."""
@@ -2761,6 +2779,33 @@ class AutonomousAgent:
                 lines = [f"ERROR: {cap.id} failed: {e}"]
             return "\n".join(lines)
         horizon = self._social_wait_horizon()
+        # A capability declares its own timeout. The human-wait loop must
+        # honour it: harvest_campaign/wait_follow declare 120s, but the old
+        # loop slept for the 600s social horizon, so one capability could
+        # outlive its contract and make a whole run look blocked. Keep the
+        # floor at zero and report the deadline explicitly.
+        try:
+            cap_timeout = float(getattr(cap, "timeout", 0) or 0)
+        except (TypeError, ValueError):
+            cap_timeout = 0.0
+        if cap_timeout > 0:
+            horizon = min(horizon, cap_timeout)
+        # Per-run ceiling: all human waits in this agent share one deadline.
+        # A single capability cannot spend the whole run, and a chain of
+        # capabilities cannot multiply the wait either.
+        if self._social_run_deadline is None:
+            self._social_run_deadline = time.time() + self._social_run_budget()
+        run_remaining = self._social_run_deadline - time.time()
+        if run_remaining <= 0:
+            self._emit("waiting", phase=cap.id, remaining=0,
+                       identity_active=self.identity_active,
+                       budget_exhausted=True,
+                       detail="per-run social wait budget exhausted — "
+                              "continuing without waiting")
+            return ""
+        horizon = min(horizon, run_remaining)
+        if horizon <= 0:
+            return ""
         deadline = time.time() + horizon
         collected: List[str] = []
         follow_lines: List[str] = []
@@ -2768,8 +2813,20 @@ class AutonomousAgent:
         sent_follows = 0
         last_follow = time.time()
         while True:
+            if self._stop_requested():
+                self._emit("waiting", phase=cap.id, remaining=0,
+                           identity_active=self.identity_active,
+                           detail="operator stop requested — human wait "
+                                  "ended at the next boundary")
+                break
             remaining = deadline - time.time()
             if remaining <= 0:
+                self._emit("waiting", phase=cap.id, remaining=0,
+                           identity_active=self.identity_active,
+                           timed_out=True,
+                           detail=f"human-wait deadline reached after "
+                                  f"{horizon:.0f}s — continuing without "
+                                  f"blocking the run")
                 break
             chunk = min(20.0, remaining)
             try:
@@ -2798,11 +2855,17 @@ class AutonomousAgent:
                            delivered=bool(fok),
                            detail="no interaction yet — sent follow-up lure "
                                   "with a fresh pretext")
-                # extend the horizon so the new link gets a real chance
+                # extend the horizon so the new link gets a real chance, but
+                # never past this run's hard social deadline
                 deadline = max(deadline, time.time() + min(300.0, horizon * 0.5))
+                if self._social_run_deadline is not None:
+                    deadline = min(deadline, self._social_run_deadline)
             self._emit("waiting", phase=cap.id, remaining=round(remaining, 1),
+                       identity_active=self.identity_active,
                        detail="waiting for the human: click / open / accept")
-            time.sleep(1.0)
+            if time.time() >= deadline:
+                continue
+            time.sleep(min(1.0, max(0.0, deadline - time.time())))
         return "\n".join(collected + follow_lines)
 
     def _ensure_local_session(self, jar: dict) -> str:
@@ -3373,6 +3436,9 @@ class AutonomousAgent:
         credentials + lateral movement) and hands the beacon over once.
         """
         self.goal = goal
+        # every run gets a fresh per-run human-wait budget, not the remainder
+        # of a previous stage that happened to use the same agent object.
+        self._social_run_deadline = None
         # P1 (per-phase reports): a caller that wants an artifact at the end
         # of EVERY stage hands in a hook; the agent only announces the
         # boundary and never writes the report itself (the orchestrator owns
@@ -3385,6 +3451,7 @@ class AutonomousAgent:
         self.job_pin = self._compute_job_pin()
         self._emit("start", target=self.target, goal=goal,
                    aggressive=self.aggressive,
+                   identity_active=self.identity_active,
                    worker=phase_wait or "lead")
         try:
             self._emit("pin", **self.job_pin)

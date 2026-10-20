@@ -33,13 +33,34 @@
 #include <atomic>
 #include <vector>
 #include <memory>
+#include <cstdio>
+#include "media_utils.h"
 
 namespace portfwd {
 
+#ifdef PHANTOM_SHELL_TRACE
+#define PF_TRACE(msg) media_utils::xtrace(msg)
+inline void pf_trace_n(const char* tag, long long n) {
+    char b[128];
+    std::snprintf(b, sizeof(b), "%s%lld", tag, n);
+    media_utils::xtrace(b);
+}
+#else
+#define PF_TRACE(msg) ((void)0)
+inline void pf_trace_n(const char*, long long) {}
+#endif
+
 // Relay data between two sockets until one closes
 inline void relay(SOCKET a, SOCKET b, std::shared_ptr<std::atomic<bool>> running) {
+    PF_TRACE("pf:relay-enter");
+    pf_trace_n("pf:relay-a=", (long long)a);
+    pf_trace_n("pf:relay-b=", (long long)b);
+    pf_trace_n("pf:relay-flag=", (long long)running.get());
+    pf_trace_n("pf:relay-run=", (long long)running->load());
+    int iter = 0;
     char buf[4096];
-    while (running) {
+    while (!running->load()) {
+        pf_trace_n("pf:relay-loop=", (long long)iter++);
         fd_set readFds;
         FD_ZERO(&readFds);
         FD_SET(a, &readFds);
@@ -51,19 +72,31 @@ inline void relay(SOCKET a, SOCKET b, std::shared_ptr<std::atomic<bool>> running
 
         int maxFd = static_cast<int>((a > b ? a : b) + 1);
         int sel = select(maxFd, &readFds, nullptr, nullptr, &tv);
+        pf_trace_n("pf:relay-sel=", sel);
         if (sel <= 0) continue;
 
         if (FD_ISSET(a, &readFds)) {
             int n = recv(a, buf, sizeof(buf), 0);
+            pf_trace_n("pf:relay-recv-a=", n);
+#ifdef _WIN32
+            if (n < 0) pf_trace_n("pf:relay-wsa-a=", (long long)WSAGetLastError());
+#endif
             if (n <= 0) break;
             send(b, buf, n, 0);
+            PF_TRACE("pf:relay-sent-b");
         }
         if (FD_ISSET(b, &readFds)) {
             int n = recv(b, buf, sizeof(buf), 0);
+            pf_trace_n("pf:relay-recv-b=", n);
+#ifdef _WIN32
+            if (n < 0) pf_trace_n("pf:relay-wsa-b=", (long long)WSAGetLastError());
+#endif
             if (n <= 0) break;
             send(a, buf, n, 0);
+            PF_TRACE("pf:relay-sent-a");
         }
     }
+    PF_TRACE("pf:relay-exit");
 }
 
 struct PortForward {
@@ -79,20 +112,23 @@ struct PortForward {
     }
 
     void stop() {
+        PF_TRACE("pf:stop");
         if (stop_flag) *stop_flag = true;
         // join before destruction so the thread never touches freed memory
         if (thread.joinable()) thread.join();
+        PF_TRACE("pf:stop-joined");
     }
 
 private:
     void run() {
+        PF_TRACE("pf:run");
 #ifdef _WIN32
         WSADATA wsa;
         WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
 
         SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (listenSock == INVALID_SOCKET) { *stop_flag = true; return; }
+        if (listenSock == INVALID_SOCKET) { PF_TRACE("pf:no-socket"); *stop_flag = true; return; }
 
         int opt = 1;
         setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
@@ -103,10 +139,12 @@ private:
         bindAddr.sin_port = htons(static_cast<u_short>(localPort));
 
         if (bind(listenSock, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
+            PF_TRACE("pf:bind-fail");
             closesocket(listenSock);
             *stop_flag = true;
             return;
         }
+        PF_TRACE("pf:bound");
 
         if (listen(listenSock, SOMAXCONN) == SOCKET_ERROR) {
             closesocket(listenSock);
@@ -128,6 +166,7 @@ private:
                 Sleep(100);
                 continue;
             }
+            pf_trace_n("pf:accept=", (long long)clientSock);
 
             addrinfo hints{}, *result = nullptr;
             hints.ai_family = AF_INET;
@@ -136,9 +175,11 @@ private:
 
             std::string portStr = std::to_string(remotePort);
             if (getaddrinfo(remoteHost.c_str(), portStr.c_str(), &hints, &result) != 0) {
+                PF_TRACE("pf:gai-fail");
                 closesocket(clientSock);
                 continue;
             }
+            PF_TRACE("pf:gai-ok");
 
             SOCKET remoteSock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
             if (remoteSock == INVALID_SOCKET) {
@@ -148,19 +189,24 @@ private:
             }
 
             if (connect(remoteSock, result->ai_addr, (int)result->ai_addrlen) == SOCKET_ERROR) {
+                PF_TRACE("pf:connect-fail");
                 closesocket(remoteSock);
                 freeaddrinfo(result);
                 closesocket(clientSock);
                 continue;
             }
             freeaddrinfo(result);
+            PF_TRACE("pf:connected");
 
             // Per-connection relay thread keeps the stop flag alive via shared_ptr
+            pf_trace_n("pf:spawn-flag=", (long long)this->stop_flag.get());
             std::thread([clientSock, remoteSock, stop_flag = this->stop_flag]() {
                 relay(clientSock, remoteSock, stop_flag);
+                PF_TRACE("pf:relay-close");
                 closesocket(clientSock);
                 closesocket(remoteSock);
             }).detach();
+            PF_TRACE("pf:relay-spawned");
         }
 
         closesocket(listenSock);
@@ -171,6 +217,7 @@ private:
 inline std::vector<PortForward*> active_forwards;
 
 inline std::string start_forward(int localPort, const std::string& remoteHost, int remotePort) {
+    PF_TRACE("pf:start");
     auto* pf = new PortForward();
     pf->localPort = localPort;
     pf->remoteHost = remoteHost;

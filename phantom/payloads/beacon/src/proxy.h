@@ -38,7 +38,7 @@ namespace proxy {
 
 inline void socks5_relay(SOCKET a, SOCKET b, std::shared_ptr<std::atomic<bool>> running) {
     char buf[8192];
-    while (running) {
+    while (!running->load()) {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(a, &fds);
@@ -64,43 +64,78 @@ inline void socks5_relay(SOCKET a, SOCKET b, std::shared_ptr<std::atomic<bool>> 
     }
 }
 
+inline bool recv_all(SOCKET s, unsigned char* buf, int len) {
+    int got = 0;
+    while (got < len) {
+        int n = recv(s, (char*)buf + got, len - got, 0);
+        if (n <= 0) return false;
+        got += n;
+    }
+    return true;
+}
+
 inline bool socks5_handshake(SOCKET s, std::string& targetHost, int& targetPort) {
-    unsigned char buf[1024];
-    int n = recv(s, (char*)buf, sizeof(buf), 0);
-    if (n < 2 || buf[0] != 5) return false;
-    if (n < 2 + buf[1]) return false;
+    // The listening socket is non-blocking (so stop() can be observed) and
+    // Winsock makes accepted sockets inherit that mode: a single recv() on a
+    // freshly accepted client can return WSAEWOULDBLOCK before the browser's
+    // CONNECT request arrives. Live defect 2026-10-19: curl got the method
+    // reply and then "Failed to receive SOCKS response" because the request
+    // read raced the client and the proxy closed the connection. Put the
+    // client socket back in blocking mode with a receive timeout and read
+    // exact lengths, tolerating TCP segmentation.
+#ifdef _WIN32
+    u_long blocking = 0;
+    ioctlsocket(s, FIONBIO, &blocking);
+    DWORD rcvto = 15000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvto, sizeof(rcvto));
+#else
+    int fl = fcntl(s, F_GETFL, 0);
+    if (fl != -1) fcntl(s, F_SETFL, fl & ~O_NONBLOCK);
+    timeval rcvto{15, 0};
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &rcvto, sizeof(rcvto));
+#endif
+
+    unsigned char hdr[2];
+    if (!recv_all(s, hdr, 2) || hdr[0] != 5) return false;
+    unsigned char methods[255];
+    if (!recv_all(s, methods, hdr[1])) return false;
     unsigned char authResp[] = {5, 0};
     send(s, (const char*)authResp, 2, 0);
 
-    n = recv(s, (char*)buf, sizeof(buf), 0);
-    if (n < 7 || buf[0] != 5 || buf[1] != 1) return false;
+    unsigned char req[4];
+    if (!recv_all(s, req, 4) || req[0] != 5 || req[1] != 1) return false;
 
-    int atyp = buf[3];
+    int atyp = req[3];
     int addrLen = 0;
     if (atyp == 1) {
         addrLen = 4;
     } else if (atyp == 3) {
-        addrLen = 1 + buf[4];
+        unsigned char lenByte = 0;
+        if (!recv_all(s, &lenByte, 1)) return false;
+        addrLen = 1 + lenByte;
     } else if (atyp == 4) {
         addrLen = 16;
     } else {
         return false;
     }
-    if (n < 4 + addrLen + 2) return false;
+
+    unsigned char addr[260];
+    if (!recv_all(s, addr, addrLen)) return false;
+    unsigned char portBuf[2];
+    if (!recv_all(s, portBuf, 2)) return false;
 
     if (atyp == 1) {
-        unsigned char* ip = buf + 4;
-        targetHost = std::to_string(ip[0]) + "." + std::to_string(ip[1]) + "."
-                   + std::to_string(ip[2]) + "." + std::to_string(ip[3]);
+        targetHost = std::to_string(addr[0]) + "." + std::to_string(addr[1]) + "."
+                   + std::to_string(addr[2]) + "." + std::to_string(addr[3]);
     } else if (atyp == 3) {
-        targetHost.assign((char*)(buf + 5), buf[4]);
+        targetHost.assign((char*)addr + 1, addr[0]);
     } else if (atyp == 4) {
         char ipv6Str[48];
-        inet_ntop(AF_INET6, buf + 4, ipv6Str, sizeof(ipv6Str));
+        inet_ntop(AF_INET6, addr, ipv6Str, sizeof(ipv6Str));
         targetHost = ipv6Str;
     }
 
-    targetPort = (buf[4 + addrLen] << 8) | buf[5 + addrLen];
+    targetPort = (portBuf[0] << 8) | portBuf[1];
 
     unsigned char resp[] = {5, 0, 0, 1, 0, 0, 0, 0, 0, 0};
     send(s, (const char*)resp, 10, 0);

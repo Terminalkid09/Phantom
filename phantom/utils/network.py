@@ -345,29 +345,56 @@ class C2Endpoint:
         return (f"{'https' if self.listener_ssl else 'http'}://"
                 f"{self.host}:{self.listener_port}")
 
+    @property
+    def bind_host(self) -> str:
+        """The address the listener binds (default 0.0.0.0), not the callback."""
+        try:
+            from phantom.core.c2_server import listener_bind_host
+            return listener_bind_host()
+        except Exception:
+            return "0.0.0.0"
+
+    @property
+    def bind_port(self) -> int:
+        """The listener's actual port, or the artefact port when none is live."""
+        return int(self.listener_port or self.port)
+
+    @property
+    def bind_url(self) -> str:
+        """Listener bind URL, useful for provenance and firewall instructions."""
+        scheme = (self.listener_ssl if self.listener_alive else self.use_ssl)
+        return (f"{'https' if scheme else 'http'}://"
+                f"{self.bind_host}:{self.bind_port}")
+
     def warnings(self) -> list:
         """Every way this artefact and this listener disagree. Empty = they match.
 
         Phrased as ACTIONS where a fix exists, because the operator reading
         this is holding a board or a pasted one-liner, not a debugger.
         """
+        problems = []
         if not self.listener_alive:
-            return [f"no listener is running: this artefact calls back to "
-                    f"{self.url} and nothing will answer there. Start it "
-                    f"with `listeners start {self.port}`, or it will never "
-                    f"check in."]
-        if not self.listener_port or self.listener_port == self.port:
-            # NOTHING to say about the SCHEME, and that is the point: it is
-            # read from this same live listener, so an artefact cannot
-            # disagree with a listener that exists. The mismatch used to be a
-            # literal `use_ssl=True`; the derivation is the fix, and a warning
-            # here would be a branch no input can reach.
-            return []
-        return [f"MISMATCH: the artefact calls back to :{self.port} but the "
+            problems.append(
+                f"no listener is running: this artefact calls back to "
+                f"{self.url} and nothing will answer there. Start it "
+                f"with `listeners start {self.port}`, or it will never "
+                f"check in.")
+        elif self.listener_port and self.listener_port != self.port:
+            problems.append(
+                f"MISMATCH: the artefact calls back to :{self.port} but the "
                 f"listener is on :{self.listener_port} — the beacon will "
                 f"never connect. Fix the artefact (`set lport "
                 f"{self.listener_port}` and regenerate) or restart the "
-                f"listener on {self.port}."]
+                f"listener on {self.port}.")
+        # NOTHING to say about the SCHEME when the port matches: it is read
+        # from the same live listener, so an artefact cannot disagree with a
+        # listener that exists.
+        if str(self.host or "").strip() in ("0.0.0.0", "::", "[::]"):
+            problems.append(
+                f"0.0.0.0 is a LISTEN address, not a reachable callback: "
+                f"this artefact embeds {self.host}. Set a LAN/public IP "
+                f"(`set lhost <ip>`), or use 127.0.0.1 only for a local test.")
+        return problems
 
 
 def c2_endpoint_status(host: str = "") -> C2Endpoint:

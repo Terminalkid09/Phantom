@@ -63,6 +63,7 @@ typedef struct {
 #define IMAGE_DIRECTORY_ENTRY_EXPORT     0
 #define IMAGE_DIRECTORY_ENTRY_IMPORT     1
 #define IMAGE_DIRECTORY_ENTRY_BASERELOC  5
+#define IMAGE_DIRECTORY_ENTRY_TLS        9
 
 /* Section characteristics */
 #define IMAGE_SCN_MEM_EXECUTE   0x20000000
@@ -138,6 +139,28 @@ typedef struct {
     DWORD PageRVA;
     DWORD BlockSize;
 } IMAGE_BASE_RELOCATION;
+
+/* TLS directory (PE32+).  This image is a MinGW EXE with a real .tls
+ * directory and three callbacks: global constructors, the MinGW TLS
+ * callback and the UCRT thread-attach hook.  Windows calls these before
+ * the entry point; a reflective loader that skips them leaves the CRT's
+ * thread-local state uninitialised.  The mapped image then runs normal
+ * library code with no TLS slot — undiagnosed crashes inside WinAPI calls
+ * are one of the ways that shows up. */
+typedef struct {
+    QWORD StartAddressOfRawData;
+    QWORD EndAddressOfRawData;
+    QWORD AddressOfIndex;
+    QWORD AddressOfCallBacks;
+    DWORD SizeOfZeroFill;
+    DWORD Characteristics;
+} IMAGE_TLS_DIRECTORY64;
+
+typedef void (__stdcall *pfnTlsCallback)(void*, DWORD, void*);
+typedef DWORD (__stdcall *pfnTlsAlloc)(void);
+typedef BOOL  (__stdcall *pfnTlsSetValue)(DWORD, void*);
+
+#define TLS_OUT_OF_INDEXES 0xFFFFFFFF
 
 /* ═══════════════════════════════════════════════════════════════════════════ *
  *  Helper: ROR13 hash (reimplements the assembly function)
@@ -297,6 +320,17 @@ void reflective_load_core(
     
     QWORD delta = (BYTE*)mapped - (BYTE*)imageBase;
     
+    /* ── Copy PE headers ──
+     * A real loader maps SizeOfHeaders too.  The old code only copied the
+     * sections, so the mapped image had no MZ/PE header: code that asks the
+     * image about itself (__ImageBase, TLS directory, exception directory,
+     * diagnostics) read zeros.  The header copy also makes the mapped image
+     * look like a PE to tooling that inspects it. */
+    DWORD sizeOfHeaders = *(DWORD*)(opt + 0x3C);
+    if (sizeOfHeaders > 0 && sizeOfHeaders < sizeOfImage) {
+        my_memcpy(mapped, dll, sizeOfHeaders);
+    }
+    
     /* ── Map sections ── */
     for (WORD i = 0; i < numSections; i++) {
         DWORD dstRVA = sections[i].VirtualAddress;
@@ -384,6 +418,55 @@ void reflective_load_core(
             }
             
             block = (IMAGE_BASE_RELOCATION*)((BYTE*)block + block->BlockSize);
+        }
+    }
+
+    /* ── Run the image's TLS callbacks ──
+     * This PE is not a DLL and it is not being loaded by the OS loader, but
+     * its .tls directory is real.  MinGW registers global constructors and
+     * its thread-attach hook there; the UCRT also needs its TLS index and
+     * per-thread block.  Skipping this block used to leave those globals at
+     * their file values, so the first library call that touched CRT thread
+     * state could fault in an apparently unrelated WinAPI function. */
+    DWORD tlsDirRVA = *(DWORD*)(opt + 0xB8); /* DataDirectory[9] = TLS */
+    if (tlsDirRVA != 0) {
+        IMAGE_TLS_DIRECTORY64* tls = (IMAGE_TLS_DIRECTORY64*)((BYTE*)mapped + tlsDirRVA);
+        DWORD tls_index = TLS_OUT_OF_INDEXES;
+        pfnTlsAlloc    pTlsAlloc = (pfnTlsAlloc)pGPA(kernel32, "TlsAlloc");
+        pfnTlsSetValue pTlsSet   = (pfnTlsSetValue)pGPA(kernel32, "TlsSetValue");
+
+        if (pTlsAlloc && tls->AddressOfIndex) {
+            tls_index = pTlsAlloc();
+            if (tls_index != TLS_OUT_OF_INDEXES) {
+                *(DWORD*)(QWORD)tls->AddressOfIndex = tls_index;
+            }
+        }
+
+        /* Copy the .tls template into the current thread's TLS block.  A
+         * normal loader gives every thread its own copy; this loader owns one
+         * thread, and the callbacks below expect the index to be usable. */
+        if (tls_index != TLS_OUT_OF_INDEXES && pTlsSet
+                && tls->StartAddressOfRawData && tls->EndAddressOfRawData
+                && tls->EndAddressOfRawData > tls->StartAddressOfRawData) {
+            QWORD raw = tls->EndAddressOfRawData - tls->StartAddressOfRawData;
+            QWORD total = raw + (QWORD)tls->SizeOfZeroFill;
+            BYTE* block_mem = (BYTE*)pVA(NULL, (DWORD)total,
+                                         MEM_RESERVE | MEM_COMMIT,
+                                         PAGE_READWRITE);
+            if (block_mem) {
+                my_memset(block_mem, 0, (DWORD)total);
+                my_memcpy(block_mem, (void*)(QWORD)tls->StartAddressOfRawData,
+                          (DWORD)raw);
+                pTlsSet(tls_index, block_mem);
+            }
+        }
+
+        if (tls_index != TLS_OUT_OF_INDEXES && tls->AddressOfCallBacks) {
+            pfnTlsCallback* callbacks =
+                (pfnTlsCallback*)(QWORD)tls->AddressOfCallBacks;
+            for (DWORD i = 0; callbacks[i] != NULL; i++) {
+                callbacks[i]((void*)mapped, DLL_PROCESS_ATTACH, NULL);
+            }
         }
     }
     

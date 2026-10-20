@@ -1476,10 +1476,13 @@ class SocialEngine:
                 note = "platform_follow_requires_oauth"
             self._follow_requests[h] = {"platform": platform,
                                         "sent_at": _now(),
-                                        "accepted": False}
+                                        "accepted": False,
+                                        "delivered": delivered,
+                                        "note": note}
             if self._state is not None:
                 try:
-                    self._state.follow_sent(h, platform)  # survives restarts
+                    self._state.follow_sent(h, platform, delivered=delivered,
+                                            note=note)  # survives restarts
                 except Exception:
                     pass
             lines.append(f"FOLLOW_SENT: handle={h} platform={platform} "
@@ -1510,6 +1513,12 @@ class SocialEngine:
         Returns FOLLOW_ACCEPTED markers for the ones accepted; no markers
         when the horizon is exhausted (the agent escalates, never hangs).
 
+        A follow the transport could NOT deliver (Instagram/TikTok/X without
+        OAuth, a login/2FA wall, an unconfirmed identity) is not pending:
+        sleeping on it only burns the capability timeout. It is reported as
+        AUTH_REQUIRED/FOLLOW_NOT_DELIVERED immediately so the planner can
+        stop waiting and choose a public-profile or non-DM path.
+
         Wall-clock aware: the ledger is RELOADED from disk during the wait,
         so an accept recorded by another session/operator lands here too."""
         deadline = time.time() + timeout
@@ -1524,15 +1533,27 @@ class SocialEngine:
                 except Exception:
                     pass
             pending = [h for h, r in self._follow_requests.items()
-                       if not r.get("accepted")]
+                       if not r.get("accepted")
+                       and r.get("delivered", 1) != 0]
             if not pending:
                 break
-            time.sleep(2.0)
+            time.sleep(min(2.0, max(0.0, deadline - time.time())))
         for h, r in self._follow_requests.items():
             if r.get("accepted"):
                 lines.append(f"FOLLOW_ACCEPTED: handle={h} "
                              f"platform={r.get('platform', '')}")
-        return (bool(lines), lines)
+            elif r.get("delivered", 1) == 0:
+                note = str(r.get("note", "") or "")
+                token = ("AUTH_REQUIRED" if "oauth" in note.lower()
+                         or "login" in note.lower()
+                         or "2fa" in note.lower()
+                         or "auth" in note.lower()
+                         else "FOLLOW_NOT_DELIVERED")
+                lines.append(f"{token}: handle={h} "
+                             f"platform={r.get('platform', '')} "
+                             f"reason={note or 'transport_refused'}")
+        return (bool([ln for ln in lines if ln.startswith("FOLLOW_ACCEPTED")]),
+                lines)
 
     def warmup_gate(self, persona_id: str = "") -> Tuple[bool, str]:
         """The pre-contact gate: is the ACTIVE persona old enough for a

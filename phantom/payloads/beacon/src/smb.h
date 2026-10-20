@@ -16,6 +16,7 @@ inline std::vector<std::string> pending_smb_commands;
 struct SmbPipeServer {
     std::string name;
     std::atomic<bool> running{false};
+    std::atomic<DWORD> threadId{0};
     std::thread thread;
     HANDLE pipeHandle = INVALID_HANDLE_VALUE;
 
@@ -32,6 +33,19 @@ struct SmbPipeServer {
 
     void stop() {
         running = false;
+        // The worker parks in ConnectNamedPipe()/ReadFile(). Closing the
+        // handle from another thread does NOT cancel a synchronous blocking
+        // call: live defect 2026-10-19, `smb-pipe-stop` hung forever and the
+        // pipe stayed alive. CancelSynchronousIo aborts the pending call so
+        // the worker observes running==false and exits.
+        DWORD tid = threadId.load();
+        if (tid != 0) {
+            HANDLE hThread = OpenThread(THREAD_TERMINATE, FALSE, tid);
+            if (hThread) {
+                CancelSynchronousIo(hThread);
+                CloseHandle(hThread);
+            }
+        }
         if (pipeHandle != INVALID_HANDLE_VALUE) {
             DisconnectNamedPipe(pipeHandle);
             CloseHandle(pipeHandle);
@@ -90,6 +104,7 @@ struct SmbPipeServer {
 
 private:
     void run() {
+        threadId = GetCurrentThreadId();
         while (running) {
             std::string err = wait_for_client();
             if (!err.empty()) {

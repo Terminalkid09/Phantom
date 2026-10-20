@@ -1,7 +1,9 @@
 """Tests for the social sleep state (waiting for the human) and the
 private-account follow -> wait -> DM orchestration."""
 import os
+import time
 import unittest
+from types import SimpleNamespace
 
 from phantom.automation.agent import AutonomousAgent
 from phantom.automation.belief import WorldModel
@@ -88,6 +90,59 @@ class TestWaitCapabilityExecution(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertIn("waiting", events)
 
+    def test_capability_timeout_caps_the_human_wait(self):
+        """The 600s social horizon must never outlive the capability's own
+        timeout: harvest_campaign/wait_follow declare 120s. A tiny timeout
+        here proves the loop stops at the contract boundary, not at 600s."""
+        old = os.environ.get("PHANTOM_SOCIAL_WAIT")
+        os.environ["PHANTOM_SOCIAL_WAIT"] = "999"
+        try:
+            agent = AutonomousAgent(
+                target="mario.rossi@gmail.com", target_type="email",
+                speed=False)
+            agent.social_engine = _FakeHarvestEngine(hits_after=999)
+            cap = SimpleNamespace(id="harvest_campaign", timeout=0.05,
+                                  interpret=lambda *args: [])
+            started = time.monotonic()
+            out = agent._run_social_wait_capability(cap, {})
+            elapsed = time.monotonic() - started
+        finally:
+            if old is not None:
+                os.environ["PHANTOM_SOCIAL_WAIT"] = old
+            else:
+                os.environ.pop("PHANTOM_SOCIAL_WAIT", None)
+        self.assertEqual(out, "")
+        self.assertLess(elapsed, 1.0)
+
+    def test_per_run_budget_stops_all_further_waits(self):
+        old = {k: os.environ.get(k) for k in
+               ("PHANTOM_SOCIAL_WAIT", "PHANTOM_SOCIAL_RUN_BUDGET")}
+        os.environ["PHANTOM_SOCIAL_WAIT"] = "999"
+        os.environ["PHANTOM_SOCIAL_RUN_BUDGET"] = "0.05"
+        try:
+            events = []
+            agent = AutonomousAgent(
+                target="mario.rossi@gmail.com", target_type="email",
+                speed=False, on_event=lambda k, d: events.append((k, d)))
+            agent.social_engine = _FakeHarvestEngine(hits_after=999)
+            cap = SimpleNamespace(id="harvest_campaign", timeout=120,
+                                  interpret=lambda *args: [])
+            started = time.monotonic()
+            self.assertEqual(agent._run_social_wait_capability(cap, {}), "")
+            # the second wait must not start a new horizon: the run budget is
+            # spent, and the event says so
+            self.assertEqual(agent._run_social_wait_capability(cap, {}), "")
+            elapsed = time.monotonic() - started
+        finally:
+            for k, v in old.items():
+                if v is not None:
+                    os.environ[k] = v
+                else:
+                    os.environ.pop(k, None)
+        self.assertLess(elapsed, 1.0)
+        self.assertTrue(any(d.get("budget_exhausted") for k, d in events
+                            if k == "waiting"), events)
+
 
 class TestFollowFlow(unittest.TestCase):
 
@@ -111,6 +166,22 @@ class TestFollowFlow(unittest.TestCase):
         self.assertTrue(ok)
         self.assertTrue(any(l.startswith("FOLLOW_ACCEPTED: handle=mario.rossi")
                             for l in lines), lines)
+
+    def test_oauth_wall_is_auth_required_not_a_human_wait(self):
+        """A follow the platform could not deliver (no OAuth / login / 2FA)
+        must be reported immediately, never slept on for the full timeout."""
+        eng = self._engine()
+        handle = f"auth_required_{time.time_ns()}"
+        ok, lines = eng.dm_follow([handle], platform="instagram")
+        self.assertTrue(ok)
+        self.assertTrue(any(l.startswith(f"FOLLOW_SENT: handle={handle}")
+                            and "delivered=0" in l for l in lines), lines)
+        started = time.monotonic()
+        ok, lines = eng.wait_follow(timeout=5.0)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.0)
+        self.assertTrue(any(l.startswith(("AUTH_REQUIRED:", "FOLLOW_NOT_DELIVERED:"))
+                            and f"handle={handle}" in l for l in lines), lines)
 
 
 class _FakeCadenceEngine(_FakeHarvestEngine):
