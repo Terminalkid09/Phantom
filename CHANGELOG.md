@@ -6,6 +6,33 @@ All notable changes to Phantom.
 
 ## [Unreleased] — current development (v3.0.0 line)
 
+### Remediation validation — 2026-10-21
+
+- **Full-range scan was bounded, not abandoned.** Stealth keeps `-T2` but adds
+  `--min-rate 500 --max-retries 1 --host-timeout 200s`; the default stays
+  top-1000. Live `.18` with `aggressive`: top-100 then one bounded full scan
+  (2 actions, ~1m16s), finding 5040/tcp, 5357/tcp (wsdapi) and 7680/tcp.
+- **OSINT accepts identities, not only URLs.** Dotted usernames are preserved,
+  profile URLs are parsed, TikTok stats come from the TokCount payload with
+  followers/following kept separate; Instagram stays honestly `unknown`
+  behind its login/429 wall.
+- **Reports carry C2 evidence.** Manual reports now include task output,
+  artifact path/size/SHA-256/mtime, GPS and embedded screenshot/camera images
+  in the operator view; the client view gets a sanitized, image-free version.
+  AUTO `98`/`114` are corrected to **events**, not scores.
+- **Remote execution is fileless.** `remote_mem.bin` is a reflective loader +
+  remote PE XORed in memory; the beacon fetches it and calls
+  `run_shellcode`. No `%TEMP%\srv*.exe`, no `CreateProcess`.
+- **Persistence strategy 2 is no-admin and no-PE.** Task Scheduler is
+  access-denied for a non-admin user; the fallback is a hidden per-user
+  Startup `.cmd` carrying the embedded PIC stager. It was live-created,
+  executed, checked in, and removed by `unpersist`; strategy 1 RunKey was
+  re-verified too.
+- **Wildcard callback hosts are refused.** `0.0.0.0` remains valid as the
+  listener **bind**; the builder/droppers now reject it (and fallback rungs)
+  as the beacon/remote **connect** address. Unreachable targets need a
+  public relay or a pre-staged deliverable, never a `0.0.0.0` callback.
+
 ### Reliability — the operator can see what a command actually did
 
 The same failure shape ran through the shells, the auto-mode, the lure layer

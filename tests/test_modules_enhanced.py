@@ -117,17 +117,33 @@ class TestInjectionHollow:
 
 
 class TestPersistenceFix:
-    def test_windows_persist_uses_pe_endpoint(self):
-        """verify establish_windows downloads from /api/v1/payload not /x."""
+    def test_windows_persist_is_fileless_and_uses_embedded_stager(self):
+        """Strategy 1 must not download or write a beacon PE.
+
+        The RunKey carries the embedded PowerShell stager; strategy 2 is the
+        no-admin Startup .cmd. Both relaunch the in-memory PIC from /x, so the
+        old `/api/v1/payload` PE download contract is gone.
+        """
         import os
         import phantom
-        src = os.path.join(os.path.dirname(phantom.__file__), "payloads",
-                           "beacon", "src", "persistence.h")
-        assert os.path.exists(src)
-        with open(src) as f:
+        srcdir = os.path.join(os.path.dirname(phantom.__file__), "payloads",
+                              "beacon", "src")
+        persistence = os.path.join(srcdir, "persistence.h")
+        startup = os.path.join(srcdir, "persistence_startup.h")
+        assert os.path.exists(persistence)
+        assert os.path.exists(startup)
+        with open(persistence, encoding="utf-8") as f:
             content = f.read()
-        assert "/api/v1/payload" in content, "Persistence should download beacon PE"
-        assert "/x" not in content or True  # /x can remain for other uses
+        with open(startup, encoding="utf-8") as f:
+            startup_content = f.read()
+        assert "C2_PS_STAGER_B64" in content
+        assert "establish_windows_startup" in content
+        assert "/api/v1/payload" not in content, \
+            "Persistence must not download an on-disk beacon PE"
+        assert "Startup" in startup_content
+        assert "C2_PS_STAGER_B64" in startup_content
+        assert "CreateFileA" in startup_content
+        assert "shell:startup" not in startup_content
 
     def test_linux_persist_copies_to_local_bin(self):
         """verify establish_linux copies to ~/.local/bin/."""

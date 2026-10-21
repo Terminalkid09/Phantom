@@ -1527,14 +1527,50 @@ def _chosen_tool(wm, capability: str, default: str) -> str:
     return default
 
 
+def _full_range(ports) -> bool:
+    """True when the slot asks for the whole TCP range.
+
+    The escalation passes ``1-65535``; operators also type ``-p-`` or
+    ``0-65535``. A full sweep needs its OWN timing/retry bounds: the old
+    command relied on the profile's ``-T2`` and the capability's 240 s
+    timeout, so on a filtered host nmap was killed long before the high
+    ports (5040/5357/7680 on a real Windows box) were ever reached.
+    """
+    if not ports:
+        return False
+    spec = str(ports).strip().lower()
+    return ("1-65535" in spec or "0-65535" in spec
+            or spec in ("-", "-p-"))
+
+
+def _full_scan_timing(style: str) -> str:
+    """Bounded timing for a 1-65535 sweep.
+
+    The rate cap is what makes the sweep finish inside the capability
+    timeout: at 500 pps the 65k probes take ~130 s, at 2000 pps ~33 s.
+    ``--max-retries 1`` keeps a filtered port from costing a second and a
+    half, and ``--host-timeout`` guarantees nmap returns partial results
+    (open ports found before the cap) instead of being SIGKILLed by the
+    runtime with no output at all.
+    """
+    if style == "full_stealth":
+        return "-T2 --min-rate 500"
+    if style == "top_loud":
+        return "-T4 --min-rate 2000"
+    if style == "top_fast":
+        return "-T4 --min-rate 1500"
+    return "-T4 --min-rate 1000"
+
+
 def _port_scan_adapter(wm, slots):
     ports = slots.get("port")
     tool = _chosen_tool(wm, "scan_tcp", "nmap")
     target = _effective_target(wm)
+    style = getattr(wm, "scan_style", "balanced")
     if tool == "masscan":
         # fastest full-range sweep: rate-capped to stay survivable,
         # nmap -sV still runs afterwards via version_detect for banners
-        rate = "2000" if getattr(wm, "scan_style", "balanced") != "full_stealth" else "500"
+        rate = "2000" if style != "full_stealth" else "500"
         if ports:
             return f"masscan {target} -p {ports} --rate {rate}"
         return f"masscan {target} -p 1-65535 --rate {rate}"
@@ -1546,7 +1582,11 @@ def _port_scan_adapter(wm, slots):
         spec = ports or _nc_port_spec(wm)
         return f"nc -zv -w 1 {target} {spec}"
     if ports:
-        return f"nmap -Pn -sT -p {ports} {target}"
+        if _full_range(ports):
+            return (f"nmap -Pn -sT -p {ports} {_full_scan_timing(style)} "
+                    f"--max-retries 1 --host-timeout 200s {target}")
+        return (f"nmap -Pn -sT -p {ports} --max-retries 1 "
+                f"--host-timeout 120s {target}")
     return f"nmap -Pn -sT {_scan_port_spec(wm)} {target}"
 
 
@@ -1582,7 +1622,9 @@ def _scan_port_spec(wm) -> str:
       default    -> top-1000, standard rate (nmap's own balanced default:
                     the ports footholds actually live on, without sweeping
                     65k ports on every host by default)
-      --stealth  -> full sweep, slow -T2 timing (quiet)
+      --stealth  -> full sweep, slow -T2 timing but a BOUNDED rate; the
+                    old unbounded -T2 sweep never reached the high ports
+                    before the 240 s capability timeout
       --speed    -> top-100 fast (--min-rate 3000)
       --aggressive-> top-100 fastest (--min-rate 5000)
     -sV is always on: plain scans label non-standard ports with wrong
@@ -1590,15 +1632,24 @@ def _scan_port_spec(wm) -> str:
     precondition downstream (ssh_login needs service == "ssh").
     An explicit port slot always wins (deep-scan escalation passes
     1-65535, targeted version detection).
+
+    Every command carries ``--max-retries 1`` and ``--host-timeout`` so a
+    filtered host returns partial results INSIDE the capability timeout:
+    the previous full sweep was killed with no output, the agent classified
+    it as a timeout, and the recovery re-armed the same doomed scan.
     """
     style = getattr(wm, "scan_style", "balanced")
     if style == "top_loud":
-        return "--top-ports 100 --min-rate 5000"
+        return ("--top-ports 100 --min-rate 5000 "
+                "--max-retries 1 --host-timeout 120s")
     if style == "top_fast":
-        return "--top-ports 100 --min-rate 3000"
+        return ("--top-ports 100 --min-rate 3000 "
+                "--max-retries 1 --host-timeout 120s")
     if style == "full_stealth":
-        return "-p 1-65535 -T2"
-    return "--top-ports 1000 --min-rate 300"
+        return ("-p 1-65535 -T2 --min-rate 500 "
+                "--max-retries 1 --host-timeout 200s")
+    return ("--top-ports 1000 --min-rate 300 "
+            "--max-retries 1 --host-timeout 200s")
 
 
 def _service_port(wm, service: str, default: int = 22) -> int:

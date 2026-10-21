@@ -122,14 +122,35 @@ class TestScanDefaults(unittest.TestCase):
         from phantom.automation.guidance.kit import _scan_port_spec
         agent = AutonomousAgent(target="10.0.0.5")
         self.assertEqual(agent.wm.scan_style, "balanced")
-        self.assertEqual(_scan_port_spec(agent.wm),
-                         "--top-ports 1000 --min-rate 300")
+        spec = _scan_port_spec(agent.wm)
+        self.assertIn("--top-ports 1000", spec)
+        self.assertIn("--min-rate 300", spec)
+        self.assertIn("--max-retries 1", spec)
+        self.assertIn("--host-timeout", spec)
 
     def test_stealth_keeps_full_range_slow(self):
         from phantom.automation.guidance.kit import _scan_port_spec
         spec = _scan_port_spec(SimpleNamespace(scan_style="full_stealth"))
         self.assertIn("1-65535", spec)
         self.assertIn("-T2", spec)
+        # bounded: the old unbounded -T2 sweep never reached high ports
+        # before the 240 s capability timeout on a filtered host
+        self.assertIn("--min-rate 500", spec)
+        self.assertIn("--max-retries 1", spec)
+        self.assertIn("--host-timeout 200s", spec)
+
+    def test_explicit_full_range_is_bounded(self):
+        from phantom.automation.guidance.kit import _port_scan_adapter
+        from phantom.automation.belief import WorldModel
+        for style, rate in (("balanced", "1000"), ("top_loud", "2000"),
+                            ("full_stealth", "500")):
+            wm = WorldModel(target="10.0.0.5")
+            wm.scan_style = style
+            cmd = _port_scan_adapter(wm, {"port": "1-65535"})
+            self.assertIn("-p 1-65535", cmd)
+            self.assertIn(f"--min-rate {rate}", cmd)
+            self.assertIn("--max-retries 1", cmd)
+            self.assertIn("--host-timeout 200s", cmd)
 
     def test_version_intensity_is_firmware_safe(self):
         from phantom.automation.belief import WorldModel

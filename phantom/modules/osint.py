@@ -1,5 +1,6 @@
 import dns.resolver
 import re
+from urllib.parse import urlparse
 from phantom.modules.base_module import BaseModule
 from phantom.core.preview import PreviewSession
 from phantom.core.executor import run_commands, run_command
@@ -45,33 +46,43 @@ class OsintModule(BaseModule):
 
         groups = {}
 
-        # CONTROLLO CONTESTO: Se contiene '_' o '@', è un handle social, non un dominio/IP
-        is_social_target = "_" in t or "@" in t
+        # The old heuristic treated only handles containing `_` or `@` as
+        # social: `damiano.silviotti1` (a dotted username, not a domain) fell
+        # through to WHOIS/DNS and `_get_username()` truncated it to
+        # `damiano`. Use the SAME classifier the planner uses, so a bare
+        # username is accepted from the CLI/API without being mistaken for a
+        # domain (2026-10-20 live defect).
+        from phantom.automation.guidance.targets import (
+            classify_target, target_host)
+        kind = classify_target(t)
+        infra_target = target_host(t, kind)
+        is_network_target = kind in ("ip", "domain", "url")
 
-        if not is_social_target:
-            # Popola i comandi infrastrutturali SOLO se è un vero dominio o IP
+        if is_network_target:
+            # Popola i comandi infrastrutturali SOLO se è un vero dominio/IP
             groups["WHOIS / DNS"] = [
-                f"whois {t}",
-                f"host {t}",
-                f"dig {t} ANY +short",
-                f"dig {t} MX +short",
-                f"dig {t} TXT +short",
-                f"dnsrecon -d {t} -t std",
+                f"whois {infra_target}",
+                f"host {infra_target}",
+                f"dig {infra_target} ANY +short",
+                f"dig {infra_target} MX +short",
+                f"dig {infra_target} TXT +short",
+                f"dnsrecon -d {infra_target} -t std",
             ]
             groups["SUBDOMAIN ENUM"] = [
-                f"amass enum -d {t} -passive",
-                f"subfinder -d {t} -silent",
-                f"assetfinder --subs-only {t}",
-                f"theHarvester -d {t} -l 500 -b all",
+                f"amass enum -d {infra_target} -passive",
+                f"subfinder -d {infra_target} -silent",
+                f"assetfinder --subs-only {infra_target}",
+                f"theHarvester -d {infra_target} -l 500 -b all",
             ]
             groups["DORKING (Shodan)"] = [
-                f"shodan search \"net:{t}\"",
-                f"shodan search \"org:'{t}'\"",
-                f"shodan stats \"net:{t}\"",
-            ] + [f"shodan search \"{dork} net:{t}\"" for dork in self.DORKS]
+                f"shodan search \"net:{infra_target}\"",
+                f"shodan search \"org:'{infra_target}'\"",
+                f"shodan stats \"net:{infra_target}\"",
+            ] + [f"shodan search \"{dork} net:{infra_target}\""
+                 for dork in self.DORKS]
             groups["VULNERABILITY SEARCH"] = [
-                f"shodan search \"vuln:CVE-2024- net:{t}\"",
-                f"shodan search \"has_vuln:true net:{t}\"",
+                f"shodan search \"vuln:CVE-2024- net:{infra_target}\"",
+                f"shodan search \"has_vuln:true net:{infra_target}\"",
             ]
 
         # Add Sherlock se il target è un candidato username valido
@@ -89,21 +100,38 @@ class OsintModule(BaseModule):
         return osint_suggestion_group()
 
     def _get_username(self, target: str) -> str:
-        """Extract a potential username from the target string without breaking social handles."""
-        if not target: 
+        """Extract a potential username without breaking social handles.
+
+        A username is an identity, not a domain: `damiano.silviotti1` must
+        stay whole (the old split-on-dot reduced it to `damiano` and ran
+        Sherlock against the wrong person). URL profiles are accepted too:
+        `instagram.com/<handle>` and `tiktok.com/@<handle>`.
+        """
+        if not target:
             return ""
-        
-        import ipaddress
-        try:
-            ipaddress.ip_address(target)
-            return "" # Un IP non è un username
-        except ValueError:
-            # Se contiene caratteri tipici dei social, l'username è l'intero target (pulito da eventuali @)
-            if "_" in target or "@" in target:
-                return _clean_username(target)
-            
-            # Se è un dominio classico (es. azienda.com), prendiamo solo la prima parte
-            return _clean_username(target.split('.')[0] if '.' in target else target)
+        from phantom.automation.guidance.targets import classify_target
+        kind = classify_target(target)
+        if kind == "username":
+            return _clean_username(target)
+        if kind == "email":
+            # the local part is a legitimate OSINT lead (not an identity
+            # proof): keep it only when it is a shell-safe token
+            return _clean_username(target.split("@", 1)[0])
+        if kind == "url":
+            parsed = urlparse(target if "://" in target
+                              else f"https://{target}")
+            parts = [p for p in (parsed.path or "").split("/") if p]
+            if not parts:
+                return ""
+            handle = parts[0]
+            if handle.startswith("@"):
+                handle = handle[1:]
+            # profile URLs only; /reel/<id>, /p/<id> are content, not a user
+            if handle.lower() in ("p", "reel", "reels", "video", "videos",
+                                  "stories", "explore", "about", "share"):
+                return ""
+            return _clean_username(handle)
+        return ""  # IP, domain, phone: not a username
 
     def do_phone(self, _):
         """phone — phone-number OSINT: carrier + region via phonenumbers

@@ -46,6 +46,7 @@ class TestUnpersistContract(unittest.TestCase):
     def setUpClass(cls):
         cls.main = _read("main.cpp")
         cls.persist = _read("persistence.h")
+        cls.startup = _read("persistence_startup.h")
 
     def test_the_verb_is_in_the_python_allow_list(self):
         from phantom.core.task_policy import BEACON_VERBS
@@ -57,6 +58,12 @@ class TestUnpersistContract(unittest.TestCase):
             self.main,
             r'action\s*==\s*XOR_DEC\(XOR_STR\("unpersist"\)\)')
 
+    def test_strategy2_is_dispatched_and_documented(self):
+        self.assertRegex(
+            self.main,
+            r'action\s*==\s*XOR_DEC\(XOR_STR\("persist2"\)\)')
+        self.assertIn("establish_windows_startup", self.persist)
+
     def test_removal_functions_exist_for_both_platforms(self):
         self.assertIn("remove_windows(", self.persist)
         self.assertIn("remove_posix(", self.persist)
@@ -64,13 +71,23 @@ class TestUnpersistContract(unittest.TestCase):
     def test_windows_removal_uses_the_same_paths_as_establish(self):
         est = _fn_body(self.persist, "inline std::string establish_windows(")
         rem = _fn_body(self.persist, "inline std::string remove_windows(")
-        # the Run key location both write/delete
+        # the Run key location both write/delete (strategy 1)
         run_key = 'Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run'
         self.assertIn(run_key, est)
         self.assertIn(run_key, rem)
-        # the on-disk directory
-        self.assertIn('"\\\\Microsoft\\\\Phantom"', est)
+        # strategy 2 writes one Startup .cmd; removal uses the same directory
+        startup = _fn_body(
+            self.startup,
+            "inline std::string establish_windows_startup(")
+        startup_dir = ('"\\\\Microsoft\\\\Windows\\\\Start Menu\\\\Programs\\\\'
+                       'Startup\\\\"')
+        self.assertIn(startup_dir, startup)
+        self.assertIn(".cmd", startup)
+        self.assertIn(startup_dir, rem)
+        self.assertIn(".cmd", rem)
+        # the legacy on-disk PE is still removed for hosts from older builds
         self.assertIn('"\\\\Microsoft\\\\Phantom"', rem)
+        self.assertNotIn('"\\\\Microsoft\\\\Phantom"', est)
 
     def test_posix_removal_uses_the_same_paths_as_establish(self):
         est = self.persist

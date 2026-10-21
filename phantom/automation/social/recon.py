@@ -272,13 +272,16 @@ class ReconResult:
     followers: str = ""
     following: str = ""
     posts: str = ""
+    likes: str = ""
+    videos: str = ""
     avatar_url: str = ""
     avatar_hash: str = ""
     avatar_dhash: str = ""       # perceptual hash: survives re-encoding
     emails: List[str] = field(default_factory=list)   # visible in bio/page
     leads: List[Lead] = field(default_factory=list)
-    posts: List[Any] = field(default_factory=list)    # mine_posts() output
+    post_items: List[Any] = field(default_factory=list)  # mine_posts() output
     topics: List[str] = field(default_factory=list)  # top interests
+    stats_source: str = ""                           # where counts came from
 
     def markers(self) -> List[str]:
         """Stable marker lines for the social interpreter."""
@@ -290,9 +293,16 @@ class ReconResult:
             out.append(f"RECON_STATE: username={self.username} "
                        f"fullname={self.full_name.replace(' ', '_')}")
         if self.followers:
-            out.append(f"RECON_STATE: username={self.username} "
-                       f"followers={self.followers} following={self.following} "
-                       f"posts={self.posts}")
+            counts = (f"RECON_STATE: username={self.username} "
+                      f"followers={self.followers} following={self.following} "
+                      f"posts={self.posts}")
+            if self.likes:
+                counts += f" likes={self.likes}"
+            if self.videos:
+                counts += f" videos={self.videos}"
+            out.append(counts)
+            if self.stats_source:
+                out.append(f"STATS_SOURCE: {self.stats_source}")
         if self.bio:
             out.append(
                 f"PROFILE: username={self.username} platform={self.platform} "
@@ -370,6 +380,53 @@ def _fetch(url: str, timeout: float = 15.0, ua: str = "",
         return (res.stdout or "")[:400000]
     except Exception:
         return ""
+
+
+def _tokcount_stats(username: str) -> Dict[str, str]:
+    """TikTok follower/following counts from TokCount's embedded JSON.
+
+    tiktok.com serves a signup shell with no counts to an anonymous GET and
+    Urlebird showed `0 following` on a real account (live defect
+    2026-10-20: the target actually had 9,816 following). TokCount renders
+    the platform's own ``stats`` object inside the page:
+
+        "stats":{"likes":0,"followers":1329,"following":9816,"videos":0}
+
+    One bounded, read-only GET. Returns {} on any failure — never invents a
+    count.
+    """
+    if not username:
+        return {}
+    try:
+        from urllib.parse import quote as _urlquote
+        html = _fetch(
+            f"https://tokcount.com/?user={_urlquote(username, safe='')}",
+            timeout=12.0)
+        if not html:
+            return {}
+        block = re.search(r'\\?"stats\\?"\s*:\s*\{([^}]*)\}', html)
+        if not block:
+            return {}
+        body = block.group(1).replace('\\"', '"')
+        out: Dict[str, str] = {}
+        for key in ("followers", "following", "likes", "videos"):
+            m = re.search(rf'\\?"{key}\\?"\s*:\s*(\d+)', body)
+            if m:
+                out[key] = m.group(1)
+        if out:
+            # display name lives next to the stats object; TokCount's
+            # __NEXT_DATA__ calls it `username` inside userData (`damy`)
+            # while the handle is `id` (`damy45111`)
+            stats_at = block.start()
+            chunk = html[max(0, stats_at - 1500):stats_at]
+            nick = re.search(
+                r'\\?"(?:nickname|username)\\?"\s*:\s*\\?"([^"\\]{1,80})',
+                chunk)
+            if nick:
+                out["nickname"] = nick.group(1)
+        return out
+    except Exception:
+        return {}
 
 
 def _jar_for(url: str, jar: Dict[str, str]) -> str:
@@ -541,6 +598,24 @@ def _state_vote(username: str, platform: str, jar=None) -> Tuple[str, float, str
 
 # ── layer 2: graph mining ────────────────────────────────────────────────────
 
+def _auth_wall(platform: str, html: str) -> bool:
+    """True when the page is the platform's login/signup wall, not a profile.
+
+    Mining handles/commenters out of a signup shell invents leads (the
+    TikTok shell produced a false `TAGGED_IN: font` lead). The stats fetched
+    through TokCount are still kept: they are real and independent.
+    """
+    low = (html or "").lower()
+    if not low:
+        return False
+    if platform == "tiktok":
+        return (("log in or sign up" in low or "sign up" in low)
+                and "followercount" not in low)
+    if platform == "instagram":
+        return ("log into instagram" in low and "follower" not in low)
+    return False
+
+
 def _mine_all(username: str, platform: str, html: str,
               result: ReconResult, jar=None) -> None:
     """`_mine_graph` plus the per-post layer (never fetches anything extra).
@@ -550,17 +625,19 @@ def _mine_all(username: str, platform: str, html: str,
     nothing on the network budget and are the best pretext material there is.
     """
     _mine_graph(username, platform, html, result, jar)
+    if _auth_wall(platform, html):
+        return
     try:
         from phantom.automation.social import social_graph as _sg
-        result.posts = _sg.mine_posts(html, author=username)
+        result.post_items = _sg.mine_posts(html, author=username)
         counts: dict = {}
-        for post in result.posts:
+        for post in result.post_items:
             for tag in list(post.hashtags) + [_norm_place(p) for p in post.places]:
                 counts[tag] = counts.get(tag, 0) + 1
         result.topics = [t for t, _c in sorted(counts.items(),
                                               key=lambda kv: (-kv[1], kv[0]))[:8]]
     except Exception:
-        result.posts = []
+        result.post_items = []
 
 
 def _norm_place(value: str) -> str:
@@ -586,14 +663,52 @@ def _mine_graph(username: str, platform: str, html: str,
             if v not in ("", None):
                 setattr(result, attr, str(v))
                 break
-    if not result.followers and platform == "tiktok":
-        vals: List = []
-        for b in blobs:
-            _walk(b, "followerCount", vals)
-            _walk(b, "followingCount", vals)
-            _walk(b, "heartCount", vals)
-        if vals:
-            result.followers = str(vals[0])
+    if platform == "tiktok":
+        # Parse each count on its own: the old code pushed followerCount,
+        # followingCount and heartCount into ONE list and assigned only
+        # vals[0] to followers, so `following` was never populated (live
+        # defect 2026-10-20: 9,816 following reported as 0).
+        for key, attr in (("followerCount", "followers"),
+                          ("followingCount", "following")):
+            if getattr(result, attr, ""):
+                continue
+            vals: List = []
+            for b in blobs:
+                _walk(b, key, vals)
+            if vals:
+                v = vals[0]
+                if isinstance(v, dict):
+                    v = v.get("count", "")
+                if v not in ("", None):
+                    setattr(result, attr, str(v))
+        if not result.followers or not result.following:
+            stats = _tokcount_stats(username)
+            if stats:
+                result.followers = result.followers or stats.get(
+                    "followers", "")
+                result.following = result.following or stats.get(
+                    "following", "")
+                result.likes = result.likes or stats.get("likes", "")
+                result.videos = result.videos or stats.get("videos", "")
+                if not result.posts:
+                    result.posts = result.videos
+                if not result.full_name and stats.get("nickname"):
+                    result.full_name = stats["nickname"][:80]
+                result.stats_source = "tokcount"
+                # The counts are public proof that the account exists; the
+                # TikTok signup shell alone voted `unknown`. Keep the vote
+                # honest but let the start-gate proceed with the evidence
+                # we actually have.
+                if result.state == "unknown":
+                    result.state = "public"
+                    result.state_confidence = max(result.state_confidence, 0.6)
+    if platform == "tiktok" and result.bio \
+            and "log in or sign up" in result.bio.lower():
+        # the anonymous TikTok page's meta description is the signup CTA,
+        # not the target's bio
+        result.bio = ""
+    if _auth_wall(platform, html):
+        return
     # full name
     for b in blobs:
         names: List = []
@@ -981,7 +1096,8 @@ def present_candidate(result: "ReconResult") -> str:
     counts = " / ".join(
         f"{k}: {v}" for k, v in
         (("followers", result.followers), ("following", result.following),
-         ("posts", result.posts)) if v)
+         ("posts", result.posts), ("likes", result.likes),
+         ("videos", result.videos)) if v != "")
     if counts:
         lines.append(f"  {counts}")
     if result.link:
@@ -1258,8 +1374,11 @@ def deep_recon(username: str, platform: str = "",
             from phantom.automation.social import social_graph as _sg
             built = _sg.graph_from_recon(results)
             for r in results:
-                if getattr(r, "posts", None):
-                    _sg.graph_from_posts(r.posts, author=r.username,
+                # `posts` is the public count; `post_items` is the mined
+                # corpus. Graph the corpus, never the count string.
+                items = getattr(r, "post_items", None)
+                if items:
+                    _sg.graph_from_posts(items, author=r.username,
                                          platform=r.platform, graph=built,
                                          source="post-mining")
             if graph is not None:

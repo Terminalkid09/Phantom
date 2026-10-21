@@ -43,6 +43,7 @@ platform's own API), `posix` (the shared POSIX path is compiled in),
 | recon_net | collection | native | native | native | native | `recon` |
 | keylogger | collection | native | posix | posix | posix | `keylog` |
 | persistence | action | native | posix | posix | posix | `persist`, `unpersist` |
+| persistence_startup | action | windows_only | absent | absent | absent | `persist2` |
 | edr_awareness | evasion | native | native | native | native | `edrcheck` |
 | edr_kill | action | native | posix | posix | posix | `edr-kill` |
 | masked_sleep | evasion | native | native | native | native | — |

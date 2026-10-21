@@ -106,6 +106,49 @@ class TestStateClassifier(unittest.TestCase):
         self.assertEqual(state, "unknown")
 
 
+class TestTikTokCounts(unittest.TestCase):
+
+    def test_follower_and_following_are_parsed_separately(self):
+        """Live defect 2026-10-20: followerCount, followingCount and
+        heartCount were pushed into one list and only vals[0] was used, so
+        `following` was never populated."""
+        page = ('<script type="application/json">'
+                '{"stats":{"followerCount":1329,"followingCount":9816}}'
+                '</script>')
+        result = R.ReconResult("damy45111", "tiktok")
+        R._mine_graph("damy45111", "tiktok", page, result)
+        self.assertEqual(result.followers, "1329")
+        self.assertEqual(result.following, "9816")
+
+    def test_tokcount_fallback_fills_all_public_counts(self):
+        """The anonymous TikTok page is a signup shell; TokCount embeds the
+        platform's real stats (verified live: 1329/9816/0/0)."""
+        with mock.patch.object(R, "_tokcount_stats",
+                               return_value={"followers": "1329",
+                                             "following": "9816",
+                                             "likes": "0",
+                                             "videos": "0",
+                                             "nickname": "damy"}):
+            result = R.ReconResult("damy45111", "tiktok")
+            R._mine_graph("damy45111", "tiktok",
+                          "<html>Log in or sign up for an account</html>",
+                          result)
+        self.assertEqual((result.followers, result.following),
+                         ("1329", "9816"))
+        self.assertEqual((result.likes, result.videos, result.posts),
+                         ("0", "0", "0"))
+        self.assertEqual(result.full_name, "damy")
+        self.assertEqual(result.stats_source, "tokcount")
+        self.assertEqual(result.state, "public")
+        self.assertEqual(result.leads, [])   # no false "font" handle
+
+    def test_auth_wall_is_not_mined_for_false_leads(self):
+        self.assertTrue(R._auth_wall(
+            "tiktok", "<html>Log in or sign up for an account</html>"))
+        self.assertFalse(R._auth_wall(
+            "tiktok", '<html>"followerCount": 10</html>'))
+
+
 class TestHandleFilter(unittest.TestCase):
 
     def test_css_and_js_directives_are_not_handles(self):

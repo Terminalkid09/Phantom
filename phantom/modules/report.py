@@ -22,7 +22,10 @@ Commands (inside `use report`):
                          evidence (typed kind, key, confidence, source)
 """
 
+import base64
+import hashlib
 import json
+import mimetypes
 import os
 import re
 from datetime import datetime
@@ -94,6 +97,250 @@ def _analyzer_findings():
 
 def _kb():
     return session.knowledge_base or {}
+
+
+# ── C2 beacon evidence ─────────────────────────────────────────────────────
+# The manual report used to read ONLY session.results: a `use report` after a
+# live beacon session produced a report with no beacon, no task output and no
+# camera/screenshot artifact, even though the C2 state had all of it. The
+# auto report had `_c2_evidence`; this is the manual equivalent, with chain of
+# custody (path, size, SHA-256, timestamp) and the artifacts themselves.
+
+_ARTIFACT_PATH_RE = re.compile(r"(?:saved to|saved —|written to)\s+([^\]]+)")
+
+
+def _artifact_path_from_output(output: str) -> str:
+    """Extract the real file path from a C2 artifact result line."""
+    m = _ARTIFACT_PATH_RE.search(output or "")
+    if not m:
+        return ""
+    path = m.group(1).strip().strip('"').rstrip(".)")
+    if path.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+        path = unquote(urlparse(path).path)
+    return path
+
+
+def _artifact_meta(path: str) -> dict:
+    """Chain-of-custody metadata for one artifact (never raises)."""
+    meta = {"path": path, "name": os.path.basename(path), "exists": False,
+            "size": 0, "sha256": "", "mtime": "", "mime": "",
+            "is_image": False}
+    try:
+        if not path or not os.path.isfile(path):
+            return meta
+        raw = open(path, "rb").read()
+        meta["exists"] = True
+        meta["size"] = len(raw)
+        meta["sha256"] = hashlib.sha256(raw).hexdigest()
+        meta["mtime"] = datetime.fromtimestamp(
+            os.path.getmtime(path)).isoformat(timespec="seconds")
+        meta["mime"] = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        meta["is_image"] = meta["mime"].startswith("image/")
+    except OSError:
+        pass
+    return meta
+
+
+def _c2_evidence(target: str = "", max_results: int = 200) -> list:
+    """Live C2 state as report evidence, selecting the engagement's beacon.
+
+    Match order: exact IP/hostname/local IP == target; otherwise the most
+    recently seen beacon. This keeps historical beacons out of a new report
+    while still working when `use report` is run from a different shell.
+    """
+    try:
+        from phantom.core.c2_server import c2_state
+    except Exception:
+        return []
+    try:
+        beacons = c2_state.get_beacons()
+    except Exception:
+        return []
+    t = (target or session.target or "").strip()
+    selected = []
+    for bid, info in beacons.items():
+        ip = str(info.get("ip", "") or "")
+        host = str(info.get("hostname", "") or "")
+        local = str(info.get("local_ips", "") or "")
+        if t and (t == ip or t == host or t in host.split(".")
+                  or t in [x.strip() for x in local.split(",")]):
+            selected.append((bid, info))
+    # A target can have many historical beacons (every rebuild enrolls a new
+    # identity). The report is for THIS engagement: keep only the newest
+    # matching beacon, otherwise old camera frames and outputs leak into a
+    # new report and the evidence table becomes unusable.
+    if selected:
+        selected = [max(selected,
+                        key=lambda kv: kv[1].get("last_seen", ""))]
+    elif beacons:
+        selected = [max(beacons.items(),
+                        key=lambda kv: kv[1].get("last_seen", ""))]
+    out = []
+    for bid, info in selected:
+        try:
+            results = c2_state.get_results(bid)[-max_results:]
+        except Exception:
+            results = []
+        tasks = []
+        for r in results:
+            output = str(r.get("output", "") or "")
+            artifact = _artifact_meta(_artifact_path_from_output(output))
+            tasks.append({
+                "task_id": r.get("task_id", ""),
+                "command": str(r.get("command", "") or ""),
+                "output": output[:4000],
+                "time": r.get("time", ""),
+                "artifact": artifact if artifact.get("path") else None,
+            })
+        out.append({
+            "beacon_id": bid,
+            "ip": info.get("ip", ""),
+            "os": info.get("os", ""),
+            "user": info.get("user", ""),
+            "hostname": info.get("hostname", ""),
+            "arch": info.get("arch", ""),
+            "local_ips": info.get("local_ips", ""),
+            "last_seen": info.get("last_seen", ""),
+            "status": info.get("status", ""),
+            "tasks_executed": len(results),
+            "tasks": tasks,
+        })
+    return out
+
+
+def _c2_markdown() -> list:
+    """Operator-report C2 section: tasks, outputs, artifacts, hashes."""
+    evidence = _c2_evidence()
+    if not evidence:
+        return []
+    lines = ["## C2 Beacon Evidence", "",
+             "> Pulled from the live C2 state. Artifact paths, sizes and "
+             "SHA-256 hashes are the chain-of-custody record.", ""]
+    for b in evidence:
+        lines += [f"### Beacon `{b['beacon_id']}`", ""]
+        lines.append(f"- **Target / connect**: {b.get('ip') or '—'}")
+        lines.append(f"- **Hostname**: {b.get('hostname') or '—'}")
+        lines.append(f"- **OS / arch**: {b.get('os') or '—'} / "
+                     f"{b.get('arch') or '—'}")
+        lines.append(f"- **User**: {b.get('user') or '—'}")
+        lines.append(f"- **Local IPs**: {b.get('local_ips') or '—'}")
+        lines.append(f"- **Last seen**: {b.get('last_seen') or '—'}")
+        lines.append(f"- **Tasks executed**: {b.get('tasks_executed', 0)}")
+        lines.append("")
+        for t in b.get("tasks", []):
+            lines.append(f"- task `{t['task_id']}` @ {t['time']} — "
+                         f"`{t['command'][:160]}`")
+            if t.get("output"):
+                lines += ["  ```", t["output"][:1200], "  ```"]
+            art = t.get("artifact")
+            if art:
+                if art.get("exists"):
+                    lines.append(
+                        f"  - artifact: `{art['path']}` — {art['size']} bytes, "
+                        f"SHA-256 `{art['sha256']}` ({art['mtime']})")
+                else:
+                    lines.append(f"  - artifact path (missing): `{art['path']}`")
+        lines.append("")
+    return lines
+
+
+def _c2_client_markdown() -> list:
+    """Sanitized C2 summary for the client: session proof + artifact hashes,
+    no commands and no raw task output (except a GPS fix, which is the
+    device's own location data)."""
+    evidence = _c2_evidence()
+    if not evidence:
+        return []
+    lines = ["## C2 Beacon Session", "",
+             "A beacon session was established during the assessment. The "
+             "table below is the chain-of-custody summary; raw task output "
+             "and images are in the operator report.", ""]
+    for b in evidence:
+        lines.append(f"- **Beacon**: `{b['beacon_id']}`")
+        lines.append(f"- **Target / connect**: {b.get('ip') or '—'}")
+        lines.append(f"- **Host**: {b.get('hostname') or '—'} "
+                     f"({b.get('os') or '—'} / {b.get('arch') or '—'})")
+        lines.append(f"- **Tasks executed**: {b.get('tasks_executed', 0)}")
+        for t in b.get("tasks", []):
+            art = t.get("artifact")
+            if art:
+                lines.append(
+                    f"- Artifact `{art['name']}` — {art['size']} bytes, "
+                    f"SHA-256 `{art['sha256'] or 'missing'}` "
+                    f"({art['mtime'] or 'missing'})")
+            elif "gps" in t["command"].lower() or "GPS" in t.get("output", ""):
+                out = t.get("output", "")
+                for line in out.splitlines():
+                    if any(k in line.upper() for k in
+                           ("LAT", "LON", "GPS", "COORD")):
+                        lines.append(f"- GPS result: `{line.strip()[:200]}`")
+        lines.append("")
+    return lines
+
+
+def _c2_section_html(embed_images: bool = False) -> str:
+    """HTML evidence section for the report.
+
+    `embed_images=True` is used by the operator raw HTML: screenshots/camera
+    frames are inlined as data URIs so the file is self-contained. The
+    client HTML keeps only metadata + hashes (no image content).
+    """
+    evidence = _c2_evidence()
+    if not evidence:
+        return ""
+    from html import escape as _e
+    parts = ['<section><h2>C2 Beacon Evidence</h2>',
+             '<p class="summary-box">Pulled from the live C2 state. '
+             'Artifact hashes and sizes are the chain-of-custody record.</p>']
+    for b in evidence:
+        parts.append('<div class="card">')
+        parts.append(f"<h3>Beacon <code>{_e(str(b['beacon_id']))}</code></h3>")
+        parts.append("<table><tr><th>Target / connect</th><th>Hostname</th>"
+                     "<th>OS / arch</th><th>User</th><th>Last seen</th>"
+                     "<th>Tasks</th></tr>")
+        parts.append(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>"
+            "<td>{}</td></tr></table>".format(
+                _e(str(b.get("ip") or "—")), _e(str(b.get("hostname") or "—")),
+                _e(f"{b.get('os') or '—'} / {b.get('arch') or '—'}"),
+                _e(str(b.get("user") or "—")),
+                _e(str(b.get("last_seen") or "—")),
+                _e(str(b.get("tasks_executed", 0)))))
+        for t in b.get("tasks", []):
+            art = t.get("artifact")
+            interesting = (art or t["command"].lower().startswith(
+                ("camera", "screenshot", "gps", "screen", "wlan", "download",
+                 "upload", "remote")))
+            if not interesting:
+                continue
+            parts.append(f"<p><strong>Task</strong> "
+                         f"<code>{_e(str(t['task_id']))}</code> @ "
+                         f"{_e(str(t['time']))}: "
+                         f"<code>{_e(t['command'][:160])}</code></p>")
+            if art:
+                parts.append(
+                    f"<p><strong>Artifact</strong>: <code>{_e(art['path'])}"
+                    f"</code><br>size {art['size']} bytes · SHA-256 "
+                    f"<code>{_e(art['sha256'] or 'missing')}</code> · "
+                    f"{_e(art['mtime'] or '')}</p>")
+                if embed_images and art.get("is_image") and art.get("exists"):
+                    try:
+                        raw = open(art["path"], "rb").read()
+                        if len(raw) <= 12 * 1024 * 1024:
+                            b64 = base64.b64encode(raw).decode("ascii")
+                            parts.append(
+                                f'<p><img alt="C2 artifact" '
+                                f'src="data:{_e(art["mime"])};base64,{b64}" '
+                                f'style="max-width:100%;border:1px solid #ddd;'
+                                f'border-radius:4px"></p>')
+                    except OSError:
+                        pass
+            elif t.get("output"):
+                parts.append(f"<pre>{_e(t['output'][:2000])}</pre>")
+        parts.append("</div>")
+    parts.append("</section>")
+    return "\n".join(parts)
 
 
 def _severity(score: int) -> str:
@@ -327,6 +574,35 @@ def _guardrails_markdown() -> list:
         return ["", f"_Guardrail manifest unavailable ({type(exc).__name__})._"]
 
 
+def _raw_html(operator_md: str) -> str:
+    """Self-contained operator HTML: full text + C2 artifact gallery.
+
+    Screenshots/camera frames are embedded as data URIs, so the file can be
+    moved off the engagement box without breaking the images. The raw text
+    is escaped (it can contain target-controlled output).
+    """
+    from html import escape as _e
+    gallery = _c2_section_html(embed_images=True)
+    return (
+        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"UTF-8\">"
+        "<title>Phantom Operator Report</title><style>"
+        "body{font-family:Segoe UI,Arial,sans-serif;background:#f8f9fa;"
+        "color:#222;margin:0;padding:24px}"
+        ".wrap{max-width:1100px;margin:0 auto;background:#fff;padding:28px;"
+        "border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,.08)}"
+        "pre{background:#2d3436;color:#dfe6e9;padding:16px;border-radius:5px;"
+        "overflow-x:auto;white-space:pre-wrap;word-break:break-word}"
+        "h2{border-left:5px solid #2c3e50;padding-left:12px}"
+        ".card{border:1px solid #ddd;border-radius:6px;padding:16px;"
+        "margin:14px 0}table{width:100%;border-collapse:collapse}"
+        "th,td{padding:8px;border-bottom:1px solid #eee;text-align:left}"
+        "th{background:#f2f2f2}img{max-width:100%;border:1px solid #ddd;"
+        "border-radius:4px}</style></head><body><div class=\"wrap\">"
+        "<h1>Phantom Operator Report</h1>"
+        f"{gallery}<h2>Full Audit</h2><pre>{_e(operator_md)}</pre>"
+        "</div></body></html>")
+
+
 def _build_operator_markdown() -> str:
     """Everything the operator needs: creds, commands, full output."""
     target = session.target or "N/A"
@@ -481,6 +757,9 @@ def _build_operator_markdown() -> str:
             w(str(res)[:4000])
             w("```")
         w()
+
+    # Live C2 evidence: the manual report used to drop it entirely.
+    out.extend(_c2_markdown())
 
     # Command history
     if session.history:
@@ -697,6 +976,8 @@ def _build_client_markdown() -> str:
         w("```")
         w()
 
+    out.extend(_c2_client_markdown())
+
     # Field notes (sanitized — no commands/creds)
     if session.notes:
         w("## Field Notes")
@@ -817,12 +1098,9 @@ class ReportModule(BaseModule):
                         "as HTML instead of PDF")
         else:
             fmt = "html"
-            from html import escape as _e
             raw_path = os.path.join(rdir, "raw_audit.html")
             with open(raw_path, "w", encoding="utf-8") as f:
-                f.write("<!DOCTYPE html>\n<html><head><meta charset=\"UTF-8\">"
-                        "<title>Phantom Raw Audit</title></head><body><pre>"
-                        f"{_e(operator_md)}</pre></body></html>")
+                f.write(_raw_html(operator_md))
             client_path = os.path.join(rdir, "client_report.html")
             self._export_html(client_path)
 
@@ -847,19 +1125,23 @@ class ReportModule(BaseModule):
 
         raw_json = os.path.join(rdir, "raw_report.json")
         raw_md = os.path.join(rdir, "raw_report.md")
+        raw_html = os.path.join(rdir, "raw_audit.html")
         client_md = os.path.join(rdir, "client_report.md")
         client_html = os.path.join(rdir, "client_report.html")
 
         self._export_json(raw_json)
         self._export_operator_md(raw_md)
+        with open(raw_html, "w", encoding="utf-8") as f:
+            f.write(_raw_html(_build_operator_markdown()))
         self._export_client_md(client_md)
         self._export_html(client_html)
 
         notifier.success(f"Full report set written to {rdir}")
         notifier.info("  raw_report.json   — full structured audit (operator)")
         notifier.info("  raw_report.md     — operator document (creds + commands)")
+        notifier.info("  raw_audit.html    — operator HTML with C2 screenshot/camera gallery")
         notifier.info("  client_report.md  — sanitized client skeleton")
-        notifier.info("  client_report.html — sanitized client HTML")
+        notifier.info("  client_report.html — sanitized client HTML + C2 evidence hashes")
 
         recorded = self._record_learning()
         if recorded:
@@ -929,6 +1211,7 @@ class ReportModule(BaseModule):
             {"module": m, "outcome": o, "error": e}
             for m, o, e in _module_outcomes()
         ]
+        data["c2_evidence"] = _c2_evidence()
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, default=str)
         notifier.success(f"JSON audit saved to {filename}")
@@ -999,6 +1282,13 @@ class ReportModule(BaseModule):
         else:
             html = html.replace("<footer>",
                                 guardrails_html + "\n\n    <footer>", 1)
+        # Live C2 evidence (client-safe: metadata + hashes, no image data
+        # and no raw command output — that stays in the operator report).
+        c2_html = _c2_section_html(embed_images=False)
+        if "{{ c2_section }}" in html:
+            html = html.replace("{{ c2_section }}", c2_html)
+        elif c2_html:
+            html = html.replace("<footer>", c2_html + "\n\n    <footer>", 1)
         html = html.replace("Phantom v2.5", f"Phantom v{VERSION}")
 
         with open(filename, "w", encoding="utf-8") as f:
@@ -1151,6 +1441,57 @@ class ReportModule(BaseModule):
                 ('GRID', (0, 0), (-1, -1), 0.5, colors.grey)
             ]))
             elements.append(t)
+
+        # C2 evidence: session metadata + artifact hashes + embedded
+        # screenshots/camera frames (Pillow converts BMP to a PDF-safe PNG).
+        evidence = _c2_evidence()
+        if evidence:
+            from xml.sax.saxutils import escape as _x
+            from reportlab.platypus import Image as _RLImage
+            elements.append(Paragraph("C2 Beacon Evidence", heading_style))
+            for b in evidence:
+                elements.append(Paragraph(
+                    f"Beacon <b>{_x(str(b['beacon_id']))}</b> — "
+                    f"{_x(str(b.get('ip') or '—'))} / "
+                    f"{_x(str(b.get('hostname') or '—'))} / "
+                    f"{_x(str(b.get('os') or '—'))} / user "
+                    f"{_x(str(b.get('user') or '—'))} / "
+                    f"tasks {b.get('tasks_executed', 0)}", styles['Normal']))
+                elements.append(Spacer(1, 6))
+                images_added = 0
+                for task in b.get("tasks", []):
+                    art = task.get("artifact")
+                    if art:
+                        elements.append(Paragraph(
+                            f"Artifact <b>{_x(str(art['name']))}</b> — "
+                            f"{art['size']} bytes, SHA-256 "
+                            f"{_x(str(art['sha256'] or 'missing'))}, "
+                            f"{_x(str(art['mtime'] or ''))}", styles['Small']))
+                        if (art.get("is_image") and art.get("exists")
+                                and images_added < 12):
+                            try:
+                                import io as _io
+                                from PIL import Image as _PILImage
+                                raw = open(art["path"], "rb").read()
+                                im = _PILImage.open(_io.BytesIO(raw))
+                                im.thumbnail((900, 900))
+                                buf = _io.BytesIO()
+                                im.convert("RGB").save(buf, format="PNG")
+                                buf.seek(0)
+                                w = 450
+                                h = int(im.height * (w / max(1, im.width)))
+                                elements.append(_RLImage(buf, width=w, height=h))
+                                elements.append(Spacer(1, 6))
+                                images_added += 1
+                            except Exception:
+                                pass
+                    elif ("gps" in task["command"].lower()
+                          or "GPS" in task.get("output", "")):
+                        out = (task.get("output") or "")[:600]
+                        if out:
+                            elements.append(Paragraph(
+                                f"GPS: {_x(out)}", styles['Small']))
+                elements.append(Spacer(1, 10))
 
         if session.notes:
             elements.append(Paragraph("Field Notes", heading_style))

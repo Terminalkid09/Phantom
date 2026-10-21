@@ -55,15 +55,20 @@ def publish(pid: str, author_result, state,
         if not ok:
             return PublishResult(False, f"cannot create branch: {out}",
                                  branch)
-    ok, worktree = git("worktree", "add", str(_wt_dir(pid)), branch)
+    # `git worktree add` prints status text ("HEAD is now at ...") on some
+    # Git builds; its output is NOT the worktree path. Use the deterministic
+    # path we passed in, otherwise Windows treats the log line as a filename
+    # and every publish dies with WinError 123 before copying a single file.
+    wt_path = str(_wt_dir(pid))
+    ok, out = git("worktree", "add", wt_path, branch)
     if not ok:
-        return PublishResult(False, f"worktree failed: {worktree}", branch)
+        return PublishResult(False, f"worktree failed: {out}", branch)
 
     try:
         # 2. copy authored files into the worktree
         for rel in files:
             src = PROJECT_ROOT / rel
-            dst = Path(worktree.strip()) / rel
+            dst = Path(wt_path) / rel
             if not src.exists():
                 return PublishResult(False, f"authored file missing: {rel}",
                                      branch)

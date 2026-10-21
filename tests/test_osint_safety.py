@@ -44,6 +44,34 @@ class TestUsernameSafety(unittest.TestCase):
         self.assertEqual(osint._get_username("mario_rossi"), "mario_rossi")
         self.assertEqual(osint._get_username("10.0.0.5"), "")
 
+    def test_dotted_username_is_kept_whole(self):
+        """Live defect 2026-10-20: `damiano.silviotti1` was split on the dot
+        and Sherlock searched for `damiano` (a different person)."""
+        osint = OsintModule()
+        self.assertEqual(osint._get_username("damiano.silviotti1"),
+                         "damiano.silviotti1")
+        self.assertEqual(
+            osint._get_username(
+                "https://www.instagram.com/damiano.silviotti1/"),
+            "damiano.silviotti1")
+        self.assertEqual(
+            osint._get_username("https://www.tiktok.com/@damy45111"),
+            "damy45111")
+        self.assertEqual(osint._get_username("example.com"), "")
+        self.assertEqual(osint._get_username("10.0.0.5"), "")
+
+    def test_bare_username_skips_whois_and_dns(self):
+        """A bare username must not be treated as a domain: WHOIS/DNS on
+        `damiano.silviotti1` is both wrong and useless."""
+        osint = OsintModule()
+        session.target = "damiano.silviotti1"
+        groups = osint.build_commands()
+        self.assertIn("USERNAME SEARCH", groups)
+        self.assertNotIn("WHOIS / DNS", groups)
+        self.assertNotIn("SUBDOMAIN ENUM", groups)
+        self.assertIn("damiano.silviotti1",
+                      " ".join(groups["USERNAME SEARCH"]))
+
     def test_sherlock_refuses_an_unsafe_username(self):
         osint = OsintModule()
         with mock.patch("phantom.modules.osint.run_command") as run, \

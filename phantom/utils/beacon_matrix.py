@@ -220,6 +220,11 @@ FEATURES: Tuple[Feature, ...] = (
         note="Windows: Run key/registry; Linux: systemd user unit/cron; "
              "macOS: launchd"),
     Feature(
+        name="persistence_startup", kind="action", verbs=("persist2",),
+        headers=("persistence_startup.h",), support=dict(_WINDOWS_ONLY),
+        note="Windows-only no-admin Startup .cmd wrapper (no PE); the POSIX "
+             "dispatcher has no analogue"),
+    Feature(
         name="edr_awareness", kind="evasion", verbs=("edrcheck",),
         headers=("evasion.h",), support=dict(_NATIVE),
         note="Linux: LSM/eBPF/audit; macOS: SIP + EndpointSecurity; "

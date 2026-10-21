@@ -125,6 +125,7 @@ phantom/payloads/beacon/src/beacon_auth.h
 
 # Remote Session module (GUI takeover) build artifacts
 phantom/payloads/remote/*.exe
+phantom/payloads/remote/remote_mem.bin
 phantom/payloads/remote/remote_linux
 phantom/payloads/remote/remote_macos
 phantom/payloads/remote/remote.apk

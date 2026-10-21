@@ -297,11 +297,12 @@ class AutonomousAgent:
         # source of truth. Contact stays a separate, explicit choice.
         self.wm.identity_consent = {"active": self.identity_active,
                                     "contact": False}
-        # port-scan coverage per run profile: default and stealth sweep the
-        # full range up front (non-standard services like SSH-on-2222 are
-        # visible immediately); speed and aggressive keep the fast top-ports
-        # (deep scan is still escalated by _recover_stall if no access
-        # service appears). Read by the scan adapters in guidance/kit.py.
+        # port-scan coverage per run profile: default keeps the top-1000;
+        # stealth sweeps the full range up front with a BOUNDED rate (the
+        # old unbounded -T2 sweep never reached the high ports); speed and
+        # aggressive keep the fast top-ports (deep scan is still escalated
+        # by _recover_stall if no access service appears). Read by the scan
+        # adapters in guidance/kit.py.
         if aggressive:
             self.wm.scan_style = "top_loud"      # fast + noisy, top ports
         elif speed:
@@ -3282,7 +3283,8 @@ class AutonomousAgent:
         # post_exploit), not just "deliver": speed/aggressive runs start
         # with top-ports and would otherwise never see SSH-on-2222, making
         # beacon_deploy over SSH impossible.
-        if goal in ("deliver", "complete_kill_chain", "post_exploit") \
+        if goal in ("deliver", "beacon", "network_beacon",
+                    "complete_kill_chain", "post_exploit") \
                 and not getattr(self, "_deep_scanned", False):
             access_ports = {"22", "2222", "22222", "3389", "5985", "5986", "445"}
             found_access = any(
