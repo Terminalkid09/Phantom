@@ -30,7 +30,8 @@ from typing import Any, Dict, List, Optional
 # every terminal fact of the network/enterprise goals is covered here.
 BRIDGED_KINDS = (
     "service", "os", "creds", "beacon", "persistence", "system_privilege",
-    "injection", "rce_foothold", "ad_domain", "ad_creds", "cracked",
+    "injection", "rce_foothold", "exploit_result", "exploit_attempt",
+    "ad_domain", "ad_creds", "cracked",
     "pivot", "internal_host", "internal_service", "defensive_gap",
     "cloud_creds", "cloud_access", "cloud_lateral", "k8s_escape",
     "environment", "mobile", "mdm_vendor", "mobile_platform",
@@ -156,6 +157,10 @@ def merge_worldmodel_into_session(wm, target: str = "",
         vec = [f.key for f in wm.find("rce_foothold")]
         kb["rce_vectors"] = sorted(set(list(kb["rce_vectors"]) + vec))
         counts["rce"] = len(vec)
+    exploit_results = [_val(f) for f in wm.find("exploit_result")]
+    if exploit_results:
+        kb["exploit_results"] = exploit_results
+        counts["exploits"] = len(exploit_results)
     if wm.find("ad_domain"):
         kb["domain_environment"] = True
         kb["domain_enumerated"] = True

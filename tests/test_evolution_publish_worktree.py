@@ -14,7 +14,6 @@ from phantom.automation.evolution.author import AuthorResult
 
 def test_publish_uses_requested_worktree_path(tmp_path, monkeypatch):
     monkeypatch.setattr(publish_mod, "PROJECT_ROOT", tmp_path)
-    monkeypatch.delenv("PHANTOM_EVOLUTION_TOKEN", raising=False)
 
     pid = "regression-publish-path"
     rel = f"docs/evolution/{pid}.md"
@@ -26,6 +25,8 @@ def test_publish_uses_requested_worktree_path(tmp_path, monkeypatch):
 
     def fake_git(*args):
         calls.append(args)
+        if args[:2] == ("remote", "get-url"):
+            return True, "https://github.com/Terminalkid09/Phantom.git"
         if args[:2] == ("rev-parse", "--verify"):
             return False, ""
         if args[:1] == ("branch",):
@@ -35,6 +36,13 @@ def test_publish_uses_requested_worktree_path(tmp_path, monkeypatch):
             # The exact output that used to be mistaken for the path.
             return True, "HEAD is now at deadbeef initial"
         return True, ""
+
+    def fake_gh(*args, **kwargs):
+        if args[:2] == ("auth", "status"):
+            return True, "Logged in"
+        if args[:2] == ("pr", "create"):
+            return True, "https://github.com/Terminalkid09/Phantom/pull/3"
+        return False, "unexpected"
 
     class State:
         @staticmethod
@@ -46,10 +54,11 @@ def test_publish_uses_requested_worktree_path(tmp_path, monkeypatch):
         AuthorResult(ok=True, proposal_relpath=rel),
         State(),
         run_git=fake_git,
+        run_gh=fake_gh,
     )
 
-    assert result.ok is True
-    assert "no PHANTOM_EVOLUTION_TOKEN" in result.detail
+    assert result.ok is True, result.detail
+    assert result.pr_url.endswith("/pull/3")
     copied = (tmp_path / "data" / "evolution" / f"wt-{pid}" / rel)
     assert copied.is_file()
     assert copied.read_text(encoding="utf-8") == "# reviewed proposal\n"

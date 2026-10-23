@@ -251,6 +251,12 @@ at read time, never while the victim's page loads).
   destructive remover: it reports `found` / `stopped` / `killed` /
   `could_not_stop` for everything. Exposed in auto-mode as the `edr_disable`
   `post` step.
+  **Validation status — unvalidated / environment-gated:** `edr-kill` is
+  implemented and covered by contract tests, but it has not been exercised
+  end-to-end because it needs an elevated lab VM whose AV/EDR is disposable.
+  Do not run it in the test suite or against a production endpoint. Treat
+  every `stopped`/`killed` report as beacon-reported, not independently
+  verified.
 - `edrcheck` (beacon command): hooked ntdll stub count + loaded EDR/AV
   kernel drivers (CrowdStrike, SentinelOne, McAfee, Defender ATP, ...)
   BEFORE acting on a foothold.
@@ -513,6 +519,7 @@ always exists and an existing flag is always documented.
 | `--c2` | open the C2 shell (`phantom.c2`) |
 | `--profile NAME` | load an engagement profile at startup |
 | `--stealth` / `--aggressive` / `--speed` | OPSEC posture: paranoid, loud+fast, first-viable-opening |
+| `--exploit-all` | After the normal run, execute every actionable CVE in the WorldModel (local PoC or Metasploit) and deliver the beacon through a verified RCE; off by default |
 | `--reason PROFILE` | reasoning objective: `balanced`, `stealth_first`, `evidence_first`, `force_first` |
 | `--identity-active` | dedicated consent for ACTIVE identity probes (reset enumeration, SMTP verify) |
 | `--goal GOAL` | terminal goal (default `deliver`) |
@@ -849,6 +856,10 @@ DIRECTLY through it (`beacon_via_rce`) — no reverse-shell detour.
 - DC detection via ports (88/389/636/3268/3269), LDAP rootDSE anonymous bind
 - Domain functional level, namingContexts, DNS SRV, Kerberos AS-REP check
 - Auto-flags: LDAP anonymous bind → user enumeration possible; Kerberos → roastable
+- **Validation status:** the AD path is exercised against an offline simulated
+  domain and, when available, an authorized Samba/AD lab. Detection results are
+  findings, not proof of domain compromise; a real Windows AD engagement needs
+  its own authorized lab and client scope before any credential attack.
 
 **Intelligent fallback chain**:
 - "Brute failed but account 'admin' exists" → phish admin, not re-brute
@@ -877,7 +888,7 @@ Historical learning above is a *statistic* ("sqli is ~60% effective on nginx"). 
 - **The author reads on demand, not the repo dump** — the prompt carries the schema, a worked example and a tree for orientation; if the model needs a specific file (e.g. a similar built-in to imitate) it requests `READ <path>` and gets the redacted content (max 4 read rounds, 20 reads/attempt). It can WRITE only into `phantom/automation/guidance/learned/`, `tests/learned/` and `docs/evolution/`. Engine code (planner, agent, the gate itself) is outside its write reach *by construction* — the guardrails cannot be rewritten by the thing they guard.
 - **Full gate, lab mandatory** — static AST allowlist (stdlib+phantom imports only, `learned.` id prefix, size caps) → registry load → offline unit subset → **dry-run against the lab through the real pipeline**. No lab reachable → no PR, no auto-load. Ever. **Every user gets a lab automatically**: the loop uses an already-running lab (your own compose on 8081, if you have one) or starts the project's own two-host stack (`lab/`, shipped with phantom) on remapped ports (18081) and tears it down after the gate — isolated, never the operator's machines, zero extra config beyond Docker itself. Without Docker installed, evolution is unavailable (stated, never faked).
 - **Repair loop with a dynamic budget** — gate failures feed back into the next attempt; the attempt cap (3–5) scales with the pattern's authoring track record. On total failure: rollback + `POSTMORTEM.md`, no PR.
-- **Human merge, always** — a gate-clean capability lands on branch `auto-evolution/<id>` and opens a PR into `dev` with the proposal + full gate results. Never self-merges; `PHANTOM_EVOLUTION_TOKEN` (repo-scoped) or the branch stays local with push instructions. Budgets: 5 gate runs/day, 2 PRs/day.
+- **Human merge, always** – a gate-clean capability lands on branch `auto-evolution/<id>` and opens a **draft** PR into `dev` with the proposal + full gate results. The only publish target is `Terminalkid09/Phantom`; a fork or redirect is refused. Publishing uses the operator's local `gh` login / git credentials (never a shared token), and the loop has no merge path: without local auth the branch stays local with the exact push/draft-PR commands. Budgets: 5 gate runs/day, 2 PRs/day.
 - **`learned/` is the production location** — the registry scans that package on every boot, so a merged PR integrates with zero plumbing; the capability auto-loads in sessions and shows up in plans with its `learned.` prefix.
 - **`--beta`** — pull the branches behind OPEN auto-evolution PRs, run the same full gate locally (lab included) and load what passes for THIS session only (temp checkout under `data/evolution/`, working tree untouched). One operator's learned capability becomes every operator's beta.
 - `review` in the AUTO shell shows authored patterns, budgets, learned capabilities and lab reachability.
@@ -1293,7 +1304,7 @@ phantom/                        # repository root
 │   └── bt_scan.h               # Bluetooth scanning
 ├── electron/                   # React + Vite + TypeScript desktop app
 ├── data/                       # Sessions, cache, certs, wordlists
-├── tests/                      # 382 test files
+├── tests/                      # 383 test files
 ├── Dockerfile                  # Multi-stage Kali-based build
 ├── docker-compose.yml          # One-command deployment
 └── .env.example                # External API template

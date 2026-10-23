@@ -3,25 +3,31 @@
 publish() runs ONLY after the full gate passed. Governance (agreed):
   * branch  auto-evolution/<proposal-id>  on this repo
   * PR into dev, body = PROPOSAL.md + gate results + test output
-  * max 2 PRs/day, token from PHANTOM_EVOLUTION_TOKEN (repo-scoped to
-    the auto-evolution/* namespace in the operator's GitHub settings)
-  * never self-merges; no token -> the branch stays local with exact
-    push instructions (fallback path, nothing silently dropped)
+  * max 2 PRs/day
+  * the ONLY publish target is Terminalkid09/Phantom (pinned below); a
+    fork/redirect is refused, never silently followed
+  * authentication is the OPERATOR'S local `gh` login (or the local git
+    credential helper). No shared personal token is read, written, or
+    committed; no token ever appears in argv or an environment dump
+  * the PR is ALWAYS a draft (`gh pr create --draft`) and is never merged
+    by the loop; without local auth the branch stays local with the exact
+    push/draft-PR commands (fallback path, nothing silently dropped)
 """
 
 from __future__ import annotations
 
-import json
+import re
 import subprocess
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 BRANCH_NS = "auto-evolution/"
 BASE_BRANCH = "dev"
-GH_API = "https://api.github.com"
+# Hard pin: publishing anywhere else (a fork, a redirect, a changed origin)
+# is a governance failure, not a configuration choice.
+PINNED_REPO = "Terminalkid09/Phantom"
 
 
 @dataclass
@@ -33,9 +39,18 @@ class PublishResult:
 
 
 def publish(pid: str, author_result, state,
-            run_git: Optional[callable] = None) -> PublishResult:
+            run_git: Optional[callable] = None,
+            run_gh: Optional[callable] = None) -> PublishResult:
     git = run_git or _git
+    gh = run_gh or _gh
     branch = f"{BRANCH_NS}{pid}"
+
+    remote = _remote_repo(git)
+    if remote.lower() != PINNED_REPO.lower():
+        return PublishResult(
+            False,
+            f"refusing to publish: origin is '{remote or 'unknown'}', "
+            f"but evolution may only target {PINNED_REPO}", branch)
 
     # collect the exact files the author produced
     files: List[str] = [p for p in (author_result.cap_relpath,
@@ -85,31 +100,51 @@ def publish(pid: str, author_result, state,
         if not ok:
             return PublishResult(False, f"commit failed: {out}", branch)
 
-        # 4. push (token-scoped) — or leave local with instructions.
+        # 4. Only an authenticated operator may publish. Check BEFORE the
+        # push and BEFORE spending a PR slot: without local `gh` auth the
+        # branch stays local and the operator gets the exact commands,
+        # rather than a pushed branch that can never get its draft PR.
+        auth_ok, auth_why = _local_gh_auth(gh)
+        if not auth_ok:
+            return PublishResult(
+                True,
+                f"branch {branch} committed locally; no local GitHub auth "
+                f"({auth_why[-300:]}). Push and open the draft PR manually: "
+                f"git push origin {branch} && gh pr create --draft "
+                f"--repo {PINNED_REPO} --base {BASE_BRANCH} --head {branch}",
+                branch)
+
+        # push with the operator's LOCAL git credentials. There is no
+        # shared token: `gh auth setup-git` / the OS credential manager owns
+        # the secret, and this process never reads it.
         # P1-4: claim the PR slot ATOMICALLY, right before the push. The
         # old can_pr()+count_pr() pair (~check~...~count~) let concurrent
         # workers over-admit past the 2/day budget; reserving here also
         # means a failure BEFORE this point never spends a slot.
         if not state.reserve_pr_slot():
             return PublishResult(False, "daily PR budget exhausted "
-                                 "(2/day) — branch kept local", branch)
-        token = _token()
-        if not token:
-            return PublishResult(
-                True, f"branch {branch} committed locally; no "
-                "PHANTOM_EVOLUTION_TOKEN — push manually: "
-                f"git push origin {branch}", branch)
-        ok, out = _push_with_token(token, branch)
+                                 "(2/day) \u2014 branch kept local", branch)
+        ok, out = _push_branch(git, branch)
         if not ok:
             return PublishResult(False, f"push failed: {out}", branch)
 
-        # 5. open the PR (as a DOSSIER — the human must be able to approve
-        # it without reading the raw authoring transcript)
+        # 5. open a DRAFT PR with the operator's `gh` login. The body is a
+        # reviewable dossier, not the raw authoring transcript. This module
+        # has no merge path at all.
         verified = bool(getattr(author_result, "verified", True))
-        pr = _open_pr(token, branch, pid, proposal_md, gate_md,
-                      author_result=author_result, verified=verified)
-        label = "" if verified else " (UNVERIFIED — lab unreachable)"
-        return PublishResult(True, f"PR opened{label}: {pr}", branch, pr)
+        body = _dossier(pid, branch, author_result, proposal_md, gate_md,
+                        verified)
+        pr, why = _open_draft_pr(gh, branch, pid, body, verified)
+        label = "" if verified else " (UNVERIFIED \u2014 lab unreachable)"
+        if pr:
+            return PublishResult(True, f"draft PR opened{label}: {pr}",
+                                 branch, pr)
+        return PublishResult(
+            False,
+            f"branch {branch} pushed to {PINNED_REPO}, but no draft PR was "
+            f"opened: {why}. Create it manually with: gh pr create --draft "
+            f"--repo {PINNED_REPO} --base {BASE_BRANCH} --head {branch}",
+            branch)
     finally:
         git("worktree", "remove", "--force", str(_wt_dir(pid)))
 
@@ -127,69 +162,71 @@ def _git(*args: str):
         return False, str(exc)
 
 
-def _token() -> str:
-    import os
-    return os.environ.get("PHANTOM_EVOLUTION_TOKEN", "").strip()
+def _push_branch(git, branch: str):
+    """Push with the operator's existing git credential helper.
+
+    `origin` was verified to be the pinned Phantom repository before this
+    call. No token is read here, so none can leak into the branch, argv, a
+    commit, or the PR body.
+    """
+    # Refuse an HTTP redirect as well: a renamed/moved origin must not
+    # silently send a machine-authored branch to a different repository.
+    return git("-c", "http.followRedirects=false", "push", "origin",
+               f"{branch}:{branch}")
 
 
-def _push_with_token(token: str, branch: str):
-    """P1-6: push with the token OUT of the URL and OUT of argv.
-
-    Both the old URL form (`https://x-access-token:TOKEN@github.com/...`)
-    and the first header form (`-c http.extraHeader=Authorization: Basic
-    TOKEN`) put the credential in the child's ARGV, where `ps` / Task
-    Manager read it. A git credential helper reads the secret from the
-    environment instead: the helper string in argv is a fixed literal, the
-    token lives only in the subprocess env, and git's own output is redacted
-    before it is returned. There is deliberately NO token-bearing fallback."""
-    import os
-    env = dict(os.environ)
-    env["PHANTOM_PUSH_TOKEN"] = token
-    helper = ("!f() { echo username=x-access-token; "
-              "echo password=$PHANTOM_PUSH_TOKEN; }; f")
+def _gh(*args: str, input_text: Optional[str] = None,
+        timeout: int = 45) -> Tuple[bool, str]:
+    """Run the operator's local `gh` CLI (never a shared token)."""
     try:
         proc = subprocess.run(
-            ["git", "-c", f"credential.helper={helper}",
-             "push", "origin", f"{branch}:{branch}"],
-            capture_output=True, text=True, timeout=60,
-            cwd=str(PROJECT_ROOT), env=env)
+            ["gh", *args], input=input_text, capture_output=True,
+            text=True, timeout=timeout, cwd=str(PROJECT_ROOT))
         text = (proc.stdout or "") + (proc.stderr or "")
-        return proc.returncode == 0, text.replace(token, "***").strip()[-200:]
+        return proc.returncode == 0, text.strip()
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
 
 
-def _remote_repo() -> str:
-    ok, out = _git("remote", "get-url", "origin")
+def _remote_repo(git=None) -> str:
+    git = git or _git
+    ok, out = git("remote", "get-url", "origin")
     if not ok:
         return ""
-    import re
-    m = re.search(r"github\.com[:/](.+?)(?:\.git)?$", out)
+    m = re.search(r"github\.com[:/](.+?)(?:\.git)?$", out.strip())
     return m.group(1) if m else ""
 
 
-def _open_pr(token: str, branch: str, pid: str, proposal_md: str,
-             gate_md: str, author_result=None, verified: bool = True) -> str:
-    repo = _remote_repo()
-    if not repo:
-        return "pushed (remote not GitHub — open the PR manually)"
-    body = _dossier(pid, branch, author_result, proposal_md, gate_md, verified)
+def _local_gh_auth(gh) -> Tuple[bool, str]:
+    """Is this operator's local `gh` authenticated for github.com?
+
+    No token is read from the environment or a config file: `gh auth
+    status` only reports whether ITS OWN credential store is usable.
+    """
+    return gh("auth", "status", "--hostname", "github.com")
+
+
+def _open_draft_pr(gh, branch: str, pid: str, body: str,
+                   verified: bool) -> Tuple[str, str]:
+    """Create a DRAFT PR in the pinned repo with the operator's gh auth.
+
+    Governance: this module has no merge call, no "ready for review" path,
+    and no fallback that creates a non-draft PR.
+    """
+    ok, auth = _local_gh_auth(gh)
+    if not ok:
+        return "", f"gh is not authenticated for this operator: {auth[-300:]}"
     title = _pr_title(pid, verified)
-    payload = json.dumps({
-        "title": title,
-        "head": branch, "base": BASE_BRANCH, "body": body[:60000],
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        f"{GH_API}/repos/{repo}/pulls", data=payload, method="POST",
-        headers={"Authorization": f"token {token}",
-                 "Accept": "application/vnd.github+json",
-                 "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = json.loads(r.read().decode("utf-8"))
-            return data.get("html_url", "PR opened")
-    except Exception as exc:  # noqa: BLE001
-        return f"pushed; PR creation failed ({exc}) — open it manually"
+    ok, out = gh(
+        "pr", "create", "--draft", "--repo", PINNED_REPO,
+        "--base", BASE_BRANCH, "--head", branch,
+        "--title", title, "--body-file", "-",
+        input_text=body[:60000])
+    if not ok:
+        return "", out[-500:]
+    m = re.search(r"https://github\.com/\S+/pull/\d+", out)
+    return (m.group(0) if m else out.splitlines()[-1].strip() if out else
+            "draft PR created"), ""
 
 
 def _pr_title(pid: str, verified: bool = True) -> str:

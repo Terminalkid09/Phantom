@@ -84,6 +84,13 @@ platform's own API), `posix` (the shared POSIX path is compiled in),
 | android | `aarch64` | `openssl` | `cert-sha256-der` | ELF | `beacon_android` |
 <!-- beacon-matrix:end -->
 
+> **`edr-kill` validation caveat.** The matrix records the *implementation*
+> reach (native/posix), not a tested kill. `edr-kill` requires elevation plus
+> a disposable AV/EDR lab and is deliberately excluded from automated tests;
+> it is documented here as unvalidated / environment-gated. Its output is
+> self-reported by the beacon and must not be treated as independent proof
+> that a defensive product was disabled.
+
 ## Anti-analysis (evasion.h)
 
 | Capability | Windows | Linux | macOS | Android |

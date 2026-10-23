@@ -25,7 +25,7 @@
 
 namespace media_utils {
 
-inline void xtrace(const char* msg) {
+inline void xtrace([[maybe_unused]] const char* msg) {
 #ifdef _WIN32
     char tmp[MAX_PATH] = {0};
     if (!GetTempPathA(MAX_PATH, tmp)) return;

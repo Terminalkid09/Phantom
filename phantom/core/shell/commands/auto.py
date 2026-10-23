@@ -66,6 +66,9 @@ def cmd_auto(shell, arg: str):
                     enumeration (mutually exclusive with --stealth)
       --speed       opportunistic: exploit the first viable opening
                     without raising detection (combines with either)
+      --exploit-all after the normal run, EXECUTE every actionable CVE
+                    in the WorldModel (local PoC / Metasploit) and use a
+                    verified RCE to deliver the beacon; off by default
       --plan        dry-run: print the planned chain, execute nothing
       --verbose     stream the live reasoning trace while running:
                     inferences, hypotheses formed, confirmations and
@@ -109,6 +112,11 @@ def cmd_auto(shell, arg: str):
                         help="paranoid OPSEC (mutually exclusive with --aggressive)")
     parser.add_argument("--aggressive", action="store_true", default=False)
     parser.add_argument("--speed", action="store_true", default=False)
+    parser.add_argument("--exploit-all", dest="exploit_all",
+                        action="store_true", default=False,
+                        help="after the normal run, execute every actionable "
+                             "CVE (local PoC / Metasploit) and deliver the "
+                             "beacon through a verified RCE")
     parser.add_argument("--reason", default="", metavar="PROFILE",
                         choices=["", "balanced", "stealth_first",
                                  "evidence_first", "force_first"],
@@ -325,7 +333,15 @@ def cmd_auto(shell, arg: str):
                 notifier.warn(
                     f"{_tool}: {str(_res.get('output', ''))[:140]}")
 
-    if args.swarm:
+    if args.swarm and args.exploit_all:
+        # The explicit sweep needs the agent's WorldModel and its
+        # post-run beacon re-plan; the swarm artifact cannot carry those.
+        # Announce the routing and take the agent path below instead of
+        # silently ignoring the flag.
+        notifier.warn(
+            "--exploit-all executes on the agent path: switching this run "
+            "from swarm to agent (the swarm has no post-run CVE sweep).")
+    if args.swarm and not args.exploit_all:
         from phantom.automation.swarm import chain_for_profile, run_swarm
         from phantom.automation.swarm.llm import LLMApproval
         from phantom.automation.swarm.profile_policy import (
@@ -385,6 +401,7 @@ def cmd_auto(shell, arg: str):
         stealth=args.stealth,
         speed=args.speed,
         plan=args.plan,
+        exploit_all=args.exploit_all,
         verbose=args.verbose,
         agents=args.agents or 0,
         goal=args.goal,

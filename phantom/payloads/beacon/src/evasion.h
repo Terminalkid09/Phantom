@@ -1290,6 +1290,11 @@ inline void stalling_delay(int intensity) {
             count += (j ^ i) * (i + 1);
         }
     }
+    // The loop's whole purpose is CPU work, but the accumulator must be
+    // READ or GCC 16 (and clang) correctly diagnose it as set-but-unused.
+    // A real read keeps the volatile work observable without suppressing
+    // the warning.
+    (void)count;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

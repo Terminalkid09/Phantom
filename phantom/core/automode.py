@@ -289,6 +289,121 @@ def _run_agent_single(target, goal, profile, aggressive, paranoid, speed,
         social_platform=social_platform)
 
 
+def _exploit_all_after_run(agent, goal: str, state_path: str,
+                           result: Dict) -> Dict:
+    """Execute every actionable finding in the finished agent's WorldModel.
+
+    This is deliberately OUTSIDE the normal planner loop: ``--exploit-all``
+    is an explicit operator decision, not a change to the default
+    ``complete_kill_chain`` contract. A verified RCE is then fed back into
+    the planner with a short ``beacon`` goal, so the beacon is preferred over
+    stopping at "vulnerable".
+    """
+    from phantom.automation.exploit.sweep import exploit_worldmodel
+    summary: Dict = {}
+    try:
+        summary = exploit_worldmodel(agent.wm, allow_msf=True,
+                                     prefer_beacon=True)
+    except Exception as exc:  # noqa: BLE001 - never lose the main run
+        notifier.warn(f"exploit-all: sweep failed: {exc}")
+        return {"error": str(exc), "beacon_after": False}
+    tried = int(summary.get("attempted", 0) or 0)
+    n_candidates = int(summary.get("candidates", 0) or 0)
+    knowledge_only = list(summary.get("knowledge_only", []) or [])
+    rce = list(summary.get("rce", []) or [])
+    vuln = list(summary.get("vulnerable", []) or [])
+    if not n_candidates:
+        notifier.info(
+            "exploit-all: no actionable CVE in the WorldModel (no local PoC "
+            "and no known Metasploit module matched the discovered services) "
+            "- nothing was executed; absence of a weapon is not a compromise.")
+    elif not tried:
+        notifier.info(
+            f"exploit-all: {n_candidates} candidate(s), none executable "
+            f"({len(knowledge_only)} knowledge-only, the rest already "
+            "attempted) - nothing was executed in this pass.")
+    if tried:
+        notifier.info(
+            f"exploit-all: {tried} execution(s), "
+            f"{len(vuln)} confirmed vulnerable, {len(rce)} RCE")
+    for line in (summary.get("outcomes", []) or []):
+        cve = line.get("cve", "?")
+        method = line.get("method", "none")
+        if line.get("rce"):
+            notifier.success(f"exploit-all: {cve} RCE via {method} "
+                             f"({line.get('evidence') or line.get('detail') or ''})")
+        elif line.get("vulnerable"):
+            notifier.success(f"exploit-all: {cve} vulnerable via {method} "
+                             f"({line.get('evidence') or line.get('detail') or ''})")
+        elif line.get("attempted"):
+            notifier.warn(f"exploit-all: {cve} via {method} - "
+                          f"{line.get('error') or line.get('detail') or 'negative'}")
+    already = bool(result.get("beacon_established")
+                   or getattr(agent, "result", {}).get("beacon_established"))
+    summary["beacon_after"] = already
+    # Audit trail: keep the sweep in the same result the report writer and
+    # caller read, even when it found nothing to execute.
+    try:
+        agent.result["exploit_all"] = summary
+    except Exception:
+        pass
+    if rce and not already:
+        notifier.info(
+            "exploit-all: RCE confirmed - re-planning the beacon through "
+            "the verified foothold (beacon_via_rce).")
+        try:
+            rerun = agent.run(goal="beacon", max_iterations=8,
+                              checkpoint_path=state_path or None)
+            summary["beacon_rerun"] = {
+                "goal_reached": bool((rerun or {}).get("goal_reached")),
+                "beacon_established": bool((rerun or {}).get("beacon_established")),
+                "beacon_id": (rerun or {}).get("beacon_id", ""),
+            }
+            summary["beacon_after"] = bool(
+                (rerun or {}).get("beacon_established"))
+            if summary["beacon_after"]:
+                # The rerun replaced agent.result; carry its beacon facts
+                # into the caller's envelope here so the copy is not left to
+                # a second, easy-to-forget loop.
+                for _key in ("beacon_established", "beacon_id",
+                             "beacon_count", "persistence_installed",
+                             "beacon_injected", "actions_taken"):
+                    if _key in agent.result:
+                        result[_key] = agent.result[_key]
+                # Recompute the ORIGINAL goal against the post-beacon
+                # WorldModel. Copying the rerun's goal_reached blindly would
+                # claim "deliver" complete on a beacon alone.
+                try:
+                    from phantom.automation.planner import GOAL_FACTS
+                    facts = GOAL_FACTS.get(goal, ())
+                    # Strict check, without the graceful-degradation
+                    # fallback: the beacon rerun sets its own fallback goal,
+                    # and that must not turn a partial "deliver" into a
+                    # completed one.
+                    result["goal_facts_missing"] = [
+                        f for f in facts if not agent.wm.has_any(f)]
+                    result["goal_reached"] = bool(
+                        facts and not result["goal_facts_missing"])
+                except Exception:
+                    pass
+                notifier.success(
+                    "exploit-all: beacon delivered through the verified RCE.")
+            else:
+                notifier.warn(
+                    "exploit-all: RCE confirmed but beacon delivery did not "
+                    "complete; the foothold remains recorded (no fake success).")
+        except Exception as exc:  # noqa: BLE001
+            notifier.warn(f"exploit-all: beacon re-plan failed: {exc}")
+            summary["beacon_rerun_error"] = str(exc)
+    # The rerun REPLACED agent.result, so write the sweep back again for the
+    # report writer after the re-plan (the pre-rerun copy is not enough).
+    try:
+        agent.result["exploit_all"] = summary
+    except Exception:
+        pass
+    return summary
+
+
 def _run_agent_campaign(targets, goal, profile, aggressive, paranoid, speed,
                         scope_list, agents, verbose=False,
                         on_event: Optional[Callable[[str, dict], None]] = None,
@@ -592,6 +707,7 @@ ensure_c2_listener = _ensure_c2_listener
 
 def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                   speed: bool = False, plan: bool = False, agents: int = 0,
+                  exploit_all: bool = False,
                   goal: str = "deliver", profile: str = "enterprise",
                   verbose: bool = False,
                   on_event: Optional[Callable[[str, dict], None]] = None,
@@ -627,6 +743,11 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
       stealth (paranoid)  max-OPSEC: slower cadence, skips loud tools
       aggressive          noisy + fast: online brute, loud tools, broad enum
       speed               opportunistic: exploit the first viable opening
+      exploit_all         after the normal run, execute every actionable
+                          CVE in the WorldModel (local PoC / Metasploit)
+                          and use a verified RCE to deliver the beacon;
+                          off by default, so complete_kill_chain semantics
+                          are unchanged
       plan                dry-run: print the planned chain, execute nothing
       verbose             stream the live reasoning trace (inferences,
                           hypotheses formed, confirmations/refutations)      agents              N sub-agents (0 = auto-decide)
@@ -819,6 +940,16 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
     engine, engine_note = _engine_for(goal, engine)
     if engine_note:
         notifier.warn(engine_note)
+    if exploit_all and engine == "swarm":
+        # The exploit sweep needs the agent's WorldModel and the post-run
+        # beacon re-plan; the swarm engine returns a different artifact.
+        # Route the explicit flag to the engine that can honor it. This is
+        # announced, never silent.
+        notifier.warn(
+            "--exploit-all executes on the agent path: switching engine "
+            "from swarm to agent for this run (the swarm already ran its "
+            "own task execution and has no post-run CVE sweep).")
+        engine = "agent"
     # the OSINT scope (--platform / the UI checkbox) is an AGENT-path input:
     # say so rather than let a swarm run look scoped when it is not.
     if social_platform and engine == "swarm":
@@ -843,6 +974,21 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
             identity_active=identity_active,
             evolution_mode=("proposal" if only_markdown else "code"),
             social_platform=social_platform)
+        exploit_summary = {}
+        if exploit_all and not plan:
+            exploit_summary = _exploit_all_after_run(
+                agent, goal, state_path, result)
+            if exploit_summary.get("beacon_after"):
+                # The rerun established a beacon through the verified RCE.
+                # Carry those facts into the envelope the rest of automode
+                # (outcome, handoff, report) already consumes.
+                for _key in ("beacon_established", "beacon_id",
+                             "beacon_count", "persistence_installed",
+                             "beacon_injected", "actions_taken"):
+                    if _key in agent.result:
+                        result[_key] = agent.result[_key]
+        if exploit_summary:
+            result["exploit_all"] = exploit_summary
         tdir, paths = _write_agent_reports(agent, profile, out_root, resolved[0])
         # auto-mode -> manual core: everything the agent learned is merged
         # into the session + manual WorldModel, so `map`, `suggest`,
@@ -884,6 +1030,22 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
         state_dir=out_root, experience=_experience_enabled(experience),
         evolution=evolution, identity_active=identity_active,
         stop_event=stop_event, social_platform=social_platform)
+    if exploit_all and not plan:
+        _all = campaign.setdefault("exploit_all", {})
+        for _t in resolved:
+            _agent = campaign.get("_agents", {}).get(_t)
+            if _agent is None:
+                continue
+            _summary = _exploit_all_after_run(
+                _agent, goal, "", campaign.get("results", {}).get(_t, {}))
+            _all[_t] = _summary
+            if _summary.get("beacon_after"):
+                _entry = campaign.setdefault("results", {}).setdefault(_t, {})
+                for _key in ("beacon_established", "beacon_id",
+                             "beacon_count", "persistence_installed",
+                             "beacon_injected", "actions_taken"):
+                    if _key in getattr(_agent, "result", {}):
+                        _entry[_key] = _agent.result[_key]
     elapsed = _fmt_elapsed(time.time() - started_wall)
     per_target = {}
     for t in resolved:

@@ -40,6 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stealth", action="store_true", help="paranoid OPSEC (auto-mode)")
     parser.add_argument("--aggressive", action="store_true", help="loud, fast exploitation (auto-mode)")
     parser.add_argument("--speed", action="store_true", help="exploit first viable opening (auto-mode)")
+    parser.add_argument("--exploit-all", dest="exploit_all", action="store_true",
+                        help="auto-mode: after the normal run, EXECUTE every "
+                             "actionable CVE the WorldModel holds (local PoC "
+                             "or Metasploit module), not just report it; a "
+                             "verified RCE is then used to deliver the beacon")
     parser.add_argument("--reason", default="", metavar="PROFILE",
                         choices=["", "balanced", "stealth_first",
                                  "evidence_first", "force_first"],
@@ -238,6 +243,7 @@ def main():
                 stealth=args.stealth,
                 speed=args.speed,
                 plan=args.plan,
+                exploit_all=args.exploit_all,
                 verbose=args.verbose,
                 agents=args.agents or 0,
                 goal=args.goal,
@@ -339,6 +345,7 @@ def build_service_command(args, targets) -> list:
     for flag, value in (("--aggressive", args.aggressive),
                         ("--stealth", args.stealth),
                         ("--speed", args.speed),
+                        ("--exploit-all", args.exploit_all),
                         ("--llm", args.llm),
                         ("--experience", args.experience),
                         ("--evolution", args.evolution),

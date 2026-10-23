@@ -105,6 +105,7 @@ class TestAutoModeFlagMatrix:
         ("--aggressive", "aggressive", True),
         ("--speed", "speed", True),
         ("--plan", "plan", True),
+        ("--exploit-all", "exploit_all", True),
         ("--verbose", "verbose", True),
         ("--force-network", "force_network", True),
         ("--reason evidence_first", "reason_profile", "evidence_first"),

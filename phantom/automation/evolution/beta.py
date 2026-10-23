@@ -17,20 +17,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 import sys
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from phantom.automation.evolution import gate as gate_mod
+from phantom.automation.evolution.publish import PINNED_REPO, _gh
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 BETA_DIR = PROJECT_ROOT / "data" / "evolution" / "beta"
-GH_API = "https://api.github.com"
 
 
 @dataclass
@@ -96,19 +94,25 @@ _PROMOTED_MARKER = "[x] reviewed-and-promoted"
 
 
 def fetch_open_evolution_prs() -> List[Dict]:
-    """Open PRs from the auto-evolution/* namespace of this repo."""
+    """Open auto-evolution PRs from the PINNED Phantom repository.
+
+    Uses the operator's local `gh` auth. There is no shared token and no
+    origin-redirect path: a clone whose origin is not Phantom refuses to
+    load machine-authored code from a different repository.
+    """
     repo = _remote_repo()
-    token = os.environ.get("PHANTOM_EVOLUTION_TOKEN", "").strip()
-    if not repo:
+    if repo.lower() != PINNED_REPO.lower():
         return []
-    url = (f"{GH_API}/repos/{repo}/pulls?state=open&per_page=30")
-    req = urllib.request.Request(
-        url, headers={"Accept": "application/vnd.github+json",
-                      **({"Authorization": f"token {token}"} if token else {})})
+    ok, out = _gh("api",
+                  f"repos/{PINNED_REPO}/pulls?state=open&per_page=30",
+                  timeout=30)
+    if not ok:
+        return []
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            prs = json.loads(r.read().decode("utf-8"))
-    except Exception:
+        prs = json.loads(out)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(prs, list):
         return []
     return [p for p in prs
             if str(p.get("head", {}).get("ref", "")).startswith(
@@ -119,13 +123,15 @@ def load_beta(advisor=None, emit=None) -> BetaResult:
     """Fetch, gate and register beta capabilities. Returns a summary the
     caller can emit into the run log."""
     res = BetaResult()
+    # Lab first: without a lab no machine-authored capability can be
+    # PROVEN, so there is no reason to fetch or check out anything.
+    if not gate_mod.lab_available():
+        _note(emit, "beta: lab unreachable \u2014 no beta capability can be "
+                    "proven; refusing to load any")
+        return res
     prs = fetch_open_evolution_prs()
     if not prs:
         _note(emit, "beta: no open auto-evolution PRs")
-        return res
-    if not gate_mod.lab_available():
-        _note(emit, "beta: lab unreachable — no beta capability can be "
-                    "proven; refusing to load any")
         return res
 
     BETA_DIR.mkdir(parents=True, exist_ok=True)
