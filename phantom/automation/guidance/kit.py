@@ -4096,6 +4096,76 @@ def _differential_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> 
     return findings
 
 
+def recon_ladder_capability():
+    """The bounded escalation rung, built ON DEMAND.
+
+    It is deliberately NOT in ``CAPABILITIES``: the planner would otherwise
+    treat a full-range sweep as just another recon move and could pick it
+    as the FIRST action (or an e2e test could execute it by accident). The
+    agent escalates to it explicitly, once, after top-ports found no
+    remote-access service.
+    """
+    return _mk("recon_ladder", "recon",
+               "Bounded escalation: preflight reachability, chunked "
+               "full-range TCP (8k slices, each with its own timeout), UDP "
+               "top ports, then a typed surface verdict with the "
+               "network→identity pivot. Stops early when the host drops two "
+               "consecutive chunks instead of scanning 65k ports for hours.",
+               [], ["service", "recon_verdict"], _ladder_engine,
+               _ladder_interp, exec_class="in_process_engine",
+               engine=_ladder_engine, opsec_cost=2.5, detection_risk=0.4,
+               stealth_level="active", timeout=600,
+               preconditions=[_has_network_host()], banner="recon ladder",
+               tools=["nmap"])
+
+
+def _ladder_engine(wm, slots):
+    """Bounded multi-rung recon: preflight, chunked TCP, UDP, verdict.
+
+    Runs at EXECUTION time only (in-process engine): the chain preview must
+    never fire a scan. The verdict is committed as a finding so the planner
+    can see that network escalation is exhausted and pivot to identity.
+    """
+    from phantom.automation.recon_ladder import run_ladder
+    target = _effective_target(wm)
+    if not target:
+        return "RECON_VERDICT: surface=unreachable pivot=identity " \
+               "reason=no_target"
+    result = run_ladder(target)
+    return "\n".join(result.markers())
+
+
+def _ladder_interp(output: str, wm, slots):
+    """Turn ladder markers into service/recon_verdict findings."""
+    findings: List[Finding] = []
+    for line in (output or "").splitlines():
+        if line.startswith("SERVICE: "):
+            kv = {k: v for k, v in (part.split("=", 1)
+                                    for part in line[9:].split() if "=" in part)}
+            port = str(kv.get("port", "")).strip()
+            if not port.isdigit():
+                continue
+            findings.append(Finding(
+                kind="service", key=f"tcp/{port}",
+                value={"port": port,
+                       "service": kv.get("service", "") or "unknown",
+                       "state": "open", "source": "recon_ladder"},
+                confidence=0.8, source="recon_ladder",
+                evidence=line, target=wm.target))
+        elif line.startswith("RECON_VERDICT: "):
+            kv = {k: v for k, v in (part.split("=", 1)
+                                    for part in line[15:].split() if "=" in part)}
+            findings.append(Finding(
+                kind="recon_verdict", key="recon",
+                value={"surface": kv.get("surface", "unknown"),
+                       "pivot": kv.get("pivot", "identity"),
+                       "open": kv.get("open", "-"),
+                       "reason": kv.get("reason", "")},
+                confidence=0.9, source="recon_ladder",
+                evidence=line, target=wm.target))
+    return findings
+
+
 CAPABILITIES = [
     _mk("fingerprint_services", "recon",
         "Deep protocol fingerprint: socket-level probes for 15+ protocols "
@@ -4120,6 +4190,8 @@ CAPABILITIES = [
         opsec_cost=2.0, detection_risk=0.35, stealth_level="active", timeout=240,
         preconditions=[_has_network_host()], banner="port scan",
         tools=["nmap", "masscan", "nc"]),
+
+
 
     # Origin discovery: the gate that keeps the chain off a provider's CDN.
     # IP/domain targets increasingly resolve to a reverse proxy, and

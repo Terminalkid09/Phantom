@@ -433,6 +433,50 @@ def cmd_social(shell, arg: str):
         Console().print(graph.render())
         return
 
+    if sub in ("find", "email-find", "email_find"):
+        # Candidate GENERATION first: the reset oracle is a yes/no, it cannot
+        # unmask c***@gmail.com. This turns identity facts into the few
+        # addresses worth testing, and asks nothing unless --verify is given.
+        from phantom.automation.social import email_candidates as ec
+        rest = parts[1:]
+
+        def _flag(name: str) -> str:
+            if name in rest:
+                index = rest.index(name)
+                if index + 1 < len(rest):
+                    return rest[index + 1]
+            return ""
+
+        domain = _flag("--domain")
+        handle = _flag("--handle")
+        name_tokens = [t for t in rest if not t.startswith("--")
+                       and t not in (domain, handle)]
+        full = " ".join(name_tokens).strip()
+        if not full and not handle:
+            notifier.error('Usage: social find "Mario Rossi" [--domain acme.it] '
+                           '[--handle mrossi] [--verify]')
+            return
+        first, _, last = full.partition(" ")
+        candidates = ec.top(ec.generate(first, last, handle, domain), 8)
+        Console().print(f"{len(candidates)} candidate(s) for "
+                        f"{full or handle}:")
+        for cand in candidates:
+            Console().print(f"  {cand.masked:<34} {cand.pattern:<12} "
+                            f"{cand.score:.2f}")
+        if "--verify" not in rest:
+            notifier.info("Nothing was asked. Add --verify to spend the reset "
+                          "oracle on the top 3 (per-service consent).")
+            return
+        if not _ask_to_enum("the top candidates",
+                            [c.masked for c in candidates[:3]]):
+            notifier.info("Nothing sent. The candidates above were NOT asked.")
+            return
+        for verified in ec.verify(candidates, confirm=_ask_per_service,
+                                  max_candidates=3):
+            Console().print(f"  {verified.candidate.masked:<34} "
+                            f"{verified.verdict}")
+        return
+
     if sub in ("emails", "email"):
         from phantom.automation.social import email_enum as ee
         address = next((p for p in parts[1:] if "@" in p), "")
@@ -462,7 +506,8 @@ def cmd_social(shell, arg: str):
 
     notifier.error("Unknown social subcommand: " + sub)
     notifier.info("Usage: social [graph [--json|--graphml FILE] [--run] | "
-                  "emails <address> [--reset-only]]")
+                  "find \"First Last\" [--domain D] [--handle H] "
+                  "[--verify] | emails <address> [--reset-only]]")
 
 
 def _ask_to_enum(address: str, services) -> bool:

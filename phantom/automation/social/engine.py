@@ -949,6 +949,18 @@ class SocialEngine:
                 lines.append(
                     f"WARNING: message likely DROPPED by the mail filter "
                     f"({rep.grade}, {rep.score}/100) - {rep.top_fix()}")
+            # HUMAN plausibility is the other half: a message can pass
+            # SPF/DMARC and still be reported on the first read. Report
+            # only (never blocks a send), with the exact tell and its fix.
+            from phantom.automation.social.pretext_score import score_pretext
+            pret = score_pretext(
+                rendered["subject"], rendered["body_text"], channel="email",
+                sender=rendered["from"], link=link.short_url)
+            lines.append(pret.marker())
+            if not pret.ready:
+                lines.append(
+                    f"WARNING: pretext reads fake ({pret.grade}, "
+                    f"{pret.value}/100) - {pret.top_fix()}")
             ok = mailer.send_email(
                 rendered["from"], recipient, rendered["subject"],
                 rendered["body_text"], html=rendered["body_html"],
@@ -1049,6 +1061,18 @@ class SocialEngine:
                         lines.append(
                             f"WARNING: {t} likely DROPPED by the mail filter "
                             f"({rep.grade}, {rep.score}/100) - {rep.top_fix()}")
+                    from phantom.automation.social.pretext_score import (
+                        score_pretext)
+                    pret = score_pretext(
+                        rendered["subject"], rendered["body_text"],
+                        channel="email", sender=rendered["from"],
+                        link=link.short_url)
+                    lines.append(pret.marker())
+                    if not pret.ready:
+                        lines.append(
+                            f"WARNING: pretext for {t} reads fake "
+                            f"({pret.grade}, {pret.value}/100) - "
+                            f"{pret.top_fix()}")
                     ok = mailer.send_email(
                         rendered["from"], t, rendered["subject"],
                         rendered["body_text"], html=rendered["body_html"],

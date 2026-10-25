@@ -260,6 +260,32 @@ def _r_recover(d: dict) -> List[str]:
             f"{d.get('detail') or 're-arming failed capabilities'}"]
 
 
+def _r_recon_preflight(d: dict) -> List[str]:
+    return [f"[recon] preflight {_tag(d)}"
+            f"reachable={int(bool(d.get('reachable')))} "
+            f"icmp={int(bool(d.get('icmp')))} "
+            f"tcp_open={d.get('tcp_open') or '-'}"]
+
+
+def _r_recon_chunk(d: dict) -> List[str]:
+    return [f"[recon] chunk {d.get('spec') or '?'}: "
+            f"{d.get('open', 0)} open, {d.get('filtered', 0)} filtered"]
+
+
+def _r_recon_udp(d: dict) -> List[str]:
+    return [f"[recon] udp: {d.get('open', 0)} open"]
+
+
+def _r_recon_stop(d: dict) -> List[str]:
+    return [f"[recon] stopped: {_clip(d.get('reason'))}"]
+
+
+def _r_recon_verdict(d: dict) -> List[str]:
+    return [f"[recon] verdict={d.get('verdict') or '?'} "
+            f"pivot={d.get('pivot') or '?'} {_tag(d)}"
+            f"{_clip(d.get('reason'))}"]
+
+
 def _r_halt(d: dict) -> List[str]:
     lines = [f"[!] {_tag(d)}{d.get('reason') or 'stopped'}"]
     # WHY the goal was unreachable: the planner's rejected candidates carry
@@ -732,6 +758,15 @@ EVENTS: Dict[str, EventSpec] = {
     "tool_missing": EventSpec("warn", _r_tool_missing, fields=("capability",)),
     "deferred": EventSpec("dim", _r_deferred, fields=("capability",)),
     "recover": EventSpec("warn", _r_recover),
+    # bounded recon ladder: per-rung progress plus the typed verdict, so a
+    # filtered endpoint is legible as a decision instead of a silent wait.
+    "recon_preflight": EventSpec("dim", _r_recon_preflight,
+                                 verbose_only=True),
+    "recon_chunk": EventSpec("dim", _r_recon_chunk, verbose_only=True),
+    "recon_udp": EventSpec("dim", _r_recon_udp, verbose_only=True),
+    "recon_stop": EventSpec("warn", _r_recon_stop),
+    "recon_verdict": EventSpec("warn", _r_recon_verdict,
+                               fields=("verdict", "pivot", "reason")),
     # `rejected`/`goal` are part of the payload, not just rendered text: the
     # UI needs the structured why (which capability, which fact, which
     # reason) to show a halt that is actionable instead of a dead end.

@@ -1305,7 +1305,7 @@ phantom/                        # repository root
 │   └── bt_scan.h               # Bluetooth scanning
 ├── electron/                   # React + Vite + TypeScript desktop app
 ├── data/                       # Sessions, cache, certs, wordlists
-├── tests/                      # 387 test files
+├── tests/                      # 394 test files
 ├── Dockerfile                  # Multi-stage Kali-based build
 ├── docker-compose.yml          # One-command deployment
 └── .env.example                # External API template

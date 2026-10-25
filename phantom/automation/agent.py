@@ -3284,21 +3284,48 @@ class AutonomousAgent:
         # with top-ports and would otherwise never see SSH-on-2222, making
         # beacon_deploy over SSH impossible.
         if goal in ("deliver", "beacon", "network_beacon",
-                    "complete_kill_chain", "post_exploit") \
+                    "complete_kill_chain", "post_exploit",
+                    # a footprint with zero open ports is not a footprint:
+                    # the hidden service lives outside the top-1000. The
+                    # ladder stops early on a dropper, so this is bounded.
+                    "footprint", "web") \
                 and not getattr(self, "_deep_scanned", False):
             access_ports = {"22", "2222", "22222", "3389", "5985", "5986", "445"}
             found_access = any(
                 f.kind == "service" and isinstance(f.value, dict)
                 and str(f.value.get("port", "")) in access_ports
                 for f in self.wm._findings.values())
-            if not found_access:
+            if not found_access and self.registry.get("scan_tcp") is not None:
+                # The registry is the authority on what this worker MAY do:
+                # when a swarm task banned `recon`, `scan_tcp` is absent and
+                # the escalation must stay out too (constructing the ladder
+                # directly would otherwise bypass the ban and turn a
+                # task-kind failure into an agent-kind one).
                 self._deep_scanned = True
-                cap = self.registry.get("scan_tcp")
+                # Prefer the bounded LADDER (chunked, early stop, typed
+                # verdict) over one unbounded `-p-`: on a host that DROPs
+                # probes the single sweep is measured at ~3h46m and leaves
+                # no partial evidence. Fall back to scan_tcp only when the
+                # ladder is unavailable (older caller registries).
+                cap = None
+                try:
+                    from phantom.automation.guidance.kit import (
+                        recon_ladder_capability)
+                    cap = recon_ladder_capability()
+                except Exception:
+                    cap = None
+                slots = {}
+                reason = ("no remote-access service in top ports — "
+                          "escalating to the bounded recon ladder")
+                if cap is None:
+                    cap = self.registry.get("scan_tcp")
+                    slots = {"port": "1-65535"}
+                    reason = ("no remote-access service in top ports — "
+                              "escalating to full-range scan")
                 if cap is not None:
                     from phantom.automation.planner import PlanStep
-                    step = PlanStep(capability=cap, slot_values={"port": "1-65535"},
-                                    reason="no remote-access service in top ports — "
-                                           "escalating to full-range scan")
+                    step = PlanStep(capability=cap, slot_values=slots,
+                                    reason=reason)
                     self._emit("recover", goal=goal, rearmed=0,
                                recovery=f"{self._recoveries}/{self._max_recoveries}",
                                detail="no remote-access service found — escalating "

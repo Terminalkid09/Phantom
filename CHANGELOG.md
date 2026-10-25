@@ -6,6 +6,40 @@ All notable changes to Phantom.
 
 ## [Unreleased] — current development (v3.0.0 line)
 
+### Bounded recon escalation and campaign quality — 2026-10-25
+
+- **A filtered host no longer costs hours.** The single `-p 1-65535`
+  escalation is replaced by `recon_ladder`: a preflight (ICMP + 22/80/443),
+  chunked TCP (8k slices, each with its own timeout), UDP top ports, and a
+  typed `open|filtered|partial|unreachable` verdict with the
+  network→identity pivot. Two consecutive all-filtered chunks stop the rung.
+  Live: `.18` returned `unreachable` in **8.0 s** (previously a ~3h46m sweep),
+  and a full localhost range returned 14 open ports in 55 s.
+- **The agent now escalates through the ladder.** The beacon-bound
+  full-range step prefers the `recon_ladder` capability and only falls back
+  to `scan_tcp` when a caller registry lacks it; the verdict is committed as
+  a finding, so the run can stop re-arming a blind scan.
+- **The contact rule is pinned as an invariant.** Only `CONTACT_NONE` work
+  (OSINT, payload authoring, candidate reasoning) fans out; scan and exploit
+  keep one acting lead plus at most one advisory, even if a caller raises
+  `max_agents` (`tests/test_contact_policy_invariant.py`).
+- **Private profiles get a way back.** `email_candidates.py` generates and
+  ranks plausible addresses from name/handle/employer/breach facts and spends
+  the consent-gated reset oracle on the top few (masked output only);
+  `image_reverse.py` builds reverse-image queries and requires two
+  independent avatar signals before a `confirmed` match.
+- **DMs are a sequence, not a spray.** `dm_flow.py` encodes
+  opener→rapport→pretext→link with a minimum exchange count, suspicion
+  accumulation, hostile stop, and operator handoff on a proof request.
+- **Phishing is scored for humans too.** `pretext_score.py` names the tells
+  that get a message reported (credential request, urgency, generic greeting,
+  brand/link mismatch) and is now emitted next to the deliverability marker
+  in the email and campaign paths; `domain_readiness.py` scores SPF/DKIM/DMARC
+  from the records before any send.
+- **Not in this cycle:** the per-phase LLM layer (exploit/finding advisor).
+  It needs its own training and evaluation cycle, so it stays out of this
+  change deliberately.
+
 ### Access planning, payload catalog and generic CVE intake — 2026-10-25
 
 - **`run` and `--exploit-all` execute the best access path, not every CVE.**
