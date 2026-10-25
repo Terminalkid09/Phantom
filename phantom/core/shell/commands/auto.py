@@ -80,6 +80,11 @@ def cmd_auto(shell, arg: str):
                     hypotheses only (never executes); requires
                     PHANTOM_LLM_MODEL=<path-to-gguf> — try a Qwen2.5
                     Instruct GGUF, swap the file to scale reasoning
+      --evolution   self-improvement (requires --llm): a stable
+                    uncovered failure authors a new capability and
+                    opens a reviewable draft PR (max 2/day)
+      --beta        fetch open auto-evolution PRs, gate them locally
+                    and use the ones that pass (working tree untouched)
       --resume <cp> resume an interrupted run from its auto-mode
                     checkpoint (extract from a .pm with import-session)
 
@@ -114,9 +119,13 @@ def cmd_auto(shell, arg: str):
     parser.add_argument("--speed", action="store_true", default=False)
     parser.add_argument("--exploit-all", dest="exploit_all",
                         action="store_true", default=False,
-                        help="after the normal run, execute every actionable "
-                             "CVE (local PoC / Metasploit) and deliver the "
+                        help="after the normal run, consider every CVE/web/"
+                             "service access candidate but execute only the "
+                             "best path (plus one fallback) and deliver the "
                              "beacon through a verified RCE")
+    parser.add_argument("--exhaustive", action="store_true", default=False,
+                        help="LAB/DEBUG only: try every actionable access "
+                             "candidate instead of the best path")
     parser.add_argument("--reason", default="", metavar="PROFILE",
                         choices=["", "balanced", "stealth_first",
                                  "evidence_first", "force_first"],
@@ -178,6 +187,17 @@ def cmd_auto(shell, arg: str):
                         help="optional local-LLM advisor (requires "
                              "PHANTOM_LLM_MODEL=<path-to-gguf>): non-gating "
                              "hypothesis suggestions, never executes anything")
+    parser.add_argument("--evolution", action="store_true", default=False,
+                        help="SELF-IMPROVEMENT (requires --llm): stable "
+                             "uncovered failure patterns spawn a background "
+                             "sub-agent that authors a new capability and "
+                             "opens a reviewable draft PR (lab required; "
+                             "max 2 PRs/day)")
+    parser.add_argument("--beta", action="store_true", default=False,
+                        help="BETA CAPABILITIES: fetch open auto-evolution "
+                             "PRs, gate them locally and use the ones that "
+                             "pass (same full gate, lab included; working "
+                             "tree untouched)")
     parser.add_argument("--experience", dest="experience",
                         action="store_true", default=None,
                         help="cross-engagement LEARNING memory (default: "
@@ -402,6 +422,7 @@ def cmd_auto(shell, arg: str):
         speed=args.speed,
         plan=args.plan,
         exploit_all=args.exploit_all,
+        exhaustive=args.exhaustive,
         verbose=args.verbose,
         agents=args.agents or 0,
         goal=args.goal,
@@ -417,6 +438,8 @@ def cmd_auto(shell, arg: str):
                      if s.strip()],
         only_markdown=args.only_markdown,
         force_network=args.force_network,
+        evolution=args.evolution,
+        beta=args.beta,
         experience=args.experience,
         social_platform=args.platform,
     )

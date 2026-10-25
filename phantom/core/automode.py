@@ -290,20 +290,28 @@ def _run_agent_single(target, goal, profile, aggressive, paranoid, speed,
 
 
 def _exploit_all_after_run(agent, goal: str, state_path: str,
-                           result: Dict) -> Dict:
-    """Execute every actionable finding in the finished agent's WorldModel.
+                           result: Dict, *, stealth: bool = False,
+                           aggressive: bool = False, speed: bool = False,
+                           exhaustive: bool = False) -> Dict:
+    """Execute the best access path from the finished agent's WorldModel.
 
-    This is deliberately OUTSIDE the normal planner loop: ``--exploit-all``
-    is an explicit operator decision, not a change to the default
-    ``complete_kill_chain`` contract. A verified RCE is then fed back into
-    the planner with a short ``beacon`` goal, so the beacon is preferred over
-    stopping at "vulnerable".
+    ``--exploit-all`` means "consider every candidate", not "fire every
+    exploit".  The sweep ranks CVEs, confirmed web anomalies, credentials and
+    exposed services with the active posture and executes the best path plus
+    one bounded fallback.  ``exhaustive`` is the explicit lab/debug override.
+    This is deliberately OUTSIDE the normal planner loop: the default
+    ``complete_kill_chain`` contract is unchanged.  A verified RCE is then
+    fed back into the planner with a short ``beacon`` goal; a non-CVE access
+    success is reported without pretending a beacon is required.
     """
+    from phantom.automation.exploit.access import resolve_mode
     from phantom.automation.exploit.sweep import exploit_worldmodel
+    mode = resolve_mode(stealth=stealth, aggressive=aggressive, speed=speed)
     summary: Dict = {}
     try:
-        summary = exploit_worldmodel(agent.wm, allow_msf=True,
-                                     prefer_beacon=True)
+        summary = exploit_worldmodel(
+            agent.wm, allow_msf=True, prefer_beacon=True, mode=mode,
+            exhaustive=exhaustive)
     except Exception as exc:  # noqa: BLE001 - never lose the main run
         notifier.warn(f"exploit-all: sweep failed: {exc}")
         return {"error": str(exc), "beacon_after": False}
@@ -726,7 +734,8 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
                    engine: str = "agent",
                    force_network: bool = False,
                    force_profile: bool = False,
-                   social_platform: str = "") -> None:
+                   social_platform: str = "",
+                   exhaustive: bool = False) -> None:
     """Autonomous kill chain (planner agent) — the `auto` entry point.
 
     Classifies each target (ip/domain/url/email/username/phone) and drives
@@ -977,7 +986,8 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
         exploit_summary = {}
         if exploit_all and not plan:
             exploit_summary = _exploit_all_after_run(
-                agent, goal, state_path, result)
+                agent, goal, state_path, result, stealth=stealth,
+                aggressive=aggressive, speed=speed, exhaustive=exhaustive)
             if exploit_summary.get("beacon_after"):
                 # The rerun established a beacon through the verified RCE.
                 # Carry those facts into the envelope the rest of automode
@@ -1037,7 +1047,9 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
             if _agent is None:
                 continue
             _summary = _exploit_all_after_run(
-                _agent, goal, "", campaign.get("results", {}).get(_t, {}))
+                _agent, goal, "", campaign.get("results", {}).get(_t, {}),
+                stealth=stealth, aggressive=aggressive, speed=speed,
+                exhaustive=exhaustive)
             _all[_t] = _summary
             if _summary.get("beacon_after"):
                 _entry = campaign.setdefault("results", {}).setdefault(_t, {})

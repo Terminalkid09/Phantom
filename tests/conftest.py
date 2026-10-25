@@ -139,6 +139,27 @@ def _isolate_sessions_dir(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_pack_registry(tmp_path, monkeypatch):
+    """Keep learned CVE packs out of the operator's real data dir.
+
+    ``intake`` persists every resolved weapon and every verdict to
+    ``data/exploit_packs.json``. Without this, a unit test that exercises
+    ``attempt_cve`` would teach the operator's production ranking, and a
+    real engagement's pack could leak into an unrelated test.
+    """
+    monkeypatch.setenv("PHANTOM_PACKS_PATH",
+                       str(tmp_path / "exploit_packs.json"))
+    try:
+        from phantom.automation.exploit import intake
+        intake.reset_cache()
+    except Exception:  # pragma: no cover - import guard for isolated runs
+        yield
+        return
+    yield
+    intake.reset_cache()
+
+
+@pytest.fixture(autouse=True)
 def _stop_leaked_servers():
     """Tear down any server a test left running (best-effort, never fails)."""
     # snapshot the config module's cached state so a test that repoints

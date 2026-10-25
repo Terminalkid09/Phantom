@@ -6,6 +6,47 @@ All notable changes to Phantom.
 
 ## [Unreleased] — current development (v3.0.0 line)
 
+### Access planning, payload catalog and generic CVE intake — 2026-10-25
+
+- **`run` and `--exploit-all` execute the best access path, not every CVE.**
+  The new `access.py` ranks every CVE, confirmed web anomaly, credential,
+  foothold and exposed service with mode-specific weights; the sweep runs the
+  best path plus one bounded fallback. `--exhaustive` is the explicit lab-only
+  mode that tries every candidate. A plan is still never a compromise.
+- **Non-CVE access is first-class.** Redis, memcached, Docker, Kubernetes,
+  Elasticsearch, FTP, SMB, NFS, SNMP, LDAP, rsync and VNC are probed with
+  read-only checks; only a positive marker becomes `access_foothold`.
+  Memcached stays `info` (a `stats` answer is not file read) and VNC is
+  visible but not actionable (no credential test exists yet).
+- **Payload catalog replaces the beacon-only goal.** One-shot commands,
+  reverse shells, webshells, in-memory stagers, MSF sessions, SOCKS pivots,
+  credential reads and the beacon are scored by access, mode and platform;
+  rendered commands use the real target, callback host/port and MSF payload,
+  and never leave an unresolved placeholder.
+- **A new CVE can be weaponized without a Phantom update.** `intake.py`
+  resolves a weapon from the curated registry, the local PoC library, the
+  ExploitDB MSF module index or a live `msfconsole search cve:<id>`, and keeps
+  `candidate`/`verified`/`deprecated` packs. Positive evidence promotes a
+  pack; three negative attempts retire it; no per-CVE branch is hardcoded and
+  no arbitrary downloaded PoC is executed.
+- **Windows MSF discovery works again.** `search_module_for_cve` now falls
+  back to the Kali WSL wrapper instead of returning `None` when native
+  `msfconsole` is absent; verified live (`CVE-2021-41773` →
+  `exploit/multi/http/apache_normalize_path_rce`).
+- **The same path handles an arbitrary new CVE.** Live, with no Phantom
+  change and no pack entry: `CVE-2024-3400` →
+  `exploit/linux/http/panos_telemetry_cmd_exec`, `CVE-2024-1709` →
+  `exploit/multi/http/connectwise_screenconnect_rce_cve_2024_1709`.
+- **The `auto` shell exposes the self-improvement flags.** `auto <target>
+  --llm --evolution` and `--beta` now reach `run_auto_mode` exactly like the
+  `phantom --auto` entry point (previously only the entry point accepted
+  them).
+- **Evolution commits carry no AI attribution.** The authoring loop commits a
+  neutral message; the PR stays a reviewable draft and is never self-merged.
+- **Live `.18`:** top-100 `-Pn -sT` scan found 100/100 filtered ports; the
+  access planner produced 0 candidates, 0 attempts and no false compromise.
+  Full suite: **5720 passed, 5 skipped, 0 failed** (`python -m pytest -q`).
+
 ### Remediation validation — 2026-10-21
 
 - **Full-range scan was bounded, not abandoned.** Stealth keeps `-T2` but adds

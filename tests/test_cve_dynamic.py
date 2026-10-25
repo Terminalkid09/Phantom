@@ -131,8 +131,31 @@ class TestMsfSearchParsing(unittest.TestCase):
     def test_missing_msf_returns_none(self):
         from phantom.automation.runtime.toolrunner import ToolMissingError
         with patch.object(msf_mod, "_require_tool",
-                          side_effect=ToolMissingError("nope")):
+                          side_effect=ToolMissingError("nope")), \
+                patch("phantom.automation.runtime.toolchain._wsl_which",
+                      return_value=None):
             self.assertIsNone(msf_mod.search_module_for_cve("CVE-2024-23897"))
+
+    def test_windows_uses_the_kali_wsl_wrapper(self):
+        from types import SimpleNamespace
+        from phantom.automation.runtime.toolrunner import ToolMissingError
+        fake = SimpleNamespace(
+            returncode=0,
+            stdout=("Matching Modules\n"
+                    "   0  exploit/multi/http/apache_normalize_path_rce  "
+                    "2021-05-10  excellent  Yes  Apache\n"),
+            stderr="")
+        with patch.object(msf_mod, "_require_tool",
+                          side_effect=ToolMissingError("nope")), \
+                patch("phantom.automation.runtime.toolchain._wsl_which",
+                      return_value="wsl -d kali-linux -- msfconsole"), \
+                patch.object(msf_mod.subprocess, "run",
+                             return_value=fake) as run:
+            mod = msf_mod.search_module_for_cve("CVE-2021-41773", timeout=5)
+        self.assertEqual(mod, "exploit/multi/http/apache_normalize_path_rce")
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:4], ["wsl", "-d", "kali-linux", "--"])
+        self.assertIn("-x", argv)
 
 
 if __name__ == "__main__":

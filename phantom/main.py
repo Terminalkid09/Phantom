@@ -41,10 +41,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--aggressive", action="store_true", help="loud, fast exploitation (auto-mode)")
     parser.add_argument("--speed", action="store_true", help="exploit first viable opening (auto-mode)")
     parser.add_argument("--exploit-all", dest="exploit_all", action="store_true",
-                        help="auto-mode: after the normal run, EXECUTE every "
-                             "actionable CVE the WorldModel holds (local PoC "
-                             "or Metasploit module), not just report it; a "
-                             "verified RCE is then used to deliver the beacon")
+                        help="auto-mode: after the normal run, consider every "
+                             "CVE/web/service access candidate but EXECUTE only "
+                             "the best path (plus one fallback); a verified RCE "
+                             "is then used to deliver the beacon")
+    parser.add_argument("--exhaustive", action="store_true",
+                        help="auto-mode LAB/DEBUG only: try every actionable "
+                             "access candidate instead of the best path; noisy "
+                             "and not for real engagements")
     parser.add_argument("--reason", default="", metavar="PROFILE",
                         choices=["", "balanced", "stealth_first",
                                  "evidence_first", "force_first"],
@@ -259,6 +263,7 @@ def main():
                 cell_stages=[s.strip() for s in args.cell_stages.split(",")
                              if s.strip()],
                 only_markdown=args.only_markdown,
+                exhaustive=args.exhaustive,
             )
 
         if args.supervise:

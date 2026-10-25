@@ -118,6 +118,42 @@ class TestPrSlotAccounting(unittest.TestCase):
         self.assertIn("budget", res.detail)
         self.assertEqual(st.calls, ["reserve"])
 
+    def test_authored_commit_has_no_ai_attribution(self):
+        st = _SpyState()
+        proj = Path(tempfile.mkdtemp())
+        worktree = Path(tempfile.mkdtemp())
+        (proj / "CHANGELOG.md").write_text("x", encoding="utf-8")
+        messages = []
+        try:
+            with mock.patch.object(publish_mod, "PROJECT_ROOT", proj), \
+                    mock.patch.object(publish_mod, "_wt_dir",
+                                      lambda pid: worktree):
+                def fake_git(*args):
+                    if args[:2] == ("remote", "get-url"):
+                        return True, ("https://github.com/"
+                                      "Terminalkid09/Phantom.git")
+                    if "commit" in args:
+                        messages.append(" ".join(str(a) for a in args))
+                    return True, str(worktree)
+
+                def fake_gh(*args, **kwargs):
+                    if args[:2] == ("auth", "status"):
+                        return False, "no local auth"
+                    return False, "unexpected"
+
+                publish("20260101-cc", _AuthorResult(), st,
+                        run_git=fake_git, run_gh=fake_gh)
+        finally:
+            shutil.rmtree(proj, ignore_errors=True)
+            shutil.rmtree(worktree, ignore_errors=True)
+        self.assertTrue(messages)
+        for message in messages:
+            low = message.lower()
+            self.assertNotIn("co-authored", low)
+            self.assertNotIn("authored by", low)
+            self.assertNotIn("generated with", low)
+            self.assertNotIn(" ai ", low)
+
 
 class TestPinnedLocalAuth(unittest.TestCase):
 

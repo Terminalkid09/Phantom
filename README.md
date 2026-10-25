@@ -519,7 +519,8 @@ always exists and an existing flag is always documented.
 | `--c2` | open the C2 shell (`phantom.c2`) |
 | `--profile NAME` | load an engagement profile at startup |
 | `--stealth` / `--aggressive` / `--speed` | OPSEC posture: paranoid, loud+fast, first-viable-opening |
-| `--exploit-all` | After the normal run, execute every actionable CVE in the WorldModel (local PoC or Metasploit) and deliver the beacon through a verified RCE; off by default |
+| `--exploit-all` | After the normal run, consider every CVE/web/service access candidate but execute only the best path plus one bounded fallback; a verified RCE may then deliver the beacon; off by default |
+| `--exhaustive` | LAB/DEBUG only: try every actionable access candidate instead of the best path; noisy, never for a real engagement |
 | `--reason PROFILE` | reasoning objective: `balanced`, `stealth_first`, `evidence_first`, `force_first` |
 | `--identity-active` | dedicated consent for ACTIVE identity probes (reset enumeration, SMTP verify) |
 | `--goal GOAL` | terminal goal (default `deliver`) |
@@ -1304,7 +1305,7 @@ phantom/                        # repository root
 │   └── bt_scan.h               # Bluetooth scanning
 ├── electron/                   # React + Vite + TypeScript desktop app
 ├── data/                       # Sessions, cache, certs, wordlists
-├── tests/                      # 383 test files
+├── tests/                      # 387 test files
 ├── Dockerfile                  # Multi-stage Kali-based build
 ├── docker-compose.yml          # One-command deployment
 └── .env.example                # External API template

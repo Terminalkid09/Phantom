@@ -10,6 +10,8 @@ presence is checked lazily so the rest of Phantom works without MSF.
 from __future__ import annotations
 
 import os
+import shlex
+import subprocess
 import tempfile
 from typing import Optional
 
@@ -119,6 +121,45 @@ class MsfRunner:
 _RANK_ORDER = {"excellent": 5, "great": 4, "good": 3, "normal": 2, "manual": 1}
 
 
+def _msf_search_output(cve_id: str, timeout: float) -> Optional[str]:
+    """Run `msfconsole search cve:<id>` natively or through Kali WSL.
+
+    On Windows msfconsole lives inside WSL, so the native-only
+    ``_require_tool`` check used to make the whole dynamic CVE path silently
+    return None. The WSL wrapper is spawned as an argv list (no shell-level
+    quote guessing) and the output is parsed by the same table reader.
+    """
+    script = "search cve:%s; exit -y" % cve_id
+    try:
+        msfconsole = _require_tool(["msfconsole"])
+    except ToolMissingError:
+        msfconsole = ""
+    if msfconsole:
+        try:
+            proc = tool_runner.spawn(f"{msfconsole} -q -x {script!r}")
+            proc.wait(timeout=timeout)
+            return proc.stdout or ""
+        except Exception:
+            return None
+    try:
+        from phantom.automation.runtime.toolchain import _wsl_which
+        wrapper = _wsl_which("msfconsole")
+    except Exception:
+        wrapper = None
+    if not wrapper:
+        return None
+    try:
+        argv = shlex.split(wrapper) + ["-q", "-x", script]
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace")
+        if proc.returncode != 0:
+            return None
+        return (proc.stdout or "") + (proc.stderr or "")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def search_module_for_cve(cve_id: str, timeout: float = 45.0) -> Optional[str]:
     """Dynamically discover the Metasploit module for a CVE id.
 
@@ -136,16 +177,8 @@ def search_module_for_cve(cve_id: str, timeout: float = 45.0) -> Optional[str]:
     cve_id = (cve_id or "").strip().upper()
     if not cve_id.startswith("CVE-"):
         return None
-    try:
-        msfconsole = _require_tool(["msfconsole"])
-    except ToolMissingError:
-        return None
-    script = "search cve:%s; exit -y" % cve_id
-    try:
-        proc = tool_runner.spawn(f"{msfconsole} -q -x {script!r}")
-        proc.wait(timeout=timeout)
-        output = proc.stdout or ""
-    except Exception:
+    output = _msf_search_output(cve_id, timeout)
+    if not output:
         return None
     candidates = []
     for line in (output or "").splitlines():

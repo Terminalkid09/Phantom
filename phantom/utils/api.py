@@ -9,6 +9,7 @@ api.py – Wrappers for free external APIs:
 import requests
 import subprocess
 import json
+import re
 import time
 import copy
 import os
@@ -157,13 +158,132 @@ def _nvd_request(params: dict) -> requests.Response:
     return with_backoff(_call)()
 
 
-def _parse_nvd_response(data: dict) -> List[Dict[str, Any]]:
+# Vendor/product hints for NVD's CPE index. Keyword search is noisy: asking
+# for "Apache httpd 2.4.49" can return zero rows, while a product-level CPE
+# match returns the affected CVEs and lets us do the version test ourselves.
+_CPE_HINTS: Dict[str, tuple] = {
+    "apache": ("apache", "http_server"),
+    "apache httpd": ("apache", "http_server"),
+    "httpd": ("apache", "http_server"),
+    "apache tomcat": ("apache", "tomcat"),
+    "tomcat": ("apache", "tomcat"),
+    "openssh": ("openbsd", "openssh"),
+    "openssl": ("openssl", "openssl"),
+    "php": ("php", "php"),
+    "nginx": ("nginx", "nginx"),
+    "microsoft iis": ("microsoft", "internet_information_services"),
+    "iis": ("microsoft", "internet_information_services"),
+    "mysql": ("oracle", "mysql"),
+    "mariadb": ("mariadb", "mariadb"),
+    "postgresql": ("postgresql", "postgresql"),
+    "redis": ("redis", "redis"),
+    "mongodb": ("mongodb", "mongodb"),
+    "elasticsearch": ("elastic", "elasticsearch"),
+    "gitlab": ("gitlab", "gitlab"),
+    "confluence": ("atlassian", "confluence"),
+    "struts2": ("apache", "struts"),
+    "log4j": ("apache", "log4j"),
+    "spring": ("vmware", "spring_framework"),
+    "vcenter": ("vmware", "vcenter_server"),
+    "fortios": ("fortinet", "fortios"),
+    "cisco asa": ("cisco", "adaptive_security_appliance_software"),
+    "citrix": ("citrix", "application_delivery_controller"),
+    "exchange": ("microsoft", "exchange_server"),
+    "sharepoint": ("microsoft", "sharepoint_server"),
+}
+
+
+def _version_tuple(text: str) -> tuple:
+    parts = []
+    for chunk in str(text or "").replace("-", ".").split("."):
+        match = re.match(r"\d+", chunk)
+        if not match:
+            break
+        parts.append(int(match.group(0)))
+    return tuple(parts)
+
+
+def _cpe_version_matches(criteria: str, version: str) -> Optional[bool]:
+    """Whether one CPE match includes ``version``.
+
+    Returns ``None`` when the CPE has no concrete version and no range (the
+    caller can then keep the advisory but must not call it exact).
+    """
+    if not version:
+        return None
+    parts = str(criteria or "").split(":")
+    cpe_version = parts[5] if len(parts) > 5 else "*"
+    wanted = _version_tuple(version)
+    if not wanted:
+        return None
+    if cpe_version not in ("*", "-", ""):
+        got = _version_tuple(cpe_version)
+        # A CPE version is usually exact; accept a prefix relationship for
+        # callers that pass "2.4" instead of the full banner version.
+        if got and (got == wanted or wanted[:len(got)] == got
+                    or got[:len(wanted)] == wanted):
+            return True
+        return False
+    return None
+
+
+def _cpe_match_includes(match: dict, version: str) -> Optional[bool]:
+    criteria = str(match.get("criteria") or "")
+    exact = _cpe_version_matches(criteria, version)
+    if exact is not None:
+        return exact
+    wanted = _version_tuple(version)
+    if not wanted:
+        return None
+    starts = [
+        ("versionStartIncluding", True), ("versionStartExcluding", False),
+    ]
+    ends = [
+        ("versionEndIncluding", True), ("versionEndExcluding", False),
+    ]
+    checked = False
+    for field, inclusive in starts:
+        if match.get(field):
+            checked = True
+            bound = _version_tuple(str(match[field]))
+            if bound and (wanted < bound or (wanted == bound and not inclusive)):
+                return False
+    for field, inclusive in ends:
+        if match.get(field):
+            checked = True
+            bound = _version_tuple(str(match[field]))
+            if bound and (wanted > bound or (wanted == bound and not inclusive)):
+                return False
+    return True if checked else None
+
+
+def _nvd_version_evidence(cve: dict, version: str) -> tuple[bool, bool]:
+    """Return (has_version_evidence, version_matches) for one NVD CVE."""
+    if not version:
+        return False, False
+    seen = False
+    matched = False
+    for config in cve.get("configurations", []) or []:
+        for node in config.get("nodes", []) or []:
+            for match in node.get("cpeMatch", []) or []:
+                if not match.get("vulnerable", True):
+                    continue
+                seen = True
+                result = _cpe_match_includes(match, version)
+                if result:
+                    matched = True
+    return seen, matched
+
+
+def _parse_nvd_response(data: dict, version: str = "") -> List[Dict[str, Any]]:
     results = []
     for vuln in data.get("vulnerabilities", []):
         cve = vuln.get("cve", {})
         metrics = cve.get("metrics", {})
         cvss = 0.0
-        if "cvssMetricV31" in metrics:
+        if "cvssMetricV40" in metrics:
+            cvss = metrics["cvssMetricV40"][0]["cvssData"]["baseScore"]
+        elif "cvssMetricV31" in metrics:
             cvss = metrics["cvssMetricV31"][0]["cvssData"]["baseScore"]
         elif "cvssMetricV2" in metrics:
             cvss = metrics["cvssMetricV2"][0]["cvssData"]["baseScore"]
@@ -172,6 +292,7 @@ def _parse_nvd_response(data: dict) -> List[Dict[str, Any]]:
         desc_lower = desc.lower()
         requires_auth = any(k in desc_lower for k in ("authentication required", "requires auth", "privileged"))
         local_only = any(k in desc_lower for k in ("local ", "locally ", "adjacent"))
+        has_evidence, version_match = _nvd_version_evidence(cve, version)
 
         results.append({
             "id": cve.get("id"),
@@ -181,39 +302,80 @@ def _parse_nvd_response(data: dict) -> List[Dict[str, Any]]:
             "requires_auth": requires_auth,
             "local_only": local_only,
             "recent": False,
-            "exact_match": True,
+            "exact_match": bool(version_match),
+            "version_match": bool(version_match),
+            "has_version_evidence": bool(has_evidence),
         })
     return results
 
 
+def _nvd_cpe_hint(software: str) -> Optional[str]:
+    key = str(software or "").strip().lower()
+    hint = _CPE_HINTS.get(key)
+    if hint is None:
+        # "Apache httpd 2.4" or "PHP 8.4.26" -> longest known prefix.
+        for name, pair in sorted(_CPE_HINTS.items(), key=lambda x: -len(x[0])):
+            if key.startswith(name):
+                hint = pair
+                break
+    if hint is None:
+        return None
+    return f"cpe:2.3:a:{hint[0]}:{hint[1]}"
+
+
+def _filter_version_matches(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop non-matching versions only when NVD gave us version evidence."""
+    evidence = [r for r in results if r.get("has_version_evidence")]
+    if not evidence:
+        return results
+    return [r for r in results if r.get("version_match")]
+
+
 @retry_api(retries=2, backoff=6, return_on_fail=[])
 def nvd_lookup(software: str, version: str = "", max_results: int = 20) -> List[Dict[str, Any]]:
-    """
-    Query NVD for CVEs matching software name and optional version.
-    Results are cached for 24 hours.
+    """Query NVD for CVEs matching a product and optional version.
+
+    Preferred path: a product-level CPE query, which is precise and avoids
+    the "Apache httpd 2.4.49" keyword dead end.  Fallback: the legacy
+    keyword search (still useful for products without a CPE hint).  Results
+    are cached for 24 hours and carry an honest ``exact_match`` flag.
     """
     query = f"{software} {version}".strip()
     if not query:
         return []
 
     _load_cache()
-    key = _cache_key(software, version)
+    cache_salt = "cpe" if _nvd_cpe_hint(software) else "kw"
+    key = _cache_key(f"{cache_salt}:{software}", version)
     entry = _cache.get(key)
     now = time.time()
     if entry and (now - entry.get("ts", 0)) < CVE_CACHE_TTL:
         return entry.get("data", [])[:max_results]
 
-    params = {"keywordSearch": query, "resultsPerPage": max_results}
-    resp = _nvd_request(params)
-    if resp is None:
-        return entry.get("data", [])[:max_results] if entry else []
+    results: List[Dict[str, Any]] = []
+    cpe_answered = False
+    cpe = _nvd_cpe_hint(software)
+    if cpe:
+        params = {"virtualMatchString": cpe, "resultsPerPage": max_results}
+        resp = _nvd_request(params)
+        if resp is not None:
+            data = resp.json()
+            parsed = _parse_nvd_response(data, version)
+            if parsed:
+                cpe_answered = True
+                results = _filter_version_matches(parsed)
 
-    data = resp.json()
-    results = _parse_nvd_response(data)
+    if not results and not cpe_answered:
+        params = {"keywordSearch": query, "resultsPerPage": max_results}
+        resp = _nvd_request(params)
+        if resp is not None:
+            results = _parse_nvd_response(resp.json(), version)
+            # A keyword hit without CPE evidence is a lead, not an exact
+            # version match. The flag is already false in that case.
 
     _cache[key] = {"ts": now, "data": results}
     _save_cache()
-    return results
+    return results[:max_results]
 
 
 def crtsh_lookup(domain: str) -> List[str]:
@@ -267,7 +429,7 @@ def shodan_lookup(ip: str, api_key: str = "") -> Dict[str, Any]:
 
 
 def exploitdb_lookup(cve_id: str) -> bool:
-    """Check if there is a public exploit for the given CVE using local searchsploit."""
+    """Check for a public exploit through native searchsploit or Kali WSL."""
     try:
         result = subprocess.run(
             ["searchsploit", "--cve", cve_id, "--json"],
@@ -279,6 +441,13 @@ def exploitdb_lookup(cve_id: str) -> bool:
             data = json.loads(result.stdout)
             exploits = data.get("RESULTS_EXPLOIT", [])
             return len(exploits) > 0
+        return False
+    except FileNotFoundError:
+        try:
+            from phantom.utils import exploitdb
+            return bool(exploitdb.by_cve(cve_id))
+        except Exception:
+            return False
     except Exception as e:
         console.print(f"[yellow]ExploitDB search error: {e}[/]")
     return False

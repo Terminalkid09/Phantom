@@ -94,8 +94,7 @@ def publish(pid: str, author_result, state,
         ok, out = git("-C", str(_wt_dir(pid)), "add", "-A")
         ok, out = git("-C", str(_wt_dir(pid)), "commit",
                       "-m", f"learned capability: {pid}",
-                      "-m", f"Authored by the phantom evolution loop "
-                            f"(proposal {pid}). Reviewed via PR; "
+                      "-m", f"Proposal {pid}. Reviewed via PR; "
                             "never self-merged.")
         if not ok:
             return PublishResult(False, f"commit failed: {out}", branch)
