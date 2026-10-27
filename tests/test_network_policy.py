@@ -128,22 +128,23 @@ class TestScanDefaults(unittest.TestCase):
         self.assertIn("--max-retries 1", spec)
         self.assertIn("--host-timeout", spec)
 
-    def test_stealth_keeps_full_range_slow(self):
+    def test_stealth_full_range_finishes_inside_the_budget(self):
+        """Live 2026-10-26: `-T2 --min-rate 500` did not finish a Windows
+        connect scan inside the 200 s host timeout, so the real ports were
+        never seen. `-T3 --min-rate 1000` did it in 41 s on the same host."""
         from phantom.automation.guidance.kit import _scan_port_spec
         spec = _scan_port_spec(SimpleNamespace(scan_style="full_stealth"))
         self.assertIn("1-65535", spec)
-        self.assertIn("-T2", spec)
-        # bounded: the old unbounded -T2 sweep never reached high ports
-        # before the 240 s capability timeout on a filtered host
-        self.assertIn("--min-rate 500", spec)
+        self.assertIn("-T3", spec)
+        self.assertIn("--min-rate 1000", spec)
         self.assertIn("--max-retries 1", spec)
         self.assertIn("--host-timeout 200s", spec)
 
     def test_explicit_full_range_is_bounded(self):
         from phantom.automation.guidance.kit import _port_scan_adapter
         from phantom.automation.belief import WorldModel
-        for style, rate in (("balanced", "1000"), ("top_loud", "2000"),
-                            ("full_stealth", "500")):
+        for style, rate in (("balanced", "1500"), ("top_loud", "2000"),
+                            ("full_stealth", "1000")):
             wm = WorldModel(target="10.0.0.5")
             wm.scan_style = style
             cmd = _port_scan_adapter(wm, {"port": "1-65535"})
@@ -151,6 +152,7 @@ class TestScanDefaults(unittest.TestCase):
             self.assertIn(f"--min-rate {rate}", cmd)
             self.assertIn("--max-retries 1", cmd)
             self.assertIn("--host-timeout 200s", cmd)
+            self.assertIn("-n", cmd)
 
     def test_version_intensity_is_firmware_safe(self):
         from phantom.automation.belief import WorldModel

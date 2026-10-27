@@ -24,13 +24,28 @@ results survive a kill, and whose end state is a typed verdict rather than
                 evidence, plus the PIVOT this implies: a filtered endpoint
                 is not a network problem, it is an identity problem.
 
-Design: every I/O touch is injectable (`runner`, `ping`, `tcp_probe`) so the
-whole ladder is verifiable offline, and no function here executes anything
-when merely building a plan.
+Scan profiles (one agent, never sub-agents — target contact stays serial):
+
+    balanced    exactly the historical behaviour: -sT, -T4, min-rate 1200,
+                chunks in ascending order, no delay. Default.
+    quiet       -T2, min-rate 300, bounded inter-chunk jitter.
+    blend       shuffled chunk order, per-chunk rate/timing/source-port
+                rotation, bounded jitter, optional SYN only with an explicit
+                `allow_syn=True`.
+
+Honest limits: source-port selection and timing changes are WEAK camouflage,
+not spoofing. A TCP handshake must return, so the source IP cannot be faked;
+the only real way to change the origin is a different egress (proxy/VPN),
+which this module does not pretend to provide. No decoys, no MAC spoofing.
+
+Design: every I/O touch is injectable (`runner`, `ping`, `tcp_probe`,
+`sleep`, `clock`) so the whole ladder is verifiable offline, and no function
+here executes anything when merely building a plan.
 """
 
 from __future__ import annotations
 
+import random
 import re
 import socket
 import subprocess
@@ -55,12 +70,110 @@ UDP_PORTS = (161, 500, 1900, 5353, 67, 123, 69, 137, 138, 5353)
 PREFLIGHT_PORTS = (22, 80, 443, 445, 3389, 8080, 8443, 8000, 53, 21, 25)
 DEFAULT_BUDGET = 600.0
 
+SCAN_PROFILES = ("quiet", "balanced", "blend")
+# A small set of ports that are almost always permitted through a firewall.
+# One per BLEND chunk; documented as camouflage, never as spoofing.
+SOURCE_PORTS = (53, 80, 443, 853)
+_BLEND_RATES = (600, 900, 1200, 1800)
+_BLEND_TIMINGS = ("-T3", "-T4")
+
+# The profile the currently-running agent asked for. The in-process engine
+# runs on a worker thread, so a thread-local would not survive; one module
+# value is correct because every acting cell in a run shares the same
+# operator policy, and calls are serialised by the egress permit.
+_DEFAULT_PROFILE = "balanced"
+
 # nmap text lines: "22/tcp   open  ssh", "Not shown: 8191 filtered tcp ports"
 _SERVICE_LINE = re.compile(
     r"^(\d{1,5})/(tcp|udp)\s+(open|filtered|closed|open\|filtered)"
     r"(?:\s+(\S+))?", re.MULTILINE)
 _NOT_SHOWN = re.compile(r"Not shown:\s+(\d+)\s+(\w+)\s+(tcp|udp)\s+ports",
                         re.IGNORECASE)
+
+
+# ── scan profiles ───────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ScanProfile:
+    """How one ladder run paces and varies its chunks."""
+
+    name: str
+    rate: int
+    timing: str
+    jitter: Tuple[float, float]      # (min, max) seconds between chunks
+    shuffle: bool = False
+    rotate_rate: bool = False
+    rotate_timing: bool = False
+    rotate_source_port: bool = False
+    rotate_technique: bool = False
+
+
+PROFILES: Dict[str, ScanProfile] = {
+    "balanced": ScanProfile("balanced", 1200, "-T4", (0.0, 0.0)),
+    "quiet": ScanProfile("quiet", 300, "-T2", (2.0, 5.0),
+                         rotate_technique=True),
+    "blend": ScanProfile("blend", 1200, "-T4", (0.5, 2.5), shuffle=True,
+                         rotate_rate=True, rotate_timing=True,
+                         rotate_source_port=True, rotate_technique=True),
+}
+
+
+def _profile(name: str) -> ScanProfile:
+    try:
+        return PROFILES[str(name or "balanced").lower()]
+    except KeyError:
+        raise ValueError(f"unknown scan profile {name!r} "
+                         f"(want one of {', '.join(SCAN_PROFILES)})")
+
+
+def set_default_profile(name: Optional[str]) -> None:
+    """Set the profile used when ``run_ladder`` is called without one."""
+    global _DEFAULT_PROFILE
+    _DEFAULT_PROFILE = "balanced" if not name else _profile(name).name
+
+
+def default_profile() -> str:
+    return _DEFAULT_PROFILE
+
+
+def profile_for_agent(agent) -> str:
+    """Map the agent's own stealth/speed posture to a scan profile.
+
+    `full_stealth`/`--stealth` buys quiet; `--aggressive`/`--speed` accepts
+    the blend; everything else stays exactly as before.
+    """
+    style = str(getattr(getattr(agent, "wm", None), "scan_style",
+                        "balanced") or "balanced")
+    if getattr(agent, "stealth", False) or style == "full_stealth":
+        return "quiet"
+    if (getattr(agent, "aggressive", False) or getattr(agent, "speed", False)
+            or style in ("top_loud", "top_fast")):
+        return "blend"
+    return "balanced"
+
+
+def _chunk_params(profile: ScanProfile, rng: random.Random, index: int,
+                  *, style: str, allow_syn: bool) -> Dict[str, object]:
+    """Rate/timing/technique/source-port/jitter for ONE chunk.
+
+    Balanced is byte-for-byte the historical command: it ignores ``rng``.
+    """
+    if profile.name == "balanced":
+        rate = 500 if style == "full_stealth" else 1200
+        return {"rate": rate, "timing": "-T4", "technique": "-sT",
+                "source_port": None, "jitter": 0.0}
+    rate = rng.choice(_BLEND_RATES) if profile.rotate_rate else profile.rate
+    timing = rng.choice(_BLEND_TIMINGS) if profile.rotate_timing \
+        else profile.timing
+    sport = rng.choice(SOURCE_PORTS) if profile.rotate_source_port else None
+    # SYN needs privileges; it is chosen ONLY when the caller said so. Every
+    # third chunk rotates so a test (and an operator) can see it happen.
+    technique = "-sS" if (allow_syn and profile.rotate_technique
+                          and index % 3 == 2) else "-sT"
+    jitter = round(rng.uniform(*profile.jitter), 2) if profile.jitter[1] > 0 \
+        else 0.0
+    return {"rate": rate, "timing": timing, "technique": technique,
+            "source_port": sport, "jitter": jitter}
 
 
 # ── data model ──────────────────────────────────────────────────────────────
@@ -93,6 +206,12 @@ class ChunkResult:
     ok: bool = True
     error: str = ""
     elapsed: float = 0.0
+    profile: str = "balanced"
+    rate: int = 0
+    timing: str = ""
+    technique: str = ""
+    source_port: Optional[int] = None
+    jitter_s: float = 0.0
 
     @property
     def fully_filtered(self) -> bool:
@@ -100,9 +219,16 @@ class ChunkResult:
                 and self.filtered >= self.expected)
 
     def marker(self) -> str:
+        extra = ""
+        if self.profile != "balanced":
+            extra = (f" profile={self.profile} rate={self.rate} "
+                     f"timing={self.timing or '?'} "
+                     f"tech={self.technique or '?'} "
+                     f"sport={self.source_port or '-'}")
         return (f"RECON_CHUNK: spec={self.spec} proto={self.proto} "
                 f"open={len(self.open_ports)} filtered={self.filtered} "
-                f"expected={self.expected} ok={int(self.ok)}")
+                f"expected={self.expected} ok={int(self.ok)} "
+                f"jitter={self.jitter_s:.2f}s{extra}")
 
 
 @dataclass
@@ -119,6 +245,8 @@ class LadderResult:
     open_ports: List[int] = field(default_factory=list)
     services: Dict[int, str] = field(default_factory=dict)
     elapsed: float = 0.0
+    profile: str = "balanced"
+    jitter_total_s: float = 0.0
 
     @property
     def surface(self) -> str:
@@ -127,6 +255,7 @@ class LadderResult:
     def marker(self) -> str:
         return (f"RECON_VERDICT: surface={self.verdict} pivot={self.pivot} "
                 f"open={','.join(str(p) for p in self.open_ports) or '-'} "
+                f"profile={self.profile} "
                 f"reason={_oneline(self.reason)}")
 
     def markers(self) -> List[str]:
@@ -145,6 +274,8 @@ class LadderResult:
     def to_dict(self) -> Dict[str, object]:
         return {"target": self.target, "verdict": self.verdict,
                 "pivot": self.pivot, "reason": self.reason,
+                "profile": self.profile,
+                "jitter_total_s": round(self.jitter_total_s, 2),
                 "open_ports": list(self.open_ports),
                 "services": dict(self.services),
                 "elapsed": round(self.elapsed, 1),
@@ -168,14 +299,22 @@ def port_chunks(size: int = CHUNK_SIZE, high: int = 65535) -> List[str]:
 
 
 def chunk_command(target: str, spec: str, *, proto: str = "tcp",
-                  style: str = "balanced") -> str:
+                  style: str = "balanced", profile: str = "balanced",
+                  rate: Optional[int] = None, timing: Optional[str] = None,
+                  technique: Optional[str] = None,
+                  source_port: Optional[int] = None) -> str:
     """The exact bounded command for one chunk (no side effects)."""
-    rate = "500" if style == "full_stealth" else "1200"
     if proto == "udp":
         return (f"nmap -Pn -sU -p {spec} -T4 --max-retries 1 "
                 f"--host-timeout 90s {target}")
-    return (f"nmap -Pn -sT -p {spec} -T4 --min-rate {rate} "
-            f"--max-retries 1 --host-timeout {CHUNK_TIMEOUT}s {target}")
+    chosen_rate = rate if rate is not None else (
+        500 if style == "full_stealth" else 1200)
+    chosen_timing = timing or "-T4"
+    chosen_tech = technique or "-sT"
+    sport = f" -g {source_port}" if source_port else ""
+    return (f"nmap -Pn {chosen_tech} -p {spec} {chosen_timing} "
+            f"--min-rate {chosen_rate} --max-retries 1 "
+            f"--host-timeout {CHUNK_TIMEOUT}s{sport} {target}")
 
 
 # ── parsing ─────────────────────────────────────────────────────────────────
@@ -280,18 +419,31 @@ def run_ladder(
     chunk_size: int = CHUNK_SIZE,
     filtered_chunks_to_stop: int = FILTERED_CHUNKS_TO_STOP,
     style: str = "balanced",
+    profile: Optional[str] = None,
+    seed: Optional[int] = None,
+    allow_syn: bool = False,
+    sleep: Optional[Callable[[float], None]] = None,
+    clock: Optional[Callable[[], float]] = None,
     udp: bool = True,
     emit: Optional[Callable[[str, Dict[str, object]], None]] = None,
 ) -> LadderResult:
     """Run the bounded ladder and return its typed verdict.
 
     ``runner(cmd, timeout) -> (ok, output)`` is injectable; the default runs
-    nmap (via WSL when the host lacks it). Nothing here retries a filtered
-    chunk: a dropper stays a dropper.
+    nmap (via WSL when the host lacks it). ``profile`` selects pacing;
+    ``None`` uses the agent's requested default (balanced). ``seed`` makes a
+    blend run deterministic (tests, reproducible engagements). ``sleep`` and
+    ``clock`` are injected by tests; production uses the real ones.
+
+    Nothing here retries a filtered chunk: a dropper stays a dropper.
     """
     run = runner or _default_runner
-    started = time.monotonic()
-    result = LadderResult(target=target)
+    spec = _profile(profile or _DEFAULT_PROFILE)
+    rng = random.Random(seed) if seed is not None else random.Random()
+    now = clock or time.monotonic
+    do_sleep = sleep or time.sleep
+    started = now()
+    result = LadderResult(target=target, profile=spec.name)
 
     def _emit(kind: str, **payload) -> None:
         if emit is not None:
@@ -303,34 +455,58 @@ def run_ladder(
     pre = preflight(target, ping=ping, probe=probe)
     result.preflight = pre
     _emit("recon_preflight", reachable=pre.reachable,
-          icmp=pre.icmp, tcp_open=list(pre.tcp_open))
+          icmp=pre.icmp, tcp_open=list(pre.tcp_open), profile=spec.name)
     if not pre.reachable:
         result.verdict = "unreachable"
         result.pivot = "identity"
         result.reason = ("no ICMP and no TCP answer on "
                          f"{','.join(str(p) for p in PREFLIGHT_PORTS)} — "
                          "host off, asleep or dropping everything")
-        result.elapsed = time.monotonic() - started
+        result.elapsed = now() - started
         _emit("recon_verdict", verdict=result.verdict, pivot=result.pivot,
-              reason=result.reason)
+              reason=result.reason, profile=spec.name)
         return result
 
+    specs = port_chunks(chunk_size)
+    if spec.shuffle:
+        rng.shuffle(specs)
+
     consecutive_filtered = 0
-    for spec in port_chunks(chunk_size):
-        remaining = budget_s - (time.monotonic() - started)
+    for index, range_spec in enumerate(specs):
+        remaining = budget_s - (now() - started)
         if remaining <= 5:
             result.reason = "time budget exhausted before the port space ended"
             break
-        cmd = chunk_command(target, spec, style=style)
-        expected = _spec_size(spec)
-        t0 = time.monotonic()
+        params = _chunk_params(spec, rng, index, style=style,
+                               allow_syn=allow_syn)
+        jitter = 0.0
+        if index and float(params["jitter"]):
+            # Bounded by what is LEFT: camouflage must never eat the budget
+            # that the remaining chunks need to produce a verdict.
+            jitter = min(float(params["jitter"]), max(0.0, remaining - 5.0))
+            if jitter > 0:
+                do_sleep(jitter)
+                result.jitter_total_s += jitter
+                remaining = budget_s - (now() - started)
+                if remaining <= 5:
+                    result.reason = ("time budget exhausted during the "
+                                     "inter-chunk delay")
+                    break
+        cmd_params = {k: v for k, v in params.items() if k != "jitter"}
+        cmd = chunk_command(target, range_spec, style=style,
+                            profile=spec.name, **cmd_params)
+        expected = _spec_size(range_spec)
+        t0 = now()
         try:
             ok, output = run(cmd, max(5.0, min(CHUNK_TIMEOUT + 20, remaining)))
         except Exception as exc:
             ok, output = False, str(exc)[:300]
-        chunk = ChunkResult(spec=spec, expected=expected, ok=bool(ok),
-                            elapsed=time.monotonic() - t0,
-                            error="" if ok else (output or "")[:200])
+        chunk = ChunkResult(
+            spec=range_spec, expected=expected, ok=bool(ok),
+            elapsed=now() - t0, error="" if ok else (output or "")[:200],
+            profile=spec.name, rate=int(params["rate"]),
+            timing=str(params["timing"]), technique=str(params["technique"]),
+            source_port=params["source_port"], jitter_s=round(jitter, 2))
         if ok:
             ports, services, filtered = parse_scan(output, proto="tcp")
             chunk.open_ports = ports
@@ -341,8 +517,9 @@ def run_ladder(
                     result.open_ports.append(port)
                 result.services.setdefault(port, services.get(port, ""))
         result.chunks.append(chunk)
-        _emit("recon_chunk", spec=spec, open=len(chunk.open_ports),
-              filtered=chunk.filtered, ok=chunk.ok)
+        _emit("recon_chunk", spec=range_spec, open=len(chunk.open_ports),
+              filtered=chunk.filtered, ok=chunk.ok, profile=spec.name,
+              jitter=chunk.jitter_s)
         if chunk.open_ports:
             consecutive_filtered = 0
             continue
@@ -359,17 +536,18 @@ def run_ladder(
             break
 
     if udp and not result.open_ports:
-        spec = ",".join(str(p) for p in sorted(set(UDP_PORTS)))
-        remaining = budget_s - (time.monotonic() - started)
+        udp_spec = ",".join(str(p) for p in sorted(set(UDP_PORTS)))
+        remaining = budget_s - (now() - started)
         if remaining > 5:
-            cmd = chunk_command(target, spec, proto="udp")
-            t0 = time.monotonic()
+            cmd = chunk_command(target, udp_spec, proto="udp")
+            t0 = now()
             try:
                 ok, output = run(cmd, max(5.0, min(120, remaining)))
             except Exception as exc:
                 ok, output = False, str(exc)[:300]
-            u = ChunkResult(spec=spec, proto="udp", expected=len(set(UDP_PORTS)),
-                            ok=bool(ok), elapsed=time.monotonic() - t0)
+            u = ChunkResult(spec=udp_spec, proto="udp",
+                            expected=len(set(UDP_PORTS)), ok=bool(ok),
+                            elapsed=now() - t0, profile=spec.name)
             if ok:
                 ports, services, filtered = parse_scan(output, proto="udp")
                 u.open_ports = ports
@@ -387,8 +565,7 @@ def run_ladder(
         result.pivot = "network"
         result.reason = (f"{len(result.open_ports)} open port(s): "
                          + ",".join(str(p) for p in result.open_ports))
-    elif any(c.ok for c in result.chunks) and len(result.chunks) < len(
-            port_chunks(chunk_size)):
+    elif any(c.ok for c in result.chunks) and len(result.chunks) < len(specs):
         result.verdict = "filtered" if result.reason else "partial"
         result.pivot = "identity"
         if not result.reason:
@@ -406,9 +583,9 @@ def run_ladder(
     if result.verdict in ("filtered", "partial") and result.pivot == "identity":
         result.reason += ("; network escalation is exhausted — pivot to the "
                           "identity path instead of re-arming the scan")
-    result.elapsed = time.monotonic() - started
+    result.elapsed = now() - started
     _emit("recon_verdict", verdict=result.verdict, pivot=result.pivot,
-          reason=result.reason)
+          reason=result.reason, profile=spec.name)
     return result
 
 

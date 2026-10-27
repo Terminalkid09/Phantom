@@ -8,6 +8,7 @@ from phantom.automation.belief import WorldModel
 from phantom.automation.exploit.access import (
     AccessCandidate,
     collect_candidates,
+    run_non_cve_candidate,
     select_candidates,
 )
 from phantom.automation.exploit.execution import ExploitOutcome
@@ -61,6 +62,43 @@ def test_memcached_stats_is_info_not_file_read():
     assert mem
     assert mem[0].access == "info"
     assert mem[0].access_level == 1
+
+
+def test_redis_info_timeout_setting_is_exposure_not_error():
+    """A healthy INFO block carries ``timeout:0``; that is data, not failure.
+
+    Measured on redis:7-alpine (docker lab, 2026-10-26): the old negative
+    list matched the bare word ``timeout`` and scored a proven
+    unauthenticated Redis as "marker not observed".
+    """
+    info = ("$131\r\n# Server\r\nredis_version:7.4.11\r\n"
+            "redis_mode:standalone\r\n# Clients\r\ntimeout:0\r\n")
+    cand = _candidate("noncve:service:redis:6379", access="control",
+                      action={"type": "service", "service": "redis",
+                              "probe": "redis", "marker": "redis_version",
+                              "port": "6379"})
+    cand.service = "redis"
+    with patch("phantom.automation.exploit.access._tcp_probe",
+               return_value=(info, "")):
+        out = run_non_cve_candidate(cand)
+    assert out.attempted is True
+    assert out.vulnerable is True and out.success is True
+    assert "redis exposure confirmed" in out.detail
+
+
+def test_probe_transport_error_stays_negative():
+    """A real transport failure must still be reported as no evidence."""
+    cand = _candidate("noncve:service:redis:6379", access="control",
+                      action={"type": "service", "service": "redis",
+                              "probe": "redis", "marker": "redis_version",
+                              "port": "6379"})
+    cand.service = "redis"
+    with patch("phantom.automation.exploit.access._tcp_probe",
+               return_value=("", "timed out")):
+        out = run_non_cve_candidate(cand)
+    assert out.attempted is True
+    assert out.vulnerable is False
+    assert out.detail == "timed out"
 
 
 def test_vnc_stays_visible_but_is_not_actionable():

@@ -1238,8 +1238,17 @@ class AutonomousAgent:
             # it yields findings, count the run as success instead of
             # burning the whole wave as a failure (which pushed the agent
             # into its retry loop).
+            # Salvage also a NON-timeout failure for scan-shaped moves: nmap
+            # exits non-zero on --host-timeout while still printing the ports
+            # it found, and treating that as "no output" threw away real
+            # evidence (2026-10-26: 5040/5357 were in the output). The
+            # interpreter only extracts scan markers, so a failure message
+            # alone cannot become a finding.
+            scan_shaped = (cap.id in ("scan_tcp", "version_detect", "os_detect")
+                           or cap.id.startswith("scan"))
             salvaged = cap.interpret(run.output or "", self.wm, slots) \
-                if (run.output and getattr(run, "timed_out", False)) else []
+                if (run.output and (getattr(run, "timed_out", False)
+                                    or scan_shaped)) else []
             if salvaged:
                 learned = self._register_findings(cap.id, salvaged)
                 self._emit_found(cap.id, salvaged, partial=True)
@@ -3323,6 +3332,17 @@ class AutonomousAgent:
                     reason = ("no remote-access service in top ports — "
                               "escalating to full-range scan")
                 if cap is not None:
+                    if cap.id == "recon_ladder":
+                        # The in-process engine runs on a worker thread, so
+                        # the posture is handed over as the module default
+                        # (one acting cell per run, serialised by the egress
+                        # permit): stealth -> quiet, aggressive/speed -> blend.
+                        try:
+                            from phantom.automation import recon_ladder
+                            recon_ladder.set_default_profile(
+                                recon_ladder.profile_for_agent(self))
+                        except Exception:
+                            pass
                     from phantom.automation.planner import PlanStep
                     step = PlanStep(capability=cap, slot_values=slots,
                                     reason=reason)
