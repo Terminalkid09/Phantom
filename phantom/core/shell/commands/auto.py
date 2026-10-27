@@ -80,6 +80,8 @@ def cmd_auto(shell, arg: str):
                     hypotheses only (never executes); requires
                     PHANTOM_LLM_MODEL=<path-to-gguf> — try a Qwen2.5
                     Instruct GGUF, swap the file to scale reasoning
+      --ai MODE     per-phase AI layer (off|local|cloud|integrated),
+                    off by default; per-phase overrides in ai.<phase>.mode
       --evolution   self-improvement (requires --llm): a stable
                     uncovered failure authors a new capability and
                     opens a reviewable draft PR (max 2/day)
@@ -187,6 +189,12 @@ def cmd_auto(shell, arg: str):
                         help="optional local-LLM advisor (requires "
                              "PHANTOM_LLM_MODEL=<path-to-gguf>): non-gating "
                              "hypothesis suggestions, never executes anything")
+    parser.add_argument("--ai", default=None,
+                        choices=["off", "local", "cloud", "integrated"],
+                        help="per-phase AI layer: off (default), local "
+                             "llama.cpp, cloud OpenAI-compatible endpoint, or "
+                             "integrated promoted adapter; per-phase "
+                             "overrides live in ai.<phase>.mode")
     parser.add_argument("--evolution", action="store_true", default=False,
                         help="SELF-IMPROVEMENT (requires --llm): stable "
                              "uncovered failure patterns spawn a background "
@@ -255,6 +263,14 @@ def cmd_auto(shell, arg: str):
         args = parser.parse_args(arg.split())
     except SystemExit:
         return
+
+    if getattr(args, "ai", ""):
+        # Process-wide; run_auto_mode has no `ai` kwarg by design (the AI
+        # layer is read where it is used), so the flag only sets the mode.
+        from phantom.automation.ai.config import set_mode
+        applied = set_mode(args.ai)
+        notifier.info(f"AI layer: mode={applied} (per-phase overrides in "
+                      f"config still win; off means deterministic only)")
 
     if args.stealth and args.aggressive:
         notifier.error(

@@ -389,6 +389,26 @@ SCHEMA: Dict[str, Dict[str, Any]] = {
     # LLM advisor + engagement governance
     "llm.model_path": {"type": str, "env": "PHANTOM_LLM_MODEL"},
     "llm.enabled": {"type": bool, "env": "PHANTOM_LLM_ENABLED"},
+    # Per-phase AI layer (off by default). `integrated` uses the promoted
+    # adapter under models/<phase>/; `local` a llama.cpp server; `cloud` an
+    # OpenAI-compatible endpoint whose credential is named, never stored.
+    "ai.mode": {"type": str, "env": "PHANTOM_AI_MODE"},
+    "ai.exploit.mode": {"type": str, "env": "PHANTOM_AI_EXPLOIT_MODE"},
+    "ai.finding.mode": {"type": str, "env": "PHANTOM_AI_FINDING_MODE"},
+    "ai.osint.mode": {"type": str, "env": "PHANTOM_AI_OSINT_MODE"},
+    "ai.social.mode": {"type": str, "env": "PHANTOM_AI_SOCIAL_MODE"},
+    "ai.scan_parse.mode": {"type": str,
+                           "env": "PHANTOM_AI_SCAN_PARSE_MODE"},
+    "ai.evolution.mode": {"type": str, "env": "PHANTOM_AI_EVOLUTION_MODE"},
+    "ai.local.base_url": {"type": str, "env": "PHANTOM_AI_LOCAL_URL"},
+    "ai.local.model": {"type": str, "env": "PHANTOM_AI_LOCAL_MODEL"},
+    "ai.cloud.base_url": {"type": str, "env": "PHANTOM_AI_CLOUD_URL"},
+    "ai.cloud.model": {"type": str, "env": "PHANTOM_AI_CLOUD_MODEL"},
+    "ai.cloud.api_key_env": {"type": str,
+                             "env": "PHANTOM_AI_CLOUD_KEY_ENV"},
+    "ai.timeout_s": {"type": float, "env": "PHANTOM_AI_TIMEOUT"},
+    "ai.budget_tokens": {"type": int,
+                         "env": "PHANTOM_AI_BUDGET_TOKENS"},
     "automation.experience": {"type": bool, "env": None},
     "toolbelt.extra": {"type": dict, "env": None},
     "toolbelt.drivers": {"type": bool, "env": None},
@@ -400,6 +420,9 @@ SCHEMA: Dict[str, Dict[str, Any]] = {
     "engagement.ransom_sim_allow": {"type": bool,
                                      "env": "PHANTOM_RANSOM_SIM_ALLOW"},
     "phishing.aitm": {"type": bool, "env": "PHANTOM_AITM"},
+    # LAB TENANT ONLY: permits the AiTM relay (and other lab-default
+    # behaviours) without the per-feature opt-in. Never implied by a profile.
+    "phishing.lab_profile": {"type": bool, "env": "PHANTOM_LAB_PROFILE"},
     # External data providers: offline fixtures + record/replay
     "providers.fixtures_dir": {"type": str,
                                "env": "PHANTOM_PROVIDER_FIXTURES"},

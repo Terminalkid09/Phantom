@@ -129,6 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "unit instead of a per-user one (needs root to "
                              "enable; survives a logout)")
     parser.add_argument("--llm", action="store_true", help="optional local-LLM advisor (auto-mode)")
+    parser.add_argument("--ai", default=None,
+                        choices=["off", "local", "cloud", "integrated"],
+                        help="AI layer mode (auto-mode): off (default), local "
+                             "llama.cpp, cloud OpenAI-compatible endpoint, or "
+                             "integrated promoted per-phase adapter; per-phase "
+                             "overrides live in ai.<phase>.mode")
     parser.add_argument("--experience", action="store_true",
                         help="CROSS-ENGAGEMENT learning memory (auto-mode): "
                              "keep cause->repair experience between runs "
@@ -156,6 +162,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     parser = build_parser()
     args, extra = parser.parse_known_args()
+    # The AI mode is process-wide: the adapters read it through
+    # `phantom.automation.ai.config` (per-phase overrides still win), so the
+    # flag needs no extra kwarg through every run_auto_mode caller.
+    if getattr(args, "ai", ""):
+        os.environ["PHANTOM_AI_MODE"] = str(args.ai)
     # `parse_known_args` exists so `--auto <t1> <t2>` can take extra TARGETS.
     # Anything else left over that looks like a flag is an option this entry
     # point does not have: refusing it is the difference between "`--agent` did
