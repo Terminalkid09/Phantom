@@ -289,6 +289,70 @@ def _run_agent_single(target, goal, profile, aggressive, paranoid, speed,
         social_platform=social_platform)
 
 
+def _fingerprint_before_exploit(agent) -> Dict:
+    """Give the CVE match something to match on before the sweep runs.
+
+    ``version_detect`` declares the ``service`` fact — the very fact the scan
+    just produced — so nothing is missing and the planner never asks for it.
+    Every service therefore reached ``exploit_worldmodel`` with ``product``
+    and ``version`` empty, and the CVE registry (which matches on exactly
+    those two fields) could not build a single candidate: auto-mode fired
+    zero weapons on the same host and port where the manual ``fire
+    CVE-2021-41773`` confirmed an Apache traversal (docker lab, 2026-10-26).
+
+    So the payload chain gets the fingerprint the manual path implicitly
+    has: one bounded ``version_detect`` over the ports the run already
+    proved open, through the same gates as any other capability. It is a
+    no-op when every service is versioned already, and a refusal (gate,
+    missing nmap, veto) is reported in the summary, never hidden.
+    """
+    summary: Dict = {"attempted": False}
+    wm = getattr(agent, "wm", None)
+    registry = getattr(agent, "registry", None)
+    if wm is None or registry is None:
+        summary["reason"] = "no world model / capability registry"
+        return summary
+
+    def _unversioned() -> List[str]:
+        ports = []
+        for finding in wm.find("service"):
+            value = finding.value if isinstance(finding.value, dict) else {}
+            if str(value.get("product") or "").strip():
+                continue
+            if str(value.get("version") or "").strip():
+                continue
+            ports.append(str(value.get("port") or finding.key))
+        return ports
+
+    pending = _unversioned()
+    summary["unversioned_ports"] = pending
+    if not pending:
+        summary["reason"] = "every service already carries a product/version"
+        return summary
+    cap = registry.get("version_detect")
+    if cap is None:
+        # a swarm task may ban recon outright: the registry is the authority
+        # on what this worker may do, so an absent capability stays absent.
+        summary["reason"] = "version_detect is not registered for this worker"
+        return summary
+    try:
+        from phantom.automation.planner import PlanStep
+        step = PlanStep(
+            capability=cap, slot_values={},
+            reason=("open ports left unversioned (no product/version to match a "
+                    "CVE against) — fingerprint them before the sweep"))
+        summary["attempted"] = True
+        summary["ok"] = bool(agent._execute_capability(step))
+    except Exception as exc:  # noqa: BLE001 - the sweep must still run
+        summary["attempted"] = True
+        summary["ok"] = False
+        summary["error"] = f"{type(exc).__name__}: {exc}"
+    still_open = _unversioned()
+    summary["versioned"] = len(pending) - len(still_open)
+    summary["still_unversioned_ports"] = still_open
+    return summary
+
+
 def _exploit_all_after_run(agent, goal: str, state_path: str,
                            result: Dict, *, stealth: bool = False,
                            aggressive: bool = False, speed: bool = False,
@@ -308,23 +372,47 @@ def _exploit_all_after_run(agent, goal: str, state_path: str,
     from phantom.automation.exploit.sweep import exploit_worldmodel
     mode = resolve_mode(stealth=stealth, aggressive=aggressive, speed=speed)
     summary: Dict = {}
+    # Fingerprint BEFORE ranking: an unversioned service makes the CVE
+    # registry structurally empty, so the sweep would report "no actionable
+    # CVE" on a host that has one (see _fingerprint_before_exploit).
+    fingerprint = _fingerprint_before_exploit(agent)
+    if fingerprint.get("attempted"):
+        total = len(fingerprint.get("unversioned_ports") or [])
+        notifier.info(
+            f"exploit-all: version fingerprint before the CVE match — "
+            f"{fingerprint.get('versioned', 0)} of {total} unversioned "
+            "service(s) now carry a product/version"
+            + ("" if fingerprint.get("ok") else " (the probe did not complete)"))
+    elif fingerprint.get("unversioned_ports"):
+        notifier.info(
+            "exploit-all: " + str(fingerprint.get("reason") or "")
+            + " — the CVE registry has no product/version to match.")
     try:
         summary = exploit_worldmodel(
             agent.wm, allow_msf=True, prefer_beacon=True, mode=mode,
             exhaustive=exhaustive)
     except Exception as exc:  # noqa: BLE001 - never lose the main run
         notifier.warn(f"exploit-all: sweep failed: {exc}")
-        return {"error": str(exc), "beacon_after": False}
+        return {"error": str(exc), "beacon_after": False,
+                "fingerprint": fingerprint}
+    summary["fingerprint"] = fingerprint
     tried = int(summary.get("attempted", 0) or 0)
     n_candidates = int(summary.get("candidates", 0) or 0)
     knowledge_only = list(summary.get("knowledge_only", []) or [])
     rce = list(summary.get("rce", []) or [])
     vuln = list(summary.get("vulnerable", []) or [])
     if not n_candidates:
+        # "no weapon" and "no fingerprint to match a weapon against" are two
+        # different findings and must not read the same in the receipt.
+        blind = [p for p in (fingerprint.get("still_unversioned_ports") or [])
+                 if p]
         notifier.info(
             "exploit-all: no actionable CVE in the WorldModel (no local PoC "
             "and no known Metasploit module matched the discovered services) "
-            "- nothing was executed; absence of a weapon is not a compromise.")
+            "- nothing was executed; absence of a weapon is not a compromise."
+            + (f" {len(blind)} open port(s) still have no product/version, "
+               "so the match could not even be attempted:"
+               f" {', '.join(blind[:10])}" if blind else ""))
     elif not tried:
         notifier.info(
             f"exploit-all: {n_candidates} candidate(s), none executable "
@@ -335,17 +423,26 @@ def _exploit_all_after_run(agent, goal: str, state_path: str,
             f"exploit-all: {tried} execution(s), "
             f"{len(vuln)} confirmed vulnerable, {len(rce)} RCE")
     for line in (summary.get("outcomes", []) or []):
-        cve = line.get("cve", "?")
+        # A non-CVE candidate has no CVE id: printing `{cve}` left the line
+        # reading "exploit-all:  vulnerable via non_cve" with a blank path
+        # (docker-lab run, 2026-10-26). Name the port/service instead, and
+        # keep the evidence on one truncated line (a Redis INFO block is
+        # 40+ lines and buried the rest of the receipt).
+        label = (line.get("cve") or line.get("id")
+                 or f"{line.get('target', '')}:{line.get('port', '')}".strip(":")
+                 or "non-CVE")
         method = line.get("method", "none")
+        evidence = str(line.get("evidence") or line.get("detail") or "")
+        evidence = " ".join(evidence.split())[:140]
         if line.get("rce"):
-            notifier.success(f"exploit-all: {cve} RCE via {method} "
-                             f"({line.get('evidence') or line.get('detail') or ''})")
+            notifier.success(f"exploit-all: {label} RCE via {method} "
+                             f"({evidence})")
         elif line.get("vulnerable"):
-            notifier.success(f"exploit-all: {cve} vulnerable via {method} "
-                             f"({line.get('evidence') or line.get('detail') or ''})")
+            notifier.success(f"exploit-all: {label} vulnerable via {method} "
+                             f"({evidence})")
         elif line.get("attempted"):
-            notifier.warn(f"exploit-all: {cve} via {method} - "
-                          f"{line.get('error') or line.get('detail') or 'negative'}")
+            notifier.warn(f"exploit-all: {label} via {method} - "
+                          f"{line.get('error') or evidence or 'negative'}")
     already = bool(result.get("beacon_established")
                    or getattr(agent, "result", {}).get("beacon_established"))
     summary["beacon_after"] = already

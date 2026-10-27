@@ -181,3 +181,101 @@ def test_automode_forwards_posture_and_exhaustive():
         automode._exploit_all_after_run(
             agent, "deliver", "", {}, stealth=True, aggressive=True)
     assert sweep.call_args.kwargs["mode"] == "aggressive"
+
+
+def _fingerprinting_agent(services):
+    """Agent double: the WorldModel, a registry with only version_detect,
+    and an executor that emulates nmap -sV storing product+version at the
+    SAME confidence as the scan finding (so belief revision supersedes)."""
+    wm = WorldModel(target="127.0.0.1")
+    for port, value in services:
+        wm.add_finding("service", f"tcp/{port}", value, confidence=0.9)
+
+    class _Reg:
+        def get(self, cid):
+            if cid == "version_detect":
+                return SimpleNamespace(id="version_detect", category="recon")
+            return None
+
+    agent = SimpleNamespace(wm=wm, result={}, registry=_Reg(), executed=[])
+
+    def _execute_capability(step):
+        agent.executed.append(step)
+        for port, _value in services:
+            agent.wm.add_finding(
+                "service", f"tcp/{port}",
+                {"port": str(port), "service": "http",
+                 "product": "Apache httpd", "version": "2.4.49"},
+                confidence=0.9, source="version_detect")
+        return True
+
+    agent._execute_capability = _execute_capability
+    return agent
+
+
+def _empty_sweep():
+    return {"candidates": 1, "attempted": 0, "rce": [], "vulnerable": [],
+            "outcomes": [], "knowledge_only": []}
+
+
+def test_exploit_all_fingerprints_unversioned_ports_before_the_match():
+    """Live docker lab: the scan labelled 8081 `blackice-icecap` with an
+    empty product/version, so the CVE registry matched nothing and the
+    auto-mode payload chain stayed empty while the manual `fire` on the same
+    port confirmed the traversal. The sweep must see a fingerprinted world."""
+    from phantom.core import automode
+
+    agent = _fingerprinting_agent([
+        (8081, {"port": "8081", "service": "blackice-icecap",
+                "product": "", "version": ""})])
+    seen = {}
+    summary = _empty_sweep()
+
+    def _sweep(wm, **kwargs):
+        seen["version"] = wm.find("service")[0].value.get("version")
+        return summary
+
+    with patch("phantom.automation.exploit.sweep.exploit_worldmodel",
+               side_effect=_sweep):
+        out = automode._exploit_all_after_run(agent, "deliver", "", {})
+
+    assert [s.capability.id for s in agent.executed] == ["version_detect"]
+    assert "unversioned" in agent.executed[0].reason
+    assert seen["version"] == "2.4.49"      # the sweep ran on the new facts
+    assert out["fingerprint"]["attempted"] is True
+    assert out["fingerprint"]["versioned"] == 1
+    assert out["fingerprint"]["still_unversioned_ports"] == []
+
+
+def test_exploit_all_refingerprints_nothing_when_versions_are_known():
+    from phantom.core import automode
+
+    agent = _fingerprinting_agent([
+        (80, {"port": "80", "service": "http", "product": "nginx",
+              "version": "1.24.0"})])
+    with patch("phantom.automation.exploit.sweep.exploit_worldmodel",
+               return_value=_empty_sweep()):
+        out = automode._exploit_all_after_run(agent, "deliver", "", {})
+
+    assert agent.executed == []
+    assert out["fingerprint"]["attempted"] is False
+    assert "already" in out["fingerprint"]["reason"]
+
+
+def test_exploit_all_says_which_ports_stayed_unversioned():
+    """A refusal (recon banned for this worker, no nmap, gate veto) must not
+    read as "no weapon exists": the receipt names the blind ports."""
+    from phantom.core import automode
+
+    agent = _fingerprinting_agent([
+        (8081, {"port": "8081", "service": "blackice-icecap",
+                "product": "", "version": ""})])
+    agent.registry = SimpleNamespace(get=lambda cid: None)
+    with patch("phantom.automation.exploit.sweep.exploit_worldmodel",
+               return_value=_empty_sweep()):
+        out = automode._exploit_all_after_run(agent, "deliver", "", {})
+
+    assert agent.executed == []
+    assert out["fingerprint"]["attempted"] is False
+    assert "not registered" in out["fingerprint"]["reason"]
+    assert out["fingerprint"]["unversioned_ports"] == ["8081"]
