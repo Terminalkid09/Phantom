@@ -213,6 +213,11 @@ class SocialEngine:
             except Exception:
                 pass
         self._video_cache: Optional[Dict[str, str]] = None
+        # DM conversation state (opener -> rapport -> pretext -> link):
+        # PERSISTED IN MEMORY for the run, so a link cannot ride the first
+        # message and a hostile/suspicious reply closes the thread instead of
+        # being retried by the next stage.
+        self._dm_flows: Dict[str, Any] = {}
 
     def set_social_config(self, aggressive: bool = False,
                           speed: bool = False) -> None:
@@ -221,6 +226,87 @@ class SocialEngine:
         that wait for the human (fast flag never waits)."""
         self._aggressive = bool(aggressive)
         self._speed = bool(speed)
+
+    # ------------------------------------------------------------------
+    # identity field: candidate addresses + the reset oracle
+    # ------------------------------------------------------------------
+
+    def email_candidates(self, first: str = "", last: str = "",
+                         handle: str = "", domain: str = "",
+                         verify: bool = False, confirm=None,
+                         max_verify: int = 3, services=None,
+                         oracle=None) -> Tuple[bool, List[str]]:
+        """Generate ranked candidate addresses; verify only WITH consent.
+
+        Generation is offline and always available. Verification spends the
+        password-reset oracle, so it requires an explicit `confirm` callback
+        (per service); without it the method returns the candidates plus a
+        refusal marker and sends nothing. Every marker carries a MASK, never
+        the address.
+        """
+        from phantom.automation.social import email_candidates as ec
+        handle = str(handle or self._discovered.get("handle") or "").strip()
+        name = " ".join(p for p in (first, last) if p).strip()
+        if not name:
+            name = str(self._discovered.get("name") or "")
+        if not (first or last) and name:
+            first, _, last = name.partition(" ")
+        if not domain:
+            emails = self._discovered.get("emails") or []
+            if emails and "@" in str(emails[0]):
+                domain = str(emails[0]).rsplit("@", 1)[-1]
+        cands = ec.top(ec.generate(first, last, handle, domain), 8)
+        if not cands:
+            return False, ["EMAIL_CANDIDATE: none (no name/handle to "
+                           "compose a candidate from)"]
+        lines = [c.markers() for c in cands]
+        if not verify:
+            lines.append("EMAIL_NOTE: offline_only "
+                         "verification needs operator consent")
+            return True, lines
+        if confirm is None:
+            lines.append("EMAIL_VERIFIED: none (refused: the reset oracle "
+                         "needs an explicit per-service confirmation)")
+            return True, lines
+        verified = ec.verify(cands, confirm=confirm,
+                             max_candidates=max_verify, services=services,
+                             oracle=oracle)
+        lines.extend(v.marker() for v in verified)
+        return True, lines
+
+    # ------------------------------------------------------------------
+    # DM conversation state machine
+    # ------------------------------------------------------------------
+
+    def dm_observe(self, handle: str, reply: str = "",
+                   platform: str = "") -> Tuple[bool, List[str]]:
+        """Record a reply (or open the thread) and return the next move.
+
+        The flow persists across calls on this engine: the opener is created
+        once, so a second observation can reach `rapport` and a third
+        `pretext` — the link stays held until the minimum exchange count.
+        """
+        from phantom.automation.social.dm_flow import (
+            Flow, advance, opening_decision)
+        h = str(handle or "").strip()
+        if not h:
+            return False, ["DM_DECISION: none (no handle)"]
+        flow = self._dm_flows.get(h)
+        if flow is None:
+            flow = Flow(target=h,
+                        platform=(platform
+                                  or self._discovered.get("platform")
+                                  or "default"))
+            self._dm_flows[h] = flow
+            opener = opening_decision(flow)
+            if not reply:
+                return True, [opener.marker(h)]
+        decision = advance(flow, reply)
+        return True, [decision.marker(h)]
+
+    def dm_flow_status(self, handle: str) -> Dict[str, Any]:
+        flow = self._dm_flows.get(str(handle or "").strip())
+        return flow.to_dict() if flow is not None else {}
 
     # ------------------------------------------------------------------
     # lazy module bindings (imported on use: the social package stays
@@ -935,6 +1021,8 @@ class SocialEngine:
             mailer = self._get_mailer()
             rendered = self._render_for(recipient, pretext, subject, body, link,
                                         pixel=True, strategic=strategic)
+            if rendered.get("ai_social"):
+                lines.append(rendered["ai_social"])
             # pre-send anti-blocking preflight: the email hop fails SILENTLY,
             # so score it against the vectors Gmail/M365 actually filter on
             # before relaying it (report only - never blocks a send).
@@ -1046,6 +1134,8 @@ class SocialEngine:
                     ct.link, ct.code = link.short_url, link.code
                     rendered = self._render_for(t, pretext, subject, body, link,
                                                 pixel=True, strategic=strategic)
+                    if rendered.get("ai_social"):
+                        lines.append(rendered["ai_social"])
                     # pre-send anti-blocking preflight (per target: a campaign
                     # is bulk mail, which is filtered harder)
                     from phantom.automation.social.deliverability import (
@@ -1428,6 +1518,19 @@ class SocialEngine:
                 lines.append(f"DM_STAGE: to={h} stage=2 delivered=0 "
                              "note=identity_unconfirmed_skipped")
                 continue
+            # Conversation state is a REFUSAL, never an extra send: a thread
+            # closed by hostility or handed to the operator must not receive
+            # the held link from a later stage just because the ledger says a
+            # reply arrived.
+            flow = self._dm_flows.get(h)
+            if flow is not None and flow.state in ("closed", "handoff"):
+                lines.append(f"DM_DECISION: handle={h} action=stop "
+                             f"stage=none state={flow.state} "
+                             "link_allowed=0 "
+                             "reason=dm_flow_refuses_the_link")
+                lines.append(f"DM_STAGE: to={h} stage=2 delivered=0 "
+                             f"note=dm_flow_{flow.state}")
+                continue
             if self._state is not None and not self._state.stage2_ready(
                     h, aggressive=aggressive):
                 st = self._state.conversation_status(h)
@@ -1456,6 +1559,20 @@ class SocialEngine:
             lines.append(f"DM_STAGE: to={h} stage=2 delivered="
                          f"{1 if ok else 0}")
             if ok:
+                # The conversation state machine's own record: a link only
+                # exists because rapport was established, and the planner
+                # can see WHICH stage authorised it.
+                from phantom.automation.social.dm_flow import Flow
+                flow = self._dm_flows.get(h)
+                if flow is None:
+                    flow = Flow(target=h, platform=(transport.platform
+                                                    or "default"))
+                    self._dm_flows[h] = flow
+                flow.state = "link"
+                flow.link_sent = True
+                lines.append(f"DM_DECISION: handle={h} action=send "
+                             "stage=link state=link link_allowed=1 "
+                             "delay_s=0 reason=stage_two_link_sent")
                 sent_any = True
         if sent_any:
             return True, lines
@@ -1685,10 +1802,38 @@ class SocialEngine:
                                         seed=hash(email) & 0xFFFF)
         sender_addr = f"{display} <{addr}>"
         pixel_url = self._pixel_url(link) if pixel else ""
+        # OPTIONAL per-phase model: the draft is only a CANDIDATE. The
+        # deterministic pretext scorer decides (`ready`), the tracker URL is
+        # the only link allowed, and `ai_social` stays empty when the layer is
+        # off so an existing run is byte-identical.
+        ai_marker = ""
+        try:
+            from phantom.automation.ai import ai_enabled
+            if ai_enabled("social"):
+                from phantom.automation.ai.advisors.social import (
+                    apply_to_body, draft)
+                proposal = draft({
+                    "platform": platform,
+                    "pretext": pretext or "",
+                    # No invented brand: the sender identity was already
+                    # derived by the dossier. A mismatch here would reject
+                    # every otherwise-good draft.
+                    "brand": "",
+                    "target_name": self._discovered.get("name") or "",
+                    "sender": sender_addr,
+                    "link": link.short_url,
+                    "body": body_text,
+                }, channel="email", subject=subj)
+                body_text, ai_marker = apply_to_body(body_text, proposal)
+        except Exception as exc:
+            ai_marker = f"AI_SOCIAL: fallback reason=engine_error:{exc}"[:160]
         body_html = build_html_body(subj, body_text, link.short_url,
                                     "Continue", tracking_pixel=pixel_url)
-        return {"from": sender_addr, "subject": subj,
-                "body_text": body_text, "body_html": body_html}
+        rendered = {"from": sender_addr, "subject": subj,
+                    "body_text": body_text, "body_html": body_html}
+        if ai_marker:                      # off -> identical shape, no marker
+            rendered["ai_social"] = ai_marker
+        return rendered
 
     _FREE_MAIL = {"gmail.com", "googlemail.com", "outlook.com", "hotmail.com",
                    "live.com", "yahoo.com", "proton.me", "protonmail.com",

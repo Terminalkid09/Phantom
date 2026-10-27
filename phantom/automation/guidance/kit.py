@@ -998,6 +998,7 @@ _SOCIAL_MARKERS = {
     "dm_attach": "DM_ATTACH:",
     "dm_stage": "DM_STAGE:",
     "dm_plan": "DM_PLAN:",
+    "dm_decision": "DM_DECISION:",
     "follow_sent": "FOLLOW_SENT:",
     "follow_accepted": "FOLLOW_ACCEPTED:",
     "identity_conf": "IDENTITY_CONF:",
@@ -1218,12 +1219,24 @@ def _social_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[F
                        "evidence": kv.get("evidence", "")},
                 confidence=0.6, source="deep_recon", target=wm.target))
         kv = _parse_marker_line(line, _SOCIAL_MARKERS["email_candidate"])
-        if kv.get("email"):
+        # The marker carries the address MASKED (a guess must not read like a
+        # discovered address), but verification needs the full address. The
+        # identity path therefore also emits local+domain, and it is
+        # reconstructed here: raw in `email` for the prober, masked for every
+        # report/key. A marker with only a mask (post-verification) keeps it.
+        raw = str(kv.get("email") or "")
+        if "@" not in raw and kv.get("local") and kv.get("domain"):
+            raw = f"{kv.get('local')}@{kv.get('domain')}"
+        masked = kv.get("masked") or (_mask_addr(raw) if "@" in raw else raw)
+        cand = raw or masked
+        if cand:
             findings.append(Finding(
-                kind="email_candidate", key=f"email_candidate:{kv['email']}",
-                value={"email": kv.get("email"),
+                kind="email_candidate", key=f"email_candidate:{masked}",
+                value={"email": raw or masked, "masked": masked,
                        "local_part": kv.get("local", ""),
-                       "domain": kv.get("domain", "")},
+                       "domain": kv.get("domain", ""),
+                       "pattern": kv.get("pattern", ""),
+                       "score": kv.get("score", "")},
                 confidence=0.3, source="email_candidates", target=wm.target))
         kv = _parse_marker_line(line, _SOCIAL_MARKERS["email_masked"])
         if kv.get("masked"):
@@ -1236,14 +1249,32 @@ def _social_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[F
                        "length": kv.get("length", "")},
                 confidence=0.8, source="reset_enum", target=wm.target))
         kv = _parse_marker_line(line, _SOCIAL_MARKERS["email_verified"])
-        if kv.get("email"):
+        verified = kv.get("masked") or kv.get("email", "")
+        if verified:
             exists = kv.get("exists", "unknown")
             conf = 0.85 if exists == "1" else (0.2 if exists == "0" else 0.4)
             findings.append(Finding(
-                kind="email_verified", key=f"email_verified:{kv['email']}",
-                value={"email": kv.get("email"), "exists": exists,
-                       "reason": kv.get("reason", "")},
+                kind="email_verified", key=f"email_verified:{verified}",
+                value={"email": verified, "masked": kv.get("masked", ""),
+                       "exists": exists, "reason": kv.get("reason", "")},
                 confidence=conf, source="email_verify", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["dm_decision"])
+        if kv.get("action"):
+            # The conversation state machine's decision is a first-class
+            # fact: stop/handoff must be visible to the planner, not buried
+            # in a free-text reason line.
+            action = kv.get("action", "")
+            findings.append(Finding(
+                kind="dm_decision",
+                key=f"dm_decision:{kv.get('handle', wm.target)}",
+                value={"handle": kv.get("handle", ""),
+                       "action": action,
+                       "stage": kv.get("stage", ""),
+                       "state": kv.get("state", ""),
+                       "link_allowed": kv.get("link_allowed", "0") == "1",
+                       "reason": kv.get("reason", "")},
+                confidence=(0.85 if action in ("stop", "handoff") else 0.6),
+                source="dm_flow", target=wm.target))
         kv = _parse_marker_line(line, _SOCIAL_MARKERS["service_account"])
         if kv.get("email"):
             findings.append(Finding(
@@ -1553,13 +1584,18 @@ def _full_scan_timing(style: str) -> str:
     (open ports found before the cap) instead of being SIGKILLed by the
     runtime with no output at all.
     """
+    # Live 2026-10-26: the old `-T2 --min-rate 500` did not finish a
+    # connect scan of a Windows host inside the 200 s host timeout, so nmap
+    # exited non-zero with no parsed services and AUTO-MODE never saw the
+    # real ports (5040/5357). `-T3 --min-rate 1000` completed the same sweep
+    # in ~130 s on that host without switching to a loud profile.
     if style == "full_stealth":
-        return "-T2 --min-rate 500"
+        return "-T3 --min-rate 1000"
     if style == "top_loud":
         return "-T4 --min-rate 2000"
     if style == "top_fast":
         return "-T4 --min-rate 1500"
-    return "-T4 --min-rate 1000"
+    return "-T4 --min-rate 1500"
 
 
 def _port_scan_adapter(wm, slots):
@@ -1583,7 +1619,7 @@ def _port_scan_adapter(wm, slots):
         return f"nc -zv -w 1 {target} {spec}"
     if ports:
         if _full_range(ports):
-            return (f"nmap -Pn -sT -p {ports} {_full_scan_timing(style)} "
+            return (f"nmap -Pn -sT -n -p {ports} {_full_scan_timing(style)} "
                     f"--max-retries 1 --host-timeout 200s {target}")
         return (f"nmap -Pn -sT -p {ports} --max-retries 1 "
                 f"--host-timeout 120s {target}")
@@ -1646,7 +1682,7 @@ def _scan_port_spec(wm) -> str:
         return ("--top-ports 100 --min-rate 3000 "
                 "--max-retries 1 --host-timeout 120s")
     if style == "full_stealth":
-        return ("-p 1-65535 -T2 --min-rate 500 "
+        return ("-p 1-65535 -T3 --min-rate 1000 "
                 "--max-retries 1 --host-timeout 200s")
     return ("--top-ports 1000 --min-rate 300 "
             "--max-retries 1 --host-timeout 200s")
@@ -4117,6 +4153,14 @@ def recon_ladder_capability():
                stealth_level="active", timeout=600,
                preconditions=[_has_network_host()], banner="recon ladder",
                tools=["nmap"])
+
+
+def _mask_addr(addr: str) -> str:
+    """One-letter local part, stars for the rest (never the full address)."""
+    local, _, domain = str(addr or "").partition("@")
+    if not local or not domain:
+        return str(addr or "")
+    return local[:1] + "*" * max(3, len(local) - 1) + "@" + domain
 
 
 def _ladder_engine(wm, slots):

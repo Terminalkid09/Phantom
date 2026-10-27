@@ -50,6 +50,13 @@ what yields the session.
 The relay is OFF by default (`phishing.aitm` / `PHANTOM_AITM`) and it is not
 wired to the auto-mode: it needs a domain and it is the highest-liability
 action in the tool, so it stays an operator decision, never an autonomous one.
+
+LAB PROFILE: `phishing.lab_profile=true` (or `PHANTOM_LAB_PROFILE=1`) is the
+ONE explicit way to make the relay available without the per-run flag, and
+only for a lab tenant. It is still an operator decision — nothing turns it on
+silently, and every mount made through it emits an `AITM_LAB:` marker so a
+reader can tell a lab default from a production opt-in. Outside lab the flag
+missing means OFF.
 """
 
 from __future__ import annotations
@@ -87,13 +94,33 @@ _OTP_FIELDS = ("otc", "otp", "mfa", "code", "verificationcode", "token",
                "authcode", "onetimecode")
 
 
-def enabled() -> bool:
-    """The AiTM relay is opt-in, always: `phishing.aitm` / `PHANTOM_AITM`."""
+def explicitly_enabled() -> bool:
+    """The per-run opt-in: `phishing.aitm` / `PHANTOM_AITM`. Never implied."""
     try:
         from phantom.utils import config as cfg
         return cfg.get_bool("phishing.aitm", False, env="PHANTOM_AITM")
     except Exception:
         return False
+
+
+def lab_profile() -> bool:
+    """Explicit lab-only default: `phishing.lab_profile` / `PHANTOM_LAB_PROFILE`.
+
+    Missing means False. This is a separate switch from `phishing.aitm` so a
+    lab box can default the relay on without ever looking like a production
+    opt-in; callers must surface an `AITM_LAB:` marker when they use it.
+    """
+    try:
+        from phantom.utils import config as cfg
+        return cfg.get_bool("phishing.lab_profile", False,
+                            env="PHANTOM_LAB_PROFILE")
+    except Exception:
+        return False
+
+
+def enabled() -> bool:
+    """Opt-in OR the explicit lab profile. Nothing else enables the relay."""
+    return explicitly_enabled() or lab_profile()
 
 
 def _origin(url: str) -> str:

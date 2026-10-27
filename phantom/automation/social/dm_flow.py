@@ -111,10 +111,16 @@ class Decision:
     delay_s: int = 0
     link_allowed: bool = False
 
-    def marker(self) -> str:
-        return (f"DM_DECISION: action={self.action} stage={self.stage} "
+    def marker(self, handle: str = "") -> str:
+        who = f" handle={handle}" if handle else ""
+        return (f"DM_DECISION:{who} action={self.action} stage={self.stage} "
                 f"state={self.state} link_allowed={int(self.link_allowed)} "
-                f"delay_s={self.delay_s} reason={self.reason}")
+                f"delay_s={self.delay_s} reason={_slug(self.reason)}")
+
+
+def _slug(text: str) -> str:
+    """Marker-safe reason: one token, no spaces (the parser splits on them)."""
+    return "_".join(str(text or "").split())[:160]
 
 
 def classify_reply(text: str) -> str:

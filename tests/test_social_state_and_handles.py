@@ -106,6 +106,62 @@ class TestStateClassifier(unittest.TestCase):
         self.assertEqual(state, "unknown")
 
 
+def _embed_html(payload: dict) -> str:
+    """Instagram's /embed/ page: the profile JSON as a JS-escaped string."""
+    import json
+    inner = json.dumps(payload, separators=(",", ":"))
+    return ("<html><script>window.__x = " + json.dumps(inner) +
+            ";</script></html>")
+
+
+PUBLIC_EMBED = _embed_html({
+    "username": "aarbana", "full_name": "Armela Arbana",
+    "is_private": False, "biography": "Quando lavorare e bello!",
+    "profile_pic_url": "https://scontent.cdninstagram.com/x.jpg",
+    "edge_followed_by": {"count": 246},
+    "edge_follow": {"count": 703},
+    "edge_owner_to_timeline_media": {"count": 104},
+})
+PRIVATE_EMBED = _embed_html({
+    "username": "someone", "full_name": "Someone",
+    "is_private": True,
+})
+
+
+class TestInstagramEmbedFallback(unittest.TestCase):
+    """Live 2026-10-26: the profile API answers 429 from this egress while
+    /embed/ keeps serving the public profile. `unknown` was the old verdict,
+    so a real, readable profile was reported unreadable."""
+
+    def _vote(self, profile_body, embed_body, username="aarbana"):
+        def fake(url, **kwargs):
+            return embed_body if "/embed/" in url else profile_body
+        with mock.patch.object(R, "_fetch", side_effect=fake):
+            return R._state_vote(username, "instagram")
+
+    def test_429_profile_falls_back_to_embed(self):
+        state, conf, html = self._vote("", PUBLIC_EMBED)
+        self.assertEqual(state, "public")
+        self.assertGreaterEqual(conf, 0.6)
+        self.assertEqual(html, PUBLIC_EMBED)
+
+    def test_private_embed_is_private_not_public(self):
+        state, _, _ = self._vote("", PRIVATE_EMBED, "someone")
+        self.assertEqual(state, "private")
+
+    def test_embed_without_profile_stays_unknown(self):
+        state, _, _ = self._vote("", SHELL_BIG)
+        self.assertEqual(state, "unknown")
+
+    def test_embed_counts_are_mined(self):
+        result = R.ReconResult("aarbana", "instagram")
+        R._mine_graph("aarbana", "instagram", PUBLIC_EMBED, result)
+        self.assertEqual(result.full_name, "Armela Arbana")
+        self.assertEqual((result.followers, result.following, result.posts),
+                         ("246", "703", "104"))
+        self.assertEqual(result.stats_source, "instagram_embed")
+
+
 class TestTikTokCounts(unittest.TestCase):
 
     def test_follower_and_following_are_parsed_separately(self):

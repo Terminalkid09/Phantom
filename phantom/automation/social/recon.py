@@ -66,6 +66,56 @@ TOP_SOCIALS = ("instagram", "tiktok", "x", "github", "telegram")
 # "other" scope searches instead of them.
 ALT_PLATFORMS = tuple(p for p in _PROFILE_URLS if p not in TOP_SOCIALS)
 
+_INSTAGRAM_EMBED = "https://www.instagram.com/{u}/embed/"
+# Live 2026-10-26: with a desktop UA the embed URL answers the same 500 KB
+# app shell as the profile page; a mobile UA gets the 300 KB page that
+# actually carries the profile JSON. The UA is part of this fallback.
+_IG_MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+                 "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 "
+                 "Mobile/15E148 Safari/604.1")
+
+
+def instagram_embed_profile(html: str) -> Dict[str, str]:
+    """The public profile fields Instagram's ``/embed/`` page carries.
+
+    Live evidence (2026-10-26): the profile API (``web_profile_info``) and
+    the normal profile page answer **429** for a datacenter egress, while
+    ``/embed/<handle>/`` keeps returning the public profile JSON without a
+    login. The page embeds it as a JS-escaped string, so the ordinary
+    ``<script>`` blob extractor cannot see it; this is the fallback that
+    makes a rate-limited profile readable instead of silently `unknown`.
+
+    Returns ``{}`` when the page carries no profile object (private or
+    nonexistent accounts render a generic shell) — never a guess.
+    """
+    raw = html or ""
+    if not raw:
+        return {}
+    decoded = raw.replace('\\"', '"').replace("\\/", "/")
+    decoded = decoded.replace("\\\\/", "/")   # double-escaped CDN URLs
+    if '"is_private"' not in decoded:
+        return {}
+
+    def one(pattern: str) -> str:
+        m = re.search(pattern, decoded)
+        return m.group(1) if m else ""
+
+    out = {
+        "username": one(r'"username":"([^"]+)"'),
+        "full_name": one(r'"full_name":"([^"]*)"'),
+        "is_private": one(r'"is_private":(true|false)'),
+        "biography": one(r'"biography":"((?:[^"\\]|\\.)*)"'),
+        "profile_pic_url": one(r'"profile_pic_url":"([^"]+)"'),
+    }
+    for key, attr in (("edge_followed_by", "followers"),
+                      ("edge_follow", "following"),
+                      ("edge_owner_to_timeline_media", "posts")):
+        count = one(r'"%s":\{"count":(\d+)' % key)
+        if count:
+            out[attr] = count
+    return out
+
+
 # every platform this module can actually fetch (API/UI validate against it)
 SUPPORTED_PLATFORMS = tuple(_PROFILE_URLS)
 
@@ -593,6 +643,24 @@ def _state_vote(username: str, platform: str, jar=None) -> Tuple[str, float, str
                 break
     state = winners[0]
     conf = counts[state] / len(votes)
+    if platform == "instagram":
+        # 429 problem: the profile page/API can answer a rate-limited shell
+        # (or an empty body) while /embed/ still serves the profile. Try the
+        # page first, then ONE embed fetch; a body without a profile object
+        # changes nothing and the verdict stays `unknown`.
+        embed = ""
+        profile = instagram_embed_profile(best_html)
+        if not profile:
+            embed = _fetch(_INSTAGRAM_EMBED.format(u=username),
+                           timeout=15.0, ua=_IG_MOBILE_UA)
+            profile = instagram_embed_profile(embed)
+        if profile:
+            best_html = embed or best_html
+            # two unreadable profile fetches + one readable embed is
+            # evidence, not certainty: never report 1.00 here.
+            conf = 0.75 if state == "unknown" else max(conf, 0.6)
+            return ("private" if profile.get("is_private") == "true"
+                    else "public"), conf, best_html
     return state, conf, best_html
 
 
@@ -649,6 +717,25 @@ def _mine_graph(username: str, platform: str, html: str,
     """Tagged/commenter/follower mining from embedded JSON + page regex."""
     ev = f"graph:{platform}"
     blobs = _extract_json_blobs(html) if html else []
+    embed = instagram_embed_profile(html) if platform == "instagram" else {}
+    if embed:
+        # the /embed/ page carries the profile as an escaped string, not as
+        # a <script> JSON blob: fill what the blob walker cannot see.
+        if not result.full_name and embed.get("full_name"):
+            result.full_name = embed["full_name"][:80]
+        for attr in ("followers", "following", "posts"):
+            if not getattr(result, attr, "") and embed.get(attr):
+                setattr(result, attr, embed[attr])
+        if not result.avatar_url and embed.get("profile_pic_url"):
+            result.avatar_url = embed["profile_pic_url"][:300]
+        if not result.bio and embed.get("biography"):
+            result.bio = embed["biography"]
+        if result.followers and not result.stats_source:
+            result.stats_source = "instagram_embed"
+        if result.state == "unknown":
+            result.state = ("private" if embed.get("is_private") == "true"
+                            else "public")
+            result.state_confidence = max(result.state_confidence, 0.6)
     # counts
     for key, attr in (("edge_followed_by", "followers"),
                       ("edge_follow", "following"),

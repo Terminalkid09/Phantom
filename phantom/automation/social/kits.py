@@ -109,3 +109,33 @@ def resolve_kit(kit: str) -> Tuple[str, bool]:
 def kit_rows() -> List[Tuple[str, str, str, str]]:
     """(id, label, channel, notes) per kit, for a table."""
     return [(kit.id, kit.label, kit.channel, kit.notes) for kit in KITS]
+
+
+def prelaunch_check(kit_id: str, real_html: str = "", clone_html: str = "",
+                    *, real_url: str = "", clone_url: str = "",
+                    headers=None, strict: bool = False) -> Dict[str, object]:
+    """Score a lure page against the real one BEFORE a campaign uses it.
+
+    Report-only by default: a blocking report is shown with its marker, but
+    the existing flow is not stopped. `strict=True` is the caller's explicit
+    decision to refuse a blocking clone — the check itself never vetoes.
+    """
+    from phantom.automation.social.clone_check import check_clone
+    effective, known = resolve_kit(kit_id)
+    report = check_clone(real_html, clone_html, real_url=real_url,
+                         clone_url=clone_url, headers=headers)
+    blocked = bool(strict and report.blocking)
+    return {
+        "kind": "kit_prelaunch",
+        "requested": (kit_id or "").strip().lower(),
+        "kit": effective,
+        "known": known,
+        "marker": report.marker(),
+        "score": report.score,
+        "grade": report.grade,
+        "blocking": report.blocking,
+        "strict": bool(strict),
+        "blocked": blocked,
+        "ok": not blocked,
+        "report": report.to_dict(),
+    }

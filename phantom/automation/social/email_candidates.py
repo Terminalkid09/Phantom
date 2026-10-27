@@ -91,7 +91,10 @@ class Candidate:
         return mask_email(self.email)
 
     def markers(self) -> str:
-        return (f"EMAIL_CANDIDATE: masked={self.masked} "
+        # `email` carries the MASK, never the address: the shared social
+        # interpreter keys findings by that field, and a generated candidate
+        # is not evidence enough to print in a report.
+        return (f"EMAIL_CANDIDATE: email={self.masked} masked={self.masked} "
                 f"pattern={self.pattern} domain={self.domain_kind} "
                 f"score={self.score:.2f}")
 
@@ -192,8 +195,10 @@ class Verified:
     evidence: str = ""
 
     def marker(self) -> str:
-        return (f"EMAIL_VERIFIED: masked={self.candidate.masked} "
-                f"verdict={self.verdict} evidence={_one(self.evidence)}")
+        exists = {"exists": "1", "absent": "0"}.get(self.verdict, "unknown")
+        return (f"EMAIL_VERIFIED: email={self.candidate.masked} "
+                f"masked={self.candidate.masked} exists={exists} "
+                f"reason={_one(self.evidence)}")
 
 
 def verify(candidates: Sequence[Candidate], *,

@@ -116,7 +116,13 @@ def email_candidates(wm) -> Tuple[bool, List[str]]:
             if addr in seen:
                 continue
             seen.add(addr)
-            lines.append(f"EMAIL_CANDIDATE: email={addr} local={tok} domain={dom}")
+            # Masked in the marker: a candidate is a GUESS, and a report/log
+            # that prints it in full can be mistaken for a discovered address
+            # (and leaks it when the guess happens to be right).
+            from phantom.automation.social.email_enum import mask_email
+            masked = mask_email(addr)
+            lines.append(f"EMAIL_CANDIDATE: email={masked} masked={masked} "
+                         f"local={tok} domain={dom}")
             count += 1
     if not domains:
         return False, ["EMAIL_CANDIDATE: none (no OBSERVED domain to compose "

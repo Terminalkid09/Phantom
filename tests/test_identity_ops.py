@@ -70,8 +70,14 @@ class TestCandidateGeneration(unittest.TestCase):
         ok, lines = email_candidates(wm)
         self.assertTrue(ok)
         blob = "\n".join(lines)
-        self.assertIn("mario.rossi@acme-corp.io", blob)
-        self.assertIn("mariorossi@acme-corp.io", blob)
+        # A candidate is a GUESS: the marker carries local+domain (enough to
+        # reconstruct for the prober) and a MASK for anything human-readable.
+        self.assertIn("local=mario.rossi", blob)
+        self.assertIn("local=mariorossi", blob)
+        self.assertIn("domain=acme-corp.io", blob)
+        self.assertIn("masked=m", blob)
+        self.assertNotIn("mario.rossi@acme-corp.io", blob,
+                         "a generated address must never be printed in full")
 
     def test_bounded(self):
         wm = _wm()
