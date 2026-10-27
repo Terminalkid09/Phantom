@@ -1,0 +1,11 @@
+{
+  "adapter": "models\\scan_parse\\2026-10-26-cpu\\adapter",
+  "base_model": "training/base/Qwen2.5-0.5B-Instruct",
+  "baseline": {},
+  "eval": {},
+  "phase": "scan_parse",
+  "promoted": false,
+  "sha256": "f735e6721702ffa72212996136b53c2cd863513f5f684b13006446c5b61ccdb7",
+  "trained_at": "2026-10-26T08:51:14Z",
+  "version": "2026-10-26-cpu"
+}

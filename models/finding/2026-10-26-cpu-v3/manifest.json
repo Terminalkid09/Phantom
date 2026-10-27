@@ -1,0 +1,17 @@
+{
+  "adapter": "models/finding/2026-10-26-cpu-v3/adapter",
+  "base_model": "training/base/Qwen2.5-0.5B-Instruct",
+  "baseline": {
+    "exact_match": 1.0
+  },
+  "dataset": "training/data/train/finding.jsonl",
+  "eval": {
+    "exact_match": 0.666667
+  },
+  "golden_rows": 3,
+  "phase": "finding",
+  "promoted": false,
+  "sha256": "b51f94a528173b2dde19ca555fb22de98715c129c388fea8643b3d8178de0881",
+  "trained_at": "2026-10-26T09:50:04Z",
+  "version": "2026-10-26-cpu-v3"
+}

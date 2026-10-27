@@ -320,6 +320,28 @@ data/wordlists/**
 !data/wordlists/custom/
 !data/wordlists/custom/.gitkeep
 
+# Per-phase AI runtime state, trained artefacts and derived datasets.
+# Weights and engagement-derived JSONL must never be committed by accident;
+# manifests and READMEs stay trackable.
+data/ai/
+data/exploit_packs.json
+training/data/
+training/base/
+training/eval/
+models/**/adapter/
+models/**/checkpoints/
+models/**/merged/
+models/**/*.gguf
+models/**/*.safetensors
+models/**/*.pt
+models/**/*.pth
+models/**/*.bin
+data/social_osint/
+# Local lab/scratch built during a session (containers, generated configs,
+# per-run logs): reproducible from the commands, never product source.
+data/lab/
+data/tmp/
+
 # OSINT output dumped into the working copy (username -> social profiles)
 someuser.txt
 # A crashed `use exploit` test used to leave its scratch file in the payload

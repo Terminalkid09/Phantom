@@ -1,0 +1,17 @@
+{
+  "adapter": "models/osint/2026-10-26-cpu-v3/adapter",
+  "base_model": "training/base/Qwen2.5-0.5B-Instruct",
+  "baseline": {
+    "brier": 0.9775
+  },
+  "dataset": "training/data/train/osint.jsonl",
+  "eval": {
+    "brier": 0.9625
+  },
+  "golden_rows": 3,
+  "phase": "osint",
+  "promoted": false,
+  "sha256": "dee93f21635ce0c25f127366b0dc75e4743c360df6ac9dff6c4a65c30da2e49e",
+  "trained_at": "2026-10-26T09:57:39Z",
+  "version": "2026-10-26-cpu-v3"
+}

@@ -1,0 +1,13 @@
+{
+  "adapter": "models/social/2026-10-26-cpu-v3/adapter",
+  "base_model": "training/base/Qwen2.5-0.5B-Instruct",
+  "baseline": {},
+  "dataset": "training/data/train/social.jsonl",
+  "eval": {},
+  "golden_rows": 3,
+  "phase": "social",
+  "promoted": false,
+  "sha256": "50e36294089a91aa660376297c948d8cf074a668ca8829b8260b1f6bd5cf1f2f",
+  "trained_at": "2026-10-26T10:00:13Z",
+  "version": "2026-10-26-cpu-v3"
+}

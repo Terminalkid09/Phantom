@@ -1,0 +1,3 @@
+{"id": "scan-1", "phase": "scan_parse", "input": {"tool": "nmap", "output": "22/tcp open ssh\n443/tcp open https\nNot shown: 998 filtered tcp ports"}, "expected": {"open_ports": ["22", "443"]}, "metric": "exact_match"}
+{"id": "scan-2", "phase": "scan_parse", "input": {"tool": "nmap", "output": "All 1000 scanned ports on 10.0.0.5 are in ignored states.\nNot shown: 1000 filtered tcp ports"}, "expected": {"open_ports": []}, "metric": "exact_match"}
+{"id": "scan-3", "phase": "scan_parse", "input": {"tool": "nmap", "output": "161/udp open snmp\n500/udp open isakmp"}, "expected": {"open_ports": ["161", "500"]}, "metric": "exact_match"}
