@@ -43,6 +43,23 @@ class TestBaseModuleSuggest:
         assert "SUGGESTED (First Steps)" in groups
         assert any("nmap" in c for c in groups["SUGGESTED (First Steps)"])
 
+    def test_first_steps_skip_host_discovery(self):
+        """Without -Pn nmap answers "Host seems down" for every host that
+        drops ICMP, and the operator reads that as "no services" on a box
+        that has some (measured live on the docker lab, 2026-10-27)."""
+        _reset(target="10.0.0.1")
+        for cmd in ScanModule().suggest_commands()["SUGGESTED (First Steps)"]:
+            assert "-Pn" in cmd, cmd
+
+    def test_basic_nmap_group_offers_a_connect_scan(self):
+        """A SYN probe comes back filtered through a port forwarder / WSL
+        loopback while the connect scan opens the same ports (measured
+        2026-10-27: 6379 and 8081 'filtered' with -sS, 'open' with -sT)."""
+        _reset(target="10.0.0.1")
+        basic = ScanModule().build_commands()["NMAP (Basic)"]
+        assert any("-sT" in cmd for cmd in basic)
+        assert all("-Pn" in cmd for cmd in basic)
+
     def test_scan_follow_up_without_probes_when_services_known(self):
         _reset(target="10.0.0.1")
         session.add_result("scan", {
@@ -421,12 +438,47 @@ class TestExploitModuleDynamic:
              "version": "Apache httpd 2.4.49"},
         ])
         selected = ["msfconsole -q -x 'x' && echo y"]
-        with patch.object(PreviewSession, "interactive",
-                          return_value=selected), \
+        # `choose` is the seam: it answers the menu with a terminal and the
+        # module's first group without one (see tests/test_preview.py).
+        with patch.object(PreviewSession, "choose", return_value=selected), \
              patch("phantom.core.executor.run_commands",
                    return_value={selected[0]: "out"}):
             ExploitModule()._execute_flow("")
         assert session.get_result("exploit_manual") is not None
+
+    def test_run_group_executes_only_the_named_group(self):
+        _reset()
+        session.add_result("service_summary", [
+            {"port": "80", "service": "http",
+             "version": "Apache httpd 2.4.49"},
+        ])
+        module = ScanModule()
+        # base_module binds run_commands at import: patch it WHERE IT IS USED,
+        # not at the source module (that patch is a no-op and let a real
+        # full-port sweep loose in the test suite).
+        with patch("phantom.modules.base_module.run_commands",
+                   return_value={"x": "out"}) as run:
+            module.do_run_group("NMAP (Basic)")
+        planned = list(module.build_commands().get("NMAP (Basic)", []))
+        assert run.call_count == 1
+        assert list(run.call_args.args[0]) == planned
+        assert "x" in session.get_result("scan")
+
+    def test_run_group_without_a_name_says_the_usage(self):
+        _reset()
+        module = ScanModule()
+        with patch("phantom.modules.base_module.notifier") as note, \
+             patch("phantom.modules.base_module.run_commands") as run:
+            module.do_run_group("")
+        assert note.error.called
+        assert not run.called
+
+    def test_run_group_with_an_unknown_name_runs_nothing(self):
+        _reset()
+        module = ScanModule()
+        with patch("phantom.modules.base_module.run_commands") as run:
+            module.do_run_group("NOPE")
+        assert not run.called
 
 
 class TestPreviewSuggestedStyling:

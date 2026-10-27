@@ -46,11 +46,22 @@ class ScanModule(BaseModule):
         xml_out = scan_xml_path(t)
 
         groups = {
+            # `-Pn` on every basic row: without it nmap's host discovery
+            # answers "Host seems down" for any box that drops ICMP, and the
+            # operator reads that as "no services" on a host that has some
+            # (measured live: the docker lab on 127.0.0.1, 2026-10-27).
             "NMAP (Basic)": [
-                f"sudo nmap -sS -p- --min-rate 5000 -T4 {t}",
-                f"sudo nmap -sV -sC -p- {t}",
-                f"sudo nmap -sV -sC -p- -oX {xml_out} {t}  # REQUIRED FOR EXPLOIT MODULE",
-                f"sudo nmap -O {t}",
+                f"sudo nmap -Pn -sS -p- --min-rate 5000 -T4 {t}",
+                f"sudo nmap -Pn -sV -sC -p- {t}",
+                f"sudo nmap -Pn -sV -sC -p- -oX {xml_out} {t}  # REQUIRED FOR EXPLOIT MODULE",
+                f"sudo nmap -Pn -O {t}",
+                # The connect scan is the row that still WORKS when a SYN
+                # probe comes back filtered: measured on a target published
+                # through a port forwarder / WSL loopback, `-sS` reported
+                # 6379+8081 filtered while `-sT` opened them (2026-10-27).
+                # Same port space and same XML, so it feeds the exploit
+                # module exactly like the SYN row above.
+                f"sudo nmap -Pn -sT -sV -sC -p- -oX {xml_out} {t}  # connect scan: use when SYN is filtered",
             ],
             "NMAP (Stealth & Evasion)": [
                 f"sudo nmap -sS -f --mtu 24 {t}  # Fragmented packets",
@@ -116,7 +127,7 @@ class ScanModule(BaseModule):
             return self.FULL_SWEEP_QUIET_TIMEOUT
         return self.quiet_timeout_default
 
-    def _execute_flow(self, _):
+    def _execute_flow(self, arg=""):
         """Show preview, let user edit, then execute selected commands."""
         if not session.target:
             notifier.error("No target set. Use 'set target <ip>' first.")
@@ -127,7 +138,10 @@ class ScanModule(BaseModule):
             return
 
         preview = PreviewSession(groups)
-        chosen_commands = preview.interactive()
+        # `choose`: the menu when a terminal is attached, the module's first
+        # group when stdin is a pipe (a scripted `use scan` + `run` used to
+        # die here with "EOF when reading a line").
+        chosen_commands = preview.choose(self._group_from_arg(arg))
         if chosen_commands is None:
             notifier.warn("Scan cancelled.")
             return

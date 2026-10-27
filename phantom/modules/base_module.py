@@ -126,10 +126,27 @@ class BaseModule(cmd.Cmd):
             return
         PreviewSession(groups).review()
 
-    def _execute_flow(self, arg: str) -> None:
-        """Default execution flow (override per module): build commands →
-        interactive selection → run. Modules keep their bespoke flows by
-        overriding this (they used to be called `do_preview`)."""
+    def _run_selected(self, chosen) -> None:
+        """Execute chosen commands and store the run under this module."""
+        chosen = filter_aggressive_commands(chosen)
+        from phantom.core.executor import RunStatus
+        status = RunStatus()
+        results = run_commands(chosen, session.target, status=status)
+        session.add_result(getattr(self, "module_name", "module"), results,
+                           status=status)
+
+    def do_run_group(self, arg: str):
+        """run-group <name> — execute exactly ONE group of this module's plan.
+
+        The group is named, so there is nothing to choose and no menu to
+        answer: this is the scriptable form of the `run-group` that only
+        exists INSIDE `run`'s interactive menu. `preview` lists the names.
+        """
+        name = (arg or "").strip()
+        if not name:
+            notifier.error("Usage: run-group <name> — `preview` lists the "
+                           "group names")
+            return
         if not session.target:
             notifier.error("No target set. Use 'set target <ip>' first.")
             return
@@ -137,16 +154,44 @@ class BaseModule(cmd.Cmd):
         if not groups:
             return
         preview = PreviewSession(groups)
-        chosen = preview.interactive()
+        chosen = preview.run_group(name)
+        if not chosen:
+            return          # run_group already named the available groups
+        notifier.status(f"Running group '{name.upper()}' on "
+                        f"{session.target}...")
+        self._run_selected(chosen)
+
+    def _execute_flow(self, arg: str) -> None:
+        """Default execution flow (override per module): build commands →
+        selection → run. Modules keep their bespoke flows by overriding this
+        (they used to be called `do_preview`).
+
+        `choose` answers the menu when a human is attached and falls back to
+        the module's own first group when stdin is a pipe, so the flow is
+        scriptable instead of dying on `input()`."""
+        if not session.target:
+            notifier.error("No target set. Use 'set target <ip>' first.")
+            return
+        groups = self.build_commands()
+        if not groups:
+            return
+        preview = PreviewSession(groups)
+        chosen = preview.choose(self._group_from_arg(arg))
         if chosen is None:
             notifier.warn("Cancelled.")
             return
-        chosen = filter_aggressive_commands(chosen)
-        from phantom.core.executor import RunStatus
-        status = RunStatus()
-        results = run_commands(chosen, session.target, status=status)
-        session.add_result(getattr(self, "module_name", "module"), results,
-                           status=status)
+        self._run_selected(chosen)
+
+    @staticmethod
+    def _group_from_arg(arg: str) -> str:
+        """`run --group <name>` picks a group without a menu."""
+        tokens = (arg or "").split()
+        for index, token in enumerate(tokens):
+            if token in ("--group", "-g") and index + 1 < len(tokens):
+                return tokens[index + 1]
+            if token.startswith("--group="):
+                return token.split("=", 1)[1]
+        return ""
 
     def _run_quiet(self, suggestions: dict) -> bool:
         """--quiet path: run the top suggested command directly, print only

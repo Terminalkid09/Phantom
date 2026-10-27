@@ -400,19 +400,25 @@ def first_steps_suggestion_group() -> dict:
             str(s.get("port")) for s in services if s.get("port")))
         groups = {
             "SUGGESTED (Follow-up)": [
-                f"sudo nmap -O {t}",
+                f"sudo nmap -Pn -O {t}",
                 f"sudo nmap -sU --top-ports 20 {t}",
             ],
         }
         if ports:
             groups["SUGGESTED (Follow-up)"].append(
-                f"sudo nmap -sV -sC -p {ports} {t}")
+                f"sudo nmap -Pn -sV -sC -p {ports} {t}")
         return groups
     from phantom.utils.paths import scan_xml_path
+    # `-Pn`: without it nmap probes with ICMP/host-discovery and answers
+    # "Host seems down ... 0 hosts up" on every host that drops ping — the
+    # operator then sees "No open services detected" on a box with 8081/6379/
+    # 2375 listening (measured against the docker lab and the Windows host,
+    # 2026-10-27). The scan is aimed at a named host that is already in
+    # scope, so skipping discovery is both correct and faster.
     return {
         "SUGGESTED (First Steps)": [
-            f"sudo nmap -sV -sC -p- -oX {scan_xml_path(t)} {t}   # enables exploit module",
-            f"sudo nmap -O {t}",
+            f"sudo nmap -Pn -sV -sC -p- -oX {scan_xml_path(t)} {t}   # enables exploit module",
+            f"sudo nmap -Pn -O {t}",
         ],
     }
 

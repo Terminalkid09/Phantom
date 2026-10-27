@@ -57,3 +57,54 @@ class TestPreviewSession:
         preview.remove(2)
         assert preview.run_all() == ["a", "c"]
         assert preview.run_single(2) == ["c"]
+
+
+class TestNonInteractiveFallback:
+    """A piped stdin must not reach `input()`.
+
+    `use scan` + `run` inside a pipe died with "EOF when reading a line",
+    which made the manual module shell unscriptable: no CI and no end-to-end
+    run could touch it (measured 2026-10-26)."""
+
+    def test_non_interactive_runs_the_first_group_and_says_so(self, capsys):
+        preview = PreviewSession(groups.copy())
+        chosen = preview.non_interactive()
+        assert chosen == groups["NMAP"]
+        assert "stdin is not a terminal" in capsys.readouterr().out
+
+    def test_non_interactive_honours_a_named_group(self):
+        preview = PreviewSession(groups.copy())
+        assert preview.non_interactive("NETWORK") == groups["NETWORK"]
+
+    def test_non_interactive_with_an_unknown_group_runs_nothing(self):
+        preview = PreviewSession(groups.copy())
+        assert preview.non_interactive("NOPE") is None
+
+    def test_non_interactive_with_no_commands_runs_nothing(self):
+        preview = PreviewSession({"NMAP": [], "NETWORK": []})
+        assert preview.non_interactive() is None
+
+    def test_first_group_skips_empty_ones(self):
+        preview = PreviewSession({"SUGGESTED": [], "NMAP": ["a"]})
+        assert preview.group_names() == ["NMAP"]
+        assert preview.non_interactive() == ["a"]
+
+    def test_choose_never_calls_input_without_a_terminal(self, monkeypatch):
+        import phantom.core.preview as preview_mod
+
+        monkeypatch.setattr(preview_mod, "_stdin_is_tty", lambda: False)
+        monkeypatch.setattr(
+            preview_mod.PreviewSession, "interactive",
+            lambda self: pytest.fail("interactive() reached without a TTY"))
+        preview = PreviewSession(groups.copy())
+        assert preview.choose() == groups["NMAP"]
+
+    def test_interactive_degrades_on_eof_instead_of_raising(self, monkeypatch,
+                                                          capsys):
+        def _eof(_prompt=""):
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", _eof)
+        preview = PreviewSession(groups.copy())
+        assert preview.interactive() == groups["NMAP"]
+        assert "stdin closed" in capsys.readouterr().out

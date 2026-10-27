@@ -1,7 +1,20 @@
+import sys
+
 from rich.console import Console
 from typing import Dict, List, Optional, Tuple
 
 console = Console()
+
+def _stdin_is_tty() -> bool:
+    """True only when a terminal is really attached (never raises)."""
+    stream = getattr(sys, "stdin", None)
+    if stream is None:
+        return False
+    try:
+        return bool(stream.isatty())
+    except Exception:
+        return False
+
 
 class PreviewSession:
     def __init__(self, groups: Dict[str, List[str]]) -> None:
@@ -83,10 +96,57 @@ class PreviewSession:
         console.print(
             "  [dim]Execute with: run | run <n> | run-group <name> | run-all | cancel[/]")
 
+    def group_names(self) -> List[str]:
+        """Non-empty group names, in the order the module ranked them."""
+        return [name for name, cmds in self.groups.items() if cmds]
+
+    def non_interactive(self, group: str = "") -> Optional[List[str]]:
+        """No terminal to answer the menu: never call `input()`.
+
+        `use scan` + `run` piped into Phantom used to die with "Failed to
+        enter module scan: EOF when reading a line" — the whole manual module
+        shell could not be scripted, so no CI and no end-to-end run could
+        touch it (measured with a piped stdin, 2026-10-26).
+
+        With no terminal nobody can pick, so the fallback is the FIRST group
+        the module itself ranked first (its primary move) and the line says
+        so; `run-group <name>` and `run-all` are how a script asks for a
+        different scope instead of guessing one.
+        """
+        self._display()
+        names = self.group_names()
+        if not names:
+            console.print("[dim]Nothing to run — the module produced no "
+                          "command group for the current state.[/]")
+            return None
+        if group:
+            return self.run_group(group) or None
+        console.print(
+            f"  [dim]stdin is not a terminal: no menu to answer — running the "
+            f"first group '{names[0]}'. Ask for another with `run-group "
+            f"<name>` (available: {', '.join(names)}) or `run-all`.[/]")
+        return self.run_group(names[0])
+
+    def choose(self, group: str = "") -> Optional[List[str]]:
+        """The menu when a human is there, the module's primary group when
+        not (see `non_interactive`)."""
+        if not _stdin_is_tty():
+            return self.non_interactive(group)
+        return self.interactive()
+
     def interactive(self) -> Optional[List[str]]:
         self._display()
         while True:
-            choice = input("  > ").strip()
+            try:
+                choice = input("  > ").strip()
+            except EOFError:
+                # stdin closed while the menu was up (a script that never
+                # asked for a group): a traceback here taught the operator
+                # nothing. Fall back the same way a non-TTY run does.
+                console.print("\n  [yellow]stdin closed — falling back to "
+                              "the module's first group.[/]")
+                names = self.group_names()
+                return self.run_group(names[0]) if names else None
             if not choice:
                 continue
 
