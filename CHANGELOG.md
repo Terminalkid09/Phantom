@@ -6,6 +6,88 @@ All notable changes to Phantom.
 
 ## [Unreleased] — current development (v3.0.0 line)
 
+### Auto-mode CVE chain, scriptable manual shell, ML data honesty — 2026-10-27
+
+- **Auto-mode fires the CVE payload again.** `version_detect` declares the
+  `service` fact the scan just produced, so the planner never asked for it and
+  every service reached the sweep with `product`/`version` empty — a CVE
+  registry that matches on exactly those two fields could build no candidate.
+  Same host, same port: the manual `fire CVE-2021-41773` returned VULNERABLE
+  while `--exploit-all` reported "no actionable CVE". `automode.
+  _fingerprint_before_exploit` now runs one bounded `version_detect` over the
+  ports the run proved open, through the normal gates, before ranking; a
+  refusal is reported, and the "no actionable CVE" receipt names the ports
+  that stayed blind.
+- **The manual shell is scriptable.** `use scan` + `run` with a piped stdin
+  died on `EOF when reading a line`. `PreviewSession.choose()` answers the menu
+  with a terminal and the module's own first group without one (and says so);
+  an `EOFError` mid-menu degrades the same way; `run-group <name>` is now a
+  command of every module, and `run --group <name>` skips the menu without a
+  redirect.
+- **Two scan rows reported a healthy host as dead.** The recommended first
+  steps probed with host discovery, so a host that drops ICMP read as "Host
+  seems down … 0 hosts up" in front of a box with 8081/6379/2375 listening;
+  `-Pn` is now on the first-steps, follow-up and basic nmap rows. And a SYN
+  probe comes back filtered through a port forwarder / WSL loopback where the
+  connect scan opens the same ports (measured: 6379+8081 `filtered` with `-sS`,
+  `open` with `-sT`), so `NMAP (Basic)` gained the `-Pn -sT … -oX` row.
+- **Exploit dataset: graded rankings instead of one-id labels.** The builder
+  labelled each step with the single id the run happened to pick while the
+  golden set asks for an order, which pinned NDCG below a heuristic that
+  returns the whole table (0.5068 vs 0.9065) and no amount of epochs could fix.
+  Rows now carry the run's real candidate table plus a tail graded by what the
+  run established: executed-and-successful, then the planner's pending
+  hypotheses by priority, then what already failed.
+- **Golden set checked against the runtime schema.** `training/golden_check`
+  maps every expectation into the payload its validator takes and refuses the
+  fixture if the runtime would: `finding-2` expected `web_anomaly`, a kind that
+  exists nowhere in `FINDING_KINDS`, so the schema-valid `hunt_anomaly` scored
+  exact_match 0. The kind is fixed and the check runs in the suite.
+- **`social` is measurable.** A rubric-graded phase reported 0 by design with
+  no callable to grade it. `training/rubric.py` supplies a deterministic one
+  built on the tells `social.pretext_score` already refuses a draft for; each
+  golden criterion maps to a check over the draft and its row context, an
+  unverifiable criterion scores 0, and the unmet list is returned. Measured
+  0.683 on the smoke adapter (0.4 for an adversarial draft, 0.0 for an empty
+  one). No manifest was promoted on it.
+- **Training step 0 measured, `--max-steps` added.** `train_lora --max-steps N`
+  runs a bounded measurement and prints s/step and samples/s. On the reference
+  CPU box: 0.5B 2.372 s/step, **Qwen3-1.7B 7.355 s/step** (~70 tokens/s
+  forward+backward), which makes a three-epoch six-phase run ~4 h here. Loading
+  Qwen3 needs `transformers >= 4.51` and `accelerate >= 1.6`.
+
+### Per-phase AI layer, training pipeline and campaign completion — 2026-10-25
+
+- **Optional AI, one advisor per phase, off by default.** `automation/ai/`
+  provides a single `ask(phase, payload)` entry point with a closed JSON
+  schema per phase (no commands, no new candidates, no file paths), secret
+  redaction, hashed telemetry and a hard fallback to the deterministic path.
+  `--ai off|local|cloud|integrated` selects the transport; `ai.<phase>.mode`
+  overrides one phase. The exploit advisor may only re-rank eligible
+  candidates, with a bounded bonus and no inversion of a large score gap;
+  the finding, OSINT, social, scan-parse and evolution advisors are
+  non-gating. A model without a promoted manifest is never loaded.
+- **GPU-ready training pipeline, no committed weights.** `training/` builds
+  per-phase datasets from sessions/packs/experience (redacted, deduped),
+  curates them, runs QLoRA, evaluates against a golden set (NDCG,
+  exact-match, Brier, pass@1) and emits the GGUF export commands;
+  `--dry-run` works without torch. `training/README.md` documents the exact
+  GPU jobs. A manifest whose eval is missing or below baseline is refused.
+- **Phase 2 wired.** Email candidates feed the consent-gated reset oracle,
+  outputs stay masked, and the DM conversation flow persists per handle:
+  no link before two exchanges, stop on suspicion/hostility, hand off on a
+  proof request. Session-2 markers (`DM_DECISION`) are parsed into findings.
+- **Phase 3 complete.** `clone_check` scores a clone against the real page
+  (form action, assets, TLS, viewport, text); `no_link` builds device-code,
+  calendar (.ics) and QR lures; AiTM defaults on only under the explicit
+  `phishing.lab_profile` and is marked `AITM_LAB`, never silently in the
+  real mode; consumer targets can be DM-first without rerouting an explicit
+  email campaign.
+- **Phase 4 camouflage, one agent only.** Scan profiles `quiet|balanced|
+  blend`: jitter, seeded chunk order, per-chunk rate/timing/source-port
+  rotation and opt-in SYN. Coverage is unchanged (every port once), the
+  budget still bounds the run, and no sub-agent is used for target contact.
+
 ### Bounded recon escalation and campaign quality — 2026-10-25
 
 - **A filtered host no longer costs hours.** The single `-p 1-65535`

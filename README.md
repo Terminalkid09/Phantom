@@ -531,6 +531,7 @@ always exists and an existing flag is always documented.
 | `--plan` | dry-run: show the plan, execute nothing |
 | `--verbose` | add the live reasoning trace to the action trace |
 | `--llm` / `--experience` / `--evolution` / `--beta` | optional advisor · cross-engagement memory · self-improvement PRs · load machine-authored capabilities |
+| `--ai off\|local\|cloud\|integrated` | per-phase AI layer (default **off**): no model, local llama.cpp, an OpenAI-compatible endpoint, or the promoted per-phase model from `models/`; `ai.<phase>.mode` overrides one phase |
 | `--resume CHECKPOINT` / `--resume-latest` | resume a checkpoint / the newest one, unattended |
 | `--supervise` / `--max-restarts N` | keep the run alive across crashes (bounded relaunches) |
 | `--print-service [kind]` | print the OS service definition for THIS invocation (writes nothing) |
@@ -711,6 +712,15 @@ the capability registry from a checklist into a reasoner:
 - **LLM hypothesizer** (`llm/`, optional `--llm`): generates hypotheses
   OUTSIDE the registry from the WorldModel, each one validated by hard
   gates (scope, evidence, plausibility) before the planner ever sees it.
+- **Per-phase AI layer** (`automation/ai/`, `--ai`, default **off**): one
+  closed-contract advisor per phase (exploit re-rank, finding triage, OSINT
+  link proposals, social drafting, scan parsing, evolution summaries). Every
+  advisor returns DATA only — no commands, no new candidates, IDs from the
+  caller's table — and the deterministic engine keeps the decision. The
+  exploit advisor can move a candidate by at most a bounded bonus and never
+  across a large score gap. `models/<phase>/<version>/manifest.json` gates
+  which model is loadable, and `training/` builds datasets, evaluates and
+  emits the GPU job (QLoRA + GGUF); no weights are committed.
 
 **Phase contract** (`phantom/automation/phases/`): every capability
 belongs to exactly ONE kill-chain phase — `recon → osint → exploit →
@@ -1305,7 +1315,7 @@ phantom/                        # repository root
 │   └── bt_scan.h               # Bluetooth scanning
 ├── electron/                   # React + Vite + TypeScript desktop app
 ├── data/                       # Sessions, cache, certs, wordlists
-├── tests/                      # 394 test files
+├── tests/                      # 402 test files
 ├── Dockerfile                  # Multi-stage Kali-based build
 ├── docker-compose.yml          # One-command deployment
 └── .env.example                # External API template
