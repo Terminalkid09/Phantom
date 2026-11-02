@@ -216,7 +216,7 @@ export interface AutomodeStatus {
  * `awaiting_approval` are the two operator-facing states DERIVED from the
  * snapshot. Deliberately absent: `paused` and `timed_out` — the backend has no
  * pause control and no wall-clock deadline on a run, so a UI showing them
- * would be inventing a state nothing can reach (docs/ManusOpenCode.md §3.3A is
+ * would be inventing a state nothing can reach (the automode handoff notes in
  * the wish-list; this union is what the backend can assert).
  */
 export type JobState =

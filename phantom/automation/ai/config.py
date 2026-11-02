@@ -64,6 +64,37 @@ def local_base_url() -> str:
                        env="PHANTOM_AI_LOCAL_URL")
 
 
+def local_candidates() -> list:
+    """Every local endpoint worth probing, in priority order.
+
+    The configured URL comes first, then the ports a model server commonly
+    listens on. This exists because ``8080`` — llama.cpp's own default — is
+    also the port another application is most likely to own already, and
+    that is exactly what happened on 2026-11-02: every AI call in a lab run
+    returned ``http 405`` from an unrelated process, the order never moved,
+    and the run looked as if the model had agreed with the deterministic
+    plan. A fallback needs a list to fall back ON.
+    """
+    raw = cfg.get_str("ai.local.urls", "", env="PHANTOM_AI_LOCAL_URLS")
+    urls = [u.strip() for u in str(raw or "").split(",") if u.strip()]
+    if not urls:
+        urls = ["http://127.0.0.1:8080", "http://127.0.0.1:8008",
+                "http://127.0.0.1:8009", "http://127.0.0.1:11434",
+                "http://127.0.0.1:1234", "http://127.0.0.1:5000"]
+    configured = str(local_base_url() or "").strip()
+    if configured and configured not in urls:
+        urls.insert(0, configured)
+    return urls
+
+
+def authority_override() -> str:
+    """``auto`` (evidence decides) or an operator-forced authority level."""
+    raw = str(cfg.get_str("ai.authority", "auto",
+                          env="PHANTOM_AI_AUTHORITY") or "auto")
+    token = raw.strip().lower()
+    return token if token in ("auto", "nudge", "decide", "full") else "auto"
+
+
 def local_model() -> str:
     return cfg.get_str("ai.local.model", "", env="PHANTOM_AI_LOCAL_MODEL")
 

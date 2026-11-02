@@ -207,6 +207,27 @@ def test_rebuild_when_crypto_config_changes(tmp_path, monkeypatch):
     assert B._needs_rebuild(str(tmp_path), "beacon.exe") is True  # keys rotated
 
 
+def test_rebuild_when_endpoint_changes(tmp_path, monkeypatch):
+    """A rebuild for a NEW callback host must not reuse the old binary.
+
+    The C2 host/port are burned into the generated config header, so a
+    fingerprint keyed on the crypto material alone answered "already built"
+    and handed back a binary pointed at an address that no longer exists —
+    observed while moving a payload from a LAN IP to a tunnel hostname.
+    """
+    monkeypatch.setattr(B, "crypto_fingerprint", lambda: "fp")
+    (tmp_path / "beacon.exe").write_bytes(b"MZ")
+    B._mark_built(str(tmp_path), "beacon.exe",
+                  B._endpoint_key("192.168.1.155", 8443, True))
+    assert B._needs_rebuild(str(tmp_path), "beacon.exe",
+                            B._endpoint_key("192.168.1.155", 8443, True)) is False
+    assert B._needs_rebuild(str(tmp_path), "beacon.exe",
+                            B._endpoint_key("hop.trycloudflare.com", 443,
+                                            True)) is True
+    assert B._needs_rebuild(str(tmp_path), "beacon.exe",
+                            B._endpoint_key("192.168.1.155", 8443, False)) is True
+
+
 def test_rebuild_when_binary_is_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(B, "crypto_fingerprint", lambda: "fp")
     assert B._needs_rebuild(str(tmp_path), "beacon.exe") is True

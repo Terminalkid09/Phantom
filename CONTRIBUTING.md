@@ -61,7 +61,18 @@ npx vite build     # production build — what CI runs
 ### Beacon / remote payload toolchain
 
 The C++20 payloads build with `g++` or `clang++` on Linux/macOS and
-MinGW-w64 (`x86_64-w64-mingw32-g++`) on Windows. The build headers are
+MinGW-w64 (`x86_64-w64-mingw32-g++`) on Windows.
+
+**Windows has no C++ compiler out of the box.** The first Windows build that
+finds none offers to install WinLibs MinGW-w64 through winget
+(`BrechtSanders.WinLibs.POSIX.UCRT`); the answer can be given up front with
+`PHANTOM_AUTO_INSTALL_TOOLCHAIN=1` for unattended runs, and declining prints
+the exact `winget install` line instead of a dead end. The installed `bin` is
+prepended to the *running process's* PATH, so the build continues without
+reopening the shell — a fresh install never updates the PATH of a process that
+is already alive.
+
+The build headers are
 **generated** — never hand-write or commit them:
 
 ```bash

@@ -390,7 +390,10 @@ def _exploit_all_after_run(agent, goal: str, state_path: str,
     try:
         summary = exploit_worldmodel(
             agent.wm, allow_msf=True, prefer_beacon=True, mode=mode,
-            exhaustive=exhaustive)
+            exhaustive=exhaustive, goal=goal,
+            # the posture the run was launched with, so the ranker's
+            # ``profile_stealth`` term is the trained one instead of the mode
+            profile=str(getattr(agent, "profile", "") or ""))
     except Exception as exc:  # noqa: BLE001 - never lose the main run
         notifier.warn(f"exploit-all: sweep failed: {exc}")
         return {"error": str(exc), "beacon_after": False,
@@ -1131,6 +1134,17 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
             resolved, goal, profile, aggressive, speed, agents,
             verbose, on_event, llm, out_root, started_wall, handoff_c2,
             resilient_stager, resume, experience, evolution)
+    if resume:
+        # The campaign runner has no checkpoint replay: it would start every
+        # target from zero while the operator believes the run is resuming,
+        # and it would write the new reports into the OLD run's directory.
+        # Saying so is the smallest honest fix; `--resume` keeps its full
+        # meaning on the single-target and swarm paths.
+        notifier.warn(
+            "--resume is NOT applied to a multi-target campaign (the campaign "
+            "runner has no checkpoint replay): this run starts FRESH for "
+            f"every target and writes into {out_root}. Resume one target at a "
+            "time with `auto <target> --resume <checkpoint.json>`.")
     campaign = _run_agent_campaign(
         resolved, goal, profile, aggressive, stealth, speed,
         scope_list, agents, verbose, on_event, llm,

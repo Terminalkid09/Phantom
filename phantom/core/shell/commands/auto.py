@@ -647,7 +647,86 @@ def cmd_agent(shell, arg: str):
         _sh.console.print(f"  [cyan]{k}[/]: {p}")
 
 
+def cmd_bench(shell, arg: str):
+    """bench [list|<scenario>] [--iterations N] [--json]
+        - Offline auto-mode benchmark (ground truth + failure injection).
+
+    Runs every scenario WITHOUT touching a network: each one injects known
+    failures (a flaky probe, a scan that lies, an out-of-scope host, a
+    budget cap) into an agent and scores the outcome against ground truth —
+    goal reached, honest reporting, no false positives, no forbidden move.
+
+    The suite was importable only from tests before this command existed:
+    an operator could not run the number the docs quote, which makes the
+    benchmark a claim rather than a measurement. Runtime ~45 s for the
+    full suite (11 scenarios, ~8 iterations each).
+
+      bench                 run the whole suite, print the table + rates
+      bench list            list scenario names (run one with its name)
+      bench scan_failure    run only that scenario
+      bench --json          machine-readable report (scripts, CI, the UI)
+      bench --iterations N  iterations per scenario (default = the suite's
+                            own 20; lowering it below what a scenario needs
+                            makes the CAP fail, not the agent — the report
+                            says so rather than blaming the planner)
+    """
+    import json as _json
+
+    from phantom.automation import benchmark as bench
+
+    parts = (arg or "").split()
+    iterations = 0
+    want_json = "--json" in parts
+    if "--iterations" in parts:
+        index = parts.index("--iterations")
+        try:
+            iterations = max(1, int(parts[index + 1]))
+        except (ValueError, IndexError):
+            notifier.error("--iterations needs a number")
+            return
+        del parts[index:index + 2]
+        notifier.warn("--iterations is an experiment: below what a scenario "
+                      "needs, the CAP is what fails — not the agent")
+    parts = [p for p in parts if not p.startswith("--")]
+
+    chosen = None
+    names = [s.name for s in bench.suite()]
+    if parts:
+        token = parts[0]
+        if token == "list":
+            notifier.info("scenarios: " + ", ".join(names))
+            return
+        matches = [s for s in bench.suite() if s.name == token]
+        if not matches:
+            notifier.error(f"unknown scenario '{token}' — try `bench list`")
+            return
+        chosen = matches
+
+    notifier.status(f"running benchmark ({len(chosen or bench.suite())} "
+                    f"scenario(s), {iterations or 20} iteration(s), "
+                    f"offline)...")
+    kwargs = {"max_iterations": iterations} if iterations else {}
+    report = bench.run_suite(scenarios=chosen, **kwargs)
+    if want_json:
+        _sh.console.print(_json.dumps(report, indent=2, default=str))
+        return
+    _sh.console.print(bench.format_table(report))
+    rates = report.get("rates") or {}
+    if rates:
+        _sh.console.print("  " + "  ".join(
+            f"{k.replace('_pct', '')}={rates[k]}%" for k in rates
+            if k.endswith("_pct")))
+    for violation in (report.get("violations") or []):
+        notifier.warn(violation)
+    if report.get("passed"):
+        notifier.success("benchmark: every scenario met its expectations")
+    else:
+        notifier.error(f"benchmark: {len(report.get('violations') or [])} "
+                       f"expectation(s) broken")
+
+
 COMMANDS = {
     "auto": cmd_auto,
     "agent": cmd_agent,
+    "bench": cmd_bench,
 }

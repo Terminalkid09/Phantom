@@ -347,3 +347,38 @@ someuser.txt
 # A crashed `use exploit` test used to leave its scratch file in the payload
 # tree; the test now uses a temp dir, this is the belt-and-braces.
 /phantom/exploits/test/demo.py
+
+# ── Gap closure, measured 2026-11-02 ───────────────────────────────────────
+# A review of a WORKING tree (164 `git status` entries) found 18 paths that
+# were neither tracked nor ignored, including the operator API token and the
+# beacon artifact key. The rules above are good; they were incomplete, and an
+# incomplete ignore list is the same as none when a single `git add -A` is
+# one keystroke away (CONTRIBUTING §3).
+
+# Operator token and per-artifact keys written next to the working copy
+/.c2_token
+*.artifact_key
+phantom/payloads/beacon/*.pe.enc
+
+# Generated output DIRECTORY inside the payload tree (extensionless files)
+phantom/payloads/beacon/payloads/
+phantom/payloads/beacon/*/payloads/
+
+# Runtime trees an engagement creates: binaries fetched for use, USB/HID
+# staging output, and the per-decision audit trail
+data/bin/
+data/usb/
+data/exploit_decisions.jsonl
+
+# Throwaway session scratch: a leading dot is this repo's convention for
+# "written by an operator or an agent during a run, not product source"
+/.*.py
+/.*.sh
+/.*.ps1
+/.*.out
+/.*.err
+/.*.txt
+/.tmp_*/
+
+# Assistant/chat transcripts pasted into the working copy
+freebuff-chat-*.md

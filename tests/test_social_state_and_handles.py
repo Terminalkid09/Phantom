@@ -24,13 +24,20 @@ import unittest
 from unittest import mock
 
 from phantom.automation.social import recon as R
+from phantom.automation.social.ratelimit import FetchResult
 
 SHELL_BIG = "<html><body>" + ("x" * 5000) + "</body></html>"
 
 
 def _vote_with(page_body, platform="instagram", username="somebody"):
-    """Run `_state_vote` against a canned page, no network."""
-    with mock.patch.object(R, "_fetch", return_value=page_body):
+    """Run `_state_vote` against a canned page, no network.
+
+    The seam is `_fetch_ex` (status-aware): since the 429 fix the vote needs
+    the TRANSPORT, so a test that only stubs the body would silently hit the
+    network and read the real answer as `unknown`.
+    """
+    with mock.patch.object(R, "_fetch_ex",
+                           return_value=FetchResult(page_body, 200, 0.0, "")):
         return R._state_vote(username, platform)
 
 
@@ -135,8 +142,9 @@ class TestInstagramEmbedFallback(unittest.TestCase):
 
     def _vote(self, profile_body, embed_body, username="aarbana"):
         def fake(url, **kwargs):
-            return embed_body if "/embed/" in url else profile_body
-        with mock.patch.object(R, "_fetch", side_effect=fake):
+            body = embed_body if "/embed/" in url else profile_body
+            return FetchResult(body, 200, 0.0, "")
+        with mock.patch.object(R, "_fetch_ex", side_effect=fake):
             return R._state_vote(username, "instagram")
 
     def test_429_profile_falls_back_to_embed(self):

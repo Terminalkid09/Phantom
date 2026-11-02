@@ -192,6 +192,51 @@ def test_scan_populates_knowledge_base():
     assert session.get_result("service_summary")
 
 
+def test_hyphenated_commands_reach_their_handler():
+    """`run-group NAME` must dispatch to `do_run_group`, not to `run`.
+
+    `cmd.Cmd.parseline` splits the command name at any character outside
+    `identchars`, and that set has no `-`: the named-group form arrived as
+    `run` + `-group "SERVICE ENUM"`, so a scripted manual shell executed the
+    module's FIRST group instead (measured 2026-10-28). The same split made
+    the documented `export-session` unreachable.
+    """
+    from phantom.core.shell import PhantomShell
+    from phantom.modules.scan import ScanModule
+
+    module = ScanModule()
+    cmd_name, arg, _line = module.parseline('run-group "SERVICE ENUM"')
+    assert (cmd_name, arg) == ("run_group", '"SERVICE ENUM"')
+    assert callable(getattr(module, f"do_{cmd_name}"))
+
+    shell = PhantomShell()
+    cmd_name, arg, _line = shell.parseline("export-session out.pm")
+    assert (cmd_name, arg) == ("export_session", "out.pm")
+    assert callable(getattr(shell, f"do_{cmd_name}"))
+
+    # a hyphen INSIDE an argument is data, not part of the command name
+    assert module.parseline("set target 10.0.0.1-5")[:2] == (
+        "set", "target 10.0.0.1-5")
+
+
+def test_scan_suggestions_never_prompt_a_piped_session(monkeypatch):
+    """A scan that finds SMB must not call `input()`.
+
+    `_conditional_suggestions` runs at the END of every scan, not from a menu
+    the operator opened — so a piped session either died with `EOFError`
+    (measured 2026-10-28, SMB host) or silently consumed the next scripted
+    line as the answer to a question whose only effect was printing a hint.
+    """
+    from phantom.modules.scan import ScanModule
+
+    def _boom(*_a, **_k):
+        pytest.fail("input() reached in a scripted scan")
+
+    monkeypatch.setattr("builtins.input", _boom)
+    ScanModule()._conditional_suggestions(
+        {"cmd": "445/tcp open microsoft-ds\n139/tcp open netbios-ssn"})
+
+
 # ── exploit enterprise enrichment ─────────────────────────────────────────
 
 class _FakeIntel:

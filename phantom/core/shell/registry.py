@@ -30,6 +30,37 @@ def iter_commands() -> Iterator[Tuple[str, Handler]]:
             yield name, fn
 
 
+def normalise_command_line(line: str) -> str:
+    """Rewrite a HYPHENATED command name to its underscore form.
+
+    ``cmd.Cmd.parseline`` ends the command name at the first character
+    outside ``identchars``, and ``identchars`` contains no ``-``. So
+    ``run-group "SERVICE ENUM"`` was parsed as the command ``run`` with the
+    argument ``-group "SERVICE ENUM"``: the module executed its FIRST group
+    instead of the named one — a scripted step that ran commands nobody
+    asked for (measured 2026-10-28, `use scan` in a piped manual shell).
+
+    The same split made every hyphenated command in the manual shell
+    unreachable, including the ``export-session`` the reports and the
+    AUTO-MODE summary tell the operator to type (the handler is registered
+    as ``export_session``).
+
+    Only the FIRST token is rewritten: a hyphen inside an argument
+    (a filename, a range) is data and must survive verbatim. ``?cmd`` and
+    ``!cmd`` keep their prefix semantics.
+    """
+    raw = str(line or "")
+    stripped = raw.lstrip()
+    if not stripped:
+        return raw
+    indent = raw[:len(raw) - len(stripped)]
+    prefix = ""
+    if stripped[0] in "?!":
+        prefix, stripped = stripped[0], stripped[1:]
+    head, sep, rest = stripped.partition(" ")
+    return f"{indent}{prefix}{head.replace('-', '_')}{sep}{rest}"
+
+
 def command_names() -> Tuple[str, ...]:
     """All registered command names (contract-tested)."""
     return tuple(name for name, _ in iter_commands())

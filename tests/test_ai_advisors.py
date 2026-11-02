@@ -63,6 +63,15 @@ def test_actionability_and_execution_flags_are_never_changed(monkeypatch):
 
 
 def test_a_failed_model_leaves_the_order_untouched(monkeypatch):
+    """No model AT ALL: the deterministic order stands and says why.
+
+    The promoted CPU ranker is a fallback ON PURPOSE (see the module docstring:
+    "the LLM is not the only model"), so this test removes it explicitly — the
+    property under test is what happens when nothing can answer.
+    """
+    from phantom.automation.ai import linear
+
+    monkeypatch.setattr(linear, "promoted", lambda *_a, **_k: None)
     a, b = _cand("a", 60.0), _cand("b", 10.0)
     monkeypatch.setattr(
         advisor, "ask",
@@ -70,6 +79,32 @@ def test_a_failed_model_leaves_the_order_untouched(monkeypatch):
     result = advisor.rerank([a, b], "balanced")
     assert [c.id for c in result.ordered] == ["a", "b"]
     assert result.applied is False and "timeout" in result.reason
+
+
+def test_an_unreachable_llm_falls_back_to_the_promoted_cpu_ranker(monkeypatch):
+    """A measured CPU ranker answers when the endpoint does not."""
+    from phantom.automation.ai import linear
+
+    class _Ranker:
+        version = "test-ranker"
+
+        def rank(self, ids, context=None, contexts=None):
+            assert contexts is not None, (
+                "the runtime must pass per-candidate contexts, or the "
+                "trained is_cve interaction is dead")
+            return sorted(ids, reverse=True)
+
+    monkeypatch.setattr(linear, "promoted", lambda *_a, **_k: _Ranker())
+    monkeypatch.setattr(
+        advisor, "ask",
+        lambda *a, **k: AIResult(ok=False, error="timeout"))
+    # a SMALL gap (the trust cap refuses an inversion across 30 points, which
+    # is the whole point of the ladder — see `test_nudge_cannot_invert_...`)
+    a, b = _cand("a", 60.0), _cand("b", 55.0)
+    result = advisor.rerank([a, b], "balanced")
+    assert result.model == "test-ranker"
+    assert result.applied is True
+    assert [c.id for c in result.ordered] == ["b", "a"]
 
 
 def test_the_payload_never_carries_a_command(monkeypatch):
@@ -146,9 +181,11 @@ def test_sweep_uses_the_bounded_order_when_ai_is_on(monkeypatch):
     monkeypatch.setattr(sweep, "collect_candidates", lambda **kw: [a, b])
     monkeypatch.setattr(sweep, "_ai_enabled",
                         lambda phase: phase == "exploit")
+    # ``goal``/``profile`` travel with the call now: the ranker's context is
+    # trained on them, so the sweep is expected to forward them.
     monkeypatch.setattr(
         "phantom.automation.ai.advisors.exploit.rerank",
-        lambda cands, mode: advisor.RerankResult(
+        lambda cands, mode, **kw: advisor.RerankResult(
             [b, a], True, "test", [("b", "0->1")], "m"))
     summary = sweep.exploit_worldmodel(wm)
     assert summary["ai_rerank"]["applied"] is True

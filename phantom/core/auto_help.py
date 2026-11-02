@@ -277,6 +277,9 @@ COMMANDS: List[CommandSpec] = [
                 "allowed or refused it", "Ops"),
 
     # ── navigation ──
+    CommandSpec("where", "where",
+                "Print the current layer, target and scope — the same command "
+                "as in the manual shell and in a module", "Navigation"),
     CommandSpec("back", "back", "Leave AUTO-MODE", "Navigation"),
     CommandSpec("exit", "exit / quit",
                 "Leave AUTO-MODE (alias of `back`)", "Navigation",

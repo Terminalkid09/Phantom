@@ -165,6 +165,115 @@ class TestTheArduinoBoard:
             pico.index("layout.write")
 
 
+class TestTheTypingCadence:
+    """A board left at full speed types a stager in a fraction of a second.
+
+    That is the second thing a HID-injection detector sees, after the device
+    itself, and it is the one property of the rhythm this layer can change:
+    the command is typed in BURSTS with a jittered pause between them. The
+    content stays whatever the operator asked for — slowing it down does not
+    make an `iex`+download one-liner signature-free, and the artefact does
+    not pretend otherwise.
+    """
+
+    CMD = "powershell -w h -c \"$i=0;" + "x" * 200 + "\""
+
+    @staticmethod
+    def _typed(body):
+        raw = "".join(ln.split('Keyboard.print(F("', 1)[1].rsplit('"));', 1)[0]
+                      for ln in body.splitlines() if "Keyboard.print(F(" in ln)
+        return raw.replace("\\\\", "\\").replace('\\"', '"')
+
+    def test_a_long_command_is_typed_in_bursts_not_in_one_go(self):
+        body = build_hid_payload("arduino", self.CMD).content
+        prints = [ln for ln in body.splitlines() if "Keyboard.print(F(" in ln]
+        assert len(prints) > 10
+        assert body.count("delay(") > 10
+
+    def test_the_pauses_are_jittered_not_a_metronome(self):
+        body = build_hid_payload("arduino", self.CMD).content
+        pauses = [ln.strip() for ln in body.splitlines()
+                  if ln.strip().startswith("delay(")]
+        assert len(set(pauses)) > 5
+
+    def test_the_same_command_always_types_the_same_way(self):
+        # deterministic seed: two generations of one artefact are byte-equal,
+        # so "does the artefact match the one I tested" stays answerable
+        assert build_hid_payload("arduino", self.CMD).content == \
+            build_hid_payload("arduino", self.CMD).content
+
+    def test_no_character_is_lost_between_bursts(self):
+        body = build_hid_payload("arduino", self.CMD).content
+        assert self._typed(body) == self.CMD
+
+    def test_a_short_command_still_types_in_one_go(self):
+        # slowing down six characters is not stealth, it is a longer window
+        # for the focus to move
+        body = build_hid_payload("arduino", "whoami").content
+        assert 'Keyboard.print(F("whoami"));' in body
+
+    def test_zero_cadence_is_the_old_single_burst(self):
+        body = build_hid_payload("arduino", self.CMD, char_delay_ms=0).content
+        assert len([ln for ln in body.splitlines()
+                    if "Keyboard.print(F(" in ln]) == 1
+
+    def test_the_pico_sleeps_between_bursts(self):
+        body = build_hid_payload("pico", self.CMD).content
+        assert body.count("layout.write(") > 10
+        assert len([ln for ln in body.splitlines()
+                    if ln.startswith("time.sleep(")]) > 10
+
+    def test_the_artefact_says_how_long_it_will_take(self):
+        notes = build_hid_payload("arduino", self.CMD).notes
+        assert any("chars/s" in n for n in notes), notes
+
+    def test_the_default_cadence_types_a_stager_in_seconds(self):
+        # Measured 2026-11-01: the 90 ms default put ~21 s of visible typing on
+        # screen, and the operator could not tell "still typing" from "hung".
+        # The cadence is a cost paid for not looking like a machine; it must
+        # not cost a payload nobody waits for. The whole delay budget of the
+        # sketch stays under ~8 s, and under ~45 ms per typed character.
+        import re
+
+        body = build_hid_payload("arduino", self.CMD).content
+        # every delay(), including the ones carrying a trailing comment
+        total = sum(int(m.group(1))
+                    for m in re.finditer(r"delay\((\d+)\)", body))
+        assert total < 12000, total
+        assert total < len(self.CMD) * 45, total
+
+    def test_duckyscript_boards_say_the_cadence_could_not_be_applied(self):
+        # STRING runs at the device's own rate; claiming otherwise would be
+        # the kind of silence this project treats as a defect
+        notes = build_hid_payload("flipper", self.CMD).notes
+        assert any("cadence NOT applied" in n for n in notes), notes
+
+    def test_the_cadence_flag_reaches_the_sketch(self, tmp_path):
+        from unittest import mock
+
+        from phantom.modules.payload import PayloadModule
+
+        out = os.path.join(str(tmp_path), "zero.ino")
+        with mock.patch("phantom.modules.payload.notifier"):
+            PayloadModule().do_hid(f"arduino '{self.CMD}' --cadence 0 "
+                                   f"--out {out}")
+        with open(out, encoding="utf-8") as handle:
+            body = handle.read()
+        assert body.count('Keyboard.print(F("') == 1
+
+    def test_a_negative_cadence_is_refused(self, tmp_path):
+        from unittest import mock
+
+        from phantom.modules.payload import PayloadModule
+
+        out = os.path.join(str(tmp_path), "neg.ino")
+        with mock.patch("phantom.modules.payload.notifier") as note:
+            PayloadModule().do_hid(f"arduino whoami --cadence -5 --out {out}")
+        assert not os.path.exists(out)
+        assert "cannot be negative" in " ".join(
+            str(c) for c in note.error.call_args_list)
+
+
 class TestFlashingNotes:
     @pytest.mark.parametrize("board", BOARDS)
     def test_every_board_explains_how_it_is_flashed(self, board):
@@ -182,7 +291,12 @@ class TestHidCommand:
         module = PayloadModule()
         out = os.path.join(str(tmp_path), "artefact")
         with mock.patch("phantom.modules.payload.notifier") as notifier:
-            module.do_hid(f"{arg} --out {out}")
+            # --layout us is PINNED here: these tests assert the exact bytes the
+            # board would type, and the layout is pre-translated per TARGET.
+            # The CLI takes that layout from the bench's locale (the fix for
+            # `:` arriving as `ç` on an Italian host), so leaving it out would
+            # make every assertion below depend on where the suite runs.
+            module.do_hid(f"{arg} --layout us --out {out}")
         with open(out, encoding="utf-8") as handle:
             return handle.read(), notifier
 
@@ -242,3 +356,73 @@ class TestHidCommand:
         from phantom.modules.payload import PayloadModule
         commands = PayloadModule().build_commands()
         assert any("hid" in c for c in commands["DELIVERY"])
+
+
+class TestItDoesNotTypeOnTheMachineThatWroteIt:
+    """The board is written (and reset) while plugged into the operator's box.
+
+    Two independent guards, because the failure is silent and embarrassing:
+    a visible countdown to unplug it, and a per-build tag that makes the FIRST
+    boot after a flash do nothing at all.
+    """
+
+    def test_the_first_boot_after_a_flash_is_silent(self):
+        body = build_hid_payload("arduino", "whoami").content
+        assert "#include <EEPROM.h>" in body
+        assert "if (justFlashed())" in body
+        # the guard returns BEFORE anything is typed
+        assert body.index("if (justFlashed())") < body.index("Keyboard.print")
+
+    def test_the_tag_belongs_to_this_artefact_only(self):
+        first = build_hid_payload("arduino", "whoami").content
+        again = build_hid_payload("arduino", "whoami").content
+        other = build_hid_payload("arduino", "whoami2").content
+        tag = next(ln for ln in first.splitlines() if "BUILD_TAG = " in ln)
+        assert tag in again
+        assert tag not in other      # a new build must be "never seen before"
+
+    def test_the_countdown_blinks_before_typing(self):
+        body = build_hid_payload("arduino", "whoami", countdown_s=15).content
+        assert "countdown(15);" in body
+        assert body.index("countdown(15);") < body.index("Keyboard.print")
+        assert "digitalWrite(LED_PIN, HIGH);" in body
+
+    def test_the_countdown_can_be_skipped(self):
+        body = build_hid_payload("arduino", "whoami", countdown_s=0).content
+        assert "countdown(" not in body
+
+    def test_the_guard_can_be_turned_off(self):
+        body = build_hid_payload("arduino", "whoami",
+                                 first_boot_safe=False).content
+        assert "justFlashed" not in body
+        assert "EEPROM.h" not in body
+
+    def test_the_pico_parks_forever_instead_of_exiting(self):
+        # ending main.py makes CircuitPython RELOAD it, and the reload would
+        # then type into the machine we are trying not to touch
+        body = build_hid_payload("pico", "whoami").content
+        assert "microcontroller.nvm" in body
+        assert "while True:" in body
+        assert body.index("_just_written") < body.index("layout.write(")
+
+    def test_duckyscript_says_both_guards_are_unavailable(self):
+        notes = build_hid_payload("flipper", "whoami").notes
+        assert any("first-boot guard NOT available" in n for n in notes), notes
+        body = build_hid_payload("flipper", "whoami", countdown_s=15).content
+        assert "DELAY 15000" in body
+
+    def test_the_flags_reach_the_sketch(self, tmp_path):
+        from unittest import mock
+
+        from phantom.modules.payload import PayloadModule
+
+        out = os.path.join(str(tmp_path), "guarded.ino")
+        with mock.patch("phantom.modules.payload.notifier") as note:
+            PayloadModule().do_hid(f"arduino whoami --countdown 5 "
+                                   f"--no-first-boot-safe --out {out}")
+        with open(out, encoding="utf-8") as handle:
+            body = handle.read()
+        assert "countdown(5);" in body
+        assert "justFlashed" not in body
+        assert any("countdown on a blinking LED" in str(c)
+                   for c in note.warn.call_args_list), note.warn.call_args_list

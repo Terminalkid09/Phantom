@@ -81,8 +81,17 @@ class TestProbeMap(unittest.TestCase):
                 # This is correct — service can be mapped from port and has a probe
                 pass
             else:
-                # Service exists only as port mapping, no probe (e.g., oracle, rpc)
-                self.assertIn(svc, ["https", "rpc", "netbios", "ldaps", "oracle", "winrm", "docker-tls"])
+                # Service exists only as port mapping, no probe (e.g., oracle, rpc).
+                # The list is explicit on purpose: a NEW label with no probe has
+                # to be added here deliberately, together with the reason it
+                # cannot be probed (`wsdapi`/`hyper-v`/`iscsi` are Windows
+                # discovery and storage services with no generic banner; added
+                # 2026-10-30 after a live host showed 5357 open).
+                self.assertIn(svc, ["https", "rpc", "netbios", "ldaps",
+                                    "oracle", "winrm", "docker-tls",
+                                    "wsdapi", "delivery-optimization",
+                                    "winrm-http", "winrm-tls", "hyper-v",
+                                    "iscsi", "http-alt", "adb"])
 
 
 class TestFingerprintEngine(unittest.TestCase):

@@ -23,12 +23,14 @@ import traceback
 
 from phantom.core.session import session
 import phantom.core.shell as _sh  # live console: _sh.console resolves the package attr at call time (test patch point)
-from phantom.core.shell.registry import iter_commands
+from phantom.core.shell.registry import iter_commands, normalise_command_line
 from phantom.core.shell.ui import (
     _context_hint,
     build_banner,
     build_dashboard,
+    build_prompt,
     build_status_bar,
+    status_signature,
 )
 from phantom.utils.notifier import notifier
 
@@ -70,23 +72,37 @@ class PhantomShell(cmd.Cmd):
         from datetime import datetime as _dt
         if not getattr(session, "engagement_started", None):
             session.engagement_started = _dt.now().isoformat(timespec="seconds")
-        # Use colored prompt for interactive sessions; class attribute remains plain for tests
-        self.prompt = "\033[1;36m[phantom]\033[0m > "
+        # Use the shared prompt grammar for interactive sessions; the class
+        # attribute stays plain because tests pin it.
+        self.prompt = build_prompt()
+        self._last_status_sig = None
         self.plugins = self._load_plugins()
         if self.plugins:
             notifier.info(f"Loaded {len(self.plugins)} plugin(s)")
 
     def postcmd(self, stop, line):
-        """Update prompt with context and refresh the live status bar."""
-        if line.strip() and not line.strip().startswith(("set ", "note ")):
+        """Redraw the prompt; redraw the status bar only when state CHANGED.
+
+        The bar used to be reprinted after every command, unchanged, on top of
+        a 40-character rule — the operator's actual output was buried under
+        chrome. It is worth showing exactly when it moved: a new finding, a
+        new beacon, a new target, a new scope.
+        """
+        changed = bool(line.strip())
+        try:
+            sig = status_signature()
+            changed = changed and sig != getattr(self, "_last_status_sig", None)
+            self._last_status_sig = sig
+        except Exception:
+            pass
+        if changed:
             try:
                 _sh.console.print("[dim]──────────────────────────────────────────[/dim]")
                 _sh.console.print(build_status_bar())
                 _sh.console.print(_context_hint())
             except Exception:
                 pass
-        t = f"(\033[1;31m{session.target}\033[0m)" if session.target else ""
-        self.prompt = f"\033[1;36mphantom\033[0m{t} > "
+        self.prompt = build_prompt()
         return stop
 
     def cmdloop(self, intro=None):
@@ -405,6 +421,16 @@ class PhantomShell(cmd.Cmd):
         "r": "report", "re": "report",
         "wl": "wordlist",
     }
+
+    def parseline(self, line):
+        """Dispatch `export-session` (and any other hyphenated name).
+
+        `cmd.Cmd` stops the command name at `-`, so the hyphenated spellings
+        that the reports, the AUTO-MODE summary and the docstrings tell the
+        operator to type fell through to "Unknown command". The registry
+        stores the underscore form; this bridges the two.
+        """
+        return super().parseline(normalise_command_line(line))
 
     @staticmethod
     def _required_fact(module_name: str) -> str:

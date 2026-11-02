@@ -53,10 +53,39 @@ IDENTITY_TYPES = ("email", "username", "phone")
 NETWORK_TYPES = ("ip", "domain", "url")
 
 
+def split_host_port(target: str) -> tuple:
+    """("host", port_or_None) for a bare ``host:port``, else the input.
+
+    A service target — ``127.0.0.1:8081``, ``example.com:8443`` — is the form
+    an operator actually has in front of them, and it used to fall through
+    every branch of `classify_target` (the ``:`` excluded it from the domain
+    branch, the port excluded it from the IP branch) and came out a
+    USERNAME: the whole network chain was replaced by an identity chain
+    against a string that was never a person. Splitting the port here keeps
+    the two facts separate instead of guessing.
+    """
+    t = (target or "").strip()
+    if not t or "://" in t:
+        return t, None
+    if t.startswith("["):                      # [::1]:8080
+        host, _, rest = t[1:].partition("]")
+        if host and rest.startswith(":") and rest[1:].isdigit():
+            port = int(rest[1:])
+            if 0 < port < 65536:
+                return host, port
+        return t, None
+    if t.count(":") == 1:
+        host, _, tail = t.partition(":")
+        if host and tail.isdigit() and 0 < int(tail) < 65536:
+            return host.strip(), int(tail)
+    return t, None
+
+
 def classify_target(target: str) -> str:
     """Classify a target string into its red-team entity type.
 
-    Order matters: URL -> IP -> email -> phone -> domain -> username.
+    Order matters: URL -> IP -> email -> phone -> (host:port) domain ->
+    username.
     """
     t = (target or "").strip()
     if not t:
@@ -64,6 +93,13 @@ def classify_target(target: str) -> str:
 
     if t.startswith(("http://", "https://")):
         return "url"
+
+    # a bare service endpoint (`host:port`): classify the HOST, not the pair
+    _host, _port = split_host_port(t)
+    if _port is not None and _host != t:
+        kind = classify_target(_host)
+        if kind in ("ip", "domain"):
+            return kind
 
     # bare IPv4 / IPv6
     try:
@@ -98,12 +134,19 @@ def classify_target(target: str) -> str:
 def target_host(target: str, target_type: str = "") -> str:
     """The hostname/IP the network tooling should aim at.
 
-    For URLs the hostname is extracted; everything else is passed through.
+    For URLs the hostname is extracted; a bare ``host:port`` loses its port
+    (nmap/osint tools take a host, and a port appended to one makes the
+    command malformed rather than more specific); everything else is passed
+    through unchanged.
     """
     tt = target_type or classify_target(target)
     if tt == "url":
         parsed = urlparse(target if "://" in target else f"http://{target}")
         return parsed.hostname or target
+    if tt in ("ip", "domain"):
+        host, port = split_host_port(target)
+        if port is not None:
+            return host
     return target
 
 

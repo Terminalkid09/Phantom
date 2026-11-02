@@ -59,6 +59,30 @@ def test_api_token_env_cannot_desync_persisted_state():
             assert get_api_token() == persisted
 
 
+def test_payload_token_env_cannot_desync_persisted_state():
+    """Same failure as the API token, with a quieter symptom.
+
+    Measured 2026-11-01: `.env` still held a previous run's
+    PHANTOM_PAYLOAD_TOKEN. The C2 listener imports c2_server, which calls
+    load_dotenv(), so it authenticated payload fetches with the .env value
+    while a stager generated in a process that never loaded dotenv embedded
+    the persisted one. Every fetch answered 403, the board typed correctly and
+    nothing happened, and no half of the system could see the disagreement.
+    """
+    path, tmp = _fresh_state_file()
+    with patch.dict(os.environ, {"PHANTOM_STATE_FILE": path}, clear=True):
+        persisted = state.get_secret("PHANTOM_PAYLOAD_TOKEN",
+                                     lambda: "persisted-token")
+        # a matching env value is a no-op
+        with patch.dict(os.environ, {"PHANTOM_PAYLOAD_TOKEN": persisted}):
+            assert state.get_secret("PHANTOM_PAYLOAD_TOKEN",
+                                    lambda: "x") == persisted
+        # a stale one is ignored, exactly like the API token
+        with patch.dict(os.environ, {"PHANTOM_PAYLOAD_TOKEN": "stale-dotenv"}):
+            from phantom.utils.c2_crypto import get_payload_token
+            assert get_payload_token() == persisted
+
+
 def test_secure_default_flags():
     path, tmp = _fresh_state_file()
     with patch.dict(os.environ, {"PHANTOM_STATE_FILE": path}, clear=True):

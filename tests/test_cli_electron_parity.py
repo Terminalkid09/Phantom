@@ -61,6 +61,9 @@ ELECTRON_SURFACES = {
            "reasoning journal (which proposal was refused, and why) and "
            "accepts/rejects one proposal at a time through the gated route",
     "help": "CommandPalette: search across modules and commands",
+    "where": "StatusBar + the active tab: the desktop app has no nested "
+             "shells, so 'which layer is this' is the tab plus the persistent "
+             "target/scope line",
     "back": "navigation: the tab switch itself",
     "exit": "navigation: closing the window",
     "quit": "navigation: closing the window",

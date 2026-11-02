@@ -353,7 +353,31 @@ def map_surface(domain: str) -> Tuple[bool, List[str]]:
         result.assets.extend(_vpn_gateways(hosts))
         result.assets.extend(_dns_misc(domain))
 
-        return True, result.markers()
+        lines = list(result.markers())
+        # DELIVERABILITY READINESS, from the same live zone read the pass above
+        # just made. `social/domain_readiness` already scores a sending domain
+        # (SPF/DMARC/NS/DS/look-alike/tracking/records) and already prints its
+        # own marker; it was only ever called from a capability nobody runs.
+        # Emitting it here means the answer comes from THIS pass's real dig
+        # answers — not from a claim the target makes about itself — so the
+        # guidance engine can gate a campaign on it instead of guessing.
+        try:
+            from phantom.automation.social.domain_readiness import check_domain
+            def _txt(qname: str) -> str:
+                # dig quotes TXT strings; the checker wants the raw value
+                return _dns("TXT", qname).replace('"', "")
+            rep = check_domain(
+                domain,
+                spf=_txt(domain),
+                dmarc=_txt(f"_dmarc.{domain}"),
+                mx=[m.strip() for m in _dns("MX", domain).splitlines()
+                    if m.strip()],
+            )
+            if rep.domain:
+                lines.append(rep.marker())
+        except Exception:
+            pass
+        return True, lines
     except Exception as e:
         return False, [f"ERROR: surface mapping failed: {e}"]
 

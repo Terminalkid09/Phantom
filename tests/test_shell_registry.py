@@ -15,7 +15,7 @@ EXPECTED = {
     "note", "notes", "save_session", "load_session", "list_sessions",
     "export_session", "import_session", "history",
     "run", "suggest", "plan", "preflight", "craft", "map", "install",
-    "scan_diff", "run_diff",
+    "scan_diff", "run_diff", "bench", "where",
     "use", "plugins",
     "auto", "agent",
     "c2", "malleable", "ad", "wordlists", "export", "guardrails",

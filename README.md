@@ -1107,7 +1107,7 @@ Phantom ships with a **React + TypeScript Electron desktop application** designe
 Electron (React + Vite + TypeScript)
         │  HTTP + Ctrl+K Command Palette
         ▼
-Python API Server  (localhost:9876, 98 route registrations)
+Python API Server  (localhost:9876, 102 route registrations)
         │
         ├─ phantom.core.automode   → auto-mode kill chain
         ├─ phantom.core.c2_server   → C2 listener + beacon control
@@ -1315,7 +1315,7 @@ phantom/                        # repository root
 │   └── bt_scan.h               # Bluetooth scanning
 ├── electron/                   # React + Vite + TypeScript desktop app
 ├── data/                       # Sessions, cache, certs, wordlists
-├── tests/                      # 402 test files
+├── tests/                      # 420 test files
 ├── Dockerfile                  # Multi-stage Kali-based build
 ├── docker-compose.yml          # One-command deployment
 └── .env.example                # External API template
@@ -1332,3 +1332,7 @@ Phantom is intended for authorized penetration testing and educational purposes 
 ## Author
 
 **Terminalkid09** — [GitHub](https://github.com/Terminalkid09)
+
+## Documentation
+
+- **Command reference** — every shell, module, C2 and AUTO-MODE command with a one-line description: [docs/COMMAND_REFERENCE.md](docs/COMMAND_REFERENCE.md).

@@ -160,6 +160,98 @@ def _isolate_pack_registry(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_anomaly_probes(monkeypatch):
+    """Keep the anomaly hunt off the network unless it targets loopback.
+
+    `agent._execute_hunt_capability` runs the REAL hunt, whose default
+    transport is `curl` against `<scheme>://<target>:<port>`. A test that
+    drives an agent at a lab address therefore performs real probes: with no
+    route to 10.0.0.x each one waits for the connect timeout, and the stealth
+    pacing delay is NOT counted against the hunt's wall-clock budget, so one
+    test held the orchestrator drain for its full 600 s and the suite never
+    finished (measured 2026-10-28: `test_automation_exploit_system` hung
+    reproducibly, alone and in the full run).
+
+    Same rule as `_hermetic_fingerprint_probes`: the suite is hermetic, a
+    non-loopback probe fails fast (an empty result, which the engine already
+    treats as "endpoint unreachable"), and a test that needs real behaviour
+    can inject its own `runner=`.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        from phantom.automation.exploit import anomaly
+    except Exception:  # pragma: no cover - import guard for isolated runs
+        yield
+        return
+    original = anomaly.curl_runner
+
+    def _curl(method, url, body="", timeout=8.0, cookies="", headers=None,
+              follow=True):
+        host = (urlparse(url).hostname or "").lower()
+        if host in ("127.0.0.1", "localhost", "::1"):
+            return original(method, url, body, timeout, cookies,
+                            headers=headers, follow=follow)
+        return anomaly.ProbeResult()
+
+    monkeypatch.setattr(anomaly, "curl_runner", _curl)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_recon_pacing(monkeypatch):
+    """Stop the recon ladder from pacing itself with REAL sleeps in tests.
+
+    The ladder's `quiet`/`blend` profiles sleep 0.5-5 s between chunks, and
+    `sleep` defaults to `time.sleep`. Any agent test that escalates to the
+    deep scan therefore spends those seconds for real — and a single test
+    can spend minutes, which is how the suite stalled inside
+    `run_ladder` → `do_sleep` (measured 2026-10-28, twice). The pacing is a
+    product behaviour worth testing with an injected recorder (which
+    `tests/test_scan_camouflage.py` does); it is not worth spending real
+    wall-clock in every agent test, so the suite defaults it to a no-op.
+    A test that cares still wins: an explicit `sleep=` is left untouched.
+    """
+    try:
+        from phantom.automation import recon_ladder
+    except Exception:  # pragma: no cover - import guard for isolated runs
+        yield
+        return
+    original = recon_ladder.run_ladder
+
+    def _run_ladder(*args, **kwargs):
+        kwargs.setdefault("sleep", lambda _seconds: None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(recon_ladder, "run_ladder", _run_ladder)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _restore_recon_ladder_profile():
+    """Undo the scan profile an agent test handed to a MODULE GLOBAL.
+
+    `agent.py` passes the worker's posture to the recon ladder with
+    ``recon_ladder.set_default_profile(...)`` — a process-wide global, which
+    nothing restores. After one stealth test the default is ``quiet``, whose
+    jitter is 2-5 REAL seconds per chunk: every later ``run_ladder`` call in
+    the same process sleeps through it, and the suite stalls inside
+    ``do_sleep`` without failing (measured 2026-10-28: the full run was killed
+    at 75%). Restoring here makes the suite order-independent; the
+    long-lived-process leak itself is the product issue documented in
+    docs/Live_Test_2026-10-28.md.
+    """
+    try:
+        from phantom.automation import recon_ladder
+    except Exception:  # pragma: no cover - import guard for isolated runs
+        yield
+        return
+    before = getattr(recon_ladder, "_DEFAULT_PROFILE", "balanced")
+    yield
+    recon_ladder._DEFAULT_PROFILE = before
+
+
+@pytest.fixture(autouse=True)
 def _stop_leaked_servers():
     """Tear down any server a test left running (best-effort, never fails)."""
     # snapshot the config module's cached state so a test that repoints

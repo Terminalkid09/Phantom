@@ -122,8 +122,12 @@ def test_a_corrupt_file_starts_empty_instead_of_raising(state_path, fast_writes)
     state = C2State()                          # must not raise
     assert state.get_beacons() == {}
     assert state.tasks == {}
-    # the unreadable file is KEPT for inspection, not overwritten in place
-    assert state_path.exists()
+    # The unreadable file is KEPT for inspection — and KEPT means renamed:
+    # left in place, the next `_persist_state` replaced it and the operator
+    # lost the very file the log told them to open (audit 2026-10-30).
+    assert not state_path.exists()
+    kept = list(state_path.parent.glob("c2_state.json.rejected-*"))
+    assert kept and kept[0].read_text(encoding="utf-8") == "{not json at all"
 
 
 def test_a_foreign_version_is_refused_not_interpreted(state_path, fast_writes):
@@ -133,6 +137,8 @@ def test_a_foreign_version_is_refused_not_interpreted(state_path, fast_writes):
         "tasks": {}, "results": {}}), encoding="utf-8")
     state = C2State()
     assert state.get_beacons() == {}
+    kept = list(state_path.parent.glob("c2_state.json.rejected-version-*"))
+    assert kept, "a newer schema must be set aside, not interpreted"
 
 
 def test_a_missing_file_is_not_an_error(state_path, fast_writes):
@@ -168,20 +174,26 @@ def test_a_wrong_shaped_field_is_ignored_not_fatal(state_path, fast_writes):
 
 # ── the debounce ──────────────────────────────────────────────────────────
 
-def test_a_write_inside_the_window_is_deferred_not_lost(state_path, monkeypatch):
-    """A change must not wait for a quiet moment, and must not be dropped."""
+def test_a_write_inside_the_window_lands_instead_of_being_deferred(
+        state_path, monkeypatch):
+    """Queued work is durable IMMEDIATELY, debounce window or not.
+
+    This test used to assert the opposite ("deferred, not lost") and only
+    looked "not lost" because it called `flush()` on the next line — which a
+    crash never does. Audit 2026-10-30: a task queued inside the 2s window and
+    a killed listener lost the task. Operator-driven changes are forced.
+    """
     monkeypatch.setattr(CS, "_STATE_PERSIST_INTERVAL", 3600.0)
     state = C2State()
     state.update_beacon(BEACON, {"ip": "10.0.0.1"})
     state.flush()                              # baseline: the file is current
 
     state.queue_task(BEACON, "screenshot")
-    assert "screenshot" not in state_path.read_text(encoding="utf-8")
-    assert state._state_dirty is True
-
-    state.flush()                              # the shutdown flush
     assert "screenshot" in state_path.read_text(encoding="utf-8")
     assert state._state_dirty is False
+
+    state.flush()                              # the shutdown flush is a no-op
+    assert "screenshot" in state_path.read_text(encoding="utf-8")
 
 
 def test_stopping_the_listener_flushes_the_deferred_state(state_path,
@@ -191,7 +203,8 @@ def test_stopping_the_listener_flushes_the_deferred_state(state_path,
     state.update_beacon(BEACON, {"ip": "10.0.0.1"})
     state.flush()
     state.queue_task(BEACON, "screenshot")
-    assert "screenshot" not in state_path.read_text(encoding="utf-8")
+    # already durable (see the test above); stop() must still leave it there
+    assert "screenshot" in state_path.read_text(encoding="utf-8")
 
     monkeypatch.setattr(CS, "c2_state", state)
     server = CS.C2Server()                     # never started: flush only

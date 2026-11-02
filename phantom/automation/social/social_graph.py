@@ -90,6 +90,40 @@ def node_key(kind: str, value: str) -> str:
     return f"{kind}:{_norm(value)}"
 
 
+_EMAIL_LIKE_RE = re.compile(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}")
+_PHONE_LIKE_RE = re.compile(r"\+?\d[\d\-\. ]{6,}\d")
+#: Size/served-variant suffixes Instagram and Facebook append to the SAME
+#: picture: `x_s150x150.jpg`, `x_n.jpg`, `...?stp=dst-jpg_s150x150`.
+_AVATAR_SIZE_RE = re.compile(r"(_|\b)(?:s|n|p|b)?\d{2,4}x\d{2,4}(?=\.|$)")
+_AVATAR_VARIANT_RE = re.compile(r"(_|/)(?:s|n|p|b)(?=\.[a-z]{2,5}$)")
+
+
+def _avatar_key(value: str) -> str:
+    """A stable avatar identity from a hash OR a URL.
+
+    Live defect: `_link_same_avatar` compared the RAW value the recon engine
+    handed over. Two profiles whose picture is literally the same file met on
+    `.../x.jpg?stp=dst-jpg_s150x150` and `.../x_s150x150.jpg` — the same bytes,
+    two different strings — and never linked. The query string is a CDN
+    cache-buster (`_nc_ht`, `stp`), never part of the picture, and the size
+    suffix is the same file resized, so both are stripped here. The HOST is
+    kept: the same filename on another origin is another picture, and saying
+    otherwise is how an avatar match invents a person.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    low = raw.lower()
+    if "://" in low or low.startswith("//"):
+        low = re.sub(r"^[a-z][a-z0-9+.\-]*://", "", low).lstrip("/")
+        low = low.split("#", 1)[0].split("?", 1)[0]
+        host, _, path = low.partition("/")
+        path = _AVATAR_SIZE_RE.sub("", path)
+        path = _AVATAR_VARIANT_RE.sub("", path)
+        return f"{host}/{path}".strip("/")
+    return low
+
+
 @dataclass
 class Node:
     key: str
@@ -726,18 +760,29 @@ def graph_from_recon(results: Sequence[Any], *,
             if value and str(value) not in (subject.attrs.get(attr),) and \
                     subject.attrs.get(attr) in (None, "", [], {}):
                 subject.attrs[attr] = str(value)[:200]
-        avatar = getattr(result, "avatar_dhash", "") or getattr(result, "avatar_hash", "")
-        if avatar:
-            avatar_node = g.add_node(node_key("url", f"avatar:{avatar}"), "url",
-                                     label=f"avatar:{avatar[:12]}",
+        # An avatar can arrive as a perceptual hash (`avatar_dhash`), a byte
+        # hash or the URL the profile served. All three are normalised to ONE
+        # key space so two sightings of the same picture meet (see
+        # `_avatar_key`; the raw URL stays on the node as an attribute).
+        for attr in ("avatar_dhash", "avatar_hash", "avatar_url"):
+            avatar = getattr(result, attr, "") or ""
+            key_part = _avatar_key(avatar)
+            if not key_part:
+                continue
+            avatar_node = g.add_node(node_key("url", f"avatar:{key_part}"),
+                                     "url",
+                                     label=f"avatar:{key_part[:48]}",
                                      source=f"recon:{platform}",
-                                     confidence=0.7)
+                                     confidence=0.7,
+                                     avatar_ref=str(avatar)[:300],
+                                     avatar_key=key_part)
             if avatar_node is not None:
                 # the subject's OWN avatar, so two profiles whose avatars hash
-                # the same meet on this node (see `_link_same_avatar`)
+                # (or resolve) the same meet on this node (see
+                # `_link_same_avatar`)
                 g.add_edge(subject.key, avatar_node.key, "same_avatar",
-                           evidence=f"avatar:{avatar[:12]}", confidence=0.75,
-                           source=f"recon:{platform}")
+                           evidence=f"avatar:{key_part[:24]}",
+                           confidence=0.75, source=f"recon:{platform}")
         for lead in getattr(result, "leads", []) or []:
             kind = getattr(lead, "kind", "")
             value = getattr(lead, "value", "") or ""
@@ -769,9 +814,74 @@ def graph_from_recon(results: Sequence[Any], *,
             # NOTE: no avatar edge for a lead. A `Lead` carries no avatar hash,
             # and the avatar node here belongs to the SUBJECT: attaching a
             # commenter to it would invent a shared-avatar proof nobody made.
+    # Aliases first: an email probed as a HANDLE is the same identity as that
+    # email, and linking it afterwards would count the same proof twice under
+    # two node ids.
+    _merge_identity_aliases(g)
     _link_same_avatar(g)
     _link_shared_emails(g)
     return g
+
+
+def _merge_identity_aliases(g: SocialGraph) -> int:
+    """Fold `handle:` nodes that ARE an email/phone into their canonical node.
+
+    Live defect: the recon engine probes an email address as a social handle
+    (it is a legal username), so the graph carried BOTH `handle:mail@x.com`
+    and `email:mail@x.com` for one identity. Every proof landed on whichever
+    one the caller happened to build first, so a shared email could never
+    connect the two profiles that both exposed it. Edges are re-pointed at the
+    canonical node and duplicates merge (one proof, not two).
+    """
+    remap: Dict[str, str] = {}
+    for key in sorted(g.nodes):
+        node = g.nodes[key]
+        if node.kind != "handle":
+            continue
+        label = _norm(node.label or key.partition(":")[2])
+        kind = ""
+        if _EMAIL_LIKE_RE.fullmatch(label):
+            kind = "email"
+        elif _PHONE_LIKE_RE.fullmatch(label) and sum(c.isdigit() for c in label) >= 7:
+            kind = "phone"
+        if not kind:
+            continue
+        canon = node_key(kind, label)
+        if canon == key:
+            continue
+        # carry the probe state over: an alias that was `missing` must not
+        # become a confirmed email once it is renamed. Reserved keyword names
+        # are dropped from `attrs` so a malformed finding can never raise here.
+        carried = {k: v for k, v in node.attrs.items()
+                   if k not in ("label", "platform", "confidence", "source")}
+        g.add_node(canon, kind, label=label, platform=node.platform,
+                   confidence=node.confidence, source="alias-merge",
+                   **carried)
+        if canon not in g.nodes:
+            continue
+        for src in node.sources:
+            if src not in g.nodes[canon].sources:
+                g.nodes[canon].sources.append(src)
+        remap[key] = canon
+    if not remap:
+        return 0
+    kept: Dict[Tuple[str, str, str], Edge] = {}
+    for edge in list(g.edges.values()):
+        edge.src = remap.get(edge.src, edge.src)
+        edge.dst = remap.get(edge.dst, edge.dst)
+        if edge.src == edge.dst:
+            continue
+        if edge.src not in g.nodes or edge.dst not in g.nodes:
+            continue
+        previous = kept.get(edge.key)
+        if previous is not None:
+            previous.merge(edge)
+        else:
+            kept[edge.key] = edge
+    g.edges = kept
+    for alias in remap:
+        g.nodes.pop(alias, None)
+    return len(remap)
 
 
 def _link_same_avatar(g: SocialGraph) -> int:
@@ -925,6 +1035,89 @@ def graph_from_wm(wm: Any, *, graph: Optional[SocialGraph] = None) -> SocialGrap
 def correlate(results: Sequence[Any]) -> SocialGraph:
     """Convenience: results -> graph (the call `recon` and the CLI both want)."""
     return graph_from_recon(results)
+
+
+def correlation_report(graph: SocialGraph) -> List[Dict[str, Any]]:
+    """Rank the candidate identity clusters and say WHY each one is a cluster.
+
+    `correlate()` returned a graph and left the operator to eyeball it. This is
+    the ranked answer, and every number in it comes from a CONFIRMING proof
+    (`STRONG_KINDS`) — a comment or a co-mention is a pivot lead, never an
+    identity.
+
+    Two honesty rules, both measured rather than stylistic:
+
+    * the score is a noisy-OR of the strong proofs, CAPPED below 1.0. Two
+      accounts that expose the same email are the same person with high
+      confidence, not with certainty, and a `1.00` in a dossier reads as proof;
+    * a cluster whose handles are ALL `missing`/`unknown` is flagged
+      `unconfirmed`: that is the Instagram-app-shell trap that produced seven
+      variant "accounts" out of nothing, and the flag is what stops a report
+      from presenting a probe outcome as an identity.
+
+    Deterministic by construction: clusters are walked from sorted node keys
+    and the output is sorted by score then id, so the same graph always yields
+    the same report.
+    """
+    kind_weight = {"same_person": 0.55, "email_match": 0.65,
+                   "reset_flow_match": 0.75, "same_avatar": 0.45}
+    peers: Dict[str, set] = {}
+    proofs: Dict[str, set] = {}
+    for edge in graph.edges.values():
+        if edge.kind not in STRONG_KINDS:
+            continue
+        if edge.src not in graph.nodes or edge.dst not in graph.nodes:
+            continue
+        peers.setdefault(edge.src, set()).add(edge.dst)
+        peers.setdefault(edge.dst, set()).add(edge.src)
+        proofs.setdefault(edge.src, set()).add(edge.kind)
+        proofs.setdefault(edge.dst, set()).add(edge.kind)
+
+    report: List[Dict[str, Any]] = []
+    seen: set = set()
+    for start in sorted(peers):
+        if start in seen:
+            continue
+        members = sorted(SocialGraph._flood(start, peers))
+        seen.update(members)
+        remaining = 1.0
+        why: set = set()
+        for key in members:
+            for kind in sorted(proofs.get(key, ())):
+                weight = kind_weight.get(kind, 0.3)
+                remaining *= (1.0 - weight)
+                why.add(kind)
+        score = min(0.99, round(1.0 - remaining, 3))
+        handles = [graph.nodes[k].label or k for k in members
+                   if graph.nodes[k].kind == "handle"]
+        platforms = sorted({graph.nodes[k].platform for k in members
+                            if graph.nodes[k].kind == "handle"
+                            and graph.nodes[k].platform})
+        states = [str(graph.nodes[k].attrs.get("state", "") or "")
+                  for k in members if graph.nodes[k].kind == "handle"]
+        unconfirmed = (not states
+                       or all(s in _UNCONFIRMED_STATES for s in states))
+        # A profile whose ONLY strong edge is to its own avatar is one
+        # identity, not a correlation: including it made the report list
+        # every scanned handle as its own "cluster", which is the noise the
+        # ranking exists to remove. An email/phone/reset-flow proof always
+        # brings a second kind in, so a real match still survives.
+        if len(handles) < 2 and set(why) == {"same_avatar"}:
+            continue
+        label = handles[0] if handles else (graph.nodes[members[0]].label
+                                            or members[0])
+        report.append({
+            "id": f"cluster:{members[0]}",
+            "label": label,
+            "platforms": platforms,
+            "handles": handles,
+            "nodes": members,
+            "score": score,
+            "why": sorted(why),
+            "unconfirmed": unconfirmed,
+        })
+    report.sort(key=lambda row: (-float(row["score"]), str(row["id"])))
+    return report
 
 
 def to_json(graph: SocialGraph, indent: int = 2) -> str:

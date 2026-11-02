@@ -12,8 +12,8 @@ This module turns that craft into a capability:
     planner      ->  lateral/smb/winrm pivots now have a host slot source
 
 The probe is deliberately BOUNDED: a fixed TCP-connect sweep over the
-ARP table (typically < 20 hosts on a real LAN segment) for at most 4
-pivot ports, 300ms timeout each. This is recon a helpdesk ticket could
+ARP table (typically < 20 hosts on a real LAN segment) for at most 8
+services, 300ms timeout each. This is recon a helpdesk ticket could
 explain, not a scan that lights up the SOC.
 """
 
@@ -24,8 +24,25 @@ from typing import Any, Dict, List
 
 from phantom.automation.belief import Finding, WorldModel
 
-# ports the pivot chain actually speaks (ssh=22, smb=445, winrm=5985)
-_PIVOT_PORTS = (22, 445, 5985)
+# Remote-execution services that exist on a real LAN, per family. SSH is
+# not "the unix one" any more (OpenSSH ships with Windows Server 2019+ and
+# macOS), SMB is not Windows-only (Samba), and RDP/VNC/Docker API/ADB are
+# all shells over the network. The probe REPORTS every one it finds; only
+# the ones with a live pivot adapter can be acted on, and the finding says
+# which is which instead of implying they are equivalent.
+_PIVOT_PORTS = (22, 445, 5985, 5986, 3389, 5900, 2375, 5555)
+
+# port -> service name: ONE table for the probe and the interpreter, so a
+# port cannot be reported under two names by two code paths.
+_PIVOT_SERVICES = {
+    22: "ssh", 139: "smb", 445: "smb",
+    5985: "winrm", 5986: "winrm-tls",
+    3389: "rdp", 5900: "vnc", 2375: "docker-api",
+    5555: "adb",
+}
+
+# the services the lateral chain can actually drive today
+_ACTIONABLE_PIVOTS = frozenset(("ssh", "smb", "winrm"))
 # bounded connect timeout (seconds) per host:port
 _PROBE_TIMEOUT = 0.3
 # never probe more neighbors than this in one snapshot (noise cap)
@@ -177,7 +194,6 @@ def internal_probe_interpreter(output: str, wm: WorldModel,
     command), so the output is split on the MARKER, not on newlines."""
     if "__SVC__" not in output:
         return []
-    svc_names = {22: "ssh", 445: "smb", 5985: "winrm"}
     out: List[Finding] = []
     seen = set()
     for chunk in output.split("__SVC__")[1:]:  # skip the pre-marker prefix
@@ -186,10 +202,16 @@ def internal_probe_interpreter(output: str, wm: WorldModel,
             host, port = toks[0], _int_or_0(toks[1])
             if host and port and (host, port) not in seen:
                 seen.add((host, port))
+                service = _PIVOT_SERVICES.get(port, str(port))
                 out.append(Finding(
                     kind="internal_service", key=f"{host}:{port}",
                     value={"host": host, "port": port,
-                           "service": svc_names.get(port, str(port))},
+                           "service": service,
+                           # a service the operator can SEE but no adapter
+                           # can drive is knowledge, not a path: saying so
+                           # here stops the planner from treating rdp/vnc/
+                           # docker-api/adb as if they were a pivot.
+                           "actionable": service in _ACTIONABLE_PIVOTS},
                     confidence=0.85, source="internal_recon_probe",
                     evidence=f"__SVC__ {host} {port}"))
     return out

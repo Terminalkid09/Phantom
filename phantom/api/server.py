@@ -358,6 +358,163 @@ async def c2_listener_stop(_request: web.Request) -> web.Response:
     return _json({"status": "stopped"})
 
 
+@routes.get("/api/c2/tunnel")
+async def c2_tunnel_status(_request: web.Request) -> web.Response:
+    """Is there a public hop, and what will the NEXT artefact dial?
+
+    `tunnel` used to be a CLI-only command, so the desktop could not show —
+    let alone manage — the one setting that decides whether a delivered
+    artefact carries this box's address. GET reports both halves: the
+    tunnel's own state and the endpoint `c2_endpoint_status()` would embed
+    right now, because the disagreement between those two is the bug worth
+    seeing.
+    """
+    from phantom.utils import tunnel as tn
+    from phantom.utils.network import c2_endpoint_status
+    tun = tn.active()
+    try:
+        ep = c2_endpoint_status()
+        endpoint = {"url": ep.url, "via_front": bool(ep.via_front),
+                    "warnings": ep.warnings()}
+    except Exception as exc:
+        endpoint = {"url": "", "error": str(exc)[:200]}
+    listener_alive = False
+    try:
+        listener_alive = bool(server_instance.thread
+                              and server_instance.thread.is_alive())
+    except Exception:
+        pass
+    return _json({
+        "running": tun.running(),
+        "public_url": tun.public_url or "",
+        "local_url": tun.local_url or "",
+        "front": tn.current_front(),
+        "error": tun.error or "",
+        "tail": tun.tail(),
+        "binary": tn.find_binary() or "",
+        "listener_alive": listener_alive,
+        "endpoint": endpoint,
+    })
+
+
+@routes.post("/api/c2/tunnel")
+async def c2_tunnel_action(request: web.Request) -> web.Response:
+    """`install` | `start` [port] | `stop` — the same sequence as the CLI.
+
+    Implemented by `tunnel.publish()` so the shell and this endpoint cannot
+    drift; the response carries the messages the shell would print.
+    """
+    from phantom.utils import tunnel as tn
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    action = str((body or {}).get("action") or "status").strip().lower()
+
+    if action == "install":
+        path, err = tn.install()
+        if not path:
+            return _error(err or "install failed", 502)
+        return _json({"ok": True, "binary": path})
+
+    if action in ("stop", "off"):
+        tn.active().stop()
+        tn.clear_front()
+        return _json({"ok": True, "front": tn.current_front(),
+                      "messages": ["tunnel stopped; c2.front cleared"]})
+
+    if action == "start":
+        try:
+            port = int((body or {}).get("port") or 0)
+        except (TypeError, ValueError):
+            return _error("'port' must be a number")
+        result = tn.publish(port)
+        if not result.get("ok"):
+            return _error("; ".join(result.get("messages", [])) or
+                          "tunnel failed", 502)
+        result.pop("ok", None)
+        return _json(result)
+
+    tun = tn.active()
+    return _json({"running": tun.running(), "public_url": tun.public_url,
+                  "front": tn.current_front(), "messages": []})
+
+
+@routes.get("/api/c2/hid")
+async def c2_hid_status(_request: web.Request) -> web.Response:
+    """Boards the toolchain can see, plus the endpoint a build would dial.
+
+    HID was the last delivery channel with no API surface at all — a board
+    could only be prepared from the CLI. The board list is what an operator
+    needs BEFORE clicking flash: after a delivery the board self-ejects and
+    stops enumerating, so an empty list here means "replug it", not "the
+    flasher is broken".
+    """
+    from phantom.utils import hid_flash as hf
+    from phantom.utils.network import c2_endpoint_status
+    from phantom.utils.arduino_flash import find_cli
+    ep = c2_endpoint_status()
+    return _json({
+        "boards": hf.boards(),
+        "arduino_cli": find_cli() or "",
+        "endpoint": {"url": ep.url, "via_front": bool(ep.via_front),
+                     "warnings": ep.warnings()},
+        "hint": ("no board enumerated: unplug/replug it — a board that "
+                 "just delivered disconnects itself and waits for a "
+                 "power cycle"),
+    })
+
+
+@routes.post("/api/c2/hid")
+async def c2_hid_action(request: web.Request) -> web.Response:
+    """`build` | `flash` a HID artefact, with the same steps as `payload hid`.
+
+    `flash` implies build: the sequence an operator clicks is "prepare and
+    upload", and a response that only wrote the sketch would read as a flash
+    that worked.
+    """
+    from phantom.utils import hid_flash as hf
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    body = body or {}
+    action = str(body.get("action") or "build").strip().lower()
+    board = str(body.get("board") or "leonardo").strip().lower()
+
+    built = hf.build(
+        board,
+        str(body.get("command") or ""),
+        platform=str(body.get("platform") or "windows"),
+        token=str(body.get("token") or ""),
+        layout=str(body.get("layout") or ""),
+        target=str(body.get("type_into") or ""),
+        open_run=bool(body.get("open_run", True)),
+        eject=bool(body.get("eject", True)),
+        countdown_s=(int(body["countdown_s"])
+                     if str(body.get("countdown_s", "")).strip() else None),
+        shots=(int(body["shots"])
+               if str(body.get("shots", "")).strip() else None),
+        char_delay_ms=(int(body["char_delay_ms"])
+                       if str(body.get("char_delay_ms", "")).strip()
+                       else None),
+    )
+    if not built.get("ok"):
+        return _error(str(built.get("error") or "build failed"), 400)
+    if action == "build":
+        return _json(built)
+
+    result = hf.flash(str(built["path"]),
+                      port=str(body.get("port") or ""),
+                      fqbn=str(body.get("fqbn") or ""),
+                      board=str(built.get("variant") or board))
+    result["built"] = built
+    if not result.get("ok"):
+        return _error(str(result.get("error") or result.get("summary") or
+                          "flash failed"), 500)
+    return _json(result)
+
+
 @routes.post("/api/c2/beacon/{beacon_id}/task")
 async def c2_beacon_task(request: web.Request) -> web.Response:
     """Queue a command for a specific beacon."""
@@ -744,7 +901,8 @@ class AutoJob:
         self.end_reason = ""
         self._state_lock = threading.Lock()
         # A handoff is a DECISION the operator makes, not a notification
-        # (docs/ManusOpenCode.md §4): `ready` until accepted or dismissed.
+        # (see CHANGELOG.md, automode handoff): `ready` until accepted or
+        # dismissed.
         self.handoff_state = "none"
         # Beacons THIS RUN established. The stream flattens events into log
         # lines and drops the event kind, so the UI had no way to tell "this

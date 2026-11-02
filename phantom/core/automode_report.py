@@ -42,6 +42,96 @@ def report_out_dir() -> str:
     return os.path.join(sessions_dir(), f"auto_{int(time.time())}")
 
 
+def _ai_last_call() -> str:
+    """The newest AI-plane call, in one sentence: model, phase, verdict.
+
+    `--ai integrated` routes every phase through `ai.router.ask`, which writes
+    one telemetry line per call. Reading it back is what lets the report say
+    "the model was asked and answered" instead of implying it.
+    """
+    try:
+        import json
+        from phantom.automation.ai import telemetry
+        path = telemetry.telemetry_path()
+        if not path.exists():
+            return "no model call was ever recorded"
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-5:]
+        for line in reversed(lines):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            when = time.strftime("%H:%M:%S", time.localtime(float(row.get("ts", 0))))
+            verdict = ("schema ok" if row.get("schema_ok")
+                       else f"failed: {row.get('error') or 'no schema'}")
+            return (f"last model call {when} phase={row.get('phase')} "
+                    f"model={row.get('model') or '?'} ({verdict})")
+        return "no model call was ever recorded"
+    except Exception as exc:
+        return f"telemetry unreadable ({exc})"
+
+
+def ai_participation(agent) -> str:
+    """Did a model take part in this run, and could it have changed it?
+
+    TWO different AI paths exist and they are not the same feature:
+
+    * ``--ai integrated|local|cloud`` — the trained per-phase planes
+      (`phantom.automation.ai`), Qwen-based, each phase with its own adapter.
+      This is the one an "AI run" means; it is OFF unless configured.
+    * the local GGUF advisor (`--llm`) — a separate, non-gating suggester.
+
+    A lab run with the AI on and one with it off produced the same result. The
+    honest answer is usually that no model call was made at all — the plane
+    was off, or integrated had no promoted manifest and fell back to an
+    endpoint nobody was serving — and in that case both runs ARE the same
+    deterministic plan. This line is the difference between "the model
+    reasoned and agreed" and "the model was never asked".
+    """
+    parts = []
+    try:
+        from phantom.automation.ai import config as ai_config
+        active = {p: ai_config.mode(p) for p in ai_config.PHASES
+                  if ai_config.mode(p) != "off"}
+    except Exception as exc:
+        active, parts = {}, [f"AI: plane not importable ({exc})"]
+    if not parts:
+        if not active:
+            parts.append("AI: OFF (ai.mode=off) — the deterministic plan, by "
+                         "design")
+        else:
+            parts.append("AI: " + ", ".join(
+                f"{p}={m}" for p, m in sorted(active.items())))
+            parts.append(_ai_last_call())
+
+    advisor = getattr(agent, "llm_advisor", None)
+    if advisor is not None and getattr(advisor, "enabled", False):
+        parts.append(_advisor_line(advisor))
+    return " · ".join(parts)
+
+
+def _advisor_line(advisor) -> str:
+    """The separate `--llm` advisor's contribution, or why there was none."""
+
+    def _count(name: str) -> int:
+        # an agent double in a test (or a partial advisor) may not carry the
+        # counters at all: "unknown" must read as 0 here, never as a crash at
+        # the very end of a finished engagement.
+        try:
+            return int(getattr(advisor, name, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    calls = _count("calls")
+    accepted = _count("accepted")
+    if calls == 0:
+        reason = str(getattr(advisor, "_error", "") or "no model backend")
+        return (f"advisor (--llm): enabled but it never called a model "
+                f"({reason}) — no suggestion reached the planner")
+    return (f"advisor (--llm): consulted {calls} time(s), {accepted} "
+            "suggestion(s) front-loaded into the planner's order")
+
+
 def write_agent_reports(agent, profile: str, out_root: str, target: str):
     from datetime import datetime as _dt
     from phantom.automation.reporting import RawReport, ClientReport, ReportWriter
@@ -215,6 +305,7 @@ def print_agent_single_tail(result: dict, paths: dict, agent, goal: str,
             f"hypotheses={result.get('hypotheses')} "
             f"({result.get('hypotheses_confirmed')} confirmed), "
             f"actions={result.get('actions_taken')}")
+    notifier.info(ai_participation(agent))
     notifier.info("Report (raw operator + sanitized client):")
     print_report_paths(paths)
     # end-of-run LEARNING receipt: what this run recorded and what the

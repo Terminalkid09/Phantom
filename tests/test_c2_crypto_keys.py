@@ -6,12 +6,14 @@ shared with c2d/envelope.go and the beacon's crypto.h (a drift there is silent:
 beacon traffic simply never decrypts), and cover the legacy fallback that keeps
 beacons built before this scheme working.
 """
+import hashlib
 import os
 import tempfile
 from unittest.mock import patch
 
 from phantom.utils import beacon_auth
 from phantom.utils.c2_crypto import (
+    _derive_to_length,
     beacon_download_token,
     beacon_envelope_key,
     decrypt_data,
@@ -67,6 +69,45 @@ def test_a_zeroed_secret_still_derives_a_distinct_key():
     zeroed = beacon_envelope_key(bytes(32), "B-TEST")
     assert len(zeroed) == 32
     assert zeroed != beacon_envelope_key(_VECTOR_SECRET, "B-TEST")
+
+
+# ── key material normalisation (the LAST-RESORT branch) ──────────────────────
+
+
+def test_normalisation_keeps_the_three_standard_encodings():
+    """The branches above the fallback are a contract with the state file: a
+    value Phantom itself generated must keep producing the same bytes, or every
+    existing deployment loses its C2 traffic on upgrade."""
+    key = bytes(range(32))
+    nonce = bytes(range(12))
+    assert _derive_to_length(key, 32) == key                       # exact
+    assert _derive_to_length(key.hex().encode(), 32) == key         # hex
+    import base64
+    assert _derive_to_length(base64.b64encode(nonce), 12) == nonce  # base64
+
+
+def test_last_resort_is_a_labelled_kdf_not_a_bare_sha256():
+    """The defect this closes: the fallback was ``sha256(raw)[:n]`` — a bare
+    hash, not a derivation. The same bytes hashed for any other purpose in the
+    tree produced the same digest, so nothing separated the AES key from the
+    material it came from. It is now an HMAC under a fixed label."""
+    raw = b"an operator passphrase that is not 32 bytes"
+    derived = _derive_to_length(raw, 32)
+    assert len(derived) == 32
+    # Deterministic: an operator's state file keeps working across restarts.
+    assert derived == _derive_to_length(raw, 32)
+    # Domain-separated: no longer equal to the bare digest it used to be.
+    assert derived != hashlib.sha256(raw).digest()
+    # Unique per input, and different labels would give different bytes.
+    assert derived != _derive_to_length(raw + b"!", 32)
+
+
+def test_last_resort_never_returns_short_key_material():
+    """A 12-byte nonce from a long passphrase must still be 12 real bytes."""
+    for length in (12, 32):
+        out = _derive_to_length(b"x" * 77, length)
+        assert len(out) == length
+        assert out != bytes(length)
 
 
 # ── behaviour against the registry ──────────────────────────────────────────

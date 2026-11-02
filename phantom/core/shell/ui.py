@@ -8,6 +8,7 @@ without import cycles — lazy imports stay inside the functions.
 from __future__ import annotations
 
 import os
+import sys
 
 from dotenv import load_dotenv
 from rich.console import Console
@@ -38,6 +39,141 @@ load_phantom_env()
 console = Console()
 
 
+# ── prompt grammar ────────────────────────────────────────────────────────
+# ONE grammar for every layer, so the operator can tell WHERE THEY ARE
+# without decoding a colour. Phantom used to have four prompts with three
+# different shapes (`phantom(10.0.0.5) > `, plain `[scan:10.0.0.5] > `,
+# magenta `C2 (a1b2c3) > `, cyan `AUTO > `) and colour was the only thing
+# telling the shell apart from a module — invisible in a log, in a report,
+# and on a terminal without colour.
+#
+#   phantom(target) ❯              the manual shell
+#   phantom(target/scan) ❯         inside a module (one layer down)
+#   phantom ▸ C2(target) ❯         C2 console (a sub-shell, depth 2)
+#   phantom ▸ auto(target) ❯       AUTO-MODE console (depth 2)
+#
+# The target never disappears, the layer is TEXT, and colour is a secondary
+# cue that is dropped entirely when the terminal cannot take it.
+
+_LAYER_COLOR = {
+    "root": "\033[1;36m",     # bright cyan
+    "module": "\033[36m",      # cyan
+    "C2": "\033[1;35m",        # magenta
+    "auto": "\033[1;33m",      # yellow
+}
+_RESET = "\033[0m"
+
+
+def use_color() -> bool:
+    """Whether the prompt may carry ANSI colour at all.
+
+    Honours the NO_COLOR convention (https://no-color.org) and Phantom's own
+    switch, and refuses colour on a redirected stream: a prompt written into
+    a log file must not be full of escape sequences.
+    """
+    if os.getenv("NO_COLOR") or os.getenv("PHANTOM_NO_COLOR"):
+        return False
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _prompt_glyph() -> str:
+    """The prompt's closing mark, ASCII when the console cannot encode `❯`.
+
+    `input(self.prompt)` writes the prompt through the CONSOLE encoding, not
+    through Rich: on a cp1252 Windows console an unmappable glyph raises
+    UnicodeEncodeError and the operator cannot type at all. Terminals on
+    Windows, Linux and macOS are not equally capable, so the glyph is picked
+    from the encoding instead of assumed.
+    """
+    enc = (getattr(sys.stdout, "encoding", "") or "utf-8").lower()
+    return "❯" if enc.replace("-", "").replace("_", "") in ("utf8", "utf16", "utf32") else ">"
+
+
+def build_prompt(layer: str = "", *, status: str = "", depth: int = 1,
+                 status_color: str = "") -> str:
+    """Build the prompt for a layer — the ONE function every shell uses.
+
+    ``layer`` is empty at the main shell, a module name one layer down, or
+    ``C2`` / ``auto`` for a sub-shell (``depth=2``). ``status`` adds a
+    bracketed detail (the active beacon); ``status_color`` is the ANSI code
+    that detail should carry (C2 liveness: green/yellow/red) and is ignored
+    when colour is unavailable. ``glyph`` (the closing mark) is chosen from
+    the console encoding, never assumed.
+    """
+    target = session.target or ""
+    if depth >= 2 and layer:
+        plain = f"phantom ▸ {layer}" + (f"({target})" if target else "")
+    elif layer:
+        plain = f"phantom({target}/{layer})" if target else f"phantom({layer})"
+    else:
+        plain = f"phantom({target})" if target else "phantom"
+
+    status_txt = f" [{status}]" if status else ""
+    glyph = _prompt_glyph()
+    if not use_color():
+        return f"{plain}{status_txt} {glyph} "
+
+    key = layer if depth >= 2 else ("module" if layer else "root")
+    code = _LAYER_COLOR.get(key, _LAYER_COLOR["root"])
+    if status_txt and status_color:
+        # the liveness colour is closed and the layer colour reopened, so the
+        # prompt after the bracket keeps its own accent
+        status_txt = f" [{status_color}{status}{code}]"
+    return f"{code}{plain}{status_txt}{_RESET} {glyph} "
+
+
+def layer_line(layer: str = "", depth: int = 1) -> str:
+    """Plain-text answer to `where` — the prompt's information, on demand.
+
+    Registered at EVERY layer (main shell, modules, C2, AUTO) under the same
+    name, because a command that only works in one of four shells is the same
+    confusion the shared prompt grammar exists to remove.
+    """
+    target = session.target or "—"
+    scope = ", ".join(session.scope) if session.scope else "—"
+    if depth >= 2 and layer:
+        where = f"{layer} console  ('back' returns to the main shell)"
+        path = f"phantom > {layer}({target})"
+    elif layer:
+        where = f"{layer} module  ('back' returns to the main shell)"
+        path = f"phantom({target}/{layer})"
+    else:
+        where = "main shell  (below: use <module>, c2, agent)"
+        path = f"phantom({target})"
+    return (f"  layer  : {where}\n"
+            f"  target : {target}\n"
+            f"  scope  : {scope}\n"
+            f"  prompt : {path}")
+
+
+def status_signature() -> tuple:
+    """The values `build_status_bar()` renders, as a comparable tuple.
+
+    `postcmd` used to redraw a separator, nine counters and a hint line after
+    EVERY command, so the output of the command itself scrolled away under
+    chrome that had not changed. Comparing this signature lets the bar print
+    only when something in it actually moved.
+    """
+    try:
+        from phantom.core.knowledge import knowledge_summary
+        counts = knowledge_summary()
+        knowledge = (counts.get("service", 0), counts.get("creds", 0),
+                     counts.get("vuln", 0),
+                     counts.get("web_app", 0) + counts.get("hunt", 0))
+    except Exception:
+        knowledge = ()
+    try:
+        from phantom.core.c2_server import c2_state
+        beacons = len(c2_state.get_beacons())
+    except Exception:
+        beacons = -1
+    return (session.target or "", tuple(session.scope or ()), knowledge,
+            beacons)
+
+
 def ask_to_install(tool: str, cmd) -> bool:
     """Ask the operator, in the shell, before running a package manager.
 
@@ -63,6 +199,9 @@ def _context_hint() -> str:
     """Faded one-line hint: what to do NEXT given the current state.
     Shown after every command so the operator never gets stuck reading
     docs — the shell tells you the obvious next move."""
+    # THREE hints, one line: the fourth used to be a generic `run` that was
+    # still proposed after the scan it belongs to. The list is state-driven,
+    # so a satisfied step stops being suggested at all.
     hints = []
     if not session.target:
         hints.append("set target <ip|domain|email>")
@@ -86,7 +225,7 @@ def _context_hint() -> str:
             hints.append("export all (report)")
         hints.append("preflight scan")
         hints.append("run")
-    return "[dim]▸ " + "   ".join(hints[:4]) + "[/dim]"
+    return "[dim]▸ " + "   ".join(hints[:3]) + "[/dim]"
 
 
 def _engagement_elapsed() -> str:
@@ -110,8 +249,12 @@ def _engagement_elapsed() -> str:
 
 def build_status_bar() -> str:
     """One-line live status: target · type · knowledge counters · beacon · timer.
-    Printed after every command so the operator always sees where the
-    engagement stands (the "status bar" of the manual shell)."""
+
+    Rendered by `postcmd` only when `status_signature()` CHANGED — redrawing
+    an identical bar after every command pushed the command's own output
+off the screen, which is the defect the signature exists to remove. The
+    documented behaviour is "printed when the engagement state moves", not
+    "printed after every command"."""
     target = session.target or "—"
     ttype = _target_type_tag()
     scope = ", ".join(session.scope) if session.scope else "—"

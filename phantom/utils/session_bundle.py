@@ -249,13 +249,24 @@ def _session_payload() -> Dict[str, Any]:
 
 
 def _engagement_id() -> str:
-    """Stable id for the CURRENT engagement: target + opening timestamp.
+    """Stable id for the CURRENT engagement: HASHED target + opening timestamp.
+
     Auto-session uses it to decide whether a dated .pm copy belongs to the
-    same engagement (overwrite) or a new one (new file)."""
+    same engagement (overwrite) or a new one (new file), so it only ever needs
+    to be compared for EQUALITY.
+
+    The target used to be written here in clear, and this id lands in two
+    places that are NOT encrypted: `data/sessions/index.json` and the dated
+    file names. The `.pm` payload is AES-GCM, so the client hostname survived
+    on disk in the one file nobody encrypted — a plaintext list of who was
+    being tested, next to timestamps (raised by the operator 2026-10-30). A
+    truncated SHA-256 answers the same question without the leak.
+    """
     from phantom.core.session import session
     started = getattr(session, "engagement_started", "") or ""
     target = (session.target or "untargeted").replace("\\", "_").replace("/", "_")
-    return f"{target}|{started}"
+    digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+    return f"{digest}|{started}"
 
 
 # keys that must NEVER appear in an exported bundle (defense in depth:
@@ -319,6 +330,29 @@ def _c2_payload() -> Dict[str, Any]:
     }
 
 
+def _write_blockers(payload: Dict[str, Any]) -> List[str]:
+    """Fields of `payload` that cannot be serialised, named one by one.
+
+    `json.dumps(..., default=str)` swallows a lot, but not a circular
+    reference or a non-string key — and when it does fail, the exception says
+    nothing about WHICH part of the engagement broke. Dumping each top-level
+    field alone names it, so the operator gets "which field" instead of
+    "session export failed".
+    """
+    blockers: List[str] = []
+    for key, value in payload.items():
+        try:
+            json.dumps({key: value}, default=str)
+        except (TypeError, ValueError) as exc:
+            blockers.append(f"{key!r}: {exc.__class__.__name__}: {exc}")
+    if not blockers:
+        try:
+            json.dumps(payload, default=str)
+        except (TypeError, ValueError) as exc:
+            blockers.append(f"payload: {exc.__class__.__name__}: {exc}")
+    return blockers
+
+
 def export_session(out_path: Optional[str] = None,
                    checkpoint: Optional[str] = None,
                    encrypt: bool = True) -> str:
@@ -349,6 +383,15 @@ def export_session(out_path: Optional[str] = None,
                 payload["checkpoint"] = json.load(f)
         except (OSError, ValueError):
             payload["checkpoint"] = None
+    # A bundle that silently loses a field is worse than a failed export: the
+    # importer restores a session that LOOKS complete. Refuse loudly, naming
+    # the field, and write nothing.
+    blockers = _write_blockers(payload)
+    if blockers:
+        raise ValueError(
+            "refusing to write a half-engagement .pm: the payload does not "
+            f"serialise ({'; '.join(blockers)}). Nothing was written — fix "
+            "the named field and export again")
     if not out_path:
         out_path = os.path.join(_sessions_root(),
                                 f"phantom_{int(time.time())}.pm")
@@ -445,7 +488,12 @@ def read_bundle(path: str) -> Dict[str, Any]:
     try:
         with gzip.open(path, "rb") as f:
             data = json.loads(f.read().decode("utf-8"))
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, EOFError) as e:
+        # EOFError is NOT an OSError: gzip raises it for a truncated stream
+        # (the killed-close case `_atomic_gzip_write` exists to prevent, and
+        # a half-copied USB transfer). Uncaught, it escaped `read_bundle` and
+        # every caller that only handles ValueError crashed instead of
+        # reporting an unreadable bundle.
         raise ValueError(f"not a valid .pm bundle ({e})") from e
     if not isinstance(data, dict) or data.get("magic") != _MAGIC:
         raise ValueError("not a Phantom .pm bundle (magic marker missing)")
@@ -486,8 +534,13 @@ def import_session(path: str, resume_dir: Optional[str] = None) -> Dict[str, Any
     base via `set_wm`, exactly like `Session.load` does.
 
     Returns {target, scope, mode, checkpoint_source, resume_path,
-    reports, notes, history, findings, session} — the caller decides
-    how to surface it.
+    reports, notes, history, findings, c2_intel, beacons_imported,
+    warnings, session} — the caller decides how to surface it.
+
+    `beacons_imported` is the beacon count of the `c2_intel` block, spelled
+    out as its own key because the C2 shell and the desktop app ask "how many
+    beacons came with this bundle?" and used to reach two levels deep into
+    `c2_intel` to answer it.
     """
     data = read_bundle(path)
     sess = data.get("session") or {}
@@ -540,6 +593,7 @@ def import_session(path: str, resume_dir: Optional[str] = None) -> Dict[str, Any
         "history": len(sess.get("history") or []),
         "findings": findings_restored,
         "c2_intel": c2_restored,
+        "beacons_imported": c2_restored.get("beacons", 0),
         "warnings": warnings,
         "session": sess,
     }
@@ -570,8 +624,12 @@ def _restore_c2_intel(c2_data: Optional[dict]) -> Dict[str, int]:
     A .pm from another operator brings beacon identities, task history and
     outputs: instead of silently dropping them, they are stored under
     session.knowledge_base["c2_intel"] where the report writer, the
-    suggest engine and the C2 shell can read them. Live beacons are NOT
-    adopted (they still check in to their original listener).
+    suggest engine and the C2 shell can read them.    Live beacons are NOT
+    adopted (they still check in to their original listener), and `c2_state`
+    is deliberately NOT hydrated: a bundle from another operator carries
+    identities that cannot reach this listener, and writing them into the
+    live beacon table would make the C2 shell offer tasks to beacons that
+    will never answer.
     """
     counts = {"beacons": 0, "tasks": 0, "results": 0}
     if not isinstance(c2_data, dict):

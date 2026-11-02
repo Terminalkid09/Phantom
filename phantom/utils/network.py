@@ -283,6 +283,15 @@ def get_c2_front() -> Optional[tuple]:
 
     raw = str(os.getenv("PHANTOM_C2_FRONT", "")).strip()
     if not raw:
+        # The LIVE front a `tunnel start` published, persisted so every
+        # other process (API server, second CLI) builds artefacts for the
+        # same endpoint instead of the one in the config file.
+        try:
+            from phantom.utils.state import get_string
+            raw = str(get_string("PHANTOM_C2_FRONT", "")).strip()
+        except Exception:
+            raw = ""
+    if not raw:
         raw = str(cfg.get("c2.front", "") or "").strip()
     if not raw:
         return None
@@ -325,13 +334,19 @@ class C2Endpoint:
 
     def __init__(self, host: str, port: int, use_ssl: bool,
                  listener_alive: bool, listener_port: int,
-                 listener_ssl: bool) -> None:
+                 listener_ssl: bool, via_front: bool = False) -> None:
         self.host = host
         self.port = int(port)
         self.use_ssl = bool(use_ssl)
         self.listener_alive = bool(listener_alive)
         self.listener_port = int(listener_port or 0)
         self.listener_ssl = bool(listener_ssl)
+        #: The callback is a public hop (`c2.front`), so its port and scheme
+        #: belong to the EDGE, not to our listener. Comparing them produced a
+        #: "MISMATCH: calls back to :443 but the listener is on :8443" warning
+        #: on every correct tunnel setup — the exact noise that teaches an
+        #: operator to skip warnings.
+        self.via_front = bool(via_front)
 
     @property
     def url(self) -> str:
@@ -375,11 +390,17 @@ class C2Endpoint:
         problems = []
         if not self.listener_alive:
             problems.append(
-                f"no listener is running: this artefact calls back to "
-                f"{self.url} and nothing will answer there. Start it "
-                f"with `listeners start {self.port}`, or it will never "
-                f"check in.")
-        elif self.listener_port and self.listener_port != self.port:
+                (f"no listener is running: this artefact calls back to "
+                 f"{self.url} and nothing will answer there. Start it with "
+                 f"`listeners start` (the local port the tunnel forwards "
+                 f"to), or it will never check in.")
+                if self.via_front else
+                (f"no listener is running: this artefact calls back to "
+                 f"{self.url} and nothing will answer there. Start it "
+                 f"with `listeners start {self.port}`, or it will never "
+                 f"check in."))
+        elif (self.listener_port and self.listener_port != self.port
+              and not self.via_front):
             problems.append(
                 f"MISMATCH: the artefact calls back to :{self.port} but the "
                 f"listener is on :{self.listener_port} — the beacon will "
@@ -421,6 +442,21 @@ def c2_endpoint_status(host: str = "") -> C2Endpoint:
 
     use_ssl = (listener_ssl if listener_alive
                else cfg.get_bool("c2.ssl", True, env="PHANTOM_C2_SSL"))
+
+    # A configured FRONT is what the target dials, so it outranks the `host`
+    # argument (the operator's own address) — otherwise `payload hid` keeps
+    # typing the LAN IP that the front exists to keep off the screen, and the
+    # artefact calls back to a port the edge never forwards. An explicit
+    # PHANTOM_C2_HOST still wins, exactly as in get_c2_endpoint().
+    if not str(os.getenv("PHANTOM_C2_HOST", "")).strip():
+        try:
+            front = get_c2_front()
+        except Exception:
+            front = None
+        if front:
+            return C2Endpoint(str(front[0] or ""), int(front[1] or 443),
+                              True, listener_alive, listener_port,
+                              listener_ssl, via_front=True)
 
     lhost = host
     lport = 0

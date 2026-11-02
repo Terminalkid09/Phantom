@@ -101,12 +101,34 @@ def doctor(say: Say = print) -> Dict[str, object]:
         f"{_platform.python_version()} (needs >= 3.10)")
 
     tools = capability_tools()
-    found = [e for e in tools if shutil.which(e.name)]
-    missing = [e for e in tools if not shutil.which(e.name)]
+    # Count through the ToolRegistry, NOT raw shutil.which: on Windows the
+    # toolbox lives in the Kali WSL distro and `which` cannot see it. The
+    # doctor printed "tools: 3/20 installed" on a fully provisioned box while
+    # the very next line said "WSL: distro(s): kali-linux" — an operator reads
+    # that as a broken install and goes hunting for a problem that is not
+    # there. The registry resolves native FIRST, then WSL, under a bounded
+    # probe budget (automation/runtime/toolchain.py), so on Kali/Linux the
+    # answer is unchanged and the WSL probe never even runs.
+    try:
+        from phantom.automation.runtime.toolchain import ToolRegistry
+        reg = ToolRegistry()
+        found = [e for e in tools if reg.has(e.name)]
+        missing = [e for e in tools if not reg.has(e.name)]
+    except Exception:
+        found = [e for e in tools if shutil.which(e.name)]
+        missing = [e for e in tools if not shutil.which(e.name)]
     say(f"{STEP_OK if not missing else STEP_WARN} tools: "
         f"{len(found)}/{len(tools)} installed"
         + (f" — missing: {', '.join(e.name for e in missing)}"
            if missing else ""))
+    if missing:
+        # A missing tool is an OPERATOR ACTION, and the wizard is the door
+        # that performs it (asks once, no silent installs). Saying only what
+        # is absent left the operator with a dead end in the one command they
+        # ran to find out what to do.
+        say(f"{STEP_WARN} install them with `phantom setup`"
+            + (" — on Windows the toolbox lives in the Kali distro, so "
+               "`phantom setup wsl`" if PLATFORM == "windows" else ""))
 
     docker = bool(shutil.which("docker"))
     say(f"{STEP_OK if docker else STEP_WARN} docker "
@@ -216,7 +238,16 @@ def _configure_distro(say: Say, ask: Ask) -> bool:
     """Distro exists: set up the toolbox (tools) inside it, unattended."""
     from phantom.core.executor import install_tool   # WSL-root aware
     targets = [e for e in capability_tools() if e.wsl_only or True]
-    missing = [e.name for e in targets if not shutil.which(e.name)]
+    # Registry, not `which`: inside the guided WSL flow the tools being
+    # checked live IN the distro, where the Windows `which` can never see
+    # them. With `which` the "toolbox already complete" branch was
+    # unreachable and every re-run re-installed everything.
+    try:
+        from phantom.automation.runtime.toolchain import ToolRegistry
+        _reg = ToolRegistry()
+        missing = [e.name for e in targets if not _reg.has(e.name)]
+    except Exception:
+        missing = [e.name for e in targets if not shutil.which(e.name)]
     if not missing:
         say(f"{STEP_OK} toolbox already complete")
         return True

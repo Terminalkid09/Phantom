@@ -279,3 +279,35 @@ def test_exploit_all_says_which_ports_stayed_unversioned():
     assert out["fingerprint"]["attempted"] is False
     assert "not registered" in out["fingerprint"]["reason"]
     assert out["fingerprint"]["unversioned_ports"] == ["8081"]
+
+
+# ── a candidate with no weapon is NOT "already tested" ────────────────────
+
+def test_a_recorded_but_unattempted_candidate_is_retried():
+    """Audit 2026-10-30: `exploit-all` with no Metasploit wrote
+    `attempted: False` for every CVE, and `_already_tested` then excluded them
+    for ever. Installing the tool and re-running reported "already attempted"
+    on a path that had never been tried once.
+    """
+    from phantom.automation.exploit.sweep import _already_tested
+
+    wm = WorldModel(target="10.0.0.5")
+    cand = AccessCandidate(id="c1", cve="CVE-2021-41773", port="80",
+                           service="http", kind="cve", access="rce")
+    key = cand.id if hasattr(cand, "id") else "c1"
+    from phantom.automation.exploit import sweep as _sweep
+    key = _sweep._candidate_key(cand)
+
+    wm.add_finding("exploit_result", key,
+                   {"cve": cand.cve, "id": cand.id, "attempted": False,
+                    "vulnerable": False, "rce": False, "detail":
+                    "no weapon available"},
+                   confidence=0.6, source="test")
+    assert _already_tested(wm, cand) is False, (
+        "nothing was executed, so the path must stay in the retry set")
+
+    wm.add_finding("exploit_result", key,
+                   {"cve": cand.cve, "id": cand.id, "attempted": True,
+                    "vulnerable": False, "rce": False},
+                   confidence=0.6, source="test")
+    assert _already_tested(wm, cand) is True

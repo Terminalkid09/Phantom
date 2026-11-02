@@ -35,8 +35,13 @@ class TestReachabilityGate(unittest.TestCase):
 
     def test_live_host_is_probed(self):
         """A reachable host proceeds into the SSRF/SQLi battery."""
+        # A real login page carries its method/action; the fixture used to
+        # omit both and still "worked" only because the endpoint-existence
+        # check treated a failed POST as proof of life (the bug that made a
+        # POST-only login undiscoverable on a real target).
         with patch("phantom.automation.exploit.webcreds._http_get",
-                   return_value="<html><form><input name='user'></form></html>") as get, \
+                   return_value="<html><form method='post' action='/login'>"
+                                "<input name='user'></form></html>") as get, \
              patch("phantom.automation.exploit.webcreds._http_post",
                    return_value="no match") as post:
             run_web_creds_dump(_wm_with_web(), "10.0.0.5")
@@ -49,6 +54,28 @@ class TestReachabilityGate(unittest.TestCase):
                    return_value=None) as get:
             run_web_creds_dump(_wm_with_web(8081), "10.0.0.5")
             self.assertEqual(get.call_count, 1)
+
+    def test_json_login_bypass_is_detected(self):
+        """An API-style login ({"ok": true}) is a bypass even with no
+        <table>/redirect/"admin" in the body and no password to dump.
+
+        The bench app answers the injection with its own user object; the
+        engine used to call that "no credentials" and stop the chain there.
+        """
+        def fake_post(url, data, timeout=None):
+            payload = " ".join(str(v) for v in data.values())
+            if "OR 1=1" in payload:
+                return '{"ok": true, "id": 1, "user": "operator", "role": "user"}'
+            return None          # bad credentials -> 401
+
+        with patch("phantom.automation.exploit.webcreds._http_get",
+                   return_value="<html><form method='post' action='/login'>"
+                                "<input name='username'></form></html>"), \
+             patch("phantom.automation.exploit.webcreds._http_post",
+                   side_effect=fake_post):
+            results = run_web_creds_dump(_wm_with_web(), "10.0.0.5")
+        self.assertTrue(results)
+        self.assertIn("operator", [c.username for c in results])
 
     def test_no_web_service_falls_back_to_common_ports(self):
         """Without service findings the dump still probes common web ports —

@@ -152,6 +152,27 @@ def cmd_help(shell, arg: str):
     # next hand-edit, the curated tables are checked against the REGISTRY
     # and whatever they miss is printed from the handlers' own docstrings,
     # so `help` can never hide a command again (`tests/test_core_help.py`).
+    # ── Where am I ──────────────────────────────────────────────────
+    # Four layers share this binary (manual shell, modules, C2, AUTO) and the
+    # whole surface is discoverable only if the operator knows the shape. The
+    # grammar below is the SAME one the prompts use (phantom.core.shell.ui
+    # .build_prompt), printed once here so the prompt and its explanation can
+    # never disagree.
+    # The glyph comes from the SAME helper the prompts use, so a console that
+    # cannot encode `❯` shows `>` here too instead of crashing `help`.
+    from phantom.core.shell.ui import _prompt_glyph
+    _g = _prompt_glyph()
+    _sh.console.print(
+        f"[bold]Where you are[/]   [dim]phantom(target) {_g}   ->   "
+        f"phantom(target/module) {_g}   ->   phantom > C2(target) {_g}  |  "
+        f"phantom > auto(target) {_g}[/]")
+    _sh.console.print(
+        "[dim]  'where' prints the current layer on demand; 'back' goes one "
+        "layer up at every level; 'exit' leaves Phantom.[/]")
+    _sh.console.print(
+        "[dim]  Start here: set target → preflight → run · suggest · plan · "
+        "auto · agent · c2[/]")
+
     tables = (t1, t2, t2b, t3, t4)
     covered = set()
     for table in tables:
@@ -920,9 +941,20 @@ def cmd_doctor(shell, arg: str):
     render(report)
 
 
+def cmd_where(shell, arg: str):
+    """where - Print the current layer, target and scope in one line.
+
+    The prompt already says it, but a prompt scrolls away. Same answer, on
+    demand, and the command is named the same at every layer so the operator
+    does not have to remember a different word per shell.
+    """
+    from phantom.core.shell.ui import layer_line
+    _sh.console.print(layer_line(), markup=False)
+
+
 def cmd_back(shell, arg: str):
     """Return to main shell (already here)"""
-    notifier.warn("Already at main shell.")
+    notifier.warn("Already at main shell — 'where' shows the current layer.")
 
 
 def _ask(prompt: str, default: str = "") -> str:
@@ -1197,6 +1229,7 @@ COMMANDS = {
     "why": cmd_why,
     "run_diff": cmd_run_diff,
     "experience": cmd_experience,
+    "where": cmd_where,
     "back": cmd_back,
     "exit": cmd_exit,
     "quit": cmd_quit,

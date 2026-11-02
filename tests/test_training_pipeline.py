@@ -330,6 +330,116 @@ def test_unknown_criterion_is_not_a_passed_one():
                          {}) == 0.0
 
 
+# ── the fold spread travels with the holdout number ─────────────────────────
+
+def _ranking_golden():
+    """Two DIFFERENT payloads: folds are grouped by payload, so one payload
+    is one group — and one group is not a measurement."""
+    return [
+        {"id": "c1", "phase": "exploit", "metric": "ndcg",
+         "input": {"goal": "deliver", "profile": "enterprise",
+                   "candidates": [{"id": "ssh_login"},
+                                  {"id": "CVE-2024-1"}]},
+         "expected": {"ranking": ["CVE-2024-1", "ssh_login"]}},
+        {"id": "c2", "phase": "exploit", "metric": "ndcg",
+         "input": {"goal": "identity", "profile": "enterprise",
+                   "candidates": [{"id": "http_probe"},
+                                  {"id": "CVE-2024-2"}]},
+         "expected": {"ranking": ["CVE-2024-2", "http_probe"]}},
+    ]
+
+
+def test_the_report_carries_the_fold_spread_next_to_the_holdout(tmp_path):
+    golden = _ranking_golden()
+    golden_path = tmp_path / "golden.jsonl"
+    golden_path.write_text(
+        "\n".join(json.dumps(row) for row in golden) + "\n",
+        encoding="utf-8")
+    pred_path = tmp_path / "pred.jsonl"
+    pred_path.write_text(
+        "\n".join(json.dumps({"id": row["id"],
+                              "prediction": row["expected"]})
+                  for row in golden) + "\n", encoding="utf-8")
+    out = tmp_path / "result.json"
+    code = training_eval.main([
+        "--phase", "exploit", "--predictions", str(pred_path),
+        "--golden", str(golden_path), "--out", str(out), "--quiet"])
+    assert code == 0
+    result = json.loads(out.read_text(encoding="utf-8"))
+    block = result["cv"]
+    for key in ("k", "folds", "mean", "stdev", "min", "max", "n_groups"):
+        assert key in block
+    # clamped to the number of payload groups, never to empty folds
+    assert block["k"] == 2
+    assert block["n_groups"] == 2
+    assert block["min"] <= block["mean"] <= block["max"]
+    # reporting only: the holdout score does not depend on the block
+    assert result["score"] == 1.0
+
+
+def test_one_payload_group_is_unmeasured_not_a_zero():
+    block = training_eval.cross_validation_block(_ranking_golden()[:1])
+    assert block["k"] == 0
+    assert block["reason"]
+    line = training_eval.format_cv_line(block)
+    assert "not measurable" in line
+    # a 0.0000 would read like a score nobody earned
+    assert "mean=" not in line
+
+
+# ── the production scorer's reach over the corpus ──────────────────────────
+
+def test_the_report_says_how_much_of_the_corpus_the_prod_scorer_can_judge(
+        tmp_path, capsys):
+    """The corpus ranks capability ids; `score_for` ranks access candidates.
+
+    The two vocabularies share no id, so the production scorer was never
+    ASKED about these rows. That is a data gap and the report has to say so
+    instead of averaging in zeros and calling it a baseline that scored
+    nothing.
+    """
+    golden = _ranking_golden()
+    golden_path = tmp_path / "golden.jsonl"
+    golden_path.write_text(
+        "\n".join(json.dumps(row) for row in golden) + "\n",
+        encoding="utf-8")
+    pred_path = tmp_path / "pred.jsonl"
+    pred_path.write_text(
+        "\n".join(json.dumps({"id": row["id"],
+                              "prediction": row["expected"]})
+                  for row in golden) + "\n", encoding="utf-8")
+    out = tmp_path / "result.json"
+    code = training_eval.main([
+        "--phase", "exploit", "--predictions", str(pred_path),
+        "--golden", str(golden_path), "--out", str(out)])
+    assert code == 0
+
+    result = json.loads(out.read_text(encoding="utf-8"))
+    block = result["baseline_production"]
+    for key in ("rows_total", "rows_scoreable", "coverage", "mean_ndcg",
+                "reason"):
+        assert key in block
+    assert block["rows_total"] == 2
+    assert block["rows_scoreable"] == 0
+    assert "data gap" in block["reason"]
+    # reporting only: the holdout score is untouched by the new block
+    assert result["score"] == 1.0
+
+    err = capsys.readouterr().err
+    assert "production baseline" in err
+    # a 0.0000 would read as "the production baseline lost", which it did not
+    assert "mean_ndcg=" not in err
+
+
+def test_a_production_block_over_no_rows_is_a_sentence_not_a_zero():
+    block = training_eval.production_baseline_block([])
+    assert block["rows_total"] == 0
+    assert block["rows_scoreable"] == 0
+    assert block["reason"]
+    line = training_eval.format_production_baseline_line(block)
+    assert "mean_ndcg=" not in line
+
+
 def test_evaluate_hands_the_row_context_to_a_three_arg_rubric():
     from training.rubric import social_rubric
 

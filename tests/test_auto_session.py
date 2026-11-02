@@ -190,14 +190,34 @@ class TestResumePrompt(unittest.TestCase):
                 self.assertFalse(AS.offer_resume())
 
     def test_register_open_appends_index(self):
+        """One open = one row; a DOUBLE call in the same second is one open.
+
+        The row is keyed by (pid, opened_at, engagement_id), which is exactly
+        what a second call from the same process produces — the Electron app
+        calling the hook twice is the case that used to write two rows for one
+        shell. A genuinely new open (different second) still appends.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(AS, "sessions_dir", lambda: tmp):
                 AS.register_open()
                 AS.register_open()
                 with open(os.path.join(tmp, "index.json"), encoding="utf-8") as f:
                     idx = json.load(f)
-                self.assertEqual(len(idx), 2)
+                self.assertEqual(len(idx), 1)
                 self.assertIn("opened_at", idx[0])
+                # a row from an EARLIER open (different opened_at) is not a
+                # duplicate and must survive the next registration
+                entry = dict(idx[0])
+                entry["opened_at"] = "2000-01-01T00:00:00"
+                with open(os.path.join(tmp, "index.json"), "w",
+                          encoding="utf-8") as f:
+                    json.dump(idx + [entry], f)
+                AS.register_open()
+                with open(os.path.join(tmp, "index.json"), encoding="utf-8") as f:
+                    idx = json.load(f)
+                self.assertEqual(len(idx), 2)
+                self.assertIn("2000-01-01T00:00:00",
+                              [row.get("opened_at") for row in idx])
 
 
 class TestNoSilentLoss(unittest.TestCase):

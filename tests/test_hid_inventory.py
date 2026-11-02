@@ -147,8 +147,11 @@ class TestPlatformMatch:
         # (--stager-mode inline, below) or when its endpoint cannot be read
         # at all (a warning, never a dead end).
         _inventory(monkeypatch, [LIN_BEACON])
-        content, _ = _run("flipper --from-payload 9c7e0b12 --type-into linux",
-                          tmp_path)
+        # --layout us pinned: without it the artefact follows the BENCH
+        # locale (`/` -> `&` for it), so this assertion would pass or fail
+        # depending on the machine that runs the suite.
+        content, _ = _run("flipper --from-payload 9c7e0b12 --type-into linux "
+                          "--layout us", tmp_path)
         assert content and "STRING sh -c" in content
         assert "10.0.0.5:8443" in content            # the payload's endpoint
         assert "api/v1/payload_linux" in content
@@ -159,7 +162,7 @@ class TestPlatformMatch:
             self, tmp_path, monkeypatch):
         _inventory(monkeypatch, [LIN_BEACON])
         content, _ = _run("flipper --from-payload 9c7e0b12 --type-into linux "
-                          "--stager-mode inline", tmp_path)
+                          "--layout us --stager-mode inline", tmp_path)
         assert content and "curl -sk" in content and "| sh" in content
 
     def test_an_unknown_platform_is_not_a_mismatch(self, tmp_path, monkeypatch):

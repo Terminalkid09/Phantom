@@ -17,7 +17,7 @@ import socket
 import subprocess
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 
 def _run(cmd: List[str], timeout: float = 60.0) -> str:
@@ -116,6 +116,64 @@ def _parse_nmap_sn(text: str) -> List[Dict[str, str]]:
     if cur:
         hosts.append(cur)
     return hosts
+
+
+#: Ports a live box holds open even when its firewall drops ICMP. Windows 11
+#: with the default Public profile answers NONE of the ping probes and only a
+#: couple of these — measured 2026-11-01 on the lab HP: ICMP 100% loss, TCP
+#: 5040 and 5357 open. A sweep that only speaks ICMP calls that host dead.
+_TCP_SWEEP_PORTS = (80, 443, 445, 139, 135, 22, 23, 21, 25, 53, 88, 389,
+                    3389, 5040, 5357, 5555, 5985, 8080, 8081, 8443, 9091,
+                    9443, 10000)
+
+
+def _tcp_sweep(cidr: str, timeout: float = 45.0,
+               ports: Sequence[int] = _TCP_SWEEP_PORTS
+               ) -> List[Dict[str, str]]:
+    """Host discovery over TCP, for the hosts ICMP cannot see.
+
+    A connect() to a closed port is refused immediately, so a filtered host is
+    only slow on the ports that are dropped rather than answered; 0.25 s per
+    port with 64 hosts in flight keeps a /24 to a few seconds. A host with ANY
+    open port is alive — that is the whole test.
+
+    Deliberately NOT a port scanner: it reports "this IP is there", the
+    ``_quick_probe_hosts`` step below does the fingerprinting. Mixing the two
+    is how a sweep starts taking minutes per run.
+    """
+    found: List[Dict[str, str]] = []
+    try:
+        import socket as _socket
+        from concurrent.futures import ThreadPoolExecutor
+
+        net = ipaddress.ip_network(cidr, strict=False)
+        addrs = [str(a) for a in net.hosts()][:254]
+        if not addrs:
+            return found
+
+        def _alive(ip_s: str) -> Optional[str]:
+            for port in ports:
+                sock = _socket.socket()
+                sock.settimeout(0.25)
+                try:
+                    if sock.connect_ex((ip_s, int(port))) == 0:
+                        return ip_s
+                except OSError:
+                    pass
+                finally:
+                    sock.close()
+            return None
+
+        deadline = time.time() + max(5.0, float(timeout))
+        with ThreadPoolExecutor(max_workers=64) as pool:
+            for result in pool.map(_alive, addrs):
+                if time.time() > deadline:
+                    break
+                if result:
+                    found.append({"ip": result})
+    except Exception:
+        pass
+    return found
 
 
 def _ping_sweep(cidr: str, timeout: float = 45.0) -> List[Dict[str, str]]:
@@ -643,6 +701,12 @@ def discover_network(target: Optional[str] = None,
         if not hosts:
             hosts = _ping_sweep(cidr, timeout=timeout)
             method = "ping sweep" if hosts else method
+        if not hosts:
+            # Last live check before the ARP cache: a host that filters ICMP
+            # (Windows 11 default) is invisible to everything above and
+            # perfectly reachable over TCP.
+            hosts = _tcp_sweep(cidr, timeout=timeout)
+            method = "tcp sweep" if hosts else method
 
     # Last, the L2 truth: a device the sweeps could not reach but the
     # neighbour table still holds is on this network RIGHT NOW — that is the
@@ -937,6 +1001,96 @@ def _probe_ports(ip: str, ports: List[int], per_port: float = 0.6,
     except Exception:
         pass
     return sorted(open_ports)
+
+
+#: A full-range connect sweep is 65 535 probes, and on a host whose firewall
+#: DROPs instead of REJECTs every one of them costs the full timeout. MEASURED
+#: on this LAN: `nmap -sV -sC -p- 192.168.1.18` took 13 552 s for 65 535
+#: filtered ports, and a scripted `scan` run therefore reported "0 services"
+#: on a Windows box that had two open (5357 + 5040, 2026-10-30). The sweep
+#: below is the same question asked over plain TCP connects: no nmap, no root,
+#: and a wall-clock budget the caller can actually wait for.
+SWEEP_WORKERS = 512
+SWEEP_PER_PORT = 0.9
+SWEEP_BUDGET = 420.0
+
+
+def sweep_all_ports(ip: str, *, first: int = 1, last: int = 65535,
+                    workers: int = SWEEP_WORKERS,
+                    per_port: float = SWEEP_PER_PORT,
+                    budget: float = SWEEP_BUDGET) -> tuple[List[int], Dict[str, Any]]:
+    """Every open TCP port on ``ip``, by connect scan. Never raises.
+
+    Returns ``(open_ports, stats)``. ``stats["complete"]`` is False when the
+    wall-clock ``budget`` ran out first — a PARTIAL sweep is reported as
+    partial instead of as "no more ports", because the difference between
+    "nothing else is open" and "we stopped looking" is the difference between
+    a finding and a lie (the nmap `-p-` run above is the expensive version of
+    that mistake).
+
+    Refused (RST) and dropped (timeout) are counted separately: a host that
+    answers RST for most ports has a small, well-defined surface, while a host
+    that drops everything has a firewall worth naming.
+    """
+    import socket as _socket
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+
+    ip = str(ip or "").strip()
+    stats: Dict[str, Any] = {"host": ip, "scanned": 0, "open": 0,
+                             "refused": 0, "filtered": 0,
+                             "elapsed": 0.0, "complete": True,
+                             "workers": int(workers), "per_port": per_port}
+    if not ip:
+        stats["complete"] = False
+        return [], stats
+    ports = [p for p in range(max(1, int(first)), min(65535, int(last)) + 1)]
+    open_ports: List[int] = []
+    refused = 0
+    filtered = 0
+    started = _time.time()
+    deadline = started + max(1.0, float(budget))
+
+    def _one(port: int):
+        sock = _socket.socket()
+        sock.settimeout(per_port)
+        try:
+            sock.connect((ip, port))
+            return port, "open"
+        except ConnectionRefusedError:
+            return None, "refused"
+        except OSError:
+            return None, "filtered"
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    pool = ThreadPoolExecutor(max_workers=max(1, int(workers)))
+    try:
+        batch = max(1, int(workers) * 4)
+        for start in range(0, len(ports), batch):
+            if _time.time() >= deadline:
+                stats["complete"] = False
+                break
+            chunk = ports[start:start + batch]
+            for port, verdict in pool.map(_one, chunk):
+                stats["scanned"] += 1
+                if verdict == "open":
+                    open_ports.append(port)
+                elif verdict == "refused":
+                    refused += 1
+                else:
+                    filtered += 1
+    finally:
+        pool.shutdown(wait=False)
+
+    stats["open"] = len(open_ports)
+    stats["refused"] = refused
+    stats["filtered"] = filtered
+    stats["elapsed"] = round(_time.time() - started, 1)
+    return sorted(open_ports), stats
 
 
 def rank_hosts_exposure(hosts: List[Dict[str, Any]],

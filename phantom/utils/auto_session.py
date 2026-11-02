@@ -46,6 +46,10 @@ from phantom.utils.session_bundle import (
 )
 
 _LATEST = "latest.pm"
+#: Dated auto copies kept on disk. `latest.pm` is always kept on top of these;
+#: every engagement used to add one file and nothing ever pruned them, so
+#: `data/sessions/` grew without bound (and `sessions` listed all of it).
+AUTO_KEEP = 20
 
 
 def _warn(message: str) -> None:
@@ -74,25 +78,109 @@ def _index_path() -> str:
     return os.path.join(_root(), "index.json")
 
 
+def _quarantine_index(path: str) -> str:
+    """Move an unreadable index aside instead of overwriting it.
+
+    It used to be read with `json.load`, and an invalid result was silently
+    replaced by `[]` on the next write: one corrupted file (two shells writing
+    at once) erased the whole open/close history with no trace. The bad file
+    is PRESERVED next to the fresh one; it costs a few KB and it is the only
+    evidence of what happened.
+    """
+    stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    aside = f"{path}.corrupt-{stamp}"
+    try:
+        os.replace(path, aside)
+        return aside
+    except OSError:
+        return ""
+
+
+def _read_index() -> List[Dict[str, Any]]:
+    """The sessions index, tolerating a missing/foreign/corrupt file."""
+    path = _index_path()
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            idx = json.load(f)
+    except (OSError, ValueError):
+        _quarantine_index(path)
+        return []
+    if not isinstance(idx, list):
+        _quarantine_index(path)
+        return []
+    return [row for row in idx if isinstance(row, dict)]
+
+
+def _write_index(rows: List[Dict[str, Any]]) -> None:
+    """Write the index atomically (temp in the same dir + `os.replace`).
+
+    The Electron app and a terminal can open an engagement at the same time,
+    and the close hook runs while the process can still be killed: written in
+    place, `index.json` was truncatable, and a reader could see half a JSON
+    array.
+    """
+    path = _index_path()
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rows[-200:], f, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _entry_key(row: Dict[str, Any]) -> tuple:
+    """Identity of ONE open: pid + opening second + engagement."""
+    return (row.get("pid"), row.get("opened_at"), row.get("engagement_id"))
+
+
 # ── open ───────────────────────────────────────────────────────────────────
 
 def register_open() -> None:
-    """Record this shell session in the sessions index (idempotent per pid+start)."""
+    """Record this shell session in the sessions index (idempotent per pid+start).
+
+    Idempotent for real: the same pid opening twice within the same second for
+    the same engagement is ONE row. A double registration used to look like
+    two engagements, which is exactly what `sessions` shows the operator.
+    """
     entry = {
         "opened_at": datetime.now().isoformat(timespec="seconds"),
         "pid": os.getpid(),
         "engagement_id": _engagement_id(),
     }
     try:
-        idx = []
-        if os.path.isfile(_index_path()):
-            with open(_index_path(), "r", encoding="utf-8") as f:
-                idx = json.load(f)
-        if not isinstance(idx, list):
-            idx = []
+        idx = _read_index()
+        if any(_entry_key(row) == _entry_key(entry) for row in idx):
+            return
         idx.append(entry)
-        with open(_index_path(), "w", encoding="utf-8") as f:
-            json.dump(idx[-200:], f, indent=2)
+        _write_index(idx)
+    except (OSError, ValueError):
+        pass
+
+
+def close_registration() -> None:
+    """Stamp `closed_at` on the newest open that belongs to this engagement.
+
+    Without it an engagement that crashed and one the operator closed
+    cleanly looked identically "open" in the index. Best effort: it runs on
+    the close path, so it must never be the thing that breaks the exit.
+    """
+    try:
+        idx = _read_index()
+        wanted = _engagement_id()
+        for row in reversed(idx):
+            if row.get("engagement_id") == wanted:
+                if not row.get("closed_at"):
+                    row["closed_at"] = datetime.now().isoformat(
+                        timespec="seconds")
+                    _write_index(idx)
+                return
     except (OSError, ValueError):
         pass
 
@@ -195,6 +283,15 @@ def auto_export() -> Optional[str]:
     try:
         latest = export_session(out_path=latest_path)
         export_session(out_path=_dated_copy_path())
+        # Only AFTER both writes landed: the index says "this engagement was
+        # closed", and a stamp written before the bundle would be a lie.
+        close_registration()
+        try:
+            _prune_dated()
+        except OSError:
+            # Retention is housekeeping. A full/read-only sessions dir must
+            # not turn a bundle that WAS written into "auto-save FAILED".
+            pass
         return latest
     except Exception as exc:
         # A failed auto-save IS data loss, and it used to be a silent `None`:
@@ -204,6 +301,42 @@ def auto_export() -> Optional[str]:
         _warn(f"session auto-save FAILED ({exc.__class__.__name__}: {exc}) — "
               f"{latest_path} is stale; run `export <file>.pm` before closing")
         return None
+
+
+# ── retention ──────────────────────────────────────────────────────────────
+
+def _prune_dated(keep: int = AUTO_KEEP) -> List[str]:
+    """Keep the newest `keep` dated copies; return the names removed.
+
+    Only a bundle that `read_bundle` READS is deleted. A corrupt file, a
+    bundle from another machine (wrong `PHANTOM_PM_KEY`) or one written by a
+    newer build is the operator's only copy of that engagement — retention
+    must never be the reason an engagement disappears. `latest.pm` is not
+    dated and is never a candidate.
+    """
+    removed: List[str] = []
+    root = _root()
+    rows: List[tuple] = []
+    for name in os.listdir(root):
+        if not (name.startswith("auto_") and name.endswith(".pm")):
+            continue
+        full = os.path.join(root, name)
+        try:
+            rows.append((os.path.getmtime(full), name, full))
+        except OSError:
+            continue
+    rows.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    for _mtime, name, full in rows[max(0, int(keep)):]:
+        try:
+            read_bundle(full)
+        except (ValueError, OSError):
+            continue
+        try:
+            os.remove(full)
+            removed.append(name)
+        except OSError:
+            continue
+    return removed
 
 
 # ── listing ────────────────────────────────────────────────────────────────

@@ -32,12 +32,31 @@ def _aes_nonce_value() -> str:
     return get_secret("PHANTOM_C2_NONCE", lambda: _secrets.token_hex(6))
 
 
+_KDF_LABEL = b"phantom-c2-key-v1"
+
+
 def _derive_to_length(raw: bytes, target_len: int) -> bytes:
     """Normalise a key value to exactly *target_len* bytes.
 
     - Exact length → return as-is.
     - 2× target-length hex → decode.
-    - Otherwise → SHA-256 digest truncated / padded to target_len.
+    - base64 of the target length → decode.
+    - Otherwise → a LABELLED HMAC-SHA256 digest, truncated to *target_len*.
+
+    The last branch used to be a bare ``sha256(raw)``, which is not a key
+    derivation: the same bytes hashed for any other purpose in the tree produce
+    the SAME digest, so the AES key and nothing else was separated from the
+    material it came from. ``_KDF_LABEL`` is the domain separator (the extract
+    step of RFC 5869 done by hand, because the input here is an operator value
+    of unknown length rather than a shared secret of known entropy). The value
+    stays deterministic and unique per provided input — an operator who set a
+    passphrase still gets the same key on the next start, from the same state
+    file — and two purposes can no longer collide on one digest.
+
+    NOTE for anyone rotating keys: this changes the derived bytes ONLY for a
+    value that is neither the exact length, nor a hex encoding of it, nor a
+    base64 encoding of it. A standard ``token_hex(16)``/``token_hex(32)`` value
+    (what Phantom generates) never reaches that branch.
     """
     if len(raw) == target_len:
         return raw
@@ -55,8 +74,12 @@ def _derive_to_length(raw: bytes, target_len: int) -> bytes:
             return decoded
     except (ValueError, UnicodeDecodeError):
         pass
-    # Last resort: deterministic derivation — still unique per-provided-value.
-    return hashlib.sha256(raw).digest()[:target_len]
+    # Last resort: labelled derivation — deterministic, unique per value,
+    # and separated from every other use of the same bytes.
+    derived = _hmac.new(_KDF_LABEL, bytes(raw), hashlib.sha256).digest()
+    while len(derived) < target_len:          # SHA-256 gives 32; keys are 12/32
+        derived += _hmac.new(_KDF_LABEL, derived, hashlib.sha256).digest()
+    return derived[:target_len]
 
 
 def get_aes_key() -> bytes:

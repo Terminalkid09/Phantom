@@ -85,12 +85,18 @@ def _arch_mismatch(head: bytes, platform: str) -> str:
     return ""
 
 
+def _artefact_present(candidate: str) -> bool:
+    """The builder seals the plaintext artefacts at rest (``.enc``)."""
+    return os.path.exists(candidate) or os.path.exists(candidate + ".enc")
+
+
 def _candidates(path: str, platform: str) -> list:
     out = [path]
     directory = os.path.dirname(os.path.abspath(path))
     for name in FALLBACK_ARTEFACT.get(platform, []):
         out.append(os.path.join(directory, name))
-    return [candidate for candidate in out if candidate and os.path.exists(candidate)]
+    return [candidate for candidate in out
+            if candidate and _artefact_present(candidate)]
 
 
 def _toolchain_ready(platform: str) -> "tuple[bool, str]":
@@ -164,13 +170,17 @@ def main(argv=None) -> int:
               f"artefact")
         return 1
     checked = []
+    sys.path.insert(0, ROOT)
+    from phantom.utils import beacon_artifacts
     for candidate in _candidates(path, args.platform):
-        size = os.path.getsize(candidate)
+        # Sealed at rest is still a real artefact: read the same bytes the C2
+        # would serve, not the container on disk.
+        data = beacon_artifacts.payload(candidate) or b""
+        size = len(data)
         if size < 1024:
             checked.append(f"{os.path.basename(candidate)}={size}B (too small)")
             continue
-        with open(candidate, "rb") as handle:
-            head = handle.read(ELF_HEADER_BYTES)
+        head = data[:ELF_HEADER_BYTES]
         for magic, label in MAGIC[args.platform]:
             if head.startswith(magic):
                 wrong = _arch_mismatch(head, args.platform)

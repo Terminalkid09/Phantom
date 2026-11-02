@@ -114,6 +114,18 @@ const RULES: readonly Rule[] = [
   { pattern: '/api/session/set', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/c2/listener/start', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/c2/listener/stop', methods: ['POST'], group: 'mutating', confirm: true },
+  // Public hop (tunnel): reading it is free; starting it republishes the
+  // listener behind a throwaway edge hostname and rewrites `c2.front` (the
+  // address every artefact embeds), and stopping it drops beacons in flight —
+  // both are writes, the stop is confirm-gated like the listener stop.
+  { pattern: '/api/c2/tunnel', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/c2/tunnel', methods: ['POST'], group: 'mutating' },
+  // HID delivery: `build` only writes a sketch under data/vectors, `flash`
+  // uploads it to a board on a serial port. The upload is the irreversible
+  // one (it rewrites the device), so it carries the confirm dialog; the GET
+  // just reports which boards arduino-cli can see.
+  { pattern: '/api/c2/hid', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/c2/hid', methods: ['POST'], group: 'mutating', confirm: true },
   { pattern: '/api/c2/generate', methods: ['POST'], group: 'mutating' },
   { pattern: '/api/c2/beacon-auth', methods: ['GET'], group: 'readonly' },
   { pattern: '/api/c2/beacon-auth', methods: ['POST'], group: 'mutating' },

@@ -36,6 +36,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from phantom.automation.social.ratelimit import (
+    RATE_STATUSES,
+    FetchResult,
+    governor,
+    host_of,
+    parse_retry_after,
+)
+
 # ── bounded constants ────────────────────────────────────────────────────────
 
 _UAS = (
@@ -406,16 +414,76 @@ def _q(arg: str) -> str:
     return quote_arg(arg)
 
 
-def _fetch(url: str, timeout: float = 15.0, ua: str = "",
-           cookies: str = "") -> str:
-    """Bounded curl GET returning the body (never raises).
+#: Sentinel curl appends (with `-w`) before the final HTTP status code.
+_STATUS_MARK = "@@PHANTOM_STATUS@@"
 
-    `cookies`: a pre-built `Cookie:` header value for THIS host (from
-    the operator's own stolen-cookie jar). Read-only views only — the
-    delivery paths never receive cookies (separate code, no parameter).
-    Values are sanitized to header-safe characters; anything exotic is
-    dropped rather than quoted.
+
+def _split_headers(raw: str) -> Tuple[str, str]:
+    """Separate the `-D -` header dump from the body.
+
+    `-L` makes curl print the headers of EVERY hop before the body, so the
+    dump is several blocks back to back; stripping only the first leaves a
+    redirect's `Location:` glued to the top of the page, which the marker
+    regexes then read as page content. Blocks start with ``HTTP/`` and end
+    at the first blank line, and the loop is bounded because a hostile body
+    could start with those four characters (in which case we must not eat
+    the whole document).
     """
+    body = raw or ""
+    status_line = re.compile(r"^HTTP/\d(?:\.\d)?\s+\d{3}")
+    for _ in range(8):
+        if not status_line.match(body):
+            break
+        cut = body.find("\r\n\r\n")
+        alt = body.find("\n\n")
+        if cut < 0 or (0 <= alt < cut):
+            cut = alt
+        if cut < 0:
+            break
+        body = body[cut + 1:].lstrip("\r\n")
+    return raw[:len(raw) - len(body)], body
+
+
+def _header_value(headers: str, name: str) -> str:
+    """Last value of one response header across every hop."""
+    found = ""
+    for line in (headers or "").splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        if key.strip().lower() == name.lower():
+            found = value.strip()
+    return found
+
+
+def _fetch_ex(url: str, timeout: float = 15.0, ua: str = "",
+              cookies: str = "") -> FetchResult:
+    """Governed, bounded curl GET that reports the TRANSPORT, not just the body.
+
+    The old `_fetch` threw the status away, and that is how a 429 shell ended
+    up in `_state_vote` as if it were the account's page: a rate-limited
+    answer is a fact about our egress, never about the target. Here the
+    status, the server's `Retry-After` and the breaker state survive the
+    call, and a cooling host is not contacted at all (`status=0`,
+    `error="cooling"`).
+
+    Headers come from `-D -` (stdout, before the body) and the status from a
+    `-w` sentinel at the very end; both are stripped here so callers keep
+    getting a clean body.
+
+    `cookies`: a pre-built `Cookie:` header value for THIS host (from the
+    operator's own stolen-cookie jar). Read-only views only — the delivery
+    paths never receive cookies (separate code, no parameter). Values are
+    sanitized to header-safe characters; anything exotic is dropped rather
+    than quoted.
+    """
+    host = host_of(url)
+    gov = governor()
+    if host:
+        left = gov.cooling(host)
+        if left > 0:
+            return FetchResult("", 0, round(left, 3), "cooling")
+        gov.wait(host)
     try:
         from phantom.core.executor import execute_quiet
         agent = ua or random.choice(_UAS)
@@ -425,11 +493,39 @@ def _fetch(url: str, timeout: float = 15.0, ua: str = "",
             if safe.strip():
                 header = f" -H {_q('Cookie: ' + safe.strip())}"
         res = execute_quiet(
-            f"curl -s -L -m {int(timeout)} -A {_q(agent)}{header} {_q(url)}",
+            f"curl -s -L -m {int(timeout)} -D - -A {_q(agent)}{header} "
+            f"-w {_q(_STATUS_MARK + '%{http_code}')} {_q(url)}",
             timeout=timeout + 10)
-        return (res.stdout or "")[:400000]
+        raw = res.stdout or ""
     except Exception:
-        return ""
+        return FetchResult("", 0, 0.0, "fetch_failed")
+
+    status = 0
+    if _STATUS_MARK in raw:
+        raw, _, tail = raw.rpartition(_STATUS_MARK)
+        code = (tail or "").strip().split()
+        try:
+            status = int(code[0])
+        except (IndexError, ValueError):
+            status = 0
+    headers, body = _split_headers(raw)
+    retry = parse_retry_after(_header_value(headers, "retry-after"))
+    if host:
+        gov.note(host, status, retry)
+    if status in RATE_STATUSES:
+        return FetchResult("", status, round(retry, 3), "rate_limited")
+    return FetchResult(body[:400000], status, round(retry, 3), "")
+
+
+def _fetch(url: str, timeout: float = 15.0, ua: str = "",
+           cookies: str = "") -> str:
+    """Bounded curl GET returning the body (never raises).
+
+    Kept as the body-only facade every existing call site already uses; a
+    rate-limited or cooling host yields `""` ("we did not read the world"),
+    which callers must not turn into a claim about the account.
+    """
+    return _fetch_ex(url, timeout=timeout, ua=ua, cookies=cookies).body
 
 
 def _tokcount_stats(username: str) -> Dict[str, str]:
@@ -594,10 +690,20 @@ def _state_vote(username: str, platform: str, jar=None) -> Tuple[str, float, str
         return "unknown", 0.0, ""
     votes: List[str] = []          # public | private | missing | unknown
     best_html = ""
+    rate_limited = 0
     cookies = _jar_for(url, jar or {})
     for i in range(2):
-        html = _fetch(url, timeout=15.0, ua=_UAS[i % len(_UAS)],
-                      cookies=cookies)
+        result = _fetch_ex(url, timeout=15.0, ua=_UAS[i % len(_UAS)],
+                           cookies=cookies)
+        if result.status in RATE_STATUSES or result.error == "cooling":
+            # A 429 is evidence about OUR egress, not about the account. It
+            # used to reach the marker voting as a short page and vote
+            # `missing`, which is how an existing profile was declared gone.
+            # The sample is dropped rather than counted as `unknown`: an
+            # unreadable sample must not outvote a page we actually read.
+            rate_limited += 1
+            continue
+        html = result.body
         if not html:
             # A failed fetch is NOT a missing account: `missing` is a claim
             # about the world and here we did not read the world at all
@@ -643,6 +749,9 @@ def _state_vote(username: str, platform: str, jar=None) -> Tuple[str, float, str
                 break
     state = winners[0]
     conf = counts[state] / len(votes)
+    if rate_limited:
+        # One readable page and one throttled fetch is not a 1.00 verdict.
+        conf = min(conf, 0.5)
     if platform == "instagram":
         # 429 problem: the profile page/API can answer a rate-limited shell
         # (or an empty body) while /embed/ still serves the profile. Try the

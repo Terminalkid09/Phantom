@@ -3787,9 +3787,22 @@ class AutonomousAgent:
             llm_prefs = self.llm_advisor.suggest(self.wm, self.registry)
             if llm_prefs:
                 self._emit("llm", hypotheses=llm_prefs)
-                for cid in llm_prefs:
-                    if cid not in prefs:
+                # FRONT-LOADED, not appended. A suggestion that lands at the
+                # TAIL of the preference list only ever matters after every
+                # deterministic move has failed — which is exactly why an
+                # "AI on" run looked identical to an "AI off" one: the model
+                # was answering, and its answer was never reached. The gates
+                # are unchanged (eligibility, scope, opsec, noise): the model
+                # changes WHICH eligible move goes first, never whether a move
+                # is allowed. In paranoid mode it stays at the tail, because
+                # max-stealth posture is not something a model may steer.
+                for cid in reversed(list(llm_prefs)):
+                    if cid in prefs:
+                        continue
+                    if getattr(self, "paranoid", False):
                         prefs.append(cid)
+                    else:
+                        prefs.insert(0, cid)
             # AUTO-MODE, no operator: the model's CONCRETE commands are decided
             # by the deterministic policy in `llm_autogate` (bounded per run,
             # every verdict journalled). Asking costs a model call, so it is

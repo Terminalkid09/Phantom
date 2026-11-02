@@ -3,9 +3,12 @@
 Real flashing needs a board on a COM port, so these tests drive the module
 through its injectable runner instead and pin the decisions: the exact argv of
 compile and upload, that a failed compile never uploads, the folder-name rule
-the Arduino toolchain enforces, and that a missing arduino-cli is a clear error
-rather than a traceback.
+the Arduino toolchain enforces, that a missing arduino-cli is a clear error
+rather than a traceback, and that the port and the FQBN are READ OFF the board
+when the operator names neither — with a refusal, not a guess, when the answer
+is ambiguous.
 """
+import json
 import os
 
 import pytest
@@ -13,8 +16,11 @@ import pytest
 from phantom.utils import arduino_flash
 from phantom.utils.arduino_flash import (
     DEFAULT_FQBN,
+    BoardCandidate,
     FlashResult,
+    choose_board,
     compile_sketch,
+    detect_boards,
     find_cli,
     flash_sketch,
     upload_sketch,
@@ -114,10 +120,12 @@ class TestFlashSketch:
         assert not result.ok and runner.calls == []
 
     def test_a_missing_port_is_refused(self, tmp_path):
+        # Detection off: this is the contract of the NON-detecting path, and
+        # the message an operator sees when they turn detection off.
         runner = FakeRunner()
         result = flash_sketch(_sketch(tmp_path), "", cli="arduino-cli",
-                              runner=runner)
-        assert not result.ok and "port" in result.error
+                              runner=runner, allow_autodetect=False)
+        assert not result.ok and "no serial port given" in result.error
         assert runner.calls == []
 
     def test_a_missing_cli_is_a_clear_error(self, tmp_path, monkeypatch):
@@ -174,3 +182,169 @@ class TestHidCommandFlash:
             f"pico 'whoami' --out {out} --flash COM9", tmp_path)
         flash.assert_not_called()
         assert notifier.error.called
+
+
+def _board_list(*entries):
+    """One ``board list --format json`` payload, in the 0.35+ shape."""
+    return json.dumps({"detected_ports": list(entries)})
+
+
+def _port(address, vid="0x2341", pid="0x8036"):
+    return {"address": address, "properties": {"vid": vid, "pid": pid}}
+
+
+def _board(address="COM5", fqbn="arduino:avr:leonardo",
+           name="Arduino Leonardo", vid="0x2341", pid="0x8036"):
+    """A board arduino-cli can NAME: ``matching_boards`` is populated."""
+    return {"port": _port(address, vid, pid),
+            "matching_boards": [{"name": name, "fqbn": fqbn}]}
+
+
+def _clone(address="COM7", vid="0x1b4f", pid="0x9205"):
+    """A clone whose descriptor is not in the Arduino board database."""
+    return {"port": _port(address, vid, pid), "matching_boards": None}
+
+
+def _unknown(address="COM3"):
+    """Somebody else's serial port: no Arduino descriptor at all.
+
+    `board list` reports these too — a Bluetooth COM port, a USB-serial
+    adapter, a printer — and they are the reason the ambiguity rule counts
+    only boards the toolchain can NAME.
+    """
+    return {"port": {"address": address, "properties": {}},
+            "matching_boards": None}
+
+
+class TestDetection:
+    """`--flash` with no port: the board says what it is, or nothing happens."""
+
+    def test_one_board_gives_up_both_the_port_and_the_fqbn(self, tmp_path):
+        runner = FakeRunner([(0, _board_list(_board()), ""),
+                             (0, "compiled", ""), (0, "uploaded", "")])
+        result = flash_sketch(_sketch(tmp_path), "", cli="arduino-cli",
+                              runner=runner)
+        assert result.ok
+        assert result.port == "COM5" and result.fqbn == "arduino:avr:leonardo"
+        assert result.detected
+        assert runner.calls[0][0][1:3] == ("board", "list")
+        # the FQBN the board reported is the one the upload was given, not the
+        # tool's default: that substitution is the whole point
+        upload_argv = runner.calls[-1][0]
+        assert upload_argv[upload_argv.index("--fqbn") + 1] == \
+            "arduino:avr:leonardo"
+
+    def test_two_boards_are_refused_and_every_port_is_named(self, tmp_path):
+        runner = FakeRunner([(0, _board_list(
+            _board("COM5"),
+            _board("COM7", fqbn="arduino:avr:micro")), "")])
+        result = flash_sketch(_sketch(tmp_path), "", cli="arduino-cli",
+                              runner=runner)
+        assert not result.ok
+        assert "COM5" in result.error and "COM7" in result.error
+        assert [candidate.port for candidate in result.candidates] == \
+            ["COM5", "COM7"]
+        # nothing was compiled and nothing was written
+        assert [call[0][1] for call in runner.calls] == ["board"]
+
+    def test_a_named_board_wins_over_serial_ports_that_are_not_boards(
+            self, tmp_path):
+        """Measured on a real bench: COM3, COM4 and a Leonardo on COM7.
+
+        Counting every serial port as a candidate made detection useless on
+        any machine with another COM device, which is most of them.
+        """
+        runner = FakeRunner([(0, _board_list(_unknown("COM3"),
+                                             _unknown("COM4"),
+                                             _board("COM7")), ""),
+                             (0, "compiled", ""), (0, "uploaded", "")])
+        result = flash_sketch(_sketch(tmp_path), "", cli="arduino-cli",
+                              runner=runner)
+        assert result.ok, result.summary()
+        assert result.port == "COM7"
+        assert result.fqbn == "arduino:avr:leonardo"
+        assert result.detected
+
+    def test_ports_nobody_can_name_are_refused_with_the_ports_listed(
+            self, tmp_path):
+        runner = FakeRunner([(0, _board_list(_unknown("COM3"),
+                                             _unknown("COM4")), "")])
+        result = flash_sketch(_sketch(tmp_path), "", cli="arduino-cli",
+                              runner=runner)
+        assert not result.ok
+        assert "COM3" in result.error and "COM4" in result.error
+        assert "--fqbn" in result.error
+        assert [call[0][1] for call in runner.calls] == ["board"]
+
+    def test_an_empty_bench_is_refused(self, tmp_path):
+        runner = FakeRunner([(0, _board_list(), "")])
+        result = flash_sketch(_sketch(tmp_path), "", cli="arduino-cli",
+                              runner=runner)
+        assert not result.ok and "no board detected" in result.error
+        assert result.candidates == ()
+
+    def test_a_clone_without_a_matching_board_uses_the_table(self, tmp_path):
+        runner = FakeRunner([(0, _board_list(_clone()), ""),
+                             (0, "compiled", ""), (0, "uploaded", "")])
+        result = flash_sketch(_sketch(tmp_path), "", cli="arduino-cli",
+                              runner=runner)
+        assert result.ok and result.fqbn == "arduino:avr:micro"
+        assert result.port == "COM7"
+
+    def test_an_unrecognised_board_asks_for_the_fqbn(self, tmp_path):
+        runner = FakeRunner([(0, _board_list(_clone(vid="0x9999",
+                                                   pid="0x0001")), "")])
+        result = flash_sketch(_sketch(tmp_path), "", cli="arduino-cli",
+                              runner=runner)
+        assert not result.ok and "--fqbn" in result.error
+
+    def test_an_explicit_fqbn_still_beats_the_detected_one(self, tmp_path):
+        runner = FakeRunner([(0, _board_list(_board()), ""),
+                             (0, "compiled", ""), (0, "uploaded", "")])
+        result = flash_sketch(_sketch(tmp_path), "", fqbn="arduino:avr:micro",
+                              cli="arduino-cli", runner=runner)
+        assert result.fqbn == "arduino:avr:micro"
+
+    def test_the_older_bare_list_shape_is_read_too(self):
+        runner = FakeRunner([(0, json.dumps([_board()]), "")])
+        found = detect_boards(cli="arduino-cli", runner=runner)
+        assert [candidate.port for candidate in found] == ["COM5"]
+        assert found[0].source == "matching_boards"
+
+    def test_a_candidate_carries_its_vid_and_pid(self):
+        runner = FakeRunner([(0, _board_list(_clone()), "")])
+        found = detect_boards(cli="arduino-cli", runner=runner)
+        assert (found[0].vid, found[0].pid) == ("1b4f", "9205")
+        assert found[0].source == "clone_table"
+
+    def test_bad_json_is_not_a_crash(self):
+        assert detect_boards(
+            cli="arduino-cli",
+            runner=lambda argv, timeout: (0, "not json", "")) == ()
+
+    def test_a_failing_cli_is_not_a_crash(self):
+        assert detect_boards(
+            cli="arduino-cli",
+            runner=lambda argv, timeout: (1, "", "boom")) == ()
+
+    def test_a_raising_runner_is_not_a_crash(self):
+        def boom(argv, timeout):
+            raise OSError("spawn failed")
+
+        assert detect_boards(cli="arduino-cli", runner=boom) == ()
+
+    def test_an_explicit_port_still_skips_the_detector(self, tmp_path):
+        runner = FakeRunner()
+        flash_sketch(_sketch(tmp_path), "COM9", cli="arduino-cli",
+                     runner=runner)
+        assert [call[0][1] for call in runner.calls] == ["compile", "upload"]
+
+    def test_choosing_from_an_empty_list_says_what_to_do(self):
+        chosen, reason = choose_board(())
+        assert chosen is None and "board list" in reason
+
+    def test_a_candidate_says_itself_what_it_is(self):
+        assert BoardCandidate(port="COM5", fqbn="", name="").summary() == \
+            "COM5=unknown"
+        assert BoardCandidate(port="COM5", fqbn=DEFAULT_FQBN,
+                              name="").summary() == f"COM5={DEFAULT_FQBN}"

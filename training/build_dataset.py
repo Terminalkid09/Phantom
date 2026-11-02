@@ -262,13 +262,19 @@ def _exploit_candidates(session: dict) -> List[dict]:
         row.update({k: v for k, v in extra.items() if v not in (None, "")})
         rows.append(row)
 
+    # ``success``/``noise``/``complexity`` are the planner's own numbers and
+    # the ranker trains on them; unless they survive this step they are
+    # dropped on the way in and the model sees a constant instead.
+    stats = ("success", "noise", "complexity")
     for action in wm.get("actions") or []:
         if isinstance(action, dict):
-            _push(action.get("capability"))
+            _push(action.get("capability"),
+                  **{key: action.get(key) for key in stats})
     for hypothesis in wm.get("hypotheses") or []:
         if isinstance(hypothesis, dict):
             _push(hypothesis.get("capability_id"),
-                  priority=hypothesis.get("priority"))
+                  priority=hypothesis.get("priority"),
+                  **{key: hypothesis.get(key) for key in stats})
     return rows
 
 

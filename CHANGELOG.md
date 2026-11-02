@@ -6,6 +6,258 @@ All notable changes to Phantom.
 
 ## [Unreleased] — current development (v3.0.0 line)
 
+### HID: three deliveries per flash, faster, and the right characters — 2026-11-01
+
+- **The delivery counter replaces the one-shot byte.** A board that types
+  exactly once is a board you must re-flash on the bench before the second
+  shell, and the operator cannot re-flash from inside the target's room. The
+  sketch now carries `SHOTS` (default 3, `--shots N`, `0` = unlimited), writes
+  it in EEPROM on the first boot after a flash and decrements it BEFORE each
+  delivery; when it reaches zero the board stays silent for ever, so carrying
+  it home still does not re-inject. Re-flashing resets it (`--repeat` is the
+  explicit unlimited opt-out).
+- **Speed: countdown 5 s → 3 s, cadence 15 ms → 6 ms, burst 8 → 4 keys.**
+  Measured budget for the 231-char stager: 6.2 s from power-up to Enter (was
+  ~11 s), of which 1.5 s enumeration, 3 s of blinking and ~1.7 s of typing.
+  The typing got faster without going back to the dropped-character class:
+  what makes 6 ms/char safe is the BURST LENGTH, not the delay — no single
+  `Keyboard.print` emits more than four characters, and every burst is
+  followed by a real pause, so no host ever has to absorb eight shifted keys
+  in one poll window.
+- **Fixed the wrong character on non-US layouts.** `:` in
+  `192.168.1.155:9443` arrived as `ç` because the AltGr combination was
+  followed IMMEDIATELY by the next print burst: the host polled the release
+  and the next key inside one frame and kept the modifier down. Every special
+  key now gets a 6 ms modifier gap, a 10 ms hold and an 18 ms tail (~34 ms per
+  combo, ~12 combos in a stager), which removes the whole class of "right key,
+  wrong character".
+
+### ML: the data finally has a wire — 2026-11-01
+
+- **`phantom/automation/exploit/decision_log.py` logs every attempted
+  candidate** with its own `success`/`noise`/`complexity` plus the context it
+  was tried in and what happened (`attempted`, `vulnerable`, `rce`). Best
+  effort by construction: a full disk or a broken candidate returns `None`
+  instead of failing an engagement, and the row carries no command, no output
+  and no evidence, so the corpus stays safe to train on. Capped at 8 MB with
+  one rotation.
+- **`training.from_decisions` turns that log into corpus rows** in the shape
+  the ranker already trains on, grouping per engagement
+  (`target, goal, profile, mode`), keeping the LAST outcome per candidate and
+  skipping one-candidate tables. The label is an observation — RCE >
+  vulnerable > never reached > tried and failed — never the planner's own
+  score, because training on the planner teaches the model to copy it.
+  `training.ranker.rows_for` reads `exploit.decisions.jsonl` when it exists, so
+  real history joins the corpus without touching the shipped golden file.
+- **This is what makes the network worth training.** The three features were
+  constant in every row (measured: 0 non-neutral values in the whole corpus);
+  now every real engagement adds rows where they vary, and the same gate
+  decides when the nonlinear model overtakes the linear one.
+
+### ML: the production features are finally a feature — 2026-11-01
+
+- **`success`, `noise`, `complexity` are in `ranker.CONTEXT` on both sides.**
+  These are the three numbers `AccessCandidate` already computes for every
+  move and the ranker could not see, so the model could only learn "which id
+  usually comes first" and never "which kind of move this engagement needs".
+  The runtime fills them from the candidate; the corpus copies them from the
+  session when it has them; absent means the production neutral 0.5, never
+  0.0 ("unmeasured" is not "hopeless").
+- **Measured, and the honest result is "wired, still inert".** The corpus
+  carries no candidate stats yet, so the three columns are constant and the
+  score moved inside noise: holdout 0.9379 vs baseline 0.9021
+  (CI [+0.0095, +0.0628], promote), grouped CV 0.9416 ± 0.0153. The manifest
+  and the artefact were regenerated together so the sha still matches.
+- **A one-hidden-layer MLP was measured on the same split, metric and CV and
+  did NOT win**: holdout 0.9274 (CI [−0.0099, +0.0591] → gate rejects) and CV
+  0.9353 vs the linear 0.9416. That is the comparison the gate exists for, and
+  it is why the linear model is still the shipped one. The next step is data,
+  not architecture: auto-mode records `Capability`, not the
+  `AccessCandidate` stats, so the corpus still has no variance to learn from.
+
+### ML: a nonlinear ranker that refuses to flatter itself — 2026-11-01
+
+- **`training.net` is the neural version of the same ranker**: one hidden
+  layer, pairwise logistic loss, over the SAME feature vector (`ranker.CONTEXT`
+  + a candidate one-hot), the same corpus, the same holdout split, the same
+  ndcg and the same `training.gate.decide`. That is deliberate: a model
+  measured on a different split or a different metric cannot be compared with
+  the linear one, and comparing it is the only reason to have two.
+- **It refuses to train below its own data floor.** 233 parameters need 466
+  rows at 2 rows/parameter; the corpus has 113. The run exits 1 with the
+  number instead of writing a model, because 113 rows and 233 weights is
+  memorisation and the holdout would be measuring the fit to itself. The same
+  check is what makes a future promotion meaningful.
+- **The runtime is pure Python and promotion is the manifest.**
+  `phantom/automation/ai/net.py` does the forward pass without numpy (twenty
+  candidates are a few hundred multiply-adds) and `promoted(phase)` returns a
+  net only when a `manifest.json` says `kind: mlp` — a `net.json` on disk is a
+  candidate, not a model. `tests/test_net_ranker.py` fits with numpy, exports,
+  loads through the runtime and asserts the two score identically.
+- **Measured where it matters, on a toy ordering where a linear model cannot
+  compete**: an XOR label gets ndcg 1.0000 on the holdout from the net and
+  0.9299 from the linear ranker (16 hidden, 2000 epochs, 0.05 — chosen by
+  measurement: the 8/300 defaults stall at the linear score). Two earlier
+  versions of that dataset proved nothing (an AND is still affine, and a
+  generator where `deliver` implied `web` was solved by one flag); both dead
+  ends are recorded in the test.
+- **Not promoted today, on purpose.** The linear ranker keeps its
+  ndcg 0.9420 vs 0.9021 (CI [+0.0150, +0.0662]) because the corpus cannot
+  support a bigger model yet. The next step is the data: log every auto-mode
+  decision with its features and outcome in production vocabulary, and the
+  same gate decides when the net overtakes the linear model.
+
+### HID: the board is reflashable with no hardware — 2026-11-01
+
+- **A sketch that never opens a serial port and ejects itself cannot be
+  reflashed.** Presented as `HID only`, a 32U4 exposes no COM port, so there is
+  nothing for `arduino-cli upload` to open and the only way back in was a wire
+  across the reset pin — which is not something an operator should ever need,
+  and this module left them there. The Arduino sketch now calls
+  `Serial.begin(115200)` (the 1200-baud touch is the bootloader's signal) and
+  does NOT eject on the silent branches (first boot, already delivered), so
+  the port stays and a reflash is a plain command. Verified: `arduino-cli
+  upload -p COM7` completed with nobody touching the board.
+- **A re-flash of the same artefact did NOT reset the one-shot marker.** The
+  first-boot tag was derived from the artefact content, so flashing the same
+  file again produced the same tag: `justFlashed()` answered false, the spent
+  byte set by the previous delivery survived, and a board that had just been
+  reflashed typed nothing on the target (measured 2026-11-01 — it looked
+  exactly like a dead board). `--nonce` (generated automatically by
+  `payload hid --flash`, and by any other flasher that cares) stamps the build,
+  so one flash = one new tag = the marker cleared exactly once. With no nonce
+  the artefact stays byte-identical for the same inputs.
+- **Cost, stated instead of hidden:** the board enumerates as HID + CDC rather
+  than HID only, and after a delivery it stays attached but silent so it can
+  be reflashed. `--no-serial-rescue` restores the HID-only profile at the
+  price of the physical reset.
+
+### HID: the four defects a live injection on the HP exposed — 2026-11-01
+
+Measured on real hardware, on a second machine, with a real stager. Every one
+of these made the board look broken while the payload was fine.
+
+- **The layout had a silent US default.** The `:` of
+  `https://192.168.1.155:9443` is Shift+`;` in the US table, and on an Italian
+  keyboard that key is ``ò`` whose shifted form is ``ç`` — the Run dialog
+  showed `192.168.1.155ç9443` while the sketch looked perfect. `--layout` now
+  defaults to `auto`, which reads the BENCH's locale (`hid_layouts
+  .detected_layout`, POSIX env then `GetUserDefaultLocaleName`), states the
+  choice, and warns when `--layout us` is asked for on a non-US machine. A
+  board cannot read the target's layout, so the only honest default is one
+  that is said out loud. `tests/test_hid_layout.py` now reconstructs the
+  emitted stream through an IT host and asserts it equals the command, with a
+  control that fails on the US table.
+- **The cadence was 21 s of visible typing.** `DEFAULT_CHAR_DELAY_MS` 90 -> 15
+  (~66 chars/s, ~4 s for the 231-char Windows stager). 90 ms was chosen to not
+  look like a machine and it read as a hung board: the operator could not tell
+  "still typing" from "finished". The floor is not stealth — under ~8 ms hosts
+  drop shifted keystrokes.
+- **The Enter was swallowed by the eject.** `usbEject()` cleared the D+ pull-up
+  in the same millisecond the last report was queued, so the detach could beat
+  the host's poll: the command was typed and never sent. The sketch now holds
+  Enter across a frame (`delay(60)`) and waits 400 ms before ejecting.
+- **The board fired again on the machine that flashed it.** The EEPROM tag
+  answers "has this sketch ever booted", not "has it ever typed": carried back
+  after a delivery on the target it had a MATCHING tag and re-typed the whole
+  payload at home. A byte set before the first keystroke (`markTyped`, addr 4)
+  makes a delivery the one shot; a re-flash clears it. `--repeat` restores the
+  old behaviour.
+- **The 15 s countdown dropped to 5.** It existed so the operator could unplug
+the board mid-typing while flashing it in place. With the one-shot default and
+the silent first boot there is nothing to rescue, so the countdown was left as
+the only wait before the target sees a keyboard: 15 s of standing in front of
+the target bought nothing (`--countdown` still overrides).
+- **Compiled, not assumed:** `arduino:avr:leonardo` 8 924 bytes (31% of flash),
+  226 bytes of RAM. Operator-reported from a second machine: the board typed,
+the Enter landed and the board ejected itself — the three things the previous
+artefact failed at. (The beacon check-in that test was for had no listener on
+the C2 port at that moment, so delivery from there is still unproven.)
+
+### HID: which board it is, and not leaving a keyboard behind — 2026-10-31
+
+- **The board says what it is instead of the operator guessing.** `--flash`
+  used to require the operator to know the COM port, and fell back to
+  `arduino:avr:micro` when they did not — so a Leonardo flashed as a Micro
+  compiles, usually runs, and the wrong board is chosen in SILENCE.
+  `--flash auto` (or `--flash` with no port) now asks
+  `arduino-cli board list --format json` and takes the port AND the FQBN from
+  its answer. Both JSON shapes are read (a bare array and the 0.35+
+  ``detected_ports`` wrapper) because the CLI version is not ours to choose;
+  the function never raises and never guesses — a missing CLI, a non-zero exit
+  or unparseable output answers `()`. Measured on a real bench: COM3, COM4 and
+  a Leonardo on COM7. That is why the ambiguity rule counts only boards the
+  toolchain can NAME: counting every serial port made the feature refuse on
+  any machine with a Bluetooth or USB-serial port, i.e. most of them. Two
+  named Arduino boards are still refused with both ports listed, and a clone
+  whose VID/PID is unknown (no `matching_boards`) is told to pass `--fqbn`
+  rather than being flashed as whatever the default happens to be. The
+  `KNOWN_32U4_CLONES` table covers the Pro Micro family that reports nothing.
+- **The board ejects itself instead of staying a live keyboard.** `--eject`
+  clears the USB D+ pull-up on the AVR (`UDCON |= (1 << DETACH)`), so the host
+  sees an unplug while the board keeps running on VBUS: no second injection
+  window, and nothing sitting there as a keyboard nobody asked for. It is
+  applied in both places that matter — after typing, and on the FIRST boot
+  after a flash, which is the machine that just wrote the sketch. On the Pico
+  it is `usb_hid.disable()`, and the artefact says the cost out loud: only a
+  power cycle brings the keyboard back, and the CIRCUITPY drive may stay
+  present. DuckyScript boards (flipper, omg) cannot control their own USB
+  interface and are told so instead of being handed a lie. Compiled for real:
+  the Leonardo sketch with ejection is 8 088 bytes (28% of flash) via
+  `arduino-cli --fqbn arduino:avr:leonardo`.
+- **The in-place-reflash warning stopped lying.** It shouted "this board
+  types as soon as it is powered, unplug it NOW" on every `--flash`, while the
+  first-boot guard (default on) and `--eject` both make that keystroke
+  impossible. It now says which guard covers the upload when one does, and
+  only warns when the board really will type on this machine — a warning that
+  cries wolf is how the warning that matters gets ignored.
+- **The grouped cross-validation reached the eval report.** `training.cv`
+  measured the fold spread but only as a side script, so the single holdout
+  number could be quoted alone. `training.eval` now carries a `cv` block and
+  prints the spread next to the score (to stderr: stdout is the JSON report).
+  Measured: exploit holdout ndcg 0.9420 vs 0.9021 baseline, delta +0.0399
+  CI [+0.0150, +0.0662]; grouped 5-fold CV mean 0.9420, spread 0.0142 over 78
+  target groups. On the 3-target golden set it honestly reports `k=3` over 3
+  groups, and a non-measurement prints a reason instead of `mean=0.0000`.
+
+### HID: the typing rhythm is part of the artefact — 2026-10-31
+
+- **Human cadence for keystroke boards.** A board left at full speed typed the
+  227-char Windows stager in a fraction of a second; no human does, and any
+  HID-injection detector that measures inter-keystroke timing sees it for
+  free. The Arduino and CircuitPython generators now emit the command in
+  bursts with a jittered pause after each one (`DEFAULT_CHAR_DELAY_MS` = 90 ms
+  per character, ~11 chars/s, seeded from the command so the same payload
+  always types the same way), exposed as `payload hid --cadence <ms>` (`0` =
+  one burst). Measured on the real Windows artefact: 114 bursts, 22.0 s of
+  typing, Leonardo sketch 8 054 bytes (28% of flash) compiled with
+  `arduino-cli` against 5 416 bytes (18%) before. Short commands are untouched
+  (below 40 chars), the full text stays in a comment so the sketch is still
+  greppable, and DuckyScript boards (flipper, omg) say in the artefact that
+  `STRING` runs at the device's own rate and the cadence could not be applied.
+  This does not make the typed CONTENT (AMSI / Script Block logging on `iex` +
+  a download) quieter: that is the loader's problem, and the docstring and the
+  operator notes say so instead of implying otherwise.
+- **The board no longer types on the machine that just flashed it.** Two
+  guards, both visible in the artefact: a `--countdown <s>` (default 15) on a
+  blinking LED — the window to unplug it and carry it — and a first boot after
+  a flash that types NOTHING, because a per-build 32-bit tag in EEPROM (AVR) or
+  `microcontroller.nvm` (Pico) does not match yet. EEPROM/nvm survive an
+  upload, the firmware does not, so the next power-up (the target) is where it
+  fires. On the Pico the silent branch parks in `while True` instead of
+  ending: exiting makes CircuitPython reload `main.py`, and the reload would
+  type into the very machine being avoided. `--no-first-boot-safe` opts out;
+  DuckyScript boards (flipper, omg) are told the guard is unavailable there.
+- **The Windows typed command stopped being a signature.** `curl.exe -skf`
+  replaced `Net.WebClient.DownloadString` plus a 71-char
+  `ServerCertificateValidationCallback={$true}`: `-k` covers the self-signed
+  listener, `-f` makes an HTTP error a curl failure so the loop retries instead
+  of `iex`-ing an error page, and an empty 200 body still counts as a failed
+  fetch. 231 characters, and the bounded retry loop now FITS the ~250-char Run
+  dialog — it had been dropped to make room for the certificate bypass.
+  Verified on this machine (hidden PowerShell + curl + `iex $s` runs the
+  fetched script).
+
 ### Auto-mode CVE chain, scriptable manual shell, ML data honesty — 2026-10-27
 
 - **Auto-mode fires the CVE payload again.** `version_detect` declares the

@@ -104,14 +104,25 @@ def test_payload_deploy_does_not_claim_a_check_in_without_a_listener(
     assert "listener up" not in lowered
 
 
-def test_payload_deploy_refuses_to_start_a_listener_on_the_wrong_port(
+def test_payload_deploy_listens_on_the_port_the_beacon_dials(
         payload_ready, listener, monkeypatch):
-    """A dropper dialling 4444 while the listener binds 8080 is a dead beacon."""
+    """The listener request follows the DIALED endpoint, whatever it is.
+
+    CONTRACT CHANGE, and it is the fix rather than a relaxation. This test
+    used to assert the opposite — no listener at all, plus a warning — and it
+    could only make sense while there were TWO resolvers: `c2.port` built the
+    dropper and `get_c2_endpoint()` started the listener, so a payload could be
+    compiled for one port and a listener opened on another (that is exactly
+    how a served PIC ended up pointing at a dead tunnel while the stager
+    fetched from the live address: measured 2026-11-02). There is one
+    resolver now, so the invariant that matters is that the listener is
+    requested on the port the beacon actually dials.
+    """
     monkeypatch.setattr("phantom.utils.network.get_c2_endpoint",
                         lambda: (C2_HOST, 4444))
     text = _capture(lambda: PayloadModule().do_deploy("")).lower()
-    assert listener["calls"] == [], "started a listener on the wrong port"
-    assert "start the listener on 8080" in text
+    assert listener["calls"], "no listener was requested for the dialed port"
+    assert "port 4444" in text
 
 
 @pytest.fixture

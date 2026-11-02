@@ -69,8 +69,12 @@ def _post_chat(base_url: str, api_key: str, model: str, messages,
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = json.loads(response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
-        # the body may echo the prompt: the status is enough for the caller
-        raise AIError(f"http {exc.code} from model endpoint") from None
+        # The body may echo the prompt, so the status is what we keep — but
+        # the ENDPOINT has to be named. A `405` on 127.0.0.1:8080 read as "the
+        # model is broken" for a whole lab run; it actually means "something
+        # that is not a chat server is listening there".
+        raise AIError(f"http {exc.code} from model endpoint {base_url} "
+                      f"(not an OpenAI-compatible chat server)") from None
     except urllib.error.URLError as exc:
         raise AIError(f"model endpoint unreachable: {exc.reason}") from None
     except (TimeoutError, OSError) as exc:
@@ -82,6 +86,32 @@ def _post_chat(base_url: str, api_key: str, model: str, messages,
         if isinstance(result, dict) and isinstance(result.get("response"), str):
             return result["response"]
         raise AIError("model endpoint returned no message content") from None
+
+
+def probe_openai(base_url: str, timeout: float = 0.6) -> bool:
+    """True when ``base_url`` is actually an OpenAI-compatible MODEL server.
+
+    A GET on ``/v1/models`` is the cheapest discriminator: llama.cpp, Ollama
+    and LM Studio answer it with a JSON list, while the applications that
+    squat the same ports answer 404/405. Treating "something is listening"
+    as "a model is listening" is the mistake this prevents — it cost a whole
+    lab run that produced an identical result for the wrong reason.
+    """
+    import urllib.request
+
+    base = str(base_url or "").rstrip("/")
+    if not base:
+        return False
+    for path in ("/v1/models", "/models"):
+        try:
+            request = urllib.request.Request(base + path, method="GET")
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read(4096).decode("utf-8", "replace")
+        except Exception:
+            continue
+        if '"data"' in body or '"models"' in body or '"object"' in body:
+            return True
+    return False
 
 
 class LocalClient:

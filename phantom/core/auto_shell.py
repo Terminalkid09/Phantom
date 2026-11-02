@@ -223,6 +223,9 @@ class AutoShell(cmd.Cmd):
         self._intr_count = 0
         self._last_intr = 0.0
         self._last_line = ""
+        self._last_status_sig = None
+        from phantom.core.shell.ui import build_prompt
+        self.prompt = build_prompt("auto", depth=2)
 
     def _run_duration(self) -> str:
         """How long the CURRENT (or last) run took — not the engagement age.
@@ -252,15 +255,24 @@ class AutoShell(cmd.Cmd):
         console.print()
 
     def postcmd(self, stop, line):
+        # The bar is worth showing when it MOVED (targets, goal, profile, the
+        # mode flags, a run that finished) — not after every keystroke, which
+        # is what buried the previous command's output.
+        sig = (tuple(self.targets), tuple(_active_flags(self.flags)),
+               self.flags.get("goal"), self.flags.get("profile"), self.has_run)
         if line.strip():
             self._last_line = line.strip()
-            try:
-                console.print(_separator())
-                console.print(_status_bar(self.targets, self.flags,
-                                          self._run_duration()))
-                console.print(_context_hint(self.targets, self.has_run))
-            except Exception:
-                pass
+            if sig != self._last_status_sig:
+                self._last_status_sig = sig
+                try:
+                    console.print(_separator())
+                    console.print(_status_bar(self.targets, self.flags,
+                                              self._run_duration()))
+                    console.print(_context_hint(self.targets, self.has_run))
+                except Exception:
+                    pass
+        from phantom.core.shell.ui import build_prompt
+        self.prompt = build_prompt("auto", depth=2)
         return stop
 
     def cmdloop(self, intro=None):
@@ -799,6 +811,11 @@ class AutoShell(cmd.Cmd):
         """
         from phantom.core.shell.commands.ops import cmd_guardrails
         cmd_guardrails(self, arg)
+
+    def do_where(self, arg: str):
+        """where - Print the current layer, target and scope (same as the shell)"""
+        from phantom.core.shell.ui import layer_line
+        console.print(layer_line("auto", depth=2), markup=False)
 
     def do_back(self, arg: str):
         """back - leave AUTO-MODE"""

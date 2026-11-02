@@ -119,6 +119,25 @@ def test_found_renders_values_and_degrades_to_the_key():
     assert bare.head.rstrip().endswith("banner:tcp/22")
 
 
+def test_found_says_when_the_list_was_truncated():
+    """Six findings is a display budget, not the result.
+
+    A live scan that found 29 services rendered six and stopped: the receipt
+    read as "the scan found six" (measured 2026-10-28, docker lab). The
+    marker is the same one the plan renderer uses.
+    """
+    findings = [f"service:tcp/{p}" for p in (135, 445, 2375, 5037, 5040,
+                                              5357, 6379, 8081)]
+    rendered = sc.render_event("found", {
+        "capability": "scan_tcp", "findings": findings}, verbose=True)
+    assert "…+2" in rendered.head
+
+    # nothing was cut: no marker at all
+    small = sc.render_event("found", {
+        "capability": "scan_tcp", "findings": findings[:6]}, verbose=True)
+    assert "…+" not in small.head
+
+
 def test_run_keeps_the_ui_field_names():
     """The Electron panel reads command/reason/stealth; the engine emits
     stealth_level. Both must survive the trip."""

@@ -23,10 +23,12 @@ Pure text/data: no I/O. ``hid_builder`` renders this into each board's artefact.
 
 from __future__ import annotations
 
+import locale
+import os
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
-HID_LAYOUTS = ("us", "it")
+HID_LAYOUTS = ("us", "it", "de")
 
 _ALIASES = {
     "": "us",
@@ -36,6 +38,10 @@ _ALIASES = {
     "it": "it",
     "it-it": "it",
     "italian": "it",
+    "de": "de",
+    "de-de": "de",
+    "german": "de",
+    "deutsch": "de",
 }
 
 # Italian layout: character -> the US character whose scan code lands on the
@@ -94,6 +100,52 @@ _IT_RAW = {
 # characters an Italian keyboard simply has no key for
 _IT_UNSUPPORTED = frozenset("`~")
 
+# ── German (de) — QWERTZ, same idea, different swaps ────────────────────────
+# German does to the number row and to Y/Z what Italian does to `-` and `'`:
+# `-` sits where US has `/`, `'` where US has `\`, `^`/`` ` `` where US has
+# `` ` `` and `=`, and `[ ] { } @ \ | ~` are AltGr. A US printer must send a
+# DIFFERENT physical key for the same character, exactly as for `it`.
+_DE_SUBSTITUTIONS = {
+    "y": "z", "z": "y",
+    "=": ")", "+": "]", "(": "*", ")": "(",
+    "/": "&", "&": "^", ":": ">", ";": "<", "?": "_",
+    '"': "@", "*": "}", "-": "/", "_": "?", "'": "|", "#": "\\",
+    # German letters that sit ON a key a US keyboard has: printing the US
+    # character types the German one, so these need no key event at all.
+    "\u00e4": "'", "\u00f6": ";", "\u00fc": "[", "\u00df": "-",
+}
+
+# German AltGr combinations (usage = the US position of the SAME key)
+_DE_ALTGR = {
+    "@": (0x14, False),   # AltGr+Q
+    "{": (0x24, False),   # AltGr+7
+    "[": (0x25, False),   # AltGr+8
+    "]": (0x26, False),   # AltGr+9
+    "}": (0x27, False),   # AltGr+0
+    "\\": (0x38, False),  # AltGr+\u00df
+    "|": (0x64, False),   # AltGr+<
+    "~": (0x2E, False),   # AltGr++
+}
+
+# On a German keyboard `^` and `` ` `` are plain keys on US positions no US
+# printable character uses the same way: explicit key events, no modifier.
+_DE_RAW = {
+    "^": (0x35, False),
+    "`": (0x2E, True),
+}
+
+_DE_UNSUPPORTED = frozenset()
+
+# One table per non-US layout; `us` needs none (the boards' own table).
+# Adding a layout means adding ONE row here plus a round-trip test, so the
+# four consumers below cannot drift apart.
+_TABLES = {
+    "it": {"subs": _IT_SUBSTITUTIONS, "altgr": _IT_ALTGR,
+           "raw": _IT_RAW, "unsupported": _IT_UNSUPPORTED},
+    "de": {"subs": _DE_SUBSTITUTIONS, "altgr": _DE_ALTGR,
+           "raw": _DE_RAW, "unsupported": _DE_UNSUPPORTED},
+}
+
 
 @dataclass(frozen=True)
 class Segment:
@@ -104,6 +156,47 @@ class Segment:
     usage: int = 0     # the raw HID usage code, for ``kind == "key"``
     shift: bool = False
     altgr: bool = False
+
+
+def detected_layout(locale_name: Optional[str] = None) -> str:
+    """The layout the OPERATOR's machine has — the best guess there is.
+
+    A keystroke board cannot read the target's layout; it only sends scan
+    codes and the target translates them. Phantom shipped ``us`` as the
+    silent default, which on an Italian target is measurably wrong: the
+    ``:`` of ``192.168.1.155:9443`` is Shift+``;`` in the US table, and on an
+    Italian keyboard that key is ``ò`` whose shifted form is ``ç`` — the URL
+    on screen became ``192.168.1.155ç9443`` while the sketch looked perfect.
+
+    The bench and the target usually share a locale, so the operator's own
+    machine is the only honest default: it is stated in the artefact, it is
+    overridable with ``--layout``, and it is wrong far less often than
+    assuming US. ``locale_name`` is injectable so this stays testable.
+    """
+    name = locale_name
+    if name is None:
+        name = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES")
+                or os.environ.get("LANG") or "")
+        if not name:
+            try:
+                name = locale.getdefaultlocale()[0] or ""
+            except (ValueError, TypeError):
+                name = ""
+        if not name:
+            # Windows keeps the answer in the kernel, not the POSIX env, and
+            # a Git Bash session frequently has LANG unset.
+            try:
+                import ctypes
+
+                buf = ctypes.create_unicode_buffer(85)
+                if ctypes.windll.kernel32.GetUserDefaultLocaleName(buf, 85):
+                    name = buf.value
+            except (AttributeError, OSError, ImportError):
+                name = ""
+    key = (name or "").strip().lower().replace("_", "-")
+    if key.startswith("it") or key == "italian":
+        return "it"
+    return "us"
 
 
 def normalize_layout(layout: str) -> str:
@@ -121,9 +214,10 @@ def translate_text(text: str, layout: str) -> str:
     This is a per-character map, not a cascade: ``?`` becomes ``"`` and the
     ``"`` that produced is NOT then re-read as ``@``.
     """
-    if layout == "us":
+    table = _TABLES.get(layout)
+    if table is None:
         return text
-    return "".join(_IT_SUBSTITUTIONS.get(c, c) for c in text)
+    return "".join(table["subs"].get(c, c) for c in text)
 
 
 def special_key_chars(text: str, layout: str) -> Tuple[str, ...]:
@@ -133,20 +227,24 @@ def special_key_chars(text: str, layout: str) -> Tuple[str, ...]:
     an explicit key event; a DuckyScript ``STRING`` cannot, which is the
     operator's cue to reword the command.
     """
-    if layout == "us":
+    table = _TABLES.get(layout)
+    if table is None:
         return ()
-    hit = {c for c in text if c in _IT_ALTGR or c in _IT_RAW}
+    hit = {c for c in text if c in table["altgr"] or c in table["raw"]}
     return tuple(sorted(hit))
 
 
 def unsupported_chars(text: str, layout: str) -> Tuple[str, ...]:
     """Characters ``layout`` has no key for: the board would type junk."""
-    if layout == "us":
+    table = _TABLES.get(layout)
+    if table is None:
         return ()
     bad = {c for c in text
-           if c in _IT_UNSUPPORTED
-           or ord(c) > 0x7E
-           or (ord(c) < 0x20 and c not in "\t\n")}
+           # a non-ASCII character the table can PRODUCE (ä, ö, ü, ß) is not
+           # unsupported: it is typed by sending a US key that lands on it
+           if (c in table["unsupported"]
+               or (ord(c) > 0x7E and c not in table["subs"])
+               or (ord(c) < 0x20 and c not in "\t\n"))}
     return tuple(sorted(bad))
 
 
@@ -157,7 +255,8 @@ def segments(text: str, layout: str) -> Tuple[Segment, ...]:
     that need AltGr or the non-US key break the text into runs, and the run
     text is translated so the same US codes come out right.
     """
-    if layout == "us":
+    table = _TABLES.get(layout)
+    if table is None:
         return (Segment("print", text=text),) if text else ()
     out = []
     buf = []
@@ -168,17 +267,17 @@ def segments(text: str, layout: str) -> Tuple[Segment, ...]:
             buf.clear()
 
     for char in text:
-        if char in _IT_ALTGR:
+        if char in table["altgr"]:
             flush()
-            usage, shift = _IT_ALTGR[char]
+            usage, shift = table["altgr"][char]
             out.append(Segment("key", usage=usage, shift=shift, altgr=True))
-        elif char in _IT_RAW:
+        elif char in table["raw"]:
             flush()
-            usage, shift = _IT_RAW[char]
+            usage, shift = table["raw"][char]
             out.append(Segment("key", usage=usage, shift=shift))
         else:
             # an unsupported character stays in the run, untranslated: the
             # caller warns about it rather than silently dropping it
-            buf.append(_IT_SUBSTITUTIONS.get(char, char))
+            buf.append(table["subs"].get(char, char))
     flush()
     return tuple(out)

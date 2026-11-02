@@ -18,8 +18,20 @@ Real run (single GPU, 12-24 GB VRAM is enough for a 1.7B QLoRA):
         --baseline-json training/golden/exploit.baseline.json
 
 After training, the manifest is written next to the adapter. It is
-``promoted`` only when the eval is present and not below the baseline; the
-runtime refuses anything else.
+``promoted`` only when the MEASUREMENT carries the claim, and it records the
+basis it rests on (``promotion_basis`` / ``promotion_reason``, see
+``training.manifest``); the runtime refuses anything else.
+
+Measured defect closed here (2026-11-02): the trainer dropped the two facts
+that make a promotion checkable. It read the eval report with a "every number
+in this JSON is a metric" rule, so the report's own ``n`` and ``delta``
+became "metrics" the baseline could never match, and it discarded the
+``gate`` block ``training.eval --gate`` had just measured — leaving the
+manifest to be judged on a bare mean, which is how a three-row tie came to be
+written as ``"promoted": true``. ``golden_rows``, the sample size the eval
+actually scored, now travels into the manifest from the report (or from
+``--golden``), never from the size of the TRAINING set: those are different
+numbers, and confusing them makes a three-row eval look like a measurement.
 """
 
 from __future__ import annotations
@@ -80,6 +92,7 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
         "seed": args.seed,
         "eval_json": args.eval_json,
         "baseline_json": args.baseline_json,
+        "golden": args.golden,
         "torch_required": True,
     }
 
@@ -101,19 +114,97 @@ def _load_rows(path: Path) -> List[dict]:
     return rows
 
 
-def _read_scores(path: str) -> Dict[str, float]:
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _read_report(path: str) -> Dict[str, Any]:
+    """The whole eval/report JSON as a dict (``{}`` when unreadable)."""
     if not path:
         return {}
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    if isinstance(data, dict) and isinstance(data.get("scores"), dict):
-        data = data["scores"]
-    if not isinstance(data, dict):
-        return {}
-    return {str(k): float(v) for k, v in data.items()
-            if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_scores(path: str) -> Dict[str, float]:
+    """The metric -> score map a report (or a baseline file) carries.
+
+    Read by SHAPE, because a ``training.eval`` report is not a score map: it
+    names its metric (``metric``/``score``) or carries a ``scores`` map, and
+    every other number in it (``n``, ``delta``, ``ci_low``) is context.
+    Reading all of them — what this did until 2026-11-02 — invented metrics
+    the baseline could never match, so a run that HAD measured something
+    reported a comparison error instead of a result.
+    """
+    report = _read_report(path)
+    if isinstance(report.get("scores"), dict):
+        source: Dict[str, Any] = report["scores"]
+    elif isinstance(report.get("metric"), str) \
+            and _is_number(report.get("score")):
+        return {str(report["metric"]): float(report["score"])}
+    else:
+        source = report
+    return {str(key): float(value) for key, value in source.items()
+            if _is_number(value)}
+
+
+def _golden_rows(report: Dict[str, Any],
+                 golden_path: str = "") -> Optional[int]:
+    """The row count the eval was MEASURED on, ``None`` when it is unstated.
+
+    ``training.eval`` states it (``n``, and again inside ``gate`` and
+    ``baseline``); ``--golden`` states it by naming the file the eval scored.
+    What is never used is the size of the training set: ``dataset_records``
+    says how much the model READ, not how much the eval JUDGED, and a 3-row
+    eval stays a 3-row eval however large the training set was.
+    """
+    for key in ("n", "rows"):
+        value = report.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return int(value)
+    for block in ("gate", "baseline"):
+        nested = report.get(block)
+        if isinstance(nested, dict):
+            value = nested.get("n")
+            if isinstance(value, int) and not isinstance(value, bool):
+                return int(value)
+    if golden_path and Path(golden_path).is_file():
+        with open(golden_path, encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
+    return None
+
+
+def build_from_report(phase: str, version: str, base_model: str,
+                      adapter: str, *, sha256: str = "",
+                      eval_json: str = "", baseline_json: str = "",
+                      golden_json: str = "",
+                      dataset: str = "") -> Dict[str, object]:
+    """The manifest for ONE measured run, built from what was measured.
+
+    The gate that ``training.eval --gate`` wrote is FORWARDED instead of
+    dropped, so a rejected verdict cannot be outvoted by a mean that happened
+    to look larger, and ``golden_rows`` is forwarded so a three-row eval is
+    refused as a promotion instead of quietly accepted as one. A report whose
+    gate carries no verdict (an eval run without ``--gate``) is not forwarded:
+    there is no statistical decision in it to honour.
+    """
+    report = _read_report(eval_json)
+    extra: Dict[str, object] = {}
+    if dataset:
+        extra["dataset"] = str(dataset)
+    rows = _golden_rows(report, golden_json)
+    if rows is not None:
+        extra["golden_rows"] = int(rows)
+    gate = report.get("gate")
+    if isinstance(gate, dict) and gate.get("verdict"):
+        extra["eval_gate"] = dict(gate)
+    return build_manifest(
+        phase=phase, version=version, base_model=base_model, adapter=adapter,
+        sha256=sha256, eval_metrics=_read_scores(eval_json),
+        baseline=_read_scores(baseline_json), extra=extra)
 
 
 def _format_text(tokenizer, messages: List[dict]) -> str:
@@ -243,13 +334,11 @@ def train(args: argparse.Namespace) -> int:
     trainer.model.save_pretrained(str(adapter_dir))
     tokenizer.save_pretrained(str(adapter_dir))
 
-    eval_scores = _read_scores(args.eval_json)
-    baseline = _read_scores(args.baseline_json)
-    manifest = build_manifest(
-        phase=args.phase, version=args.version,
-        base_model=args.base_model, adapter=str(adapter_dir),
+    manifest = build_from_report(
+        args.phase, args.version, args.base_model, str(adapter_dir),
         sha256=sha256_file(adapter_dir / "adapter_model.safetensors"),
-        eval_metrics=eval_scores, baseline=baseline,
+        eval_json=args.eval_json, baseline_json=args.baseline_json,
+        golden_json=args.golden, dataset=str(args.dataset),
     )
     errors = validate_manifest(manifest)
     write_manifest(manifest, output_dir)
@@ -257,8 +346,16 @@ def train(args: argparse.Namespace) -> int:
                       "manifest": manifest, "errors": errors,
                       "measured": measured},
                      indent=2, sort_keys=True))
+    # The verdict is the manifest's, not the error list's: a run can be
+    # honestly un-promoted (a tie, too few rows) with nothing invalid about
+    # it, and announcing "NOT promoted: <errors>" in that case names a cause
+    # that does not exist. The basis and the reason travel with it, so the
+    # operator reads WHY without opening the file.
+    state = "promoted" if manifest.get("promoted") else "NOT promoted"
+    print(f"{state} ({manifest.get('promotion_basis')}): "
+          f"{manifest.get('promotion_reason')}", file=sys.stderr)
     if errors:
-        print("NOT promoted: " + "; ".join(errors), file=sys.stderr)
+        print("manifest problems: " + "; ".join(errors), file=sys.stderr)
     return 0
 
 
@@ -298,6 +395,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help='{"metric": score} produced by training.eval')
     parser.add_argument("--baseline-json", default="",
                         help='{"metric": score} the model must reach')
+    parser.add_argument("--golden", default="",
+                        help="golden JSONL the eval scored: its row count is "
+                             "recorded as golden_rows (the eval report's own "
+                             "n wins when it states one). Never the size of "
+                             "the training set.")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the resolved plan; do NOT import torch")
     args = parser.parse_args(argv)

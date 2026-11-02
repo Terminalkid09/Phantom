@@ -58,11 +58,18 @@ def _warns(note):
 
 
 def _typed_from_sketch(content):
-    """The command an Arduino sketch actually types, unescaped."""
-    line = next(ln for ln in content.splitlines() if "Keyboard.print(F(" in ln)
-    body = line.split('Keyboard.print(F("', 1)[1]
-    body = body[:body.rindex('"));')]
-    return body.replace('\\"', '"').replace("\\\\", "\\")
+    """The command an Arduino sketch actually types, unescaped.
+
+    The command is typed in BURSTS (human cadence), so it is every
+    ``Keyboard.print`` line joined — not one line. The full text also appears
+    in a comment, which is deliberately NOT read here: what the target sees is
+    what the prints emit.
+    """
+    chunks = [ln.split('Keyboard.print(F("', 1)[1].rsplit('"));', 1)[0]
+              for ln in content.splitlines() if "Keyboard.print(F(" in ln]
+    assert chunks
+    body = "".join(chunks)
+    return body.replace("\\\\", "\\").replace('\\"', '"')
 
 
 class TestTheSchemeFollowsTheListener:

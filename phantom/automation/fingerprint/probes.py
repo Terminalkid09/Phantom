@@ -809,6 +809,16 @@ PORT_SERVICE_MAP: Dict[int, str] = {
     3389: "rdp", 5432: "postgresql", 5985: "winrm",
     6379: "redis", 6443: "kubernetes", 8443: "kubernetes",
     27017: "mongodb",
+    # Windows' own services that a top-1000 scan can miss and that say a lot
+    # about the host (measured 2026-10-30 on 192.168.1.18: open 5357 and 5040
+    # were invisible to everything that only knew the list above).
+    # 5040 is deliberately ABSENT: it answers a connect and then says nothing
+    # at all (no banner, no HTTP, no TLS), so calling it anything would be a
+    # guess. The sweep reports it with a "?" and the operator probes it by hand.
+    5357: "wsdapi",
+    7680: "delivery-optimization", 47001: "winrm-http",
+    10243: "wsdapi", 2179: "hyper-v", 3260: "iscsi",
+    5000: "http-alt", 5555: "adb", 5986: "winrm-tls",
 }
 
 

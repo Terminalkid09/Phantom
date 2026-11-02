@@ -118,12 +118,18 @@ def _found_parts(data: dict) -> List[str]:
     """
     values = data.get("values")
     values = values if isinstance(values, dict) else {}
+    findings = data.get("findings") or []
     parts = []
-    for key in (data.get("findings") or [])[:6]:
+    for key in findings[:6]:
         if not isinstance(key, str):
             key = str(key)
         value = values.get(key)
         parts.append(f"{key} = {_clip(value, 60)}" if value else key)
+    # Six is a display budget, not the result: a scan that found 29 services
+    # printed 6 with no sign the rest existed, which reads as "the scan found
+    # six" (measured 2026-10-28 on the docker lab). Same marker as the plan.
+    if len(findings) > len(parts):
+        parts.append(f"…+{len(findings) - len(parts)}")
     return parts
 
 
@@ -557,8 +563,20 @@ def _r_hypothesis_lifecycle(d: dict, verb: str) -> List[str]:
 
 
 def _r_hunt_probe(d: dict) -> List[str]:
-    """Behavioural hunt probe line: what was sent and what it revealed."""
-    req = d.get("request") or {}
+    """Behavioural hunt probe line: what was sent and what it revealed.
+
+    `request` arrives in two shapes: the agent's probe callback emits the
+    plain request line (``"GET /admin?id=1"``), while a structured caller
+    passes ``{"probe", "method", "path", "signals"}``. Assuming the dict
+    raised AttributeError on every single probe, so a hunt printed one
+    "unrenderable event" per request instead of its trace — the operator
+    lost the only evidence that the hunt was working.
+    """
+    req = d.get("request")
+    if isinstance(req, str):
+        return [f"[~] {_tag(d)}{req.strip()}"]
+    if not isinstance(req, dict):
+        req = {}
     return [f"[~] {_tag(d)}{req.get('probe', '')} "
             f"{req.get('method', 'GET')} {req.get('path', '')} "
             f"→ {req.get('signals', '')}".replace("  ", " ").strip()]

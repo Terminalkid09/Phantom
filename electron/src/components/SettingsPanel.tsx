@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '@/store'
 import { useApi, useApiError, apiError as apiErrorText } from '@/hooks/useApi'
+import { useAppVersion } from '@/hooks/useAppVersion'
 import ExternalTools from '@/components/ExternalTools'
 import {
   Settings, Cpu, Server, Shield, Key, Eye, EyeOff,
@@ -26,6 +27,13 @@ export default function SettingsPanel() {
   const [apiKeys, setApiKeys] = useState<Record<string, KeyInfo>>({})
   const [keyDrafts, setKeyDrafts] = useState<Record<string, string>>({})
   const [keySaved, setKeySaved] = useState('')
+  // The About card used to print a HARDCODED `3.7.3`: a number nothing in the
+  // tree declares, disagreeing on screen with the title bar (`App.tsx`) and the
+  // sidebar footer, which both read `package.json` through `useAppVersion`.
+  // Whichever number an operator quotes in a report was wrong half the time.
+  // One source of truth now: the hook, and an empty string (no version shown)
+  // is better than a wrong one when the IPC bridge is unavailable.
+  const version = useAppVersion()
 
   const loadKeys = async () => {
     const res = await api('GET', '/api/config/keys')
@@ -526,8 +534,8 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
           </h2>
           <div className="grid grid-cols-3 gap-2 text-xs">
             <div>
-              <span className="text-text-dim">Version:</span>{' '}
-              <span className="text-text-primary font-mono">3.7.3</span>
+            <div className="text-text-dim">Electron:</span>{' '}
+            <span className="text-text-primary font-mono">{version || '—'}</span>
             </div>
             <div>
               <span className="text-text-dim">Platform:</span>{' '}

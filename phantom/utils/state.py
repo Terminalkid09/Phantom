@@ -72,8 +72,19 @@ def _env(name: str) -> str:
     # process (every renderer fetch → 401). Persisted state is authoritative
     # for the API token; a matching env value is still accepted (no-op), and
     # operators who genuinely need the override can pass --env-state-file.
+    #
+    # The PAYLOAD token needs the same guard, and the damage is quieter.
+    # Measured 2026-11-01: `.env` still held a previous run's token. The C2
+    # listener imports c2_server, which calls load_dotenv(), so IT
+    # authenticated payload fetches with the .env value while a stager
+    # generated outside that process embedded the persisted one: every fetch
+    # answered 403 and the delivered one-liner looked broken on the target.
+    # Nothing logs the disagreement, because each half is consistent with
+    # itself. Both halves now resolve to the persisted state (which is what
+    # every process that never calls load_dotenv already used), and an
+    # operator who really wants the override has --env-state-file.
     value = os.getenv(name, "").strip()
-    if name == "PHANTOM_API_TOKEN" and value:
+    if name in ("PHANTOM_API_TOKEN", "PHANTOM_PAYLOAD_TOKEN") and value:
         with _STATE_LOCK:
             persisted = _read().get(name)
         if persisted and str(persisted) != value:
@@ -131,6 +142,25 @@ def set_flag(name: str, value: bool) -> None:
     with _STATE_LOCK:
         data = _read()
         data[name] = bool(value)
+        _write(data)
+
+
+def set_string(name: str, value: str) -> None:
+    """Persist a string setting under its env-var name.
+
+    Symmetric with :func:`get_string`, and it exists for values a PROCESS
+    cannot own: a live `c2.front` set by `tunnel start` has to be visible to
+    every other process (the API server, the CLI) or the artefact one of them
+    generates silently keeps the previous address — env vars are per-process
+    and that is exactly how two surfaces disagree about where the C2 is.
+    An empty value removes the key rather than storing "".
+    """
+    with _STATE_LOCK:
+        data = _read()
+        if str(value or "").strip():
+            data[name] = str(value).strip()
+        else:
+            data.pop(name, None)
         _write(data)
 
 

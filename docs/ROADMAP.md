@@ -1,7 +1,7 @@
 # Phantom — Roadmap di lavoro (audit consolidato)
 
 **Commit di riferimento:** `f6771f55967e4d0d33c5c3536316736946dbaea3` (branch `dev`)
-**Fonti verificate:** `docs/Phantom_dev_audit.md` (Manus #1), `docs/master_review.md` (Manus #2 — **fa fede dove discorda**), verifica indipendente Buffy.
+**Fonti:** il codice fa fede. La roadmap è stata consolidata dagli audit dell'ottobre 2026 — rimossi da `docs/` perché materiale datato: vivono in [`../CHANGELOG.md`](../CHANGELOG.md) e nella storia git — più una verifica indipendente.
 **Data creazione:** 2026-09-13
 
 ---
@@ -18,7 +18,7 @@
 
 ---
 
-## Decisioni vincolanti (da master_review + proprietario — NON rinnovare il dibattito)
+## Decisioni vincolanti (proprietario — NON rinnovare il dibattito)
 
 | # | Decisione | Conseguenza |
 |---|---|---|

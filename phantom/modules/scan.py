@@ -149,6 +149,9 @@ class ScanModule(BaseModule):
         # Check for aggressive commands and ask for confirmation
         chosen_commands = filter_aggressive_commands(chosen_commands)
 
+        # Answer the `-p-` question BEFORE handing a 4-hour nmap the job.
+        self._fast_full_sweep(chosen_commands)
+
         notifier.status(f"Starting scan sequence for {session.target}...")
         from phantom.core.executor import RunStatus
         status = RunStatus()
@@ -165,6 +168,78 @@ class ScanModule(BaseModule):
             notifier.success(f"Scan results saved to history.")
         
         self._conditional_suggestions(results)
+
+    #: Time the internal full-range sweep may spend before it reports a
+    #: PARTIAL result. Big enough for a DROP-everything host on a /24 (measured
+    #: 199 s for 65 535 ports with 500 workers), small enough to be waited on.
+    FAST_SWEEP_BUDGET = 420.0
+
+    def _fast_full_sweep(self, commands) -> None:
+        """Find the open ports of a full-range request without nmap.
+
+        The defect (2026-10-30): `nmap -sV -sC -p-` against a Windows host that
+        DROPs instead of REJECTs took 3 h 46 m for 65 535 filtered ports, so a
+        scripted run either waited an afternoon or was killed with an empty
+        XML and reported "no services" — while a plain TCP connect sweep found
+        two open ports in three minutes. The sweep runs only when the chosen
+        rows actually ask for full coverage (`-p-`), because that is the intent
+        it answers; a quick top-1000 scan stays quick.
+
+        Never raises: a failed sweep leaves the nmap rows to do their job.
+        """
+        import ipaddress
+
+        if not any("-p-" in str(c) for c in commands or []):
+            return
+        target = str(session.target or "").strip()
+        try:
+            ipaddress.IPv4Address(target)
+        except ValueError:
+            return                      # hostname: not a connect-sweep target
+        try:
+            from phantom.core.netmap import sweep_all_ports
+        except Exception:
+            return
+        notifier.status(f"Fast full-range connect sweep on {target} "
+                        f"(no nmap, no root)...")
+        try:
+            ports, stats = sweep_all_ports(target, budget=self.FAST_SWEEP_BUDGET)
+        except Exception as exc:        # a sweep must never break the scan
+            console.print(f"[yellow][!] fast sweep failed: {exc}[/]")
+            return
+        if ports:
+            try:
+                from phantom.automation.fingerprint.probes import PORT_SERVICE_MAP
+            except Exception:
+                PORT_SERVICE_MAP = {}
+            found = [(str(port), PORT_SERVICE_MAP.get(int(port), ""))
+                     for port in ports]
+            table = Table(title=f"Fast sweep: {len(found)} open TCP port(s) on {target}")
+            table.add_column("Port", style="cyan")
+            table.add_column("Service", style="green")
+            for port, service in found:
+                table.add_row(port, service or "?")
+            console.print(table)
+            from phantom.core.knowledge import add_service
+            for port, service in found:
+                add_service(port, service or "tcp", product="",
+                            version="", confidence=0.6, source="fast_sweep")
+        else:
+            console.print(f"[dim]    Fast sweep: no open TCP port in the range.[/]")
+        # A partial sweep is reported as partial: "nothing else is open" and
+        # "we stopped looking" are different answers and only one is a fact.
+        if not stats.get("complete", True):
+            console.print(
+                f"[yellow][!] sweep incomplete: {stats.get('scanned')} of "
+                f"65535 port(s) probed in {stats.get('elapsed')}s "
+                f"(budget {int(self.FAST_SWEEP_BUDGET)}s) — "
+                f"{stats.get('filtered')} filtered, {stats.get('refused')} "
+                f"refused. Raise scan.fast_sweep_budget to finish.[/]")
+        else:
+            console.print(
+                f"[dim]    sweep complete in {stats.get('elapsed')}s: "
+                f"{stats.get('refused')} refused, {stats.get('filtered')} "
+                f"filtered (a DROP-everything firewall shows up as filtered).[/]")
 
     def _analyze_vulnerabilities(self, results):
         """Light post-scan summary — full CVE analysis deferred to exploit module."""
@@ -234,8 +309,12 @@ class ScanModule(BaseModule):
         if "445/tcp open" in all_output or "microsoft-ds" in all_output:
             console.print("\n[yellow][!] Port 445 / SMB detected.[/]")
             console.print("    Consider running: enum4linux -a, smbclient, rpcclient")
-            if input("    Add these commands now? [y/N] ").strip().lower() == "y":
-                console.print("    [dim]Run: use scan, then run-group \"SERVICE ENUM\"[/]")
+            # No prompt here: this runs at the END of EVERY scan, so a piped
+            # session died with EOFError on an SMB host — or, worse, ate the
+            # next scripted line as the answer (measured 2026-10-28). The
+            # question never did anything either way: a "y" only printed the
+            # line below, and nothing was ever added to the plan.
+            console.print("    [dim]Run: use scan, then run-group \"SERVICE ENUM\"[/]")
 
         # HTTPS
         if "443/tcp open" in all_output:

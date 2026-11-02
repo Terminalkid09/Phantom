@@ -17,12 +17,31 @@ class BaseModule(cmd.Cmd):
 
     def __init__(self):
         super().__init__()
-        target = session.target if session.target else "no-target"
-        self.prompt = f"[{self.module_name}:{target}] > "
+        # ONE prompt grammar across every layer (see phantom.core.shell.ui):
+        # this used to be a plain `[module:target] > ` that looked nothing
+        # like the shell it was entered from and carried no depth cue.
+        from phantom.core.shell.ui import build_prompt
+        self.prompt = build_prompt(self.module_name)
+
+    def parseline(self, line):
+        """Keep hyphenated commands whole (`run-group <name>`).
+
+        `cmd.Cmd` ends a command name at `-`, so `run-group "SERVICE ENUM"`
+        arrived as `run` with the argument `-group "SERVICE ENUM"`: the
+        module ran its FIRST group and the named-group form of the scripted
+        manual core did the wrong thing silently (measured 2026-10-28).
+        """
+        from phantom.core.shell.registry import normalise_command_line
+        return super().parseline(normalise_command_line(line))
 
     def do_back(self, _):
         """Return to the main shell"""
         return True
+
+    def do_where(self, _):
+        """where - Print the current layer, target and scope (same as the shell)"""
+        from phantom.core.shell.ui import layer_line
+        console.print(layer_line(self.module_name), markup=False)
 
     def do_exit(self, _):
         """Exit Phantom"""

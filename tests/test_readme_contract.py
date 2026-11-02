@@ -147,6 +147,9 @@ class TestTheDocsIndexStaysTrue(unittest.TestCase):
     def _index(self):
         return _read(_ROOT / "docs" / "README.md")
 
+    def _docs(self):
+        return _ROOT / "docs"
+
     def test_every_document_in_docs_is_indexed(self):
         index = self._index()
         missing = [p.name for p in sorted((_ROOT / "docs").glob("*.md"))
@@ -163,25 +166,36 @@ class TestTheDocsIndexStaysTrue(unittest.TestCase):
         self.assertEqual(broken, [],
                          "index rows pointing at a file that is not there")
 
-    def test_the_historical_audits_declare_which_one_is_current(self):
-        """Two audits on the same subject must not contradict each other in
-        silence: the newer one says what it supersedes."""
-        index = self._index()
-        self.assertIn("superseded", index.lower())
-        current = _read(_ROOT / "docs" / "Audit_2026-10-13.md")
-        self.assertIn("ManusReview.md", current)
-        older = _read(_ROOT / "docs" / "ManusReview.md")
-        self.assertIn("Audit_2026-10-13.md", older)
+    def test_docs_holds_current_truth_only(self):
+        """Point-in-time material lives in CHANGELOG.md and git, not in docs/.
 
-    def test_the_master_review_is_labelled_as_instructions_not_findings(self):
-        """`master_review.md` is a prompt for an external reviewer. The index
-        used to call it "authoritative", which turned a prompt into a source."""
+        `docs/` had accumulated nine `Live_Test_*` transcripts, two audits of
+        the same subject that contradicted each other, three `Manus*` tool
+        transcripts and a reviewer PROMPT filed as if it were findings: every
+        reader had to work out which page was still true, and the honest
+        answer was usually "none". The rule is mechanical and enforced here —
+        a dated transcript or a point-in-time audit added to `docs/` now fails
+        the suite instead of quietly becoming a source.
+        """
+        stale = re.compile(
+            r"^(Live_Test|Live_Retest|Audit_|Audit\.|REVIEW|master_review|"
+            r"ManusReview|manus|Phantom_dev_audit|Phantom\.md|"
+            r"PHANTOM_VERIFICATION|PHANTOM_FULL_MANUAL_TEST|"
+            r"AutoModeBrief|BEACON_AUDIT|CROSS_PLATFORM_BUILD_STATUS)")
+        offenders = [p.name for p in sorted(self._docs().glob("*.md"))
+                     if stale.match(p.name)]
+        self.assertEqual(offenders, [],
+                         "point-in-time documents: what changed belongs in "
+                         "CHANGELOG.md and the full text in git history — a "
+                         "reader cannot tell when these stopped being true")
+
+    def test_the_index_says_where_history_lives(self):
+        """A reader who arrives looking for the old audit must be told where
+        it went, not left to conclude it never existed."""
         index = self._index().lower()
-        row = [line for line in index.splitlines() if "master_review.md" in line]
-        self.assertTrue(row, "the master review must stay indexed")
-        self.assertIn("instruction", row[0])
-        body = _read(_ROOT / "docs" / "master_review.md")
-        self.assertIn("ISTRUZIONI, non finding", body)
+        self.assertIn("changelog", index)
+        self.assertIn("git", index)
+        self.assertIn("current truth", index)
 
 
 if __name__ == "__main__":

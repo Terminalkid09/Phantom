@@ -12,6 +12,114 @@ _INSTALL_TIMEOUT = 300   # apt-get install
 _UPDATE_TIMEOUT = 120    # apt-get update
 
 
+# The Windows beacon is a MinGW cross-build: there is no C++ compiler in a
+# stock Windows install, and the failure used to be a dead end ("Install them
+# manually" with no command that installs a toolchain). winget ships with
+# Windows 10 1809+/11 and carries a portable WinLibs MinGW-w64, so the missing
+# compiler is something the tool can fix WITH the operator's consent instead of
+# a manual download nobody documents.
+_MINGW_WINGET_ID = "BrechtSanders.WinLibs.POSIX.UCRT"
+_MINGW_COMPILER = "x86_64-w64-mingw32-g++"
+
+
+def _winget_mingw_bin() -> str:
+    """Directory holding the winget-installed MinGW compiler, or "".
+
+    winget unpacks portable packages under
+    ``%LOCALAPPDATA%\\Microsoft\\WinGet\\Packages\\<Id>_...``; the exact
+    suffix is source-generated, so it is globbed rather than assumed.
+    """
+    import glob
+    local = os.environ.get("LOCALAPPDATA", "")
+    if not local:
+        return ""
+    pattern = os.path.join(local, "Microsoft", "WinGet", "Packages",
+                           f"{_MINGW_WINGET_ID}_*", "mingw64", "bin")
+    for candidate in glob.glob(pattern):
+        if os.path.exists(os.path.join(candidate, _MINGW_COMPILER + ".exe")):
+            return candidate
+    return ""
+
+
+def mingw_bin_dir() -> str:
+    """A usable MinGW ``bin`` directory, from PATH or from a winget install."""
+    found = shutil.which(_MINGW_COMPILER)
+    if found:
+        return os.path.dirname(found)
+    return _winget_mingw_bin()
+
+
+def _activate_mingw() -> str:
+    """Put the discovered MinGW ``bin`` on this process's PATH; return it.
+
+    A winget install does not touch the PATH of a process that is already
+    running, so a build started afterwards sees the compiler on disk and still
+    reports "not found". Detection is cheap and idempotent, so it runs before
+    every Windows build instead of trusting the environment.
+    """
+    bin_dir = mingw_bin_dir()
+    if not bin_dir:
+        return ""
+    parts = os.environ.get("PATH", "").split(os.pathsep)
+    if bin_dir not in parts:
+        os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+    return bin_dir
+
+
+def install_windows_toolchain(consent: bool = False) -> bool:
+    """Fetch MinGW-w64 with winget and put it on THIS process's PATH.
+
+    Returns True only when a compiler is usable afterwards, so a caller never
+    proceeds into a build that would fail the same way. Declining (or no
+    winget) returns False with the command printed: a refusal must still be
+    actionable.
+    """
+    if os.name != "nt":
+        console.print("[yellow][!] The Windows toolchain is only auto-installable "
+                      "on Windows; on this host install g++-mingw-w64 with your "
+                      "package manager.[/]")
+        return False
+    if not consent:
+        return False
+    winget = shutil.which("winget")
+    if not winget:
+        console.print(f"[red][!] winget not found — install '{_MINGW_WINGET_ID}' "
+                      "from the Microsoft Store (App Installer), or install "
+                      "MinGW-w64 manually, then re-run.[/]")
+        return False
+    console.print(f"[cyan][*] Installing MinGW-w64 via winget ({_MINGW_WINGET_ID})...[/]")
+    try:
+        result = subprocess.run(
+            [winget, "install", "-e", "--id", _MINGW_WINGET_ID,
+             "--accept-package-agreements", "--accept-source-agreements",
+             "--disable-interactivity"],
+            capture_output=True, text=True, timeout=_INSTALL_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        console.print(f"[red][!] winget install failed: {exc}[/]")
+        return False
+    # A fresh install does not update THIS process's PATH, and the build runs
+    # in-process: without this the compiler exists and still "is not found".
+    bin_dir = _activate_mingw()
+    if not bin_dir:
+        # Detection FIRST, exit code second: winget answers "Found an existing
+        # package already installed" with a NON-ZERO code (0x8A15002B) on a
+        # box where the toolchain is present and perfectly usable. Reading
+        # the exit code first turned a working install into a reported
+        # failure (measured 2026-10-30).
+        detail = (result.stderr or result.stdout or "").strip()[:300]
+        console.print(f"[red][!] MinGW-w64 could not be found after the winget "
+                      f"run (exit {result.returncode}): {detail}[/]")
+        return False
+    if result.returncode != 0 and "already installed" not in (
+            (result.stdout or "") + (result.stderr or "")).lower():
+        console.print(f"[yellow][!] winget reported exit {result.returncode}; "
+                      "checking the toolchain anyway.[/]")
+    ok = shutil.which(_MINGW_COMPILER) is not None
+    console.print("[green][+] MinGW-w64 ready: " + bin_dir + "[/]" if ok else
+                  "[red][!] MinGW installed but the compiler still does not run.[/]")
+    return ok
+
+
 def _safe_choice(prompt: str, default: str = "n") -> str:
     """Read y/N input without ever hanging (EOF -> default, then skip)."""
     try:
@@ -311,7 +419,15 @@ def _mark_deps_ready(platform):
 def check_build_env(platform, arch="x64"):
     """Check dependencies for the platform and offer an automatic fix."""
     if _deps_ready(platform):
-        return True
+        # The marker is written once and outlives the toolchain that justified
+        # it (a reimage, a winget uninstall, a different machine profile). For
+        # Windows the compiler is the ONE fact worth re-checking: trusting a
+        # stale marker sent the build on to a bare "No suitable C++ compiler
+        # found" with no offer to install one (measured 2026-10-30, marker
+        # dated three months earlier). Every other platform keeps the fast
+        # path.
+        if platform != "windows" or _activate_mingw() or shutil.which("cl"):
+            return True
 
     missing = []
     
@@ -377,6 +493,7 @@ def check_build_env(platform, arch="x64"):
                     missing.append(full_pkg)
         
     elif platform == "windows":
+        _activate_mingw()
         has_cl = shutil.which("cl") is not None
         # Check for mingw cross-compilers on Linux
         mingw_64 = shutil.which("x86_64-w64-mingw32-g++")
@@ -385,7 +502,29 @@ def check_build_env(platform, arch="x64"):
         if os.name == 'nt':
             if not has_cl and not mingw_64 and not mingw_32:
                 console.print("[red][!] 'cl.exe' (MSVC) or mingw toolchain not found in PATH.[/]")
-                return False
+                # There is no compiler in a stock Windows install, so "install
+                # it manually" left the operator with nothing to paste. Offer
+                # the winget install; auto-consent only when explicitly opted
+                # in (PHANTOM_AUTO_INSTALL_TOOLCHAIN=1) or the operator says yes.
+                opt_in = os.environ.get("PHANTOM_AUTO_INSTALL_TOOLCHAIN", "").strip().lower()
+                if opt_in in ("1", "yes", "true", "y"):
+                    consent = True
+                elif sys.stdin.isatty():
+                    consent = _safe_choice(
+                        "Download and install MinGW-w64 with winget? [y/N]: ") == "y"
+                else:
+                    consent = False
+                if not consent:
+                    console.print(
+                        f"[yellow][!] Windows payloads will be skipped until "
+                        f"MinGW-w64 is installed. Either re-run with "
+                        f"PHANTOM_AUTO_INSTALL_TOOLCHAIN=1 (no prompt) or run: "
+                        f"winget install -e --id {_MINGW_WINGET_ID}[/]")
+                    return False
+                if not install_windows_toolchain(consent=True):
+                    return False
+                _mark_deps_ready(platform)
+                return True
         else:
             # On Linux targeting Windows
             if arch == "x64" and not mingw_64:

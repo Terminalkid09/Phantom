@@ -72,16 +72,67 @@ def _cloud_redact(text: str) -> str:
         return _redact_secrets(text)
 
 
+_LIVE_ENDPOINT = ""
+
+
+def _local_endpoint() -> str:
+    """The first local endpoint that is really a MODEL server.
+
+    ``ai.local.base_url`` is tried first, then the ports a model server
+    usually listens on. A port owned by another application is SKIPPED
+    instead of being mistaken for a broken model, and the configured URL is
+    the last resort so a failure still names what the operator configured.
+    Cached: one probe per process, not one per call.
+    """
+    global _LIVE_ENDPOINT
+    if _LIVE_ENDPOINT:
+        return _LIVE_ENDPOINT
+    from .client import probe_openai
+    configured = config.local_base_url()
+    for url in config.local_candidates():
+        if probe_openai(url):
+            _LIVE_ENDPOINT = url
+            return url
+    return configured
+
+
+def reset_endpoint_cache() -> None:
+    """Forget the discovered endpoint (tests, or after starting a server)."""
+    global _LIVE_ENDPOINT
+    _LIVE_ENDPOINT = ""
+
+
+def _integrated_model(phase: str) -> str:
+    """The model id a phase's PROMOTED adapter is served under, or AIError.
+
+    ``integrated`` used to fall through to the plain local endpoint when no
+    manifest was promoted, so an "AI run" quietly became a run against
+    whatever was on 127.0.0.1:8080 — measured 2026-11-02: every call came back
+    ``http 405``, the model field was empty, the order never changed, and the
+    report implied the trained model had been consulted. A missing promoted
+    manifest is a CONFIGURATION fact, and it is cheap to state.
+    """
+    manifest = ModelRegistry().promoted(phase)
+    if not manifest:
+        raise AIError(
+            f"integrated: no promoted manifest for phase {phase!r} — train a "
+            f"model, export it and promote it under models/{phase}/ (the "
+            f"registry refuses a manifest without measured eval/baseline), or "
+            f"use ai.mode=local to talk to a llama.cpp server directly")
+    return str(manifest.get("model_id") or manifest.get("version") or "").strip()
+
+
 def _client_for(phase: str, mode: str) -> AIClient:
     """Build the transport for one call (the test seam)."""
-    if mode in ("local", "integrated"):
-        model = config.local_model()
-        if mode == "integrated":
-            manifest = ModelRegistry().promoted(phase)
-            if manifest:
-                model = str(manifest.get("model_id")
-                            or manifest.get("version") or model)
-        return LocalClient(config.local_base_url(), model=model,
+    if mode == "integrated":
+        # an integrated run must name the trained model it is asking for: the
+        # failure mode this replaces was an empty model id against whatever
+        # happened to listen on the local port.
+        return LocalClient(_local_endpoint(),
+                           model=_integrated_model(phase),
+                           timeout=config.timeout_s())
+    if mode == "local":
+        return LocalClient(_local_endpoint(), model=config.local_model(),
                            timeout=config.timeout_s())
     if mode == "cloud":
         return CloudClient(config.cloud_base_url(),

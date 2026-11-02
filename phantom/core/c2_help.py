@@ -91,6 +91,10 @@ COMMANDS: List[CommandSpec] = [
                 "Listener", handler="listeners"),
     CommandSpec("listeners", "Show listener status", GLOBAL_SCOPE,
                 "Listener", handler="listeners"),
+    CommandSpec("tunnel [start [port]|install|stop]",
+                "Publish the listener on a throwaway Cloudflare hostname "
+                "(c2.front) so artefacts and the HID stager never carry this "
+                "box's address", GLOBAL_SCOPE, "Listener", handler="tunnel"),
     CommandSpec("certs [status|uninstall]",
                 "Inspect or remove TLS certificate pair", GLOBAL_SCOPE,
                 "Listener", handler="certs"),
