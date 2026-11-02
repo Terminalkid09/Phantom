@@ -532,19 +532,19 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
           <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-2">
             About
           </h2>
-          <div className="grid grid-cols-3 gap-2 text-xs">
-            <div>
-            <div className="text-text-dim">Electron:</span>{' '}
-            <span className="text-text-primary font-mono">{version || '—'}</span>
-            </div>
-            <div>
-              <span className="text-text-dim">Platform:</span>{' '}
-              <span className="text-text-primary">{navigator.platform}</span>
-            </div>
-            <div>
-              <span className="text-text-dim">Electron:</span>{' '}
-              <span className="text-text-primary font-mono">31.x</span>
-            </div>
+            <div className="grid grid-cols-3 gap-2 text-xs">
+              <div>
+                <span className="text-text-dim">Version:</span>{' '}
+                <span className="text-text-primary font-mono">{version || '—'}</span>
+              </div>
+              <div>
+                <span className="text-text-dim">Platform:</span>{' '}
+                <span className="text-text-primary">{navigator.platform}</span>
+              </div>
+              <div>
+                <span className="text-text-dim">Electron:</span>{' '}
+                <span className="text-text-primary font-mono">{version ? `v${version}` : '—'}</span>
+              </div>
             <div className="col-span-3 mt-2">
               <span className="text-text-dim">PHANTOM — Offensive Security Framework</span>
             </div>
