@@ -4,7 +4,15 @@ from __future__ import annotations
 from phantom.automation.ai.advisors import exploit as advisor
 from phantom.automation.ai.advisors import finding as finder
 from phantom.automation.ai.router import AIResult
+from phantom.automation.ai.trust import Trust
 from phantom.automation.exploit.access import AccessCandidate
+
+
+#: The rerank tests exercise the CONTRACT, not the repository's current
+#: model state: passing the ladder explicitly keeps them green when no
+#: manifest is promoted (2026-11-02) and still bounds the influence.
+NUDGE = Trust(phase="exploit", level="nudge", bound=0.12,
+              max_steps=2, gap=0.15)
 
 
 def _cand(cid: str, score: float, *, actionable: bool = True,
@@ -37,7 +45,7 @@ def test_an_unknown_id_is_dropped_and_the_order_is_unchanged(monkeypatch):
 def test_a_close_pair_can_be_reordered_and_is_recorded(monkeypatch):
     a, b = _cand("a", 60.0), _cand("b", 59.0)
     monkeypatch.setattr(advisor, "ask", lambda *a, **k: _ok(["b", "a"]))
-    result = advisor.rerank([a, b], "balanced")
+    result = advisor.rerank([a, b], "balanced", trust=NUDGE)
     assert [c.id for c in result.ordered] == ["b", "a"]
     assert result.applied is True
     assert result.changed
@@ -76,7 +84,7 @@ def test_a_failed_model_leaves_the_order_untouched(monkeypatch):
     monkeypatch.setattr(
         advisor, "ask",
         lambda *a, **k: AIResult(ok=False, error="timeout"))
-    result = advisor.rerank([a, b], "balanced")
+    result = advisor.rerank([a, b], "balanced", trust=NUDGE)
     assert [c.id for c in result.ordered] == ["a", "b"]
     assert result.applied is False and "timeout" in result.reason
 
@@ -101,7 +109,7 @@ def test_an_unreachable_llm_falls_back_to_the_promoted_cpu_ranker(monkeypatch):
     # a SMALL gap (the trust cap refuses an inversion across 30 points, which
     # is the whole point of the ladder — see `test_nudge_cannot_invert_...`)
     a, b = _cand("a", 60.0), _cand("b", 55.0)
-    result = advisor.rerank([a, b], "balanced")
+    result = advisor.rerank([a, b], "balanced", trust=NUDGE)
     assert result.model == "test-ranker"
     assert result.applied is True
     assert [c.id for c in result.ordered] == ["b", "a"]
@@ -117,7 +125,7 @@ def test_the_payload_never_carries_a_command(monkeypatch):
     a = _cand("a", 60.0)
     a.action = {"command": "id", "shell": "bash"}
     monkeypatch.setattr(advisor, "ask", fake_ask)
-    advisor.rerank([a], "balanced")
+    advisor.rerank([a], "balanced", trust=NUDGE)
     row = seen["payload"]["candidates"][0]
     assert row["id"] == "a"
     assert {"action", "command", "shell", "cmd"} & set(row) == set()

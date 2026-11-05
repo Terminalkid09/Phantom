@@ -199,6 +199,24 @@ def _measured_trust(phase: str, *, registry: Any = None) -> Trust:
                              f"{baseline:.3f} baseline): nearby reordering "
                              f"only"),
                      **_NUDGE)
+    # LARGE-GAP AUTHORITY NEEDS MORE THAN THE BARE FLOOR (measured 2026-11-03).
+    # The 23-row production corpus promoted a ranker whose delta (+0.130) was
+    # 97% of the 0.133 headroom a 0.867 baseline left, so the ladder handed it
+    # the `decide` profile: +/-35 points, five positions, inversions up to a
+    # 0.30 gap. The row floor is the bar for "this is evidence at all", not for
+    # giving a model the widest lever it can hold. Below TWICE the floor the
+    # authority stays at `nudge`: still a real, measurable effect (+/-12
+    # points, two positions) that cannot rewrite a decision across a big gap.
+    # This is a constant of the LADDER, not of any one corpus: it applies to a
+    # 40-row holdout exactly as to a 23-row cross-validation.
+    if rows < 2 * max(1, min_rows):
+        return Trust(phase=name, level="nudge", source="manifest",
+                     reason=(f"gate promoted on {rows} row(s), which is below "
+                             f"twice the {min_rows}-row floor: the advantage "
+                             f"is measured but thin, so nearby reordering "
+                             f"only (large-gap authority needs a bigger "
+                             f"sample)"),
+                     **_NUDGE)
     ci_floor = round(_CI_SHARE * threshold, 4)
     if ci_low < ci_floor:
         return Trust(phase=name, level="nudge", source="manifest",

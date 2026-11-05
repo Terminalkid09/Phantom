@@ -111,6 +111,13 @@ def _integrated_model(phase: str) -> str:
     ``http 405``, the model field was empty, the order never changed, and the
     report implied the trained model had been consulted. A missing promoted
     manifest is a CONFIGURATION fact, and it is cheap to state.
+
+    A promoted LINEAR RANKER is not a chat model either (same date): it is
+    served in-process by ``phantom.automation.ai.linear`` and has no model id
+    any endpoint could answer to. Naming its version at a llama.cpp server
+    asked for an artifact that server has never heard of, so the request can
+    only fail — and it fails by CLOSING the mode's only path, not by pretending
+    the ranker is an LLM.
     """
     manifest = ModelRegistry().promoted(phase)
     if not manifest:
@@ -119,6 +126,15 @@ def _integrated_model(phase: str) -> str:
             f"model, export it and promote it under models/{phase}/ (the "
             f"registry refuses a manifest without measured eval/baseline), or "
             f"use ai.mode=local to talk to a llama.cpp server directly")
+    version = str(manifest.get("version") or "").strip()
+    if str(manifest.get("kind") or "").strip().lower() == "linear-ranker":
+        raise AIError(
+            f"integrated: phase {phase!r} is served by the promoted linear "
+            f"ranker {version!r}, which answers IN PROCESS "
+            f"(phantom.automation.ai.linear) and is not a chat model: asking "
+            f"a llama.cpp server for that model id can only fail. The advisor "
+            f"already uses it without a transport; use ai.mode=local only if "
+            f"you also want a chat model for other phases")
     return str(manifest.get("model_id") or manifest.get("version") or "").strip()
 
 

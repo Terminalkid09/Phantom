@@ -22,12 +22,20 @@ This module produces ONE ranked list both commands read:
 Every row shows exactly the command `run <n>` will execute, and it goes
 through the same guards the module flow uses (scope + tool check +
 aggressive confirmation). Nothing here decides policy — it only orders it.
+
+Ordering is deterministic, and a MEASURED model may re-order it within the
+reach it earned (`_ai_order`, the same bounded advisor the auto-mode uses).
+Measured 2026-11-03: this module had no AI code at all, so `--ai integrated`
+could not change a single manual decision — the lab outcome with and without
+the trained model was identical because the model was never in the loop.
+At the default `observe` trust level the advisor is not even called, so an
+unmeasured run stays byte-identical to the deterministic ranking.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from phantom.core.session import session
 
@@ -106,6 +114,33 @@ class Move:
         return not any(b.startswith(("missing:", "out-of-scope"))
                        for b in self.blockers)
 
+    # ── advisor surface ───────────────────────────────────────────────────
+    # A ``Move`` is a candidate like an access candidate: the advisor only
+    # ever sees ids it was given, and can only REORDER them. These properties
+    # are derived from facts (the command, the blockers), never invented, so
+    # the model cannot promote a move that cannot run here.
+    @property
+    def id(self) -> str:
+        """Stable, unique-within-a-ranking identifier handed to the advisor."""
+        key = (self.capability or _display(self.command)
+               or self.title or self.module)
+        return f"{self.module or 'core'}:{key}"
+
+    @property
+    def score(self) -> float:
+        """Deterministic 0-100 score the advisor's bounds are expressed in."""
+        return round(float(self.trust) * 100.0, 3)
+
+    @property
+    def actionable(self) -> bool:
+        """Only a move that can run HERE is an executable candidate."""
+        return self.runnable()
+
+    @property
+    def auto_execute(self) -> bool:
+        """Same question as :attr:`actionable`: `run <n>` needs a human."""
+        return self.runnable()
+
     def badge(self) -> str:
         marks = []
         if self.chain:
@@ -127,6 +162,11 @@ class RankedMoves:
     moves: List[Move] = field(default_factory=list)
     rejected: List[Dict[str, str]] = field(default_factory=list)
     goal: str = ""
+    #: What the measured model did to this ordering, when it did anything.
+    #: Empty dict = the deterministic order stands (no model, no authority,
+    #: a failure, or nothing to move). Read by `render_moves` and by a
+    #: report that must say whether a decision was the model's or the rules'.
+    ai: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +361,62 @@ def _chain_steps(shell, steps, moves) -> List[Move]:
     return out
 
 
+def _ai_order(moves: List[Move], goal: str = "",
+              mode: str = "balanced") -> Tuple[List[Move], Dict[str, Any]]:
+    """Let the MEASURED model re-order the moves within the reach it earned.
+
+    Returns ``(ordered, record)``. ``record`` is empty unless the model was
+    genuinely consulted AND its order was applied, so a caller can always
+    tell a rule-made decision from a model-made one.
+
+    The default trust level is ``observe`` (no promoted model, a rejected
+    gate, too few measured rows): there the advisor is not even imported or
+    called, which is what keeps every unmeasured run identical to the
+    deterministic ranking. Above it, the same bounded advisor the auto-mode
+    uses applies its position/gap caps — it can never add, remove, execute
+    or re-trust a move. Any doubt returns the deterministic order untouched.
+    """
+    if not moves:
+        return moves, {}
+    try:
+        from phantom.automation.ai.trust import trust_for
+        if str(getattr(trust_for("exploit"), "level", "observe")) == "observe":
+            return moves, {}
+    except Exception:
+        return moves, {}
+    ids = [move.id for move in moves]
+    if len(set(ids)) != len(ids):
+        return moves, {}          # two moves, one id: nothing safe to apply
+    try:
+        from phantom.automation.ai.advisors.exploit import rerank
+        profile = getattr(session, "threat_profile", "") or _DEFAULT_PROFILE
+        result = rerank(moves, mode, goal=goal or engagement_goal(),
+                        profile=profile)
+    except Exception:
+        return moves, {}
+    if not getattr(result, "applied", False):
+        return moves, {}
+    ordered = list(getattr(result, "ordered", None) or [])
+    if len(ordered) != len(moves) or {m.id for m in ordered} != set(ids):
+        return moves, {}          # a different set of moves is not a re-order
+    # The advisor's own contract keeps the ineligible tail last, but the
+    # bridge does not TRUST that: an order that promotes a move which cannot
+    # run here is refused outright, because "the model said so" is not a way
+    # to make a blocked move executable.
+    states = [m.runnable() for m in ordered]
+    if any(not states[i] and states[i + 1] for i in range(len(states) - 1)):
+        return moves, {}
+    record = {
+        "applied": True,
+        "level": str(getattr(result, "level", "")),
+        "model": str(getattr(result, "model", "")),
+        "reason": str(getattr(result, "reason", "")),
+        "changed": [f"{cid}:{movement}" for cid, movement in
+                    (getattr(result, "changed", None) or [])],
+    }
+    return ordered, record
+
+
 # ---------------------------------------------------------------------------
 # public entry point
 # ---------------------------------------------------------------------------
@@ -361,6 +457,9 @@ def rank_next_moves(shell=None, limit: int = 9,
     # then the chain; then a stable tie-break so two runs are identical
     moves.sort(key=lambda m: (not m.runnable(), -m.trust, not m.chain,
                               m.title))
+    # The deterministic order is the FLOOR. A measured model may re-order it
+    # inside its earned caps; at `observe` this is a no-op by construction.
+    moves, ai = _ai_order(moves, goal=goal)
 
     # Keep every move that answers EVIDENCE found, points at the CHAIN, or
     # reports an honest gap (a step the manual core cannot run yet). Cap the
@@ -378,7 +477,7 @@ def rank_next_moves(shell=None, limit: int = 9,
             unevidenced += 1
 
     ranked = RankedMoves(moves=kept[:max(1, limit)], rejected=rejected,
-                         goal=goal)
+                         goal=goal, ai=ai)
     for i, move in enumerate(ranked.moves, 1):
         move.index = i
     if remember:
@@ -404,6 +503,11 @@ def render_moves(ranked: RankedMoves, console=None) -> None:
     for move in ranked.moves:
         why = f"  [dim]why: {move.why}[/]" if move.why else ""
         console.print(f"  [{move.index:2}] {move.title}{why}  {move.badge()}")
+    if ranked.ai:
+        console.print(
+            f"  [dim]model reordered {len(ranked.ai.get('changed') or [])} "
+            f"move(s): {ranked.ai.get('level') or '?'} · "
+            f"{ranked.ai.get('model') or '?'}[/]")
     rejected = ranked.rejected[:4]
     if rejected:
         console.print("[bold cyan]── WHY NOT ──[/]")

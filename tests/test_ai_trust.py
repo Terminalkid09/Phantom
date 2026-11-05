@@ -193,12 +193,34 @@ def test_a_strong_baseline_delta_can_now_reach_decide(tmp_path):
     advantage. The old constant asked for 0.10 (102% of it) and downgraded it
     to ``nudge`` for a reason that had nothing to do with the measurement.
     """
-    registry = _manifest(tmp_path, {"verdict": "promote", "n": 31,
+    # n=40, not 31: the ladder also requires TWICE the row floor for the
+    # large-gap profile (`test_a_thin_sample_is_only_a_nudge`), and this test
+    # is about the THRESHOLD formula, so it must hold the sample fixed and
+    # comfortably above that bar instead of accidentally testing both rules.
+    registry = _manifest(tmp_path, {"verdict": "promote", "n": 40,
                                     "delta": 0.0399, "ci_low": 0.0150,
                                     "baseline": 0.9021, "min_rows": 20})
     got = trust_for("exploit", registry=registry)
     assert got.level == "decide", got.reason
     assert "headroom" in got.reason
+
+
+def test_a_thin_sample_is_only_a_nudge(tmp_path):
+    """Measured 2026-11-03: a 23-row promotion earned the widest lever.
+
+    The 23-row production corpus promoted a ranker at +0.130 over a 0.133
+    headroom (97% of the room), so the ladder handed it +/-35 points and five
+    positions on 23 generated rows. The row floor says "this is evidence at
+    all"; the large-gap profile needs a bigger sample than that, and the
+    reason must say which rule refused it.
+    """
+    registry = _manifest(tmp_path, {"verdict": "promote", "n": 31,
+                                    "delta": 0.0399, "ci_low": 0.0150,
+                                    "baseline": 0.9021, "min_rows": 20})
+    got = trust_for("exploit", registry=registry)
+    assert got.level == "nudge", got.reason
+    assert "twice the" in got.reason
+    assert got.bound == 0.12, "nudge keeps the small, real effect"
 
 
 def test_a_weak_baseline_delta_of_the_same_size_is_only_a_nudge(tmp_path):

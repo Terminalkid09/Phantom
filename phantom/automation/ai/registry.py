@@ -16,13 +16,30 @@ A manifest is the only way a model enters the runtime:
 A manifest without non-empty numeric ``eval`` and ``baseline`` is REFUSED:
 an unmeasured adapter is not a model, it is an experiment. That is the gate
 between ``training/`` and the live decision path.
+
+THE ARTIFACT MUST EXIST (measured 2026-11-02). A manifest is a claim about a
+model, and the claim used to outlive the model: ``models/exploit/
+ranker-2026-10-30/manifest.json`` still carried ``promoted: true`` after its
+``ranker.json`` was deleted, so ``ModelRegistry.promoted('exploit')`` returned
+it, ``trust_for('exploit')`` reported ``nudge`` (the runtime believed it had a
+second opinion), and ``--ai integrated`` handed the manifest's version string
+to a chat endpoint as a model id. Three subsystems were told a model existed
+because one JSON file said so. ``manifest_errors`` now also refuses a promoted
+manifest whose named artifact cannot be resolved on disk, which makes
+"promoted" mean "measured AND installed" in ONE place — the registry — instead
+of three.
+
+A manifest that names no artifact at all (``ranker``/``adapter`` absent) is
+still validated by its measurement alone: those are hand-written test and
+benchmark manifests, and refusing them would test the rule rather than the
+model. A manifest that NAMES an artifact owes that file.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 REQUIRED = ("phase", "version", "base_model", "sha256", "trained_at",
@@ -35,8 +52,79 @@ def _numbers(mapping: Any) -> bool:
                     for v in mapping.values()))
 
 
-def manifest_errors(manifest: Dict[str, Any], phase: str = "") -> List[str]:
-    """Why this manifest may not serve ``phase`` (empty = acceptable)."""
+def _artifact_reference(manifest: Dict[str, Any]) -> Tuple[str, bool]:
+    """``(reference, is_a_file)`` for the artifact this manifest names.
+
+    A linear ranker is one JSON file; every other kind is a directory of
+    adapter weights. The distinction lives here so the registry and
+    ``linear.promoted`` cannot disagree about what "installed" means.
+    """
+    if str(manifest.get("kind") or "").strip().lower() == "linear-ranker":
+        return str(manifest.get("ranker") or "").strip(), True
+    return str(manifest.get("adapter") or "").strip(), False
+
+
+def artifact_path(manifest: Dict[str, Any],
+                  root: Optional[Path] = None) -> Optional[Path]:
+    """Where the named artifact is, or would be (``None`` = names none).
+
+    Resolution order matches ``linear.promoted``: next to the manifest first,
+    then the registry root. Windows-authored manifests carry backslashes
+    (``models\\exploit\\v1\\ranker.json``), so the reference is normalised
+    before it becomes a path: on POSIX that string is one long filename, not a
+    nested path.
+    """
+    reference, is_file = _artifact_reference(manifest)
+    if not reference:
+        return None
+    candidate = Path(reference.replace("\\", "/"))
+    if candidate.is_absolute():
+        return candidate
+    bases: List[Path] = []
+    manifest_dir = str(manifest.get("_manifest_dir") or "").strip()
+    if manifest_dir:
+        bases.append(Path(manifest_dir))
+    bases.append(Path(root) if root is not None else PROJECT_ROOT)
+    for base in bases:
+        resolved = base / candidate
+        if (resolved.is_file() if is_file else resolved.is_dir()):
+            return resolved
+    return bases[0] / candidate
+
+
+def artifact_problem(manifest: Dict[str, Any],
+                     root: Optional[Path] = None) -> str:
+    """Why the artifact this manifest names is not servable ("" = fine)."""
+    kind = str(manifest.get("kind") or "").strip().lower()
+    reference, is_file = _artifact_reference(manifest)
+    if not reference:
+        # A manifest that CLAIMS to be a ranker and names no file is broken,
+        # not measurement-only; the same holds for an explicitly empty
+        # ``adapter`` path. A manifest with neither key is a test/benchmark
+        # fixture and keeps the old, measurement-only rule.
+        if kind == "linear-ranker":
+            return "a linear-ranker manifest must name its 'ranker' file"
+        if "adapter" in manifest:
+            return "the 'adapter' path is empty"
+        return ""
+    resolved = artifact_path(manifest, root)
+    exists = bool(resolved is not None
+                  and (resolved.is_file() if is_file else resolved.is_dir()))
+    if exists:
+        return ""
+    what = "file" if is_file else "directory"
+    return (f"artifact {what} missing: {reference!r} (a promoted manifest "
+            f"owes the model it names)")
+
+
+def manifest_errors(manifest: Dict[str, Any], phase: str = "",
+                    root: Optional[Path] = None) -> List[str]:
+    """Why this manifest may not serve ``phase`` (empty = acceptable).
+
+    ``root`` is the registry's project root; it is only used to resolve a
+    relative artifact reference, so a test registry stays self-contained
+    instead of resolving against the real checkout.
+    """
     errors: List[str] = []
     if not isinstance(manifest, dict):
         return ["manifest is not an object"]
@@ -56,6 +144,10 @@ def manifest_errors(manifest: Dict[str, Any], phase: str = "") -> List[str]:
         errors.append("baseline must be a non-empty map of metric -> number")
     if manifest.get("promoted") is not True:
         errors.append("manifest is not promoted")
+    else:
+        problem = artifact_problem(manifest, root)
+        if problem:
+            errors.append(problem)
     return errors
 
 
@@ -88,7 +180,7 @@ class ModelRegistry:
     def get(self, phase: str, version: str) -> Optional[Dict[str, Any]]:
         for manifest in self.candidates(phase):
             if str(manifest.get("version")) == str(version) \
-                    and not manifest_errors(manifest, phase):
+                    and not manifest_errors(manifest, phase, self.root):
                 return manifest
         return None
 
@@ -99,7 +191,7 @@ class ModelRegistry:
         registry is deterministic across filesystems.
         """
         valid = [m for m in self.candidates(phase)
-                 if not manifest_errors(m, phase)]
+                 if not manifest_errors(m, phase, self.root)]
         if not valid:
             return None
         valid.sort(key=lambda m: (str(m.get("trained_at", "")),

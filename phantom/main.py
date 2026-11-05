@@ -135,6 +135,13 @@ def build_parser() -> argparse.ArgumentParser:
                              "llama.cpp, cloud OpenAI-compatible endpoint, or "
                              "integrated promoted per-phase adapter; per-phase "
                              "overrides live in ai.<phase>.mode")
+    parser.add_argument("--ai-authority", default=None,
+                        choices=["auto", "nudge", "decide", "full"],
+                        help="AI authority override (auto-mode): auto (default) "
+                             "lets the measured eval gate decide. nudge/decide/"
+                             "full FORCE a level and say so in the run log — an "
+                             "override is announced, never silent, and it can "
+                             "never make a model add candidates or emit commands")
     parser.add_argument("--experience", action="store_true",
                         help="CROSS-ENGAGEMENT learning memory (auto-mode): "
                              "keep cause->repair experience between runs "
@@ -167,6 +174,12 @@ def main():
     # flag needs no extra kwarg through every run_auto_mode caller.
     if getattr(args, "ai", ""):
         os.environ["PHANTOM_AI_MODE"] = str(args.ai)
+    # Same seam for the authority ladder: `trust.apply_authority` reads this
+    # variable and ANNOUNCES the override in the decision reason, so a forced
+    # level can never pass for an earned one (measured 2026-11-02: the
+    # operator could only set it in the config file, not from the CLI).
+    if getattr(args, "ai_authority", ""):
+        os.environ["PHANTOM_AI_AUTHORITY"] = str(args.ai_authority)
     # `parse_known_args` exists so `--auto <t1> <t2>` can take extra TARGETS.
     # Anything else left over that looks like a flag is an option this entry
     # point does not have: refusing it is the difference between "`--agent` did

@@ -168,6 +168,11 @@ def _manifest(tmp_path, phase="exploit", version="v1", **overrides):
     manifest.update(overrides)
     folder = tmp_path / "models" / phase / version
     folder.mkdir(parents=True)
+    # A promoted manifest that NAMES an adapter owes the directory: since
+    # 2026-11-02 the registry refuses `promoted: true` over an artefact that
+    # is not on disk (that is how a deleted ranker kept `trust` at `nudge`).
+    # The fixture writes what a real promotion would have written.
+    (folder / "adapter").mkdir(exist_ok=True)
     (folder / "manifest.json").write_text(json.dumps(manifest),
                                           encoding="utf-8")
     return manifest
