@@ -109,6 +109,54 @@ class TaskPolicyError(PermissionError):
 _STATE_VERSION = 1
 _STATE_PERSIST_INTERVAL = 2.0
 
+# BOUNDED RETENTION. The file is rewritten whole on every save, so an
+# unbounded history is an unbounded write: measured 2026-11-05, the operator's
+# state file was 116 KB with 45 beacon records, most of them stale test
+# artefacts from one afternoon, and nothing ever removed them. These caps keep
+# the NEWEST records and drop the oldest by timestamp.
+MAX_BEACONS = 200
+MAX_TASKS = 2000
+MAX_RESULTS = 2000
+
+#: Fields consulted, in order, to date a record. Producers stamp different
+#: keys; a record with none of them sorts OLDEST, because it cannot be shown
+#: to be recent and keeping it while dropping a dated one would lose the newer
+#: half of the operation without saying so.
+_STAMP_KEYS = ("last_seen", "seen", "updated", "created", "timestamp",
+               "ts", "time")
+
+
+def _record_stamp(record: Any) -> str:
+    """A sortable timestamp for one persisted record ('' when undatable)."""
+    if not isinstance(record, dict):
+        return ""
+    for key in _STAMP_KEYS:
+        value = record.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return f"{float(value):020.6f}"
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _bounded(mapping: Any, cap: int) -> tuple:
+    """Return ``(kept, dropped)`` with at most ``cap`` entries, newest kept.
+
+    Dict order is preserved on the survivors, so the on-disk shape does not
+    churn between saves. Sorting is stable: equally-dated (or undatable)
+    records keep insertion order and the earliest inserted are the first to
+    go, which is the best available reading of "oldest".
+    """
+    if not isinstance(mapping, dict) or len(mapping) <= cap:
+        return mapping, 0
+    keys = list(mapping)
+    keys.sort(key=lambda k: _record_stamp(mapping.get(k)))
+    drop = set(keys[:len(keys) - cap])
+    kept = {k: v for k, v in mapping.items() if k not in drop}
+    return kept, len(drop)
+
 
 class C2State:
     """Thread-safe state shared by the C2 shell and aiohttp listener."""
@@ -150,6 +198,10 @@ class C2State:
         self._state_persist_path = self._resolve_state_path()
         self._state_persist_last = 0.0
         self._state_dirty = False
+        # how many records the LAST save dropped to respect the caps, so the
+        # operator can see the compaction instead of discovering it.
+        self._state_dropped: dict[str, int] = {
+            "beacons": 0, "tasks": 0, "results": 0}
         # Review-3: the remote-session modules get their OWN expiring token.
         # The global payload token unlocks EVERY payload forever; a remote
         # session is a time-boxed capability grant with its own revocation,
@@ -393,14 +445,25 @@ class C2State:
                            f"({exc.__class__.__name__})")
             return
         with self.lock:
+            beacons, dropped_beacons = _bounded(_jsonable(self.beacons),
+                                                MAX_BEACONS)
+            tasks, dropped_tasks = _bounded(_jsonable(self.tasks), MAX_TASKS)
+            results, dropped_results = _bounded(_jsonable(self.results),
+                                                MAX_RESULTS)
             payload = {
                 "version": _STATE_VERSION,
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
-                "beacons": _scrub_secrets(_jsonable(self.beacons)),
-                "tasks": _scrub_secrets(_jsonable(self.tasks)),
-                "results": _scrub_secrets(_jsonable(self.results)),
+                "beacons": _scrub_secrets(beacons),
+                "tasks": _scrub_secrets(tasks),
+                "results": _scrub_secrets(results),
                 "auto_shell": bool(self.auto_shell),
             }
+            # In memory the engagement is complete; only the FILE is bounded.
+            # The counts stay out of the payload so the on-disk schema is
+            # unchanged for every existing reader.
+            self._state_dropped = {"beacons": dropped_beacons,
+                                   "tasks": dropped_tasks,
+                                   "results": dropped_results}
         try:
             directory = os.path.dirname(os.path.abspath(path))
             if directory:
@@ -421,6 +484,24 @@ class C2State:
     def flush(self) -> None:
         """Write whatever the debounce deferred (used on shutdown)."""
         self._persist_state(force=True)
+
+    def compacted(self) -> dict[str, int]:
+        """How many records the LAST save dropped to respect the caps."""
+        with self.lock:
+            return dict(self._state_dropped)
+
+    def stats(self) -> dict[str, Any]:
+        """Retention at a glance: live counts, caps and last compaction."""
+        with self.lock:
+            return {
+                "beacons": len(self.beacons),
+                "tasks": len(self.tasks),
+                "results": len(self.results),
+                "max_beacons": MAX_BEACONS,
+                "max_tasks": MAX_TASKS,
+                "max_results": MAX_RESULTS,
+                "dropped_last_save": dict(self._state_dropped),
+            }
 
     def set_auto_shell(self, enabled: bool) -> bool:
         """Turn auto-open shell on/off for this run (audited)."""
