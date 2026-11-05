@@ -3061,43 +3061,21 @@ class AutonomousAgent:
         return out[:60]
 
     def _materialize_payload(self, command: str) -> str:
-        """Write the payload command to a temp file so sandbox backends can
-        actually scan/detonate it (Defender, Docker, VM). The dropper is a
-        shell script staged from our C2 listener."""
-        import os
-        import tempfile
-        fd, path = tempfile.mkstemp(prefix="phantom_payload_", suffix=".sh",
-                                    dir=tempfile.gettempdir())
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(command)
-        return path
+        """Delegate to :mod:`phantom.automation.agent_payload` (moved
+        2026-11-05: the payload boundary does not belong in the planner)."""
+        from phantom.automation.agent_payload import materialize_payload
+        return materialize_payload(command)
 
     def _deploy_sample_path(self) -> str:
-        """The artifact the sandbox backends scan/detonate for beacon_deploy:
-        the actual binary shipped to the target (the static Linux build when
-        present — exactly what _wrap_remote_exec scp's over). Scanning the
-        *deployment command* instead validated nothing: a scp/ssh or curl
-        dropper cannot run inside the networkless docker container (no
-        sshpass, no curl) so it always "crashed" with EXIT:127, and it is
-        the binary — not the one-liner — that AV/EDR would ever see."""
-        binary = getattr(self, "_last_beacon_binary", "")
-        if not binary or not os.path.exists(binary):
-            return ""
-        static = os.path.join(os.path.dirname(binary), "beacon_linux_static")
-        if os.path.exists(static):
-            return static
-        return binary
+        """Delegate to :mod:`phantom.automation.agent_payload`."""
+        from phantom.automation.agent_payload import deploy_sample_path
+        return deploy_sample_path(self)
 
     def _preflight(self, capability_id: str,
                    sample_path: str = "") -> SandboxVerdict:
-        self._emit("sandbox", capability=capability_id,
-                   detail="pre-flight sample validation",
-                   sample=sample_path)
-        try:
-            return self.sandbox.preflight(sample_path)
-        except Exception as e:
-            return SandboxVerdict(approved=False, results=[],
-                                  reason=f"sandbox error: {e}")
+        """Delegate to :mod:`phantom.automation.agent_payload`."""
+        from phantom.automation.agent_payload import preflight
+        return preflight(self, capability_id, sample_path)
 
     # ------------------------------------------------------------- main loop
 
