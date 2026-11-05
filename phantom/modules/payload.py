@@ -1160,6 +1160,16 @@ class PayloadModule(BaseModule):
             return
         # sandbox preflight of the compiled binary (best-effort: backends
         # missing just means 'no verdict', never a crash)
+        #
+        # The verdict is RECORDED, not just printed (measured 2026-11-03).
+        # This block used to end at a notifier line inside a bare `except`, so
+        # a drop that reached quarantine, a drop that never executed and a
+        # drop nobody scanned looked identical in the report. The record
+        # separates the three facts, and only the first may read as clean.
+        from phantom.utils.defender_check import preflight_record
+        preflight = {"backend": "", "approved": False,
+                     "summary": "no sandbox backend available — UNSCANNED",
+                     "scanned": False}
         try:
             from phantom.automation.sandbox.sandbox import SandboxEngine
             from phantom.utils import beacon_artifacts
@@ -1176,12 +1186,31 @@ class PayloadModule(BaseModule):
                 handle.close()
                 staged = handle.name
             verdict = SandboxEngine().preflight(staged)
-            if verdict.approved:
-                notifier.success("Sandbox preflight: APPROVED.")
+            preflight = preflight_record(verdict)
+            if preflight["scanned"] and preflight["approved"]:
+                notifier.success(
+                    f"Sandbox preflight: APPROVED — {preflight['summary']}")
             else:
-                notifier.warn(f"Sandbox preflight: {verdict.summary()}")
-        except Exception:
+                notifier.warn(f"Sandbox preflight: {preflight['summary']}")
+        except Exception as exc:
+            preflight = {"backend": "", "approved": False,
+                         "summary": (f"sandbox unavailable "
+                                     f"({type(exc).__name__}) — UNSCANNED"),
+                         "scanned": False}
             notifier.warn("Sandbox preflight unavailable (no backend) — skipping.")
+        # One record, on the session, so the report can state what happened
+        # instead of the operator having to remember a warning they scrolled
+        # past. Never raises: a missing session must not fail a deploy.
+        try:
+            session.add_note(
+                f"Payload preflight ({platform}): "
+                + (f"scanned — {preflight['summary']}"
+                   if preflight["scanned"] else
+                   f"UNSCANNED — {preflight['summary']}"))
+            session.knowledge_base.setdefault("preflight", {})["deploy"] = \
+                dict(preflight)
+        except Exception:
+            pass
         # RESILIENT by default: this one-liner is pasted by hand and may be
         # run before the C2 is up (a physical drop, a staged exfil). If the
         # first download fails it schedules its own retry with the endpoint
@@ -1191,6 +1220,36 @@ class PayloadModule(BaseModule):
         if not dropper:
             notifier.error("No dropper defined for this platform.")
             return
+        # Windows targets: say out loud that Defender may eat the drop. The
+        # measured failure (2026-11-02) was a beacon whose process stayed alive
+        # with no check-in, which reads as "the payload crashed" unless the
+        # operator is told quarantine is a separate explanation. Warning only:
+        # this path NEVER disables an injection technique or changes its exit.
+        #
+        # The note answers the TARGET question (2026-11-03): it used to be
+        # gated on THIS box having Defender, so an operator on Linux or macOS
+        # deploying to Windows was told nothing — about the one machine where
+        # the payload actually runs.
+        # ...and it names EVERY registered AV, not just Defender (measured
+        # 2026-11-03 on this box: SecurityCenter2 answers Defender AND McAfee
+        # while WinDefend is stopped, so the old Defender-only answer was both
+        # wrong and silent about the product that is actually installed).
+        # ONE enumeration for the whole deploy: the probe starts a PowerShell
+        # (~1 s) and there is no reason to pay for it twice.
+        from phantom.utils.defender_check import av_note, av_products
+        from phantom.utils.defender_check import is_target_windows
+        _av = av_products() if is_target_windows(platform) else []
+        _defender = av_note(platform, products=_av)
+        if _defender:
+            notifier.warn(_defender)
+            if _av:
+                session.add_note("AV on the operator box: " + ", ".join(
+                    str(p.get("name")) for p in _av))
+        if is_target_windows(platform) and not preflight.get("scanned"):
+            notifier.warn(
+                "This build was NOT scanned by any local engine: 'not "
+                "detected' would be a guess here, not a result. The "
+                "quarantine history on the target is the only evidence.")
         console.print(f"\n[bold green][+] Deploy command (run on target):[/]")
         console.print(f"    [yellow]{dropper}[/]\n")
         session.add_note(f"Payload: {platform} beacon built for {c2_host}:{c2_port}")

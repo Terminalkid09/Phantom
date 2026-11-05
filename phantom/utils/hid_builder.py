@@ -68,6 +68,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from phantom.utils.hid_layouts import (
     HID_LAYOUTS,
+    is_strict,
     normalize_layout,
     segments,
     special_key_chars,
@@ -1100,8 +1101,10 @@ def build_hid_payload(board: str, command: str, *,
     it when the operator carries it back, without making it useless after the
     first shell. ``0`` = unlimited.
 
-    Raises ``ValueError`` on an unknown board, an unknown layout or an empty
-    command: a blank HID payload is a bad flash, not a silent no-op.
+    Raises ``ValueError`` on an unknown board, an unknown layout, an empty
+    command, or a character the chosen layout has no verified key for: a blank
+    HID payload is a bad flash, and a guessed key is a wrong character in a
+    command the operator will run as root.
     """
     board = canonical_board(board)
     if board not in BOARDS:
@@ -1166,11 +1169,29 @@ def build_hid_payload(board: str, command: str, *,
     if layout != "us":
         missing = unsupported_chars(command, layout)
         if missing:
-            notes.append(
-                f"layout {layout}: no key produces {''.join(missing)!r} — the "
-                f"board will type something else there; reword the command")
+            if is_strict(layout):
+                notes.append(
+                    f"layout {layout}: no verified key produces "
+                    f"{''.join(missing)!r} — the build is REFUSED rather "
+                    f"than typing an approximation; reword the command or "
+                    f"pick another layout")
+            else:
+                notes.append(
+                    f"layout {layout}: no key produces "
+                    f"{''.join(missing)!r} — the board will type something "
+                    f"else there; reword the command")
         needs_keys = special_key_chars(command, layout)
         if needs_keys and board in DUCKYSCRIPT_BOARDS:
+            if is_strict(layout):
+                # A strict layout has no fallback: STRING would send the US
+                # character, which on this layout is a DIFFERENT character.
+                # Refusing is the only honest outcome.
+                raise ValueError(
+                    f"layout {layout!r}: DuckyScript STRING cannot press "
+                    f"{''.join(needs_keys)!r} (they need AltGr or a non-US "
+                    f"key), and typing the US character instead would put "
+                    f"the wrong one in the command — use an "
+                    f"Arduino/CircuitPython board or reword it")
             notes.append(
                 f"layout {layout}: DuckyScript STRING cannot type "
                 f"{''.join(needs_keys)!r} (they need AltGr or a non-US key) — "

