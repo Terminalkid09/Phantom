@@ -77,7 +77,8 @@ class TestGroundTruthScoring(unittest.TestCase):
         metrics = score(scenario, {}, events, _WM())
         self.assertEqual(metrics.inappropriate_actions, ["cleanup"])
 
-    def test_operator_interventions_are_counted(self):
+    def test_operator_interventions_are_counted_and_classified(self):
+        """The total is kept, but the three categories are NOT the same thing."""
         scenario = Scenario(name="x")
         events = _events(("handoff", {"beacon_id": "b1"}),
                          ("blocked", {"capability": "a",
@@ -87,6 +88,35 @@ class TestGroundTruthScoring(unittest.TestCase):
                          ("found", {"capability": "c"}))
         metrics = score(scenario, {}, events, _WM())
         self.assertEqual(metrics.operator_interventions, 2)
+        self.assertEqual(metrics.terminal_handoffs, 1)
+        self.assertEqual(metrics.midrun_interventions, 1)
+        self.assertEqual(metrics.honest_escalations, 0)
+
+    def test_a_terminal_handoff_is_not_an_autonomy_failure(self):
+        """The handover at the beacon is the design, and it used to be scored
+        as "the operator was needed", which made every successful run look
+        like a run that could not proceed alone."""
+        metrics = score(Scenario(name="x"), {}, _events(
+            ("handoff", {"beacon_id": "b1"})), _WM())
+        self.assertEqual(metrics.terminal_handoffs, 1)
+        self.assertEqual(metrics.midrun_interventions, 0)
+        self.assertEqual(metrics.operator_interventions, 1)
+
+    def test_an_honest_escalation_is_not_a_midrun_ask(self):
+        """`wrong_altitude` / `no_visibility` are the run saying it cannot
+        continue; penalising them would reward inventing a path."""
+        metrics = score(Scenario(name="x"), {}, _events(
+            ("escalation", {"reason": "wrong_altitude"}),
+            ("escalation", {"reason": "no_visibility"})), _WM())
+        self.assertEqual(metrics.honest_escalations, 2)
+        self.assertEqual(metrics.midrun_interventions, 0)
+
+    def test_a_confirm_while_the_plan_has_moves_is_a_midrun_intervention(self):
+        metrics = score(Scenario(name="x"), {}, _events(
+            ("confirm", {"capability": "a"})), _WM())
+        self.assertEqual(metrics.midrun_interventions, 1)
+        self.assertEqual(metrics.terminal_handoffs, 0)
+        self.assertEqual(metrics.honest_escalations, 0)
 
     def test_the_outcome_comes_from_the_production_model(self):
         scenario = Scenario(name="x", goal="complete_kill_chain")
@@ -226,6 +256,8 @@ class TestTheStandardSuite(unittest.TestCase):
                    if r["scenario"] == OPEN_TARGET.name)
         self.assertGreater(row["moves"], 0)
         self.assertEqual(row["operator_interventions"], 1)   # the handoff
+        self.assertEqual(row["terminal_handoffs"], 1)
+        self.assertEqual(row["midrun_interventions"], 0)
 
 
 class TestOneScenarioAtATime(unittest.TestCase):

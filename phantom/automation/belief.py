@@ -304,6 +304,40 @@ class WorldModel:
         self._findings[(kind, key)] = f
         return f
 
+    def confirm_service(self, key: str, source: str = "probe") -> bool:
+        """A port that a scanner ADVERTISED has now answered us in person.
+
+        A scan report is an advertisement: the text says ``3306/tcp open
+        mysql`` whether or not anything is listening (measured 2026-11-02:
+        the ``decoy_scan`` benchmark plants exactly that line and the run
+        believed it, scoring ``service:tcp/3306`` as a false positive). The
+        finding keeps its ``advertised`` flag until a handshake with that
+        port succeeds; this is the ONE place that clears it, so "confirmed"
+        has a single definition and every caller can be audited.
+
+        Additive on purpose: the value dict is copied rather than mutated
+        (a caller may still hold the dict it passed to ``add_finding``), and
+        the finding is not re-created, so the key, evidence and target stay
+        those of the original observation. Returns False when there is no
+        such finding, when its value is not a dict, or when it is already
+        confirmed — never raises.
+        """
+        stored = self._findings.get(("service", str(key)))
+        if stored is None or not isinstance(stored.value, dict):
+            return False
+        if not stored.value.get("advertised"):
+            return False
+        value = dict(stored.value)
+        value["advertised"] = False
+        stored.value = value
+        stored.confidence = max(float(stored.confidence), 0.95)
+        if source:
+            seen = set(stored.sources or ())
+            seen.add(str(source))
+            stored.sources = tuple(sorted(seen))
+            stored.independent_sources = len(seen)
+        return True
+
     def _record_revision(self, rev: Revision) -> None:
         self.revisions.append(rev)
         self.last_revision = rev

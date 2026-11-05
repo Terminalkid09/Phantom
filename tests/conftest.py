@@ -122,6 +122,30 @@ def _isolate_c2_engagement_state(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_audit_log(tmp_path, monkeypatch):
+    """Keep the hash-chained audit log out of the operator's real chain.
+
+    ``AuditLog`` defaults to ``<data_dir>/c2_audit.log``, so every test that
+    exercises a C2 path appended REAL records to the engagement's immutable
+    chain of custody, and tests that assert on it read a file the whole
+    suite writes. Measured 2026-11-02 under ``pytest-xdist``:
+    ``test_autopersist_honesty`` scans ``audit_log.tail(300)`` for its own
+    ``auto_persist_queued`` event and passed alone, then failed in the full
+    run because 16 workers had appended more than 300 records after it. The
+    singleton is redirected rather than re-created: production code imports
+    ``audit_log`` (the instance), so patching the module attribute would not
+    reach the call sites.
+    """
+    try:
+        from phantom.utils.audit_log import audit_log
+    except Exception:  # pragma: no cover - import guard for isolated runs
+        yield
+        return
+    monkeypatch.setattr(audit_log, "path", str(tmp_path / "c2_audit.log"))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_sessions_dir(tmp_path_factory, monkeypatch):
     """Keep session snapshots out of the operator's real data dir.
 

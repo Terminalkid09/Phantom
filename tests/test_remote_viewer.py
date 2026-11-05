@@ -31,10 +31,18 @@ def viewer(fake_beacon):
     yield port, token
 
 
+#: The client timeout is generous on purpose. These routes answer in
+#: milliseconds, but the suite runs under ``pytest-xdist`` (16 workers on this
+#: box), and a 5 s budget turned a loaded localhost connect + loopback server
+#: thread into a ``TimeoutError`` that passed when the file ran alone
+#: (measured 2026-11-02). A real hang still fails, only later.
+_CLIENT_TIMEOUT = 15
+
+
 def _get(url, token=""):
     req = urllib.request.Request(
         url, headers=({"Authorization": "Bearer " + token} if token else {}))
-    return urllib.request.urlopen(req, timeout=5).read()
+    return urllib.request.urlopen(req, timeout=_CLIENT_TIMEOUT).read()
 
 
 def _post(url, body, token=""):
@@ -43,7 +51,7 @@ def _post(url, body, token=""):
         headers["Authorization"] = "Bearer " + token
     req = urllib.request.Request(
         url, data=json.dumps(body).encode(), headers=headers)
-    return urllib.request.urlopen(req, timeout=5).read()
+    return urllib.request.urlopen(req, timeout=_CLIENT_TIMEOUT).read()
 
 
 def test_viewer_binds_loopback_random_port(viewer, fake_beacon):

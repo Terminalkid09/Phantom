@@ -417,6 +417,21 @@ _PHANTOM_COMMANDS = frozenset({
     "craft", "map", "install", "agent",
     # payload/handler module action words appearing in suggestion groups
     "generate", "deploy", "privesc", "listen", "start-listener",
+    # Suggestion-group verbs that LOOK like binaries (measured 2026-11-03).
+    # `payload` suggests `bind 4444` and `reverse 1.2.3.4 4444`, `web` suggests
+    # `creds`, `pivot` suggests `socks 1080` and `setup`, `wordlist` suggests
+    # `mutate`: each is a Phantom subcommand, and without this list a
+    # preflight would offer `apt-get install bind` for a verb. `host` is NOT
+    # here on purpose: in the osint group it is the real `host <domain>`
+    # binary from dnsutils/bind-utils.
+    "bind", "reverse", "socks", "setup", "creds", "mutate",
+    # `payload hid <board>` (build/flash the HID artefact) and `pivot`'s
+    # `portfwd` are the same kind of word: verbs, never packages.
+    "hid", "portfwd",
+    # `report`'s `export` writes the client report. Found by the coverage
+    # test once a session held findings: the gate was offering
+    # `apt-get install export` for a Phantom verb.
+    "export",
 })
 
 
@@ -493,7 +508,16 @@ def module_missing_tools(instance, commands=None) -> list:
 
 
 def tool_install_hint(tool: str) -> str:
-    """Cross-platform install hint for a missing tool (apt/brew/pip/choco)."""
+    """Cross-platform install hint for a missing tool (apt/brew/pip/choco).
+
+    ONE registry decides the package: `phantom.utils.toolchain` maps a tool to
+    the package name for the manager this machine actually has, and that
+    registry is also what the API toolchain endpoint and the Electron
+    installer read. The literal dict below is the FALLBACK for tools (or
+    managers) the registry does not cover, so the two surfaces cannot
+    advertise different packages for the same tool — they used to be two
+    independent lists, and every tool added to one was invisible in the other.
+    """
     import sys as _sys_mod
     if _sys_mod.platform.startswith("win"):
         sys_os = "windows"
@@ -501,6 +525,14 @@ def tool_install_hint(tool: str) -> str:
         sys_os = "darwin"
     else:
         sys_os = "linux"
+    try:
+        from phantom.utils import toolchain as _tc
+        cmd = _tc.install_command(tool, _tc.detect_env(_tc._os_release_text()))
+    except Exception:
+        cmd = None
+    if cmd:
+        # already elevated/per-user exactly as the manager needs it
+        return " ".join(cmd)
     hints = {
         "nmap": "sudo apt install nmap | brew install nmap | choco install nmap",
         "traceroute": "sudo apt install traceroute | brew install traceroute",

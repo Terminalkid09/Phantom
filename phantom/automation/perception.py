@@ -51,13 +51,26 @@ _SCRIPT_RE = re.compile(r"\|\s*([\w\-\.]+):\s*\n?((?:\|.*\n?)+)")
 
 
 def parse_nmap_ports(output: str, source: str = "nmap") -> List[Dict[str, Any]]:
-    """Extract open ports/services/versions from text output.
+    """Extract open ports/services/versions from TEXT output.
 
     Accepts nmap's classic table, the toolbelt's `nc -zv` floor sweep and
     masscan 'Discovered open port' lines — so every scan implementer feeds
     the same `service` facts downstream. nc/masscan lines carry no service
     label; the well-known-port table fills the gap (weak labels are fine:
-    version_detect and the fingerprint engine re-probe and correct)."""
+    version_detect and the fingerprint engine re-probe and correct).
+
+    A scan REPORT is an advertisement, not a handshake. Measured 2026-11-02:
+    the ``decoy_scan`` benchmark plants ``3306/tcp open mysql`` on a host
+    with no MySQL, and the run stored it as a service fact (false positive
+    ``service:tcp/3306``) then planned around it. So a port that only a
+    report claims is marked ``advertised: True`` and stays non-actionable
+    until ``WorldModel.confirm_service`` sees the port answer.
+
+    The ``nc -zv`` branch is the exception on purpose: its line is logged
+    only after the TCP connect SUCCEEDED ("Connection to ... succeeded"),
+    which is the handshake the other two formats only promise. It is marked
+    confirmed here rather than advertised, otherwise the one genuinely
+    probed path would need a second probe to trust itself."""
     if not output:
         return []
     findings = []
@@ -68,7 +81,7 @@ def parse_nmap_ports(output: str, source: str = "nmap") -> List[Dict[str, Any]]:
             continue
         seen.add((port, proto))
         value = {"port": port, "protocol": proto, "service": svc,
-                 "version": ver, "product": ""}
+                 "version": ver, "product": "", "advertised": True}
         if ver:
             value["product"] = ver.split()[0] if ver else ""
         findings.append(_p(kind="service", key=f"{proto}/{port}", value=value,
@@ -85,7 +98,10 @@ def parse_nmap_ports(output: str, source: str = "nmap") -> List[Dict[str, Any]]:
         svc = m.group(2) or PORT_SERVICE_MAP.get(int(port), "unknown")
         findings.append(_p(kind="service", key=f"tcp/{port}",
                            value={"port": port, "protocol": "tcp",
-                                  "service": svc, "version": "", "product": ""},
+                                  "service": svc, "version": "", "product": "",
+                                  # a logged SUCCEEDED connect: confirmed, not
+                                  # merely advertised (see the docstring)
+                                  "advertised": False},
                            confidence=0.7, evidence=m.group(0), source=source or "nc"))
     if findings:
         return findings
@@ -98,7 +114,8 @@ def parse_nmap_ports(output: str, source: str = "nmap") -> List[Dict[str, Any]]:
         svc = PORT_SERVICE_MAP.get(int(port), "unknown")
         findings.append(_p(kind="service", key=f"{proto}/{port}",
                            value={"port": port, "protocol": proto,
-                                  "service": svc, "version": "", "product": ""},
+                                  "service": svc, "version": "", "product": "",
+                                  "advertised": True},
                            confidence=0.7, evidence=m.group(0),
                            source=source or "masscan"))
     return findings

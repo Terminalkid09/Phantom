@@ -122,7 +122,14 @@ class TestTheStrictModeDecision(unittest.TestCase):
     @staticmethod
     def _cfg_bool(strict, unscoped):
         """A deterministic control-source stub: no dependence on the host's
-        config.json or on an env var another test may have leaked."""
+        config.json or on an env var another test may have leaked.
+
+        ``_flag`` is stubbed alongside it for the same reason: a machine whose
+        persisted state says ``PHANTOM_MTLS_REQUIRED=false`` turns this test
+        red on a correct build, because the guardrail then rightly reports a
+        disabled control. The decision under test is about strict mode, not
+        about what the operator switched off last week.
+        """
         def _inner(key, env):
             if key == "engagement.strict_guardrails":
                 return strict, "config"
@@ -142,6 +149,9 @@ class TestTheStrictModeDecision(unittest.TestCase):
         try:
             with mock.patch.object(gr, "_cfg_bool",
                                    self._cfg_bool(strict, unscoped)), \
+                 mock.patch.object(gr, "_flag",
+                                   side_effect=lambda _n, default: (True,
+                                                                   gr.DEFAULT)), \
                  mock.patch.object(gr, "snapshot_to_audit",
                                    return_value={"seq": 1}) as log:
                 allowed = shell._announce_guardrails()

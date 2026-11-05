@@ -96,12 +96,27 @@ class TestBackgroundProcess(unittest.TestCase):
         self.assertIn("B", out)
 
     def test_write_stdin(self):
+        # The child must FLUSH. A pipe makes Python's stdout block-buffered, so
+        # `write()` alone keeps the answer in an 8 KB buffer: the test then read
+        # an empty string and failed only under load (measured in the full
+        # parallel run, 2026-11-03), while passing alone. The assertion is the
+        # same — only the child's contract changed, because a background process
+        # whose output appears only at exit is not a usable background process.
         p = execute_quiet_bg(
-            self._py("import sys; [sys.stdout.write((l or '').upper()) for l in sys.stdin]")
+            self._py("import sys; [(sys.stdout.write((l or '').upper()), "
+                     "sys.stdout.flush()) for l in sys.stdin]")
         )
         p.write("hello\n")
-        time.sleep(0.3)
-        out = p.read()
+        # WAIT for the answer instead of assuming 0.3 s. The child is a fresh
+        # Python process that must start, read a line and flush it back; on a
+        # 16-worker run that took longer than the fixed sleep and the test
+        # failed with an empty read (measured 2026-11-03, twice). A bounded
+        # poll is not a weaker assertion — it still requires the real output.
+        out = ""
+        deadline = time.time() + 10.0
+        while time.time() < deadline and "HELLO" not in out:
+            out += p.read()
+            time.sleep(0.05)
         self.assertIn("HELLO", out)
         p.terminate()
 
