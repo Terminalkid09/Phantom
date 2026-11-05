@@ -384,7 +384,12 @@ class DMTransport:
     supports_files = False
 
     def send(self, target: str, text: str, timeout: float = 15.0) -> bool:
-        raise NotImplementedError
+        # An empty NotImplementedError used to reach the operator as a bare
+        # traceback with no channel in it. The message names the class method
+        # that the concrete channel must provide.
+        raise NotImplementedError(
+            f"{type(self).__name__}.send is an interface: the concrete DM "
+            "channel must implement it (platform policy differs per channel)")
 
     def send_document(self, target: str, path: str, caption: str = "",
                       filename: str = "", timeout: float = 90.0) -> bool:

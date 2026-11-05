@@ -30,6 +30,45 @@ PHASE_ORDER = (
     "report",
 )
 
+# Which module ACTUALLY implements each phase.
+#
+# The phase packages are a DECLARATIVE surface: they own the capability ids
+# and re-export adapters/interpreters from guidance/kit.py, while the
+# executable code lives in agent.py, kit.py and the per-phase modules. Without
+# this table "a phase exists" and "a phase is wired" read as the same
+# sentence, and the audit of 2026-11-05 could only conclude that the layer was
+# orphaned because nothing recorded the difference.
+#
+# A phase listed in PHASE_ORDER but absent here is NOT implemented — it has a
+# name and a capability list and nothing that runs. `unimplemented_phases()`
+# is the list an operator (or a test) can act on.
+IMPLEMENTATIONS: Dict[str, str] = {
+    "recon": "phantom.automation.recon_ladder",
+    "osint": "phantom.automation.social.engine",
+    "exploit": "phantom.automation.exploit.access",
+    # foothold's adapters/interpreters ARE guidance/kit.py functions, re-exported
+    # under this phase's namespace; the registry holds the live implementations.
+    "foothold": "phantom.automation.guidance.kit",
+    "beacon": "phantom.modules.payload",
+    "post": "phantom.automation.post.internal_recon",
+    "report": "phantom.automation.reporting",
+}
+
+
+def implementation_for(phase: str) -> Optional[str]:
+    """The module that implements a phase, or None when nothing does."""
+    return IMPLEMENTATIONS.get(phase)
+
+
+def unimplemented_phases() -> List[str]:
+    """Declared phases with no implementing module.
+
+    Empty is the goal. A non-empty list is an honest answer, not a bug: it
+    means the phase exists in the vocabulary and nowhere else.
+    """
+    return [p for p in PHASE_ORDER if p not in IMPLEMENTATIONS]
+
+
 # Two channel routes in the agent's registry belong to NO single kill-chain
 # phase and carry a LANE label instead:
 #

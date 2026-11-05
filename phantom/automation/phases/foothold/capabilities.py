@@ -2,6 +2,13 @@
 capabilities.py — the foothold phase's capabilities.
 
 Credential validation and (aggressive-only) bounded brute force.
+
+DECLARATIVE SURFACE: this module owns the ids and the phase-contract view, not
+behaviour. The adapters/interpreters are re-exported from guidance/kit.py
+(see adapters.py and interpreters.py in this package), and the executable
+phase lives in phantom.automation.agent. `phases.implementation_for("foothold")`
+returns that location, so "the phase exists" and "the phase is wired" are not
+the same claim.
 """
 
 from __future__ import annotations

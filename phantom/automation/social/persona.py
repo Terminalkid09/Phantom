@@ -38,15 +38,21 @@ class TempMailProvider:
 
     def create(self) -> Dict[str, str]:
         """Return {address, email_id} for a fresh inbox."""
-        raise NotImplementedError
+        raise NotImplementedError(
+            "TempMailProvider.create is an interface: the concrete provider "
+            "(e.g. GuerrillaMail) must implement it")
 
     def fetch_inbox(self, email_id: str, timeout: float = 30.0) -> List[Dict[str, str]]:
         """Return list of {id, from_, subject, body} — may block for new mail."""
-        raise NotImplementedError
+        raise NotImplementedError(
+            "TempMailProvider.fetch_inbox is an interface: the concrete "
+            "provider must implement it")
 
     def destroy(self, email_id: str) -> None:
         """Forget the inbox (use-and-discard)."""
-        raise NotImplementedError
+        raise NotImplementedError(
+            "TempMailProvider.destroy is an interface: the concrete provider "
+            "must implement it")
 
 
 class GuerrillaMail(TempMailProvider):
