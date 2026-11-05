@@ -14,7 +14,8 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 FLAG = os.environ.get("FLAG", "PHANTOM{chain_complete_ssrf_to_admin}")
-TOKEN = "adm-7f3c91e2"
+# Lab default, overridable by env so the secret is not a repository constant.
+TOKEN = os.environ.get("ADMIN_TOKEN", "adm-7f3c91e2")
 
 
 @app.route("/")

