@@ -30,6 +30,7 @@ import argparse
 import json
 import math
 import random
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -219,21 +220,46 @@ class Ranker:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
-def rows_for(phase: str = "exploit", *, ratio: float = 0.25
+#: Where a corpus comes from. ``auto`` is the historical pair (the curated
+#: rows plus any real engagement history); ``production`` is the corpus
+#: ``training.prod_vocab`` generates in PRODUCTION's candidate vocabulary.
+CORPORA = ("auto", "production")
+
+
+def corpus_paths(phase: str, corpus: str = "auto") -> List[Path]:
+    """The files one corpus name resolves to (one definition, one place)."""
+    token = str(corpus or "auto").strip().lower()
+    if token == "auto":
+        return [holdout.DATA_DIR / f"{phase}.jsonl",
+                # Real engagement history (``training.from_decisions``) is a
+                # second source with the SAME schema. Read when it exists: a
+                # checkout without it trains exactly as before.
+                holdout.DATA_DIR / f"{phase}.decisions.jsonl"]
+    if token == "production":
+        return [holdout.GOLDEN_DIR / f"{phase}.production.jsonl"]
+    raise ValueError(f"unknown corpus {corpus!r}: expected one of {CORPORA}")
+
+
+def rows_for(phase: str = "exploit", *, ratio: float = 0.25,
+             corpus: str = "auto"
              ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """``(train, test)`` from the SAME deterministic split the gate uses.
 
     The split comes from ``training.holdout.bucket`` on the raw corpus row, so
     a row used to fit the weights can never be the row that measures them.
+
+    ``corpus="production"`` reads ``training/golden/<phase>.production.jsonl``
+    instead of ``training/data/``. That wire was missing, and it is the whole
+    difference between a model that is measured and one that is inert: the
+    curated corpus asks about CAPABILITY ids (``beacon_deploy``) while
+    production emits ACCESS ids (``noncve:service:ssh:22``), so every per-id
+    weight fitted on the former scored zero on the latter. Measured
+    2026-11-02: the production corpus existed (23 rows, 23 scoreable) and no
+    ranker had ever read it.
     """
-    paths = [holdout.DATA_DIR / f"{phase}.jsonl",
-             # Real engagement history (``training.from_decisions``) is a
-             # second source with the SAME schema. Read when it exists: a
-             # checkout without it trains exactly as before.
-             holdout.DATA_DIR / f"{phase}.decisions.jsonl"]
     train: List[Dict[str, Any]] = []
     test: List[Dict[str, Any]] = []
-    for path in paths:
+    for path in corpus_paths(phase, corpus):
         if not path.is_file():
             continue
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -258,6 +284,35 @@ def rows_for(phase: str = "exploit", *, ratio: float = 0.25
                 continue
             (test if holdout.bucket(raw, ratio) == 0 else train).append(row)
     return train, test
+
+
+def scoreable_rows(rows: Iterable[Dict[str, Any]]) -> int:
+    """Rows that offer an ORDERING at all (two candidate ids or more).
+
+    One candidate is not a ranking: a corpus of single-service boxes would
+    train on nothing while looking populated, which is why the count is a
+    refusal condition and not a footnote.
+    """
+    return sum(1 for row in rows
+               if len(_candidates(row.get("input") or {})) >= 2)
+
+
+def unscoreable_weight_ids(model: Ranker,
+                           rows: Iterable[Dict[str, Any]]) -> List[str]:
+    """Non-zero weights the corpus never offered (empty = aligned).
+
+    A weight for an id the corpus cannot offer is not a weak weight, it is a
+    term that can never be applied: the runtime keys scores by the ids
+    production emits, so a model fitted on capability names scores every
+    production candidate at the bias. Measured 2026-11-02 — that is exactly
+    how the promoted ranker carried ``beacon_deploy`` while production spoke
+    ``noncve:service:ssh:22``, and why the reranker changed no decision.
+    """
+    offered: set[str] = set()
+    for row in rows:
+        offered.update(_candidates(row.get("input") or {}))
+    return sorted(cid for cid, weight in (model.weights or {}).items()
+                  if abs(float(weight)) > 1e-9 and cid not in offered)
 
 
 def train(rows: Iterable[Dict[str, Any]], *, epochs: int = EPOCHS,
@@ -393,8 +448,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                                      description=__doc__)
     parser.add_argument("--phase", default="exploit", choices=list(PHASES))
     parser.add_argument("--ratio", type=float, default=0.25)
-    parser.add_argument("--out", default="models/exploit/" + VERSION
-                        + "/ranker.json")
+    # No default path on purpose (2026-11-02): the old default wrote
+    # `models/exploit/<VERSION>/ranker.json` on EVERY run, including a run the
+    # gate had just REJECTED. A retrain therefore overwrote the published
+    # weights of an existing version directory with an unmeasured model, while
+    # the comment below says a retrain must not reuse the previous version
+    # string. The export now happens only when the gate promotes, unless the
+    # operator names a path explicitly.
+    parser.add_argument("--out", default="",
+                        help="where to write the weights (default: "
+                             "models/<phase>/<version>/ranker.json, written "
+                             "only when the gate promotes; an explicit path "
+                             "is always written, for inspection)")
     parser.add_argument("--version", default=VERSION,
                         help="version string recorded in the manifest — the "
                              "registry picks the newest PROMOTED manifest by "
@@ -407,21 +472,80 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--cv", action="store_true",
                         help="also report grouped k-fold CV over the TRAINING "
                              "rows (a second measurement, never the gate)")
+    parser.add_argument("--eval", default="auto",
+                        choices=("auto", "holdout", "cv"),
+                        help="what the GATE measures on: `holdout` (one "
+                             "untouched split), `cv` (grouped k-fold over the "
+                             "whole corpus, one out-of-fold prediction per "
+                             "row), or `auto` (holdout when it holds at least "
+                             "the gate's floor of rows, cv otherwise)")
+    parser.add_argument("--corpus", default="auto", choices=list(CORPORA),
+                        help="which corpus to train on: `auto` (the curated "
+                             "rows + real engagement history) or `production` "
+                             "(training.prod_vocab's rows, in production's "
+                             "candidate vocabulary)")
+    parser.add_argument("--require-scoreable", action="store_true",
+                        help="refuse to export a model the corpus cannot "
+                             "score: exit 3 when no row offers an ordering or "
+                             "when a non-zero weight names an id the corpus "
+                             "never offered")
     args = parser.parse_args(argv)
 
-    train_rows, test_rows = rows_for(args.phase, ratio=args.ratio)
+    train_rows, test_rows = rows_for(args.phase, ratio=args.ratio,
+                                     corpus=args.corpus)
     if not train_rows or not test_rows:
-        print("no rows: run `python -m training.holdout --write` first")
+        hint = ("run `python -m training.prod_vocab --write` first"
+                if args.corpus == "production"
+                else "run `python -m training.holdout --write` first")
+        print(f"no rows for corpus {args.corpus!r}: {hint}")
         return 2
     epochs = args.epochs
     ranker = train(train_rows, epochs=epochs)
     model, base, ids = evaluate(ranker, test_rows)
 
-    from training.gate import decide
-    decision = decide(args.phase, list(zip(model, base)))
+    from training.gate import MIN_ROWS, decide
+    # WHICH measurement the gate may use (measured 2026-11-03). The holdout is
+    # ONE split, and on a small corpus it can hold fewer rows than the gate's
+    # own floor: the 23-row production corpus leaves 8, so `n=8 < min_rows=20`
+    # rejected every model BY CONSTRUCTION. Nothing could ever be promoted,
+    # so the trained ranker never reached the runtime and `--ai integrated`
+    # behaved exactly like no AI at all.
+    #
+    # Grouped k-fold over the WHOLE corpus gives each row exactly one
+    # out-of-fold prediction (the group is the target's payload, so a target
+    # is never in the fit set and the validation set at once). The floor is
+    # NOT lowered: it now applies to the pooled n of out-of-fold rows, and
+    # the same bootstrap CI must still clear zero. `auto` prefers the holdout
+    # whenever it is big enough, so a healthy corpus keeps measuring on a
+    # split the model never trained on.
+    measurement = {"mode": "holdout", "rows": len(test_rows), "folds": 0}
+    pairs: List[Tuple[float, float]] = list(zip(model, base))
+    if args.eval == "cv" or (args.eval == "auto"
+                             and len(test_rows) < MIN_ROWS):
+        from training.cv import grouped_folds
+        folds = grouped_folds(list(train_rows) + list(test_rows), k=5)
+        pooled: List[Tuple[float, float]] = []
+        for fit_rows, validation_rows in folds:
+            if not fit_rows or not validation_rows:
+                continue
+            fold_model = train(fit_rows, epochs=epochs)
+            fold_scores, fold_base, _fold_ids = evaluate(fold_model,
+                                                         validation_rows)
+            pooled.extend(zip(fold_scores, fold_base))
+        if pooled:
+            pairs = pooled
+            measurement = {"mode": "grouped-cv", "rows": len(pooled),
+                           "folds": len(folds)}
+    decision = decide(args.phase, pairs)
     val_score = inner_validation_score(ranker, train_rows)
-    print(f"trained on {len(train_rows)} row(s), measured on {len(test_rows)} "
-          f"(epochs {epochs})")
+    if measurement["mode"] == "grouped-cv":
+        print(f"trained on {len(train_rows)} row(s); the holdout held only "
+              f"{len(test_rows)} row(s), below the gate's {MIN_ROWS}-row "
+              f"floor, so the gate measured {measurement['rows']} out-of-fold "
+              f"row(s) from {measurement['folds']} grouped fold(s)")
+    else:
+        print(f"trained on {len(train_rows)} row(s), measured on "
+              f"{len(test_rows)} (epochs {epochs})")
     print(f"inner validation ndcg {val_score:.4f} (a DIFFERENT measurement — "
           f"not the reported score)")
     print(f"model {sum(model) / len(model):.4f}  "
@@ -431,6 +555,22 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"-> {decision['verdict']}")
     for reason in decision["reasons"]:
         print(f"  reject: {reason}")
+    if args.require_scoreable:
+        everything = list(train_rows) + list(test_rows)
+        scoreable = scoreable_rows(everything)
+        offenders = unscoreable_weight_ids(ranker, everything)
+        if not scoreable or offenders:
+            print("REFUSED: the corpus cannot score this model.",
+                  file=sys.stderr)
+            print(f"  corpus {args.corpus!r}: {scoreable} row(s) offer an "
+                  f"ordering (need >= 1)", file=sys.stderr)
+            if offenders:
+                shown = ", ".join(offenders[:8])
+                print(f"  {len(offenders)} non-zero weight(s) name an id the "
+                      f"corpus never offered: {shown}", file=sys.stderr)
+            print("  nothing was written; train on the corpus whose ids the "
+                  "runtime emits (--corpus production)", file=sys.stderr)
+            return 3
     if args.cv:
         # A second, INDEPENDENT view: the holdout is one 31-row split, whose
         # resolution is ~0.03 per row. Folds are grouped by payload, because
@@ -454,7 +594,15 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"{report['n_groups']} target group(s) — a DIFFERENT measurement "
               f"from the holdout above, and not what the gate decides on")
 
-    out = Path(args.out)
+    if not args.out and decision["verdict"] != "promote":
+        print("not exported: the gate did not promote this model, so no "
+              "weights were written")
+        print("  pass --out <path> to export it deliberately, or retrain on "
+              "more rows (the gate's reason is above)")
+        # Same convention as the end of this function: a rejected run is a
+        # non-zero exit, whether or not it exported anything.
+        return 1
+    out = Path(args.out or f"models/{args.phase}/{args.version}/ranker.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     exported = ranker.to_dict()
     # The version has to travel INTO the weights file: the runtime reports
@@ -468,19 +616,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"ranker -> {out}")
 
     if args.write_manifest and decision["verdict"] == "promote":
+        # REAL timestamp, not a constant. The registry picks the live model by
+        # (trained_at, version), so a hard-coded date made every retrain tie
+        # with the previous one and left "which model is live" to the version
+        # string alone — measured 2026-11-03: ranker-2026-11-01 and
+        # ranker-2026-11-03 both claimed 2026-10-30T00:00:00Z.
+        from datetime import datetime, timezone
+        trained_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         manifest = {
             "phase": args.phase,
             "version": args.version,
             "base_model": "linear-pairwise-ranker",
             "sha256": __import__("hashlib").sha256(
                 out.read_bytes()).hexdigest(),
-            "trained_at": "2026-10-30T00:00:00Z",
+            "trained_at": trained_at,
             "training": {"epochs": epochs, "val_ndcg": val_score,
                          "val_ratio": VAL_RATIO,
                          "decide_delta": decision.get("decide_delta")},
             "eval": {"ndcg": round(sum(model) / len(model), 6)},
             "baseline": {"ndcg": round(sum(base) / len(base), 6)},
             "eval_gate": decision,
+            # Provenance of the NUMBER the gate decided on: a grouped-CV
+            # verdict is not the same evidence as a held-out one, and a report
+            # that cannot tell them apart is how "promoted" stops meaning
+            # anything.
+            "measurement": measurement,
             "promoted": True,
             "kind": "linear-ranker",
             # Relative to the manifest: the runtime resolves ``ranker.json``

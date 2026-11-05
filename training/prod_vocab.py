@@ -74,7 +74,7 @@ MEASUREMENT (2026-11-02, this checkout, offline: ``include_nvd=False``, so no
 request leaves the box). ``python -m training.prod_vocab --report``:
 
     before   exploit.holdout.jsonl     31 rows,  0 scoreable, coverage 0.00, no ndcg
-    after    exploit.production.jsonl  48 rows, 48 scoreable, coverage 1.00, ndcg 0.9x
+    after    exploit.production.jsonl  23 rows, 23 scoreable, coverage 1.00, ndcg 0.977
 
 The production ordering reaches a mean NDCG in the mid 0.9s against this
 rubric, and the disagreements are the finding, not a defect to tune away. Two
@@ -84,8 +84,10 @@ of them, visible in ``SWEEP`` without leaving this file:
   ``noncve:service:elasticsearch:9200`` (auth, no read) at 69.03 and the
   curated RCE ``CVE-2015-1427`` at 67.92 â€” an unauthenticated index read is
   ranked ABOVE a module that executes. Its ``success`` (0.78) and ``noise``
-  (0.20) beat the RCE's (0.85 / 0.70) at usefulness, because ``impact`` is
-  worth 0.25 while ``success + quiet`` are worth 0.65.
+  (0.20) beat  the RCE's (0.85 / 0.70) at usefulness, because ``success + quiet``
+  outweighed ``impact`` (0.65 against 0.25 when this was measured; the
+  ``balanced`` weights now put ``impact`` at 0.15, so re-run ``--report``
+  before quoting that gap).
 * the ``big-box-*`` sets, where a memcached stats answer (info only, success
   0.82 / noise 0.15) lands above nfs/rsync file reads and above a null SMB
   session: the weighting prefers a cheap trivial answer to a valuable one.
@@ -405,6 +407,42 @@ SWEEP: Tuple[Dict[str, Any], ...] = (
     {"scenario": "elastic-stack", "target": "10.20.3.13",
      "services": (_svc("9200", "elasticsearch"), _svc("11211", "memcached"),
                   _svc("22", "ssh"))},
+    # -- COVERAGE (measured 2026-11-03) ------------------------------------
+    # The corpus above taught the ranker 4 of the 10 candidate ids a
+    # twentieth-service host emits (`noncve:service:redis:6379`,
+    # `:vnc:5900`, `:snmp:161`, `:ldap:389`, `:mongodb:27017`, `:nfs:111`
+    # were all missing), so 60% of a real table arrived OUT OF VOCABULARY:
+    # the model could not score it, `rerank` agreed with the rules and the
+    # run looked identical with and without AI. These scenarios teach the
+    # ids the runtime actually emits, each paired with a move the doctrine
+    # ranks differently (a quiet file service against a loud database), so
+    # the ordering is not learned from one class of host alone.
+    {"scenario": "redis-ssh", "target": "10.20.4.11",
+     "services": (_svc("22", "ssh", "OpenSSH", "OpenSSH 7.4"),
+                  _svc("6379", "redis", "Redis", "6.0.9"))},
+    {"scenario": "redis-http", "target": "10.20.4.12",
+     "services": (_svc("80", "http", "nginx", "1.18.0"),
+                  _svc("6379", "redis", "Redis", "5.0.7"))},
+    {"scenario": "vnc-rdp", "target": "10.20.4.13",
+     "services": (_svc("3389", "ms-wbt-server"), _svc("5900", "vnc"),
+                  _svc("445", "microsoft-ds"))},
+    {"scenario": "snmp-ldap", "target": "10.20.4.14",
+     "services": (_svc("161", "snmp"),
+                  _svc("389", "ldap", "OpenLDAP", "2.4.44"),
+                  _svc("22", "ssh", "OpenSSH", "OpenSSH 8.2"))},
+    {"scenario": "mongodb-ssh", "target": "10.20.4.15",
+     "services": (_svc("27017", "mongodb", "MongoDB", "4.4.1"),
+                  _svc("22", "ssh", "OpenSSH", "OpenSSH 8.0"))},
+    {"scenario": "nfs-rpcbind", "target": "10.20.4.16",
+     "services": (_svc("111", "rpcbind"), _svc("2049", "nfs"),
+                  _svc("22", "ssh", "OpenSSH", "OpenSSH 7.9"))},
+    {"scenario": "postgres-redis", "target": "10.20.4.17",
+     "services": (_svc("5432", "postgresql", "PostgreSQL", "13.4"),
+                  _svc("6379", "redis", "Redis", "6.2.6"),
+                  _svc("80", "http", "nginx", "1.20.1"))},
+    {"scenario": "telnet-ftp-legacy", "target": "10.20.4.18",
+     "services": (_svc("23", "telnet"), _svc("21", "ftp", "vsftpd", "3.0.3"),
+                  _svc("22", "ssh", "OpenSSH", "OpenSSH 5.9"))},
 )
 
 
@@ -560,7 +598,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     rows = build_rows()
     if args.write:
-        path = write(rows)
+        path = write(rows, GOLDEN_PATH)
         print(f"written {len(rows)} row(s) -> {path}")
     if args.report:
         info = report()

@@ -228,3 +228,82 @@ def test_the_installed_ranker_is_measurable_end_to_end():
         pytest.skip("no promoted ranker installed in this checkout")
     assert loaded.weights
     assert loaded.rank(["web_rce", "scan_tcp"], {"web_surface": 1.0})
+
+
+def test_the_installed_ranker_speaks_the_runtime_vocabulary():
+    """Every non-zero per-id weight must be an id the runtime can emit.
+
+    This is the defect the scoreboard used to call "efficacia 3/10": the
+    promoted model carried ``scan_tcp``/``beacon_deploy``, production emits
+    ``noncve:service:ssh:22`` and ``CVE-...``, so every candidate scored the
+    bias and the reranker changed nothing. A regression here is silent — the
+    model still loads, still answers, and has no effect — so it is pinned.
+    """
+    loaded = linear.promoted("exploit")
+    if loaded is None:
+        pytest.skip("no promoted ranker installed in this checkout")
+    train_rows, test_rows = training_ranker.rows_for("exploit",
+                                                    corpus="production")
+    # BOTH halves: the weights are fitted on the train rows, so judging them
+    # against the holdout alone reports an id as unscoreable that the trainer
+    # legitimately saw.
+    everything = list(train_rows) + list(test_rows)
+    offenders = training_ranker.unscoreable_weight_ids(loaded, everything)
+    assert not offenders, (
+        "non-zero weights name ids the production corpus never offered: "
+        f"{offenders[:8]}")
+
+
+def test_the_promoted_ranker_corrects_a_production_ordering():
+    """End-to-end: through the production ``rerank`` API, not a bare score.
+
+    The row is one where the deterministic planner (``score_for``) puts an
+    already-open FTP service above a reachable RCE; the labelled order puts
+    the RCE first. The assertion is on the ORDER the advisor returns, so a
+    ranker that is loaded but never applied fails here.
+    """
+    from phantom.automation.ai.advisors import exploit as advisor
+    from phantom.automation.exploit.access import AccessCandidate
+
+    if linear.promoted("exploit") is None:
+        pytest.skip("no promoted ranker installed in this checkout")
+    path = training_ranker.corpus_paths("exploit", "production")[0]
+    rows = [json.loads(line) for line in
+            path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    row = next((r for r in rows
+                if r.get("id") == "prod-ssh-http-apache-ftp"), None)
+    if row is None:
+        pytest.skip("the production corpus no longer carries that row")
+
+    # The numbers production puts on a candidate of each access class
+    # (``access._RANK_SUCCESS`` for a `good` module, and the constant
+    # complexity/noise per class). Using ONE fallback for every non-exec row
+    # would flatten a file-read service into an `info` lead and hide exactly
+    # the ordering this test is about.
+    stats = {"exec": (0.75, 0.45, 0.70), "file_read": (0.70, 0.30, 0.40),
+             "info": (0.25, 0.55, 0.25)}
+    candidates = []
+    for cand in row["input"]["candidates"]:
+        access = str(cand.get("access") or "info")
+        success, complexity, noise = stats.get(access, stats["info"])
+        candidates.append(AccessCandidate(
+            id=str(cand["id"]), cve=str(cand.get("cve") or ""),
+            port=str(cand.get("port") or ""),
+            service=str(cand.get("service") or ""),
+            product=str(cand.get("product") or ""),
+            version=str(cand.get("version") or ""),
+            kind=str(cand.get("kind") or ""), access=access,
+            success=success, complexity=complexity, noise=noise,
+            actionable=True, auto_execute=True, exact_match=True))
+
+    deterministic = [c.id for c in sorted(
+        candidates,
+        key=lambda c: (-c.score_for("balanced"), -c.access_level,
+                       c.complexity, c.noise, c.id))]
+    result = advisor.rerank(candidates, "balanced",
+                            goal=str(row["input"].get("goal") or ""),
+                            profile=str(row["input"].get("profile") or ""))
+    expected = list(row["expected"]["ranking"])
+    assert [c.id for c in result.ordered] == expected
+    assert deterministic != expected
+    assert result.applied
