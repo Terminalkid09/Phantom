@@ -50,7 +50,10 @@ leaves the box.
 | `inappropriate_actions` | moves that must never be taken automatically | capabilities in the scenario's `forbidden` set that actually ran |
 | `time_to_recover` | moves from the last injected failure to the next evidence | the Nth failure is the Nth injection; the first success after it |
 | `budget` | OPSEC spend and the noise allowance, and whether either was crossed | the shared WorldModel's ledger (`opsec_spent`, `noise_score`) |
-| `operator_interventions` | how often a human was needed | `handoff`/`confirm`/`consent`/`await_operator` events, plus `blocked` events that ask for one |
+| `operator_interventions` | EVERY operator-facing event, all three categories below added up | `handoff` + `escalation` + the mid-run asks |
+| `terminal_handoffs` | the shell is handed over at the beacon | `handoff` events |
+| `honest_escalations` | the run says it cannot continue (wrong altitude, no visibility) | `escalation` events |
+| `midrun_interventions` | **the autonomy number**: an ask while the plan still had moves | `confirm`/`consent`/`await_operator`/`manual_step`, plus `blocked` events that ask for one |
 | `honest` | the outcome agrees with the metrics | a computed invariant, not a hand-set field |
 
 Attempts are reconstructed from the **event stream the UI renders**, so the
@@ -72,51 +75,69 @@ metric and the operator see the same run.
 | `decoy_scan` | the open box, but the SCANNER advertises MySQL on 3306 that is not there | goal reachable | the run must not trust an unconfirmed banner. **Measured gap: it does** — 1 false positive, reported, not hidden |
 | `mobile_no_surface` | phone-shaped target, no TCP surface, `mobile` | goal **not** reachable | `no_visibility` is said out loud and no service is invented |
 
-## Misura 2026-10-29 (11 scenari)
+## Misura (11 scenari; ultima esecuzione 2026-10-29, metrica corretta il 2026-11-02)
 
 `python scripts/automode_benchmark.py` — output reale, non un obiettivo:
 
-| scenario | esito | goal | mosse | recovery | fp | vietate | interventi | budget |
-|---|---|---|---|---|---|---|---|---|
-| open_target | completed_goal | sì | 6 | – | 0 | 0 | 1 | ok |
-| flaky_web_probe | completed_goal | sì | 6 | 1 | 0 | 0 | 1 | ok |
-| scan_failure | partial | **no** | 11 | 4 | 0 | 0 | 2 | ok |
-| fortress | partial | no | 9 | – | 0 | 0 | 2 | ok |
-| budget_capped | completed_goal | sì | 6 | – | 0 | 0 | 1 | OVER |
-| rdp_only | partial | no | 3 | – | 0 | 0 | 1 | ok |
-| web_app_deep | completed_goal | sì | 6 | 2 | 0 | 0 | 1 | ok |
-| grey_noise | completed_goal | sì | 6 | – | 0 | 0 | 1 | ok |
-| out_of_scope | completed_without_goal | no | **0** | – | 0 | 0 | 0 | ok |
-| decoy_scan | completed_goal | sì | 6 | – | **1** | 0 | 1 | ok |
-| mobile_no_surface | partial | no | 9 | – | 0 | 0 | 2 | ok |
+| scenario | esito | goal | mosse | recovery | fp | vietate | handoff | escal | mid | budget |
+|---|---|---|---|---|---|---|---|---|---|---|
+| open_target | completed_goal | sì | 6 | – | 0 | 0 | 1 | 0 | 0 | ok |
+| flaky_web_probe | completed_goal | sì | 6 | 1 | 0 | 0 | 1 | 0 | 0 | ok |
+| scan_failure | partial | **no** | 11 | 4 | 0 | 0 | 0 | 2 | 0 | ok |
+| fortress | partial | no | 9 | – | 0 | 0 | 0 | 2 | 0 | ok |
+| budget_capped | completed_goal | sì | 6 | – | 0 | 0 | 1 | 0 | 0 | OVER |
+| rdp_only | partial | no | 3 | – | 0 | 0 | 0 | 1 | 0 | ok |
+| web_app_deep | completed_goal | sì | 6 | 2 | 0 | 0 | 1 | 0 | 0 | ok |
+| grey_noise | completed_goal | sì | 6 | – | 0 | 0 | 1 | 0 | 0 | ok |
+| out_of_scope | completed_without_goal | no | **0** | – | 0 | 0 | 0 | 0 | 0 | ok |
+| decoy_scan | completed_goal | sì | 6 | – | **0** | 0 | 1 | 0 | 0 | ok |
+| mobile_no_surface | partial | no | 9 | – | 0 | 0 | 0 | 2 | 0 | ok |
 
-Percentuali (calcolate da `benchmark.rates`, stampate a fine tabella):
+Percentuali (calcolate da `benchmark.rates`, stampate a fine tabella). Questa
+è la ri-esecuzione del **2026-11-02**, sullo stesso codice che stampa la
+tabella qui sopra:
 
 ```
 goal reached 85.7%   (6/7 scenari raggiungibili; l'unico mancato e' scan_failure)
-honest 100.0%        no false positive 90.9%   no forbidden action 100.0%
-no operator intervention 9.1%    (10 scenari su 11 chiedono un umano)
+honest 100.0%        no false positive 100.0%   no forbidden action 100.0%
+no operator intervention 9.1%    (TOTALE: handoff + escalation + mid-run)
+no mid-run intervention 100.0%   (nessuna richiesta mentre il piano aveva mosse)
 ```
 
-Il 90.9% (invece del 100%) e' il numero piu' utile della suite: viene dallo
-scenario `decoy_scan`, dove la scansione dichiara un MySQL che non esiste.
-L'agente lo riporta come finding (`service:tcp/3306`): **si fida del banner
-senza confermarlo**. E' esattamente il tipo di errore che un benchmark di soli
-target onesti non puo' vedere, ed e' per questo che e' stato aggiunto.
+Le tre colonne `handoff` / `escal` / `mid` sono la classificazione misurata, e
+spiegano perché la vecchia percentuale unica non era autonomia:
+
+* `handoff` — la shell viene consegnata all'operatore al beacon. Succede in
+  ogni run che arriva all'obiettivo: è il prodotto che funziona.
+* `escal` — il run dichiara di non poter proseguire (`wrong_altitude`,
+  `no_visibility`). È la risposta corretta su un target che non si raggiunge.
+* `mid` — una richiesta **mentre il piano aveva ancora mosse**. È l'unico
+  numero che misura l'autonomia, ed è `0` su tutti gli 11 scenari.
+
+Il falso positivo di `decoy_scan` è chiuso: la scansione dichiara ancora un
+MySQL inesistente, e il run lo registra come `service:tcp/3306` **annunciato**
+(`advertised`), non come servizio confermato. Il banner resta visibile in
+`unconfirmed_services` del report JSON, quindi la bugia del tool non viene
+nascosta — semplicemente non viene più scambiata per una misura. Un servizio
+che una probe ha davvero raggiunto resta un fatto confermato, e un servizio
+confermato che non esiste è ancora un falso positivo.
 
 Lettura onesta dei tre numeri che contano:
 
 * **85.7%** — la capacita` di arrivare all'obiettivo e` alta ma non completa, e
   il buco e` noto e riproducibile (`scan_failure`).
-* **90.9%** su falsi positivi (non 100%): la scansione bugiarda di `decoy_scan`
-  passa. Non inventa e non distrugge (`out_of_scope` con 0 mosse), ma **crede
-  al tool** — ed e` la prossima cosa da correggere.
-* **9.1%** su "nessun intervento operatore" — l'autonomia vera e` ancora bassa.
-  E` la metrica da guardare per prima: un run che chiede aiuto ogni volta non
-  e` automation, e` un assistente.
+* **100%** su falsi positivi: la scansione bugiarda di `decoy_scan` non passa
+  più come servizio confermato. Il 90.9% precedente era la misura del difetto,
+  non un obiettivo raggiunto.
+* **100%** su "nessun intervento mid-run": il 9.1% precedente contava l'`handoff`
+  finale (che è il design) e le escalation oneste (che sono l'alternativa
+  corretta all'inventare). La metrica da guardare è
+  `no_midrun_intervention_pct`: un run che chiede aiuto mentre il piano ha
+  ancora mosse non e` automation, e` un assistente.
 
-Caso peggiore: `mobile_no_surface`, 9 mosse e 2 interventi su un telefono che
-non espone TCP. Un profilo `mobile` non dovrebbe tentare una scansione di
+Caso peggiore: `mobile_no_surface`, 9 mosse e 2 eventi verso l'operatore su un
+telefono che non espone TCP — due `escalation` oneste (`no_visibility`), non due
+richieste di aiuto. Un profilo `mobile` non dovrebbe tentare una scansione di
 rete: e` il primo fix di questa lista.
 
 `scan_failure` deserves the emphasis: it asserts *honesty*, not success. If a

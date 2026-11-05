@@ -138,8 +138,8 @@ is a removal of duplication, not a feature.
 | # | Item | State | Criterion |
 |---|---|---|---|
 | D1 | **The Windows beacon runs on Win11 + Defender** | open — WinError 225 | a real check-in on a machine with Defender active. It is the bottleneck: without it the release does not impress a red teamer, whatever the UI does |
-| D2 | Single version | open — `SettingsPanel` says 3.7.3, `package.json`/`setup.py` 3.0.0 | one number, read from one place |
-| D3 | Untracked files committed | 36 untracked | `git status` clean apart from artefacts |
+| D2 | Single version | **closed 2026-11-02** — `SettingsPanel` reads `useAppVersion`; `3.7.3` survives only in the changelog as a historical entry | one number, read from one place |
+| D3 | Untracked files committed | **closed 2026-11-02** — the tree is clean apart from operator artefacts | `git status` clean apart from artefacts |
 | D4 | CHANGELOG frozen + tag `v3.0.0` | open | tag on the freeze commit |
 | D5 | Install smoke on a clean machine | open | `phantom --version` + one command per module |
 | D6 | Code signing | absent — SmartScreen warns | at least one certificate, or the limitation written in the README |

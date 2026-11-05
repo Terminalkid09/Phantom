@@ -31,7 +31,11 @@ models/
 
 The loader (`phantom.automation.ai.registry`) refuses a manifest that is
 missing, has no `eval`, has no `baseline` for a metric, scores below the
-baseline, or claims `promoted: true` while invalid. An unmeasured model is
+baseline, claims `promoted: true` while invalid, **or names an artefact that is
+not on disk**. The last rule was added on 2026-11-02 after a promoted ranker's
+`ranker.json` was deleted: the registry kept serving the manifest and
+`trust_for("exploit")` still said `nudge`, so the runtime advertised an
+authority it could not exercise. An unmeasured model is
 never loaded "just to try it": that is how a regression ships.
 
 ## Phases

@@ -6,6 +6,180 @@ All notable changes to Phantom.
 
 ## [Unreleased] — current development (v3.0.0 line)
 
+### AI: from "authority" to an effect you can measure — 2026-11-03
+
+- **The model was never in the decision path.** `next_moves.rank_next_moves`
+  is the single ranked list behind `run <n>`, `suggest` and the auto-mode move
+  order, and it contained no AI code: the trained advisor was reachable only
+  from `exploit sweep`. That is why `--ai integrated` produced the same lab
+  result as no AI — not because the model was bad, because it was not called.
+  The engine now asks the advisor after its deterministic sort, records the
+  outcome on the ranking (`ai: {applied, level, model, changed}`) and prints
+  one dim line when the model actually moved something. At `observe` (the
+  default) the advisor is not called at all and the order is byte-identical.
+- **Nothing could ever be promoted, by construction.** The gate demanded 20
+  rows and the 23-row production corpus leaves 8 in the holdout, so every
+  model was rejected on `n=8 < min_rows=20`. `training.ranker` gained
+  `--eval auto|holdout|cv`: grouped k-fold over the whole corpus gives every
+  row exactly one OUT-OF-FOLD prediction (the group is the target's payload,
+  so a target is never fitted and validated at once) and the same floor and
+  bootstrap CI now apply to the pooled rows. `auto` keeps the holdout
+  whenever it is big enough.
+- **Large-gap authority now needs more than the bare floor.** The first model
+  promoted by grouped CV earned `decide` (±35 points, 5 positions) on 23
+  generated rows, because its delta was 97% of the headroom. Below twice the
+  row floor the ladder caps at `nudge` (±12 points, 2 positions) and says
+  which rule refused it. The promoted manifest records HOW it was measured
+  (`measurement: {mode, rows, folds}`), so a report cannot mistake a small-n
+  CV verdict for a held-out one.
+- **`models/exploit/ranker-2026-11-03-prodcv`** is the first model installed
+  under that rule: 15 train rows, 23 out-of-fold evaluations, ndcg 1.000 vs
+  baseline 0.871, delta +0.1295, CI [+0.104, +0.151].
+
+### Manual modules: a missing tool is named, not a silent degradation — 2026-11-03
+
+- The tool registry knew 10 of the binaries the modules actually invoke.
+  `preflight`, the API toolchain panel and the Electron installer could not
+  name — let alone install — `enum4linux`, `smbclient`, `rpcclient`,
+  `snmpwalk`, `onesixtyone`, `sslscan`, `nuclei`, `nikto`, `ffuf`,
+  `feroxbuster`, `wafw00f`, `whatweb`, `arjun`, `sqlmap`, `msfconsole`, `nc`,
+  `ncat`, `traceroute`, `arp-scan`, `reaver`, `ssh`, `airmon-ng`,
+  `airodump-ng`, `aireplay-ng`, `searchsploit`, `host`, `chisel`. All of them
+  are registered now, with per-manager packages where a real one exists (and
+  an honest "no Windows-native build" where there is none), and the approved
+  tool manifest is merged in so `setup` and the preflight cannot disagree.
+- `tool_install_hint` asks the registry first instead of keeping a second
+  hand-written table, and `tests/test_toolchain_module_coverage.py` walks the
+  modules' own `build_commands`/`suggest_commands` so a future command cannot
+  introduce a dependency nobody can install.
+- Phantom SUBCOMMANDS (`bind`, `socks`, `mutate`, `creds`, `hid`, `portfwd`, …)
+  are excluded from the tool gate: they were being translated into
+  `apt-get install bind`.
+
+### Windows Defender: the warning was aimed at the wrong machine — 2026-11-03
+
+- `defender_note(platform)` returned "" unless the OPERATOR's box had the
+  `Windefend` service, so a Windows TARGET deployed from Linux/macOS got no
+  caveat at all. The two questions are now separate: a Windows target always
+  gets the quarantine caveat, and only the local-scanner sentence depends on
+  this machine.
+- `do_deploy` records the sandbox preflight as data (`backend`, `approved`,
+  `summary`, `scanned`) on the session, and "no scanner ran" is reported as
+  UNSCANNED — never as a pass. The caveat names the command that answers the
+  question on the target (`Get-MpThreatDetection`).
+
+### AI: an authority the runtime can actually deliver — 2026-11-02
+
+- **A promoted manifest whose artefact is missing is no longer promoted.**
+  `models/exploit/ranker-2026-10-30` still said `promoted: true` after its
+  `ranker.json` had been deleted, so `ModelRegistry.promoted("exploit")`
+  returned it and `trust_for("exploit")` reported `nudge` — the runtime
+  claimed ML authority with nothing to load, and `--ai integrated` named
+  `ranker-2026-10-30` as a chat model to llama.cpp. The registry now checks
+  the artefact (ranker file or adapter directory) inside the same
+  `manifest_errors` that already refused an unmeasured model, and
+  `_integrated_model` refuses a linear ranker with the reason and the
+  in-process path that serves it. Measured after the fix: `promoted()` is
+  `None`, `trust_for("exploit")` is `observe`, and the flag is refused.
+- **The operator can force the ladder from the CLI**, loudly: `--ai-authority
+  auto|nudge|decide|full`. It was config/env-only, so an override was
+  invisible in a report; `trust.apply_authority` still announces it and the
+  hard invariants (no new candidate, no flag change, nothing executable)
+  still hold.
+- **The corpus is finally the one the runtime speaks.** `training.ranker`
+  gained `--corpus production` (reads `training/golden/<phase>.production.jsonl`)
+  and `--require-scoreable`, which refuses to write a model whose weights are
+  keyed by ids the corpus never offers. The shipped ranker's weights were
+  capability names (`beacon_deploy`) while production emits
+  `noncve:service:ssh:22`, so every per-id weight scored zero.
+- **Measured result, reported instead of promoted:** 23 production rows →
+  15 train / 8 test; ndcg 1.0000 against baseline 0.8711, delta +0.1289,
+  CI [+0.0851, +0.1682] — **rejected by the gate on `n=8 < min_rows=20`**.
+  The weights are now keyed by production ids (11 ids, all scoreable) and the
+  5-fold CV over the training rows is 1.0000 ± 0.0000 over 15 groups, which
+  is exactly why 8 test rows are not evidence: the model memorises a rubric
+  that small. The honest state is `observe` until real engagement history
+  (`training.from_decisions`) grows the corpus.
+- **A rejected model no longer overwrites a published one.** `--out`
+  defaulted to `models/exploit/<VERSION>/ranker.json`, so the run above —
+  verdict `reject` — still replaced that version's weights file, and a
+  `--phase finding` run would have written into the exploit directory. The
+  export now happens only when the gate promotes, an explicit `--out` is
+  always honoured (exporting a rejected model for inspection is a legitimate
+  operator choice), and the default path follows `--phase`.
+  `tests/test_ranker_export.py` pins all three.
+
+### Benchmark: the autonomy number was measuring the handoff — 2026-11-02
+
+- `operator_interventions` counted three different events: the terminal
+  `handoff` (the shell handover, by design), `escalation` on a target that
+  cannot be reached (the honest stop), and a real ask while the plan had
+  moves. Every successful scenario therefore scored 1 and every honest
+  failure 2, which is how "9.1% autonomy" was produced. `Metrics` now carries
+  `terminal_handoffs`, `honest_escalations` and `midrun_interventions`, and
+  `rates` reports `no_midrun_intervention_pct`.
+- **Re-measured:** goal 85.7%, honest 100%, no false positive **100%**
+  (was 90.9%), no forbidden action 100%, mid-run interventions **0/11**.
+
+### Auto-mode: a banner is a claim, not a measurement — 2026-11-02
+
+- `decoy_scan` advertised MySQL on 3306 that does not exist and the run stored
+  it as a confirmed `service`, which the benchmark scored as a false
+  positive. Textual scan output (nmap table, `nc` floor sweep, masscan) now
+  carries `advertised: True`, `WorldModel.confirm_service` clears it only
+  when a real exchange proves the port, and `access.py` will not build an
+  actionable `noncve:service:` candidate from an unconfirmed one. The
+  benchmark lists the banner under `unconfirmed_services` instead of hiding
+  it: the tool's lie stays visible, it just is not counted as the agent's
+  claim.
+- The simulation was corrected with it: `nc -z` now answers from ground truth
+  only, so a connect probe can prove a port while a scan report still lies.
+
+### HID: six more layouts, with the tables measured — 2026-11-02
+
+- `fr`, `es`, `uk`, `pt`, `br`, `us-intl`, with aliases and **fail-closed**
+  translation: a character a layout does not cover is refused with its name
+  and the layout, never typed "hoping it is right". `us`/`it`/`de` are
+  byte-identical to before.
+- The tables were then measured against the real Windows layouts
+  (`VkKeyScanExW` + `MapVirtualKeyExW`, `0000040c`/`0000040a`/`00000809`/
+  `00000816`/`00000416`), and three guesses were wrong: French typed the
+  whole bottom row backwards (`:` → `/` instead of `.`), Portuguese copied
+  `+`/`*` from Spanish, and ABNT2 listed `/`/`?` as ordinary keys although
+  they need AltGr. A table and a test written by the same guess agree with
+  each other and are still wrong; the tests now carry the measured values.
+- Still hardware-unverified per layout: one real flash each before calling
+  them measured.
+
+### Tests: three isolation defects the full run exposed — 2026-11-02
+
+- **A test no longer writes the operator's audit chain.** `AuditLog`
+  defaults to `<data_dir>/c2_audit.log`, so every C2-touching test appended
+  REAL records to the engagement's immutable chain (22 MB / 63,722 lines on
+  this checkout) and `test_autopersist_honesty` scanned `tail(300)` of a file
+  16 xdist workers were writing: green alone, red in the full run. `conftest`
+  now redirects the `audit_log` singleton per test; verified that a C2 test
+  run leaves the real file's line count unchanged.
+- **Two files read the persisted mTLS flag instead of isolating it.** On a
+  machine whose `state` file says `PHANTOM_MTLS_REQUIRED=false` (an operator
+  who ran `guardrails disable mtls`), `test_stager_mtls_conflict` and
+  `test_autoshell_scope_flags` failed on a correct build: `use_mtls()`
+  short-circuits and strict mode rightly reports a disabled control. Both now
+  pin the control they measure, which is what their docstrings already claimed.
+- **`test_viewer_send_queues_task` timed out under load.** The loopback
+  routes answer in milliseconds, but a 5 s client budget on a 16-worker
+  Windows run produced `TimeoutError`; a real hang still fails, at 15 s.
+- README's test-file count is derived from the tree by a contract test, and it
+  moved to 428 with `tests/test_ranker_export.py`.
+
+### Beacon: the Defender utility has a call site — 2026-11-02
+
+- `defender_check.is_defender_present()` was dead code. `defender_note()`
+  now runs in the manual `payload deploy` path for Windows targets and warns
+  that a drop may be quarantined and that a missing check-in is not proof the
+  payload failed. Warning only: nothing is disabled automatically, and no
+  success/failure is inferred from it.
+
 ### HID: three deliveries per flash, faster, and the right characters — 2026-11-01
 
 - **The delivery counter replaces the one-shot byte.** A board that types

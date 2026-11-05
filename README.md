@@ -532,6 +532,7 @@ always exists and an existing flag is always documented.
 | `--verbose` | add the live reasoning trace to the action trace |
 | `--llm` / `--experience` / `--evolution` / `--beta` | optional advisor · cross-engagement memory · self-improvement PRs · load machine-authored capabilities |
 | `--ai off\|local\|cloud\|integrated` | per-phase AI layer (default **off**): no model, local llama.cpp, an OpenAI-compatible endpoint, or the promoted per-phase model from `models/`; `ai.<phase>.mode` overrides one phase |
+| `--ai-authority auto\|nudge\|decide\|full` | force the AI authority ladder for this run (default **auto**: the measured eval gate decides). A forced level is announced in the run log and still cannot add candidates, change flags or execute anything |
 | `--resume CHECKPOINT` / `--resume-latest` | resume a checkpoint / the newest one, unattended |
 | `--supervise` / `--max-restarts N` | keep the run alive across crashes (bounded relaunches) |
 | `--print-service [kind]` | print the OS service definition for THIS invocation (writes nothing) |
@@ -1315,7 +1316,7 @@ phantom/                        # repository root
 │   └── bt_scan.h               # Bluetooth scanning
 ├── electron/                   # React + Vite + TypeScript desktop app
 ├── data/                       # Sessions, cache, certs, wordlists
-├── tests/                      # 420 test files
+├── tests/                      # 431 test files
 ├── Dockerfile                  # Multi-stage Kali-based build
 ├── docker-compose.yml          # One-command deployment
 └── .env.example                # External API template
