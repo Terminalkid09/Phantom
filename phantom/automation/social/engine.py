@@ -703,7 +703,8 @@ class SocialEngine:
             # Probing the other networks "just in case" is exactly how a
             # namesake (same handle, different person) ends up in the chain.
             from phantom.automation.social.recon import (
-                normalize_scope, TOP_SOCIALS)
+                normalize_scope, TOP_SOCIALS, is_platform_boilerplate,
+                ReconResult)
             scope, pinned = normalize_scope(platform)
             scope_note = ""
             if scope == "pin" and pinned:
@@ -744,11 +745,22 @@ class SocialEngine:
                     # (`this account is private`), so it is read, not skipped.
                     continue
                 bio = self._extract_bio(html, p)
+                # PAGE FURNITURE IS NOT A PERSON (measured 2026-11-05): a
+                # t.me page renders Telegram's own tagline for EVERY handle,
+                # and the older path reported it as this target's bio and
+                # platform. Drop it before it becomes evidence; the raw
+                # string is not carried at all, so it cannot reach a report
+                # looking like a fact about the person.
+                if is_platform_boilerplate(bio, p):
+                    bio = ""
                 link = self._extract_link(bio)
                 handles = self._extract_handles(bio)
                 emails = self._extract_emails(f"{html} {bio}")
-                if not private and not bio and not link:
-                    continue  # page was served but nothing usable
+                if not private and not bio and not link and not handles \
+                        and not emails:
+                    # page served, nothing account-specific on it: skip the
+                    # platform instead of inventing an attribution for it
+                    continue
                 self._remember("platform", p)
                 for e in emails:
                     self._remember("emails", e)
@@ -759,6 +771,17 @@ class SocialEngine:
                     "private": private, "bio": bio, "link": link,
                     "handles": handles, "emails": emails,
                 }
+                # keep the pass as a ReconResult so cross-account
+                # correlation has typed fields (bio, link, avatar) instead
+                # of re-parsing our own marker lines
+                _rec = ReconResult(username=username, platform=p, bio=bio,
+                                   link=link,
+                                   state=("private" if private else "public"))
+                _rec.emails = list(emails)
+                self._profile_records = [
+                    r for r in getattr(self, "_profile_records", [])
+                    if not (r.username == username and r.platform == p)]
+                self._profile_records.append(_rec)
                 def _tok(v: str) -> str:
                     return (v or "").replace(" ", "_")
                 lines.append(
@@ -775,9 +798,43 @@ class SocialEngine:
             # nothing stays as silent as it always was (no news, no lines).
             if lines and scope_note:
                 lines.insert(0, scope_note)
-            return (True, lines) if lines else (True, [])
+            if lines:
+                lines.extend(self._correlate_profiles(username))
+            # NOTHING FOUND IS NOT SUCCESS (measured 2026-11-05): this used
+            # to return (True, []) so a caller could not tell "no account"
+            # from "account found, nothing usable". `ok` answers "did this
+            # pass produce evidence", and only evidence earns it.
+            return (True, lines) if lines else (False, [])
         except Exception as e:
             return False, [f"ERROR: profile recon failed: {e}"]
+
+    def _correlate_profiles(self, username: str) -> List[str]:
+        """Cross-account correlation over the profiles seen this session.
+
+        A link is stated ONLY with the field that proves it (a shared avatar
+        hash, or a bio the two accounts genuinely share). With fewer than two
+        profiles, or with nothing shared, the verdict is `unknown` and the
+        reason says so — an operator must never read "same person" out of a
+        pair of unrelated handles.
+        """
+        from phantom.automation.social.recon import correlate_accounts
+        records = list(getattr(self, "_profile_records", []) or [])
+        current = next((r for r in reversed(records)
+                        if r.username == username), None)
+        others = [r for r in records if r is not current]
+        if current is None or not others:
+            return []
+        leads = correlate_accounts([current] + others)
+        if leads:
+            return [
+                f"IDENTITY_CORRELATION: verdict=linked "
+                f"account={l.username} platform={l.platform} "
+                f"evidence={l.evidence} confidence={l.confidence:.2f}"
+                for l in leads]
+        compared = ",".join(sorted({r.platform for r in others}))
+        return [f"IDENTITY_CORRELATION: verdict=unknown account={username} "
+                f"platform={current.platform} "
+                f"reason=no_shared_evidence compared_with={compared}"]
 
     def deep_recon(self, username: str, platform: str = "",
                    cookies=None) -> Tuple[bool, List[str]]:

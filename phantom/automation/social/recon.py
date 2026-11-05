@@ -1195,6 +1195,63 @@ def _bio_similarity(a: str, b: str) -> float:
     return len(ta & tb) / len(ta | tb)
 
 
+# ── boilerplate: page furniture is not a person ─────────────────────────────
+# A public page renders the PLATFORM's own description when it has nothing
+# account-specific to show. `t.me/<handle>` is the canonical case: every
+# handle page carries Telegram's tagline, so reading it as a bio invents both
+# a field and a platform for the target (measured 2026-11-05: a personal
+# handle came back as `platform=telegram bio=Fast._Secure._Powerful.`).
+_PLATFORM_BOILERPLATE = {
+    "telegram": (
+        "fast. secure. powerful.",
+        "fast secure powerful",
+        "telegram is a cloud-based mobile and desktop messaging app",
+        "telegram messenger",
+    ),
+    "instagram": (
+        "see instagram photos and videos from",
+        "create an account or log in to instagram",
+        "instagram photos and videos",
+    ),
+    "tiktok": ("tiktok - make your day",),
+    "twitter": ("the latest tweets from",),
+    "x": ("the latest tweets from",),
+    "facebook": ("log in to facebook",
+                 "see posts, photos and more on facebook"),
+    "linkedin": ("sign in to linkedin",),
+    "youtube": ("enjoy the videos and music you love",),
+    "github": ("github is where people build software",),
+}
+
+#: Only short strings are judged: a real bio that happens to quote a
+#: marketing phrase must not be discarded.
+_BOILERPLATE_MAX_CHARS = 200
+
+
+def _norm_furniture(text: str) -> str:
+    return " ".join((text or "").lower().split()).strip(" ._-|/")
+
+
+def is_platform_boilerplate(text: str, platform: str = "") -> bool:
+    """True when `text` is the platform's own page furniture, not a bio.
+
+    Two tests, both conservative: a known phrase for THIS platform, or a
+    phrase that is the WHOLE text on any platform (a tagline pasted into an
+    og:description by an unrelated site is still furniture, not a person).
+    """
+    norm = _norm_furniture(text)
+    if not norm or len(norm) > _BOILERPLATE_MAX_CHARS:
+        return False
+    for generic in _PLATFORM_BOILERPLATE.get((platform or "").lower(), ()):
+        if generic and _norm_furniture(generic) in norm:
+            return True
+    for phrases in _PLATFORM_BOILERPLATE.values():
+        for generic in phrases:
+            if generic and _norm_furniture(generic) == norm:
+                return True
+    return False
+
+
 def correlate_accounts(results: List[ReconResult]) -> List[Lead]:
     """Cross-result correlation: same-avatar-hash or high bio-similarity
     between two platforms = same person with different handles."""
