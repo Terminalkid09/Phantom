@@ -36,6 +36,10 @@ def main(argv=None) -> int:
                         help="print the report as JSON (for tooling)")
     parser.add_argument("--list", action="store_true",
                         help="list the scenarios and their ground truth")
+    parser.add_argument("--compare", action="store_true",
+                        help="run the suite twice (AI off, then on) and report "
+                             "whether the advice picks the move the ground "
+                             "truth says works")
     args = parser.parse_args(argv)
 
     from phantom.automation import benchmark as bench
@@ -60,6 +64,28 @@ def main(argv=None) -> int:
             names = ", ".join(s.name for s in bench.suite())
             print(f"unknown scenario {args.scenario!r} (have: {names})")
             return 1
+
+    if args.compare:
+        report = bench.run_comparison(chosen, max_iterations=args.iterations)
+        if args.json:
+            print(json.dumps(report, indent=2, default=str))
+        else:
+            off = report["baseline"]["rates"]
+            on = report["candidate"]["rates"]
+            agree = report["candidate"]["ai"].get("agreement", {})
+            print("AUTOMODE BENCHMARK — AI comparison (same scenarios, twice)")
+            print(f"  goal reached     off {off.get('goal_reached_pct')}%  "
+                  f"on {on.get('goal_reached_pct')}%  "
+                  f"delta {report['delta'].get('goal_reached_pct')}")
+            print(f"  no intervention  off "
+                  f"{off.get('no_operator_intervention_pct')}%  on "
+                  f"{on.get('no_operator_intervention_pct')}%")
+            print(f"  advice accuracy  deterministic "
+                  f"{agree.get('deterministic_pct')}%  ai "
+                  f"{agree.get('ai_pct')}%  delta "
+                  f"{agree.get('delta_pct')}")
+            print(f"  note: {report['note']}")
+        return 0
 
     report = bench.run_suite(chosen, max_iterations=args.iterations)
     if args.json:

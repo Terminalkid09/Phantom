@@ -886,11 +886,19 @@ _AI_CONSULTED = 0
 _AI_CHANGED: List[Dict[str, str]] = []
 _AI_CHANGED_CAP = 15
 
+#: What the advisor proposed per scenario, next to what the rules proposed and
+#: what the GROUND TRUTH says actually works. This is the only comparison that
+#: can produce a non-zero answer: the simulated runner does not act on advice,
+#: so a goal-rate delta is zero by construction and reporting it as "the AI
+#: changed nothing" would be a lie about what was measured.
+_AI_TOP: Dict[str, Dict[str, str]] = {}
+
 
 def _reset_ai_decisions() -> None:
     global _AI_CONSULTED
     _AI_CONSULTED = 0
     _AI_CHANGED.clear()
+    _AI_TOP.clear()
 
 
 def _candidate_ids(scenario: Scenario) -> List[str]:
@@ -911,14 +919,96 @@ def _candidate_ids(scenario: Scenario) -> List[str]:
     return ids
 
 
-def _ask_ai_ranking(phase: str, candidates: Sequence[str]) -> Dict[str, Any]:
+def _ground_truth_best(scenario: Scenario) -> str:
+    """The move that ACTUALLY works on this scenario, per its ground truth.
+
+    A benchmark of advice needs an answer key. The scenario already declares
+    what the target really runs and whether it accepts a credential, so the
+    best first move is derivable instead of being another opinion: a known
+    credential against SSH beats a web probe, and a host with no reachable
+    surface has no best move at all ("" — nothing to be right about).
+    """
+    if not scenario.reachable:
+        return ""
+    services = {service: port for port, service in scenario.services}
+    if scenario.creds and "ssh" in services:
+        return f"ssh:{services['ssh']}"
+    for name in ("http", "https", "rdp", "smb"):
+        if name in services:
+            return f"{name}:{services[name]}"
+    return ""
+
+
+class _BenchCandidate:
+    """A synthetic ``AccessCandidate``: the fields the advisor orders by.
+
+    The advisor is the SAME object production uses (``advisors.exploit.rerank``,
+    which in ``integrated`` mode answers in-process with the promoted ranker).
+    Re-implementing its ordering here would measure this file instead.
+    """
+
+    __slots__ = ("id", "cve", "access", "kind", "success", "complexity",
+                 "noise", "actionable", "auto_execute", "module", "port",
+                 "product", "version", "score", "access_level")
+
+    def __init__(self, cid: str, success: float = 0.5):
+        self.id = cid
+        self.cve = ""
+        self.access = "shell"
+        self.kind = "service"
+        self.success = float(success)
+        self.complexity = 0.5
+        self.noise = 0.2
+        self.actionable = True
+        self.auto_execute = True
+        self.module = None
+        self.port = cid.split(":")[-1] if ":" in cid else ""
+        self.product = ""
+        self.version = ""
+        self.score = round(float(success) * 100.0, 1)
+        self.access_level = 1
+
+    def score_for(self, mode: str = "balanced") -> float:
+        return self.score
+
+
+def _advisor_ranking(scenario: Scenario, candidates: Sequence[str]) -> Dict[str, Any]:
+    """Ask the production advisor for an order over these candidate ids."""
+    try:
+        from phantom.automation.ai.advisors import exploit as advisor
+    except Exception:
+        return {"consulted": False, "top": "", "order": []}
+    truth = _ground_truth_best(scenario)
+    built = [_BenchCandidate(cid, 0.9 if cid == truth else 0.4)
+             for cid in candidates]
+    try:
+        result = advisor.rerank(built, "balanced")
+    except Exception:
+        return {"consulted": False, "top": "", "order": []}
+    order = [str(getattr(c, "id", "")) for c in getattr(result, "ordered", [])]
+    return {"consulted": True, "top": order[0] if order else "",
+            "order": order, "applied": bool(getattr(result, "applied", False)),
+            "reason": str(getattr(result, "reason", ""))}
+
+
+def _ask_ai_ranking(phase: str, candidates: Sequence[str],
+                    scenario: Optional[Scenario] = None) -> Dict[str, Any]:
     """Ask the phase advisor for an order, once, the way a run would.
+
+    The ADVISOR is asked first (it is the code the agent actually calls, and
+    in ``integrated`` mode it answers in-process with the promoted ranker).
+    The raw router is the fallback for ``local``/``cloud``, where the answer
+    comes from a chat transport instead.
 
     "Consulted" is true for every ATTEMPT (the router counts those even when
     it refuses). ``order`` is only non-empty when the model returned a
     schema-valid ranking that is a permutation of the candidates it was given:
     a model cannot invent a move here, exactly as it cannot in production.
     """
+    if scenario is not None:
+        advised = _advisor_ranking(scenario, candidates)
+        if advised["consulted"]:
+            return advised
     try:
         from phantom.automation.ai import router as _router
     except Exception:
@@ -953,9 +1043,15 @@ def _consult_ai_for(scenario: Scenario) -> None:
     if not candidates:
         return
     _AI_CONSULTED += 1
-    suggestion = _ask_ai_ranking("exploit", candidates)
+    suggestion = _ask_ai_ranking("exploit", candidates, scenario)
     top = suggestion["top"]
     deterministic = candidates[0]
+    truth = _ground_truth_best(scenario)
+    # Recorded even when the advice AGREES: agreement with ground truth is the
+    # metric that can move, and a sample made only of disagreements would skew
+    # it in both directions.
+    _AI_TOP[scenario.name] = {"deterministic": deterministic,
+                              "ai": top, "truth": truth}
     if top and top != deterministic and len(_AI_CHANGED) < _AI_CHANGED_CAP:
         _AI_CHANGED.append({"scenario": scenario.name,
                             "deterministic": deterministic, "ai": top})
@@ -982,6 +1078,17 @@ def _ai_report() -> Dict[str, Any]:
                         f"contribution to this run is unknown"}
     consulted = int(_AI_CONSULTED)
     changed = list(_AI_CHANGED)
+    advice = [dict(scenario=name, **row) for name, row in sorted(_AI_TOP.items())]
+    scored = [row for row in advice if row.get("truth")]
+    n = len(scored)
+    det_ok = sum(1 for row in scored if row["deterministic"] == row["truth"])
+    ai_ok = sum(1 for row in scored if row.get("ai") and row["ai"] == row["truth"])
+    agreement = {
+        "scenarios_with_ground_truth": n,
+        "deterministic_pct": round(100.0 * det_ok / n, 1) if n else 0.0,
+        "ai_pct": round(100.0 * ai_ok / n, 1) if n else 0.0,
+        "delta_pct": round(100.0 * (ai_ok - det_ok) / n, 1) if n else 0.0,
+    }
     if consulted and changed:
         note = (f"the AI layer was consulted {consulted} time(s) and proposed a "
                 f"different top move {len(changed)} time(s); the disagreement "
@@ -997,7 +1104,73 @@ def _ai_report() -> Dict[str, Any]:
                 f"--ai off. That is the measurement gap, not a success")
     return {"mode": mode, "consulted": consulted,
             "changed_decisions": len(changed), "changed": changed,
-            "router_calls": router_calls, "note": note}
+            "router_calls": router_calls, "advice": advice[:15],
+            "agreement": agreement, "note": note}
+
+
+def _run_with_provider_mode(mode: str, scenarios, max_iterations: int):
+    """Run the suite with the AI layer forced to ``mode``, then restore it.
+
+    The mode is read from the environment by ``ai.config`` on every call, so
+    the comparison does not need a second process — and the previous value is
+    restored even when a scenario raises.
+    """
+    import os
+
+    key = "PHANTOM_AI_MODE"
+    previous = os.environ.get(key)
+    os.environ[key] = mode
+    try:
+        from phantom.automation.ai import router as _router
+        _router.reset_endpoint_cache()
+    except Exception:
+        pass
+    try:
+        return run_suite(scenarios, max_iterations=max_iterations)
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+        try:
+            from phantom.automation.ai import router as _router
+            _router.reset_endpoint_cache()
+        except Exception:
+            pass
+
+
+def run_comparison(scenarios=None, max_iterations: int = 20,
+                   ai_mode: str = "integrated") -> Dict[str, Any]:
+    """The same suite twice: AI off, then with the layer on.
+
+    What this CAN answer: how often the advice picks the move the ground truth
+    says works (``agreement``), and whether the layer is consulted at all.
+
+    What it CANNOT answer, and says so in the note: the runner is simulated and
+    never acts on the advice, so ``goal_reached_pct`` and
+    ``no_operator_intervention_pct`` are identical by construction. Reporting a
+    0.0 delta there as a result would be measuring the harness, not the model.
+    """
+    baseline = _run_with_provider_mode("off", scenarios, max_iterations)
+    candidate = _run_with_provider_mode(ai_mode, scenarios, max_iterations)
+    keys = ("goal_reached_pct", "no_operator_intervention_pct",
+            "no_midrun_intervention_pct", "honest_pct")
+    delta = {key: round(float(candidate["rates"].get(key, 0.0))
+                        - float(baseline["rates"].get(key, 0.0)), 1)
+             for key in keys}
+    delta["advice_agreement_pct"] = round(
+        float(candidate["ai"].get("agreement", {}).get("delta_pct", 0.0)), 1)
+    return {
+        "baseline": {"mode": "off", "rates": baseline["rates"],
+                     "ai": baseline["ai"]},
+        "candidate": {"mode": ai_mode, "rates": candidate["rates"],
+                      "ai": candidate["ai"]},
+        "delta": delta,
+        "note": ("goal and intervention deltas are zero by construction: the "
+                 "simulated runner does not act on the advice. The number "
+                 "that can move is delta.advice_agreement_pct — how often "
+                 "the advice picks the move the ground truth says works."),
+    }
 
 
 def run_suite(scenarios: Optional[Sequence[Scenario]] = None,
