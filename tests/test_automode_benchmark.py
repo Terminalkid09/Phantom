@@ -16,6 +16,7 @@ The suite runs the real agent with scripted answers, so the whole file takes a
 few seconds and never touches the network.
 """
 import unittest
+from unittest import mock
 
 from phantom.automation import benchmark as bench
 from phantom.automation.benchmark import (
@@ -279,6 +280,49 @@ class TestTheAICounter(unittest.TestCase):
         router.ask("exploit", {})
         self.assertGreaterEqual(router.calls(), 1)
         self.assertTrue(router.last_mode())
+
+
+class TestTheAIConsultation(unittest.TestCase):
+    """A run with the layer ON must actually ASK it, and record the answer.
+
+    Reporting `consulted == 0` made the gap visible; these tests close it: the
+    advisor is consulted at the ordering point, a different top move is counted
+    in `changed_decisions`, and an `off` run is never asked at all.
+    """
+
+    def test_an_enabled_layer_is_consulted_and_a_different_top_is_counted(self):
+        from phantom.automation.ai import config as ai_config
+        from phantom.automation.ai import router as router
+
+        class _Result:
+            ok = True
+            data = {"ranking": ["beacon_deploy", "http:80", "ssh:22"]}
+
+        with mock.patch.object(ai_config, "mode", return_value="integrated"), \
+                mock.patch.object(router, "ask", return_value=_Result()):
+            report = bench.run_suite(scenarios=(OPEN_TARGET,),
+                                     max_iterations=12)
+        ai = report["ai"]
+        self.assertGreaterEqual(ai["consulted"], 1)
+        self.assertIsInstance(ai["changed_decisions"], int)
+        self.assertEqual(ai["changed_decisions"], 1)
+        self.assertEqual(ai["changed"][0]["ai"], "beacon_deploy")
+        self.assertEqual(ai["changed"][0]["deterministic"], "ssh:22")
+
+    def test_an_off_layer_is_never_consulted(self):
+        from phantom.automation.ai import config as ai_config
+        from phantom.automation.ai import router as router
+
+        def _refuse(*a, **k):
+            raise AssertionError("the advisor was asked while the layer is off")
+
+        with mock.patch.object(ai_config, "mode", return_value="off"), \
+                mock.patch.object(router, "ask", side_effect=_refuse):
+            report = bench.run_suite(scenarios=(OPEN_TARGET,),
+                                     max_iterations=12)
+        ai = report["ai"]
+        self.assertEqual(ai["consulted"], 0)
+        self.assertIn("indistinguishable", ai["note"])
 
 
 class TestOneScenarioAtATime(unittest.TestCase):

@@ -591,6 +591,9 @@ def run_scenario(scenario: Scenario, log: Optional[List[str]] = None,
     # is only a test if the /24 is not derived from the target.
     counters: Dict[str, int] = {}
     runner = inject_failures(base, scenario.failures, counters)
+    # ORDERING POINT: if the AI layer is on, this is where a run asks it for an
+    # order. Recorded in the report as consulted/changed_decisions.
+    _consult_ai_for(scenario)
 
     from phantom.automation.belief import WorldModel
 
@@ -876,6 +879,88 @@ def rates(rows: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
     }
 
 
+#: How many consultations this benchmark run made, and how often the advisor
+#: disagreed with the deterministic top candidate. Module-level because the
+#: report is assembled AFTER the scenarios ran; `run_suite` zeroes both.
+_AI_CONSULTED = 0
+_AI_CHANGED: List[Dict[str, str]] = []
+_AI_CHANGED_CAP = 15
+
+
+def _reset_ai_decisions() -> None:
+    global _AI_CONSULTED
+    _AI_CONSULTED = 0
+    _AI_CHANGED.clear()
+
+
+def _candidate_ids(scenario: Scenario) -> List[str]:
+    """The moves this scenario makes possible, in deterministic order.
+
+    Taken from the ground truth (the services that ARE there, whether a beacon
+    is winnable) because that is the order the deterministic planner starts
+    from. An AI suggestion only means something against an order it had to
+    disagree with.
+    """
+    ids: List[str] = []
+    for port, service in scenario.services:
+        ids.append(f"{service}:{port}")
+    if scenario.creds:
+        ids.append("creds:ssh")
+    if scenario.reachable:
+        ids.append("beacon_deploy")
+    return ids
+
+
+def _ask_ai_ranking(phase: str, candidates: Sequence[str]) -> Dict[str, Any]:
+    """Ask the phase advisor for an order, once, the way a run would.
+
+    "Consulted" is true for every ATTEMPT (the router counts those even when
+    it refuses). ``order`` is only non-empty when the model returned a
+    schema-valid ranking that is a permutation of the candidates it was given:
+    a model cannot invent a move here, exactly as it cannot in production.
+    """
+    try:
+        from phantom.automation.ai import router as _router
+    except Exception:
+        return {"consulted": False, "top": "", "order": []}
+    result = _router.ask(phase, {"target": "", "candidates": list(candidates)})
+    if not getattr(result, "ok", False):
+        return {"consulted": True, "top": "", "order": []}
+    data = getattr(result, "data", {}) or {}
+    proposed = data.get("ranking") or data.get("order") or data.get("items") or []
+    allowed = set(candidates)
+    clean = [str(item) for item in proposed if str(item) in allowed]
+    return {"consulted": True, "top": clean[0] if clean else "", "order": clean}
+
+
+def _consult_ai_for(scenario: Scenario) -> None:
+    """Consult the advisor at the point a run orders its candidate moves.
+
+    Skipped when the layer is off, so an `off` run still reports
+    ``consulted == 0`` and the gap note stays true. A disagreement is RECORDED,
+    not applied: the benchmark measures the advice, it does not let the model
+    steer the run it is being measured against.
+    """
+    global _AI_CONSULTED
+    try:
+        from phantom.automation.ai import config as _ai_config
+
+        if str(_ai_config.mode("exploit")) == "off":
+            return
+    except Exception:
+        return
+    candidates = _candidate_ids(scenario)
+    if not candidates:
+        return
+    _AI_CONSULTED += 1
+    suggestion = _ask_ai_ranking("exploit", candidates)
+    top = suggestion["top"]
+    deterministic = candidates[0]
+    if top and top != deterministic and len(_AI_CHANGED) < _AI_CHANGED_CAP:
+        _AI_CHANGED.append({"scenario": scenario.name,
+                            "deterministic": deterministic, "ai": top})
+
+
 def _ai_report() -> Dict[str, Any]:
     """Whether the AI layer was consulted at all during this run.
 
@@ -888,23 +973,31 @@ def _ai_report() -> Dict[str, Any]:
     try:
         from phantom.automation.ai import config as _ai_config
         from phantom.automation.ai import router as _router
-        consulted = int(_router.calls())
+        router_calls = int(_router.calls())
         mode = _router.last_mode() or str(_ai_config.mode(""))
     except Exception as exc:  # the layer is optional; never fail a run for it
         return {"mode": "unknown", "consulted": None,
-                "changed_decisions": None,
+                "changed_decisions": None, "changed": [],
                 "note": f"the ai layer could not be inspected ({exc}), so its "
                         f"contribution to this run is unknown"}
-    if consulted:
-        note = (f"the AI layer was consulted {consulted} time(s); "
-                f"changed_decisions is not recorded yet, so the effect on the "
-                f"plan is still unmeasured")
+    consulted = int(_AI_CONSULTED)
+    changed = list(_AI_CHANGED)
+    if consulted and changed:
+        note = (f"the AI layer was consulted {consulted} time(s) and proposed a "
+                f"different top move {len(changed)} time(s); the disagreement "
+                f"is recorded, not applied, so this measures the advice and "
+                f"claims no benefit")
+    elif consulted:
+        note = (f"the AI layer was consulted {consulted} time(s); its proposed "
+                f"order never disagreed with the deterministic one (0 changed "
+                f"decisions), so it added nothing here")
     else:
         note = (f"the benchmark runner does not consult the AI layer: this "
                 f"run with mode={mode} is indistinguishable from a run with "
                 f"--ai off. That is the measurement gap, not a success")
     return {"mode": mode, "consulted": consulted,
-            "changed_decisions": None, "note": note}
+            "changed_decisions": len(changed), "changed": changed,
+            "router_calls": router_calls, "note": note}
 
 
 def run_suite(scenarios: Optional[Sequence[Scenario]] = None,
@@ -913,6 +1006,7 @@ def run_suite(scenarios: Optional[Sequence[Scenario]] = None,
     chosen = tuple(scenarios) if scenarios else suite()
     rows: List[Dict[str, Any]] = []
     violations: List[str] = []
+    _reset_ai_decisions()
     try:
         from phantom.automation.ai import router as _router
 
