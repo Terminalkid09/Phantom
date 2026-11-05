@@ -780,6 +780,69 @@ def tools_summary_from(rows) -> str:
     return out
 
 
+#: Docker Desktop publishes every container port on the HOST. The distro that
+#: carries nmap (the WSL bridge) lives on its own virtual network and has no
+#: route to the Docker bridge networks, so a container IP such as 172.18.0.7
+#: accepts the SYN from the host and never sees it from the distro. Measured
+#: 2026-11-05: a container serving HTTP on :80 looked like "no open services"
+#: to a run whose only scanner was the bridged nmap.
+_BRIDGE_NETWORK_NOTE = (
+    "tools resolve only through the WSL bridge, which has NO route to Docker "
+    "Desktop bridge networks (172.x): target the PUBLISHED host port "
+    "(127.0.0.1:<port>) instead of the container IP, or run the scan from "
+    "inside the same docker network"
+)
+
+
+def bridge_network_note(rows) -> str:
+    """The reachability caveat, only when a tool is actually bridged.
+
+    A host-native install reaches the Docker published ports directly, so the
+    note would be noise there; it appears only when at least one row came from
+    the WSL bridge.
+    """
+    if any(source == "wsl" for _name, source in (rows or ())):
+        return _BRIDGE_NETWORK_NOTE
+    return ""
+
+
+def _bridge_network_check() -> Check:
+    """Report the WSL<->Docker reachability limit as a check, not as folklore.
+
+    Probing every manifest tool through the bridge would spawn one WSL call
+    per tool (60+), so the bridge is consulted only when something is missing
+    natively — the common case on Windows, and free on native Linux.
+    """
+    try:
+        from phantom.utils.toolchain import TOOLS
+        names = sorted(TOOLS)
+        native_rows = tool_sources(names, bridged=lambda _name: False)
+        if all(source == "host" for _name, source in native_rows):
+            return Check("tool-bridge", "pass",
+                         "every tool resolves on this host")
+        # Only the tools missing natively are worth a bridge probe, and only up
+        # to a bounded number of them: a WSL call per tool is a subprocess, and
+        # the doctor must stay a two-second command even with a thin host.
+        probe = _default_bridged_probe()
+        budget = 25
+        rows = []
+        for name, source in native_rows:
+            if source == "missing" and budget > 0:
+                budget -= 1
+                if probe(name):
+                    source = "wsl"
+            rows.append((name, source))
+    except Exception as exc:
+        return Check("tool-bridge", "warn", f"unavailable: {exc}")
+    note = bridge_network_note(rows)
+    if not note:
+        return Check("tool-bridge", "pass", "missing tools are missing here")
+    bridged = sum(1 for _n, s in rows if s == "wsl")
+    return Check("tool-bridge", "warn",
+                 f"{bridged} tool(s) run through the WSL bridge",
+                 hint=note)
+
+
 def tools_summary(names, *, native=None, bridged=None) -> str:
     """The doctor's one-line tool state WITH its provenance.
 
@@ -798,6 +861,7 @@ def run_doctor(net: bool = False) -> DoctorReport:
     """Run the checks and return the report (never raises)."""
     fns: List[CheckFn] = [
         _python_check, _core_deps_check, _toolchain_check, _ad_tools_check,
+        _bridge_network_check,
         _data_dir_check, _config_check, _c2_hardening_check,
         _auto_persist_grant_check, _toolbelt_check,
         _external_services_check, _drivers_check,

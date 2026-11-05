@@ -91,6 +91,116 @@ MANIFEST: Tuple[ToolEntry, ...] = (
               description="Metasploit (heavy — Kali repos recommended)"),
     ToolEntry("sudo", "base", "sudo", "sudo", "sudo", base=True,
               description="Privilege elevation"),
+
+    # ── expanded coverage (2026-11-05) ───────────────────────────────────
+    # 20 entries was a recon-and-brute list, not the set a framework needs to
+    # run recon, web, credentials, AD, lateral movement and post-exploitation.
+    # Every row below is a tool a Phantom capability or manual module actually
+    # invokes, grouped by the PHASE that needs it, so `phantom doctor` can say
+    # "this phase is blind here" instead of only "some binaries are missing".
+    # Packages are real for the manager they name; a blank manager means the
+    # tool has no package there (an honest gap beats a guessed name).
+
+    # recon
+    ToolEntry("fping", "recon", "fping", "fping", "fping", brew="fping",
+              description="Fast ICMP sweep (host liveness)"),
+    ToolEntry("dig", "recon", "dnsutils", "bind-utils", "bind", brew="bind",
+              description="DNS A/MX/TXT/NS lookups"),
+    ToolEntry("dnsrecon", "recon", "dnsrecon", "dnsrecon", "dnsrecon",
+              brew="dnsrecon", pip="dnsrecon",
+              description="DNS enumeration (AXFR, SRV)"),
+    ToolEntry("whois", "recon", "whois", "whois", "whois", brew="whois",
+              description="Registration / netblock owner"),
+    ToolEntry("traceroute", "recon", "traceroute", "traceroute",
+              "traceroute", brew="traceroute",
+              description="Path to the target (where the filter sits)"),
+    ToolEntry("tcpdump", "recon", "tcpdump", "tcpdump", "tcpdump",
+              brew="tcpdump", description="Packet capture for traffic analysis"),
+    ToolEntry("tshark", "recon", "tshark", "wireshark-cli", "wireshark-cli",
+              brew="wireshark", description="Protocol decode (Wireshark CLI)"),
+    ToolEntry("amass", "recon", "amass", "", "", brew="amass",
+              description="Passive subdomain enumeration"),
+    ToolEntry("subfinder", "recon", "subfinder", "", "", brew="subfinder",
+              pip="subfinder", description="Fast passive subdomain enumeration"),
+    ToolEntry("theHarvester", "recon", "theharvester", "theharvester",
+              "theharvester", brew="theharvester", pip="theHarvester",
+              description="Emails and hosts from public sources"),
+    ToolEntry("sherlock", "recon", "sherlock", "", "sherlock",
+              brew="sherlock", pip="sherlock-project",
+              description="Username -> accounts across sites"),
+    ToolEntry("searchsploit", "recon", "exploitdb", "", "", brew="exploitdb",
+              description="Local ExploitDB lookup (CVE -> exploit)"),
+
+    # web
+    ToolEntry("ffuf", "web", "ffuf", "", "", brew="ffuf",
+              description="Content / vhost fuzzing"),
+    ToolEntry("feroxbuster", "web", "feroxbuster", "", "",
+              description="Recursive content discovery"),
+    ToolEntry("gobuster", "web", "gobuster", "gobuster", "gobuster",
+              brew="gobuster", description="Directory and vhost brute force"),
+    ToolEntry("nikto", "web", "nikto", "", "", brew="nikto",
+              description="Web server misconfiguration scan"),
+    ToolEntry("nuclei", "web", "nuclei", "", "", brew="nuclei",
+              description="Template-driven CVE / misconfig checks"),
+    ToolEntry("whatweb", "web", "whatweb", "", "", brew="whatweb",
+              description="CMS / framework / version fingerprint"),
+    ToolEntry("wafw00f", "web", "", "", "", pip="wafw00f",
+              description="WAF fingerprint before spending requests"),
+    ToolEntry("sqlmap", "web", "sqlmap", "", "", brew="sqlmap",
+              pip="sqlmap", description="SQL injection confirmation"),
+    ToolEntry("arjun", "web", "", "", "", pip="arjun",
+              description="Hidden HTTP parameter discovery"),
+    ToolEntry("wpscan", "web", "wpscan", "", "", brew="wpscan",
+              description="WordPress enumeration and checks"),
+
+    # credentials / active directory
+    ToolEntry("smbclient", "ad", "smbclient", "samba-client", "samba",
+              brew="samba", description="SMB shares / null sessions"),
+    ToolEntry("rpcclient", "ad", "smbclient", "samba-client", "samba",
+              brew="samba", description="MS-RPC enumeration"),
+    ToolEntry("netexec", "ad", "netexec", "", "", pip="netexec",
+              description="SMB/WinRM/LDAP swiss army knife"),
+    ToolEntry("enum4linux-ng", "ad", "enum4linux-ng", "", "",
+              description="SMB/NetBIOS users, shares, policy"),
+    ToolEntry("kerbrute", "ad", "kerbrute", "", "",
+              description="User enumeration and Kerberos spraying"),
+    ToolEntry("responder", "ad", "responder", "", "",
+              description="LLMNR/NBT-NS/mDNS poisoning (lab only)"),
+    ToolEntry("certipy", "ad", "", "", "", pip="certipy-ad",
+              description="AD CS enumeration and abuse"),
+    ToolEntry("ldapdomaindump", "ad", "", "", "", pip="ldapdomaindump",
+              description="LDAP dump of users, groups, policy"),
+
+    # lateral movement / pivoting
+    ToolEntry("ncat", "lateral", "ncat", "nmap-ncat", "gnu-netcat",
+              brew="nmap", description="Netcat with TLS and --exec"),
+    ToolEntry("socat", "lateral", "socat", "socat", "socat", brew="socat",
+              description="Relay / port-forward primitive"),
+    ToolEntry("proxychains4", "lateral", "proxychains4", "proxychains-ng",
+              "proxychains-ng", brew="proxychains-ng",
+              description="Route tool traffic through a pivot"),
+    ToolEntry("chisel", "lateral", "chisel", "", "", brew="chisel",
+              description="Reverse SOCKS tunnel over HTTP"),
+
+    # wireless
+    ToolEntry("airmon-ng", "wireless", "aircrack-ng", "aircrack-ng",
+              "aircrack-ng", brew="aircrack-ng",
+              description="Put the card in monitor mode"),
+    ToolEntry("airodump-ng", "wireless", "aircrack-ng", "aircrack-ng",
+              "aircrack-ng", brew="aircrack-ng",
+              description="Capture beacons and handshakes"),
+    ToolEntry("aireplay-ng", "wireless", "aircrack-ng", "aircrack-ng",
+              "aircrack-ng", brew="aircrack-ng",
+              description="Deauth / injection"),
+
+    # build toolchain (the beacon cannot exist without these)
+    ToolEntry("g++", "build", "g++", "gcc-c++", "gcc", brew="gcc",
+              description="Native C++ compiler (Linux beacon)"),
+    ToolEntry("x86_64-w64-mingw32-g++", "build", "mingw-w64", "mingw64-gcc",
+              "mingw-w64-gcc", brew="mingw-w64",
+              description="Windows cross-compiler (Windows beacon)"),
+    ToolEntry("arduino-cli", "build", "", "", "", brew="arduino-cli",
+              description="Compile/upload the HID sketch"),
 )
 
 _BY_NAME: Dict[str, ToolEntry] = {e.name: e for e in MANIFEST}
@@ -112,6 +222,23 @@ def capability_tools() -> List[ToolEntry]:
     for cap in CAPABILITIES:
         used.update(cap.tools)
     return [e for e in MANIFEST if e.name in used]
+
+
+def setup_tools() -> List[ToolEntry]:
+    """Every installable manifest entry, base tools excluded.
+
+    This is the list `phantom setup` and the doctor's tool line should count:
+    a framework that does recon, web, credentials, AD, lateral movement and
+    post-exploitation needs its whole surface visible, not only the subset an
+    automation capability happens to name. Measured 2026-11-05: the doctor
+    reported `/20` because it counted `capability_tools()`, and the operator
+    could not see that the web, AD, lateral and wireless phases were empty.
+
+    `capability_tools()` keeps its narrower meaning (the preflight of one
+    capability); this one answers "what does this machine need to run Phantom
+    at full strength".
+    """
+    return [e for e in MANIFEST if not e.base]
 
 
 # ── per-platform resolution ──────────────────────────────────────────────
