@@ -423,9 +423,48 @@ def inner_validation_score(ranker: Ranker,
     return round(sum(scores) / len(scores), 6)
 
 
+#: Field names a corpus may use to carry the DETERMINISTIC ordering it was
+#: labelled against. The shipped training corpus carries none, which is
+#: exactly why the gate compares against ``training.predict._baseline`` — and
+#: why a manifest has to SAY so: the runtime's competitor is the production
+#: scorer, not the training heuristic, and the two are different numbers.
+_DETERMINISTIC_KEYS = ("deterministic_rank", "deterministic", "oracle",
+                       "baseline_rank", "production_rank")
+
+
+def deterministic_ranking(row: Dict[str, Any]
+                          ) -> Optional[Dict[str, List[str]]]:
+    """The deterministic ordering carried BY THE ROW, or ``None``.
+
+    Accepted at the row's top level, under ``expected`` or under ``meta``, as
+    a plain list of ids or as a ``{"ranking": [...]}`` mapping. Nothing is
+    reconstructed from the model's own output: a baseline is a property of the
+    corpus, not something the trainer can infer after the fact.
+    """
+    for container in (row, row.get("expected") or {}, row.get("meta") or {}):
+        if not isinstance(container, dict):
+            continue
+        for key in _DETERMINISTIC_KEYS:
+            value = container.get(key)
+            if isinstance(value, list) and value:
+                return {"ranking": [str(item) for item in value]}
+            if isinstance(value, dict):
+                ranking = value.get("ranking")
+                if isinstance(ranking, list) and ranking:
+                    return {"ranking": [str(item) for item in ranking]}
+    return None
+
+
 def evaluate(ranker: Ranker, rows: Sequence[Dict[str, Any]],
-             *, baseline=None) -> Tuple[List[float], List[float], List[str]]:
-    """Per-row ``(model, baseline, id)`` scores — the gate's input."""
+             *, baseline: str = "training"
+             ) -> Tuple[List[float], List[float], List[str]]:
+    """Per-row ``(model, baseline, id)`` scores — the gate's input.
+
+    ``baseline`` names WHICH competitor the gate measures against, and the
+    manifest records it: ``training`` is the heuristic the corpus was labelled
+    with; ``production`` is the deterministic ordering the corpus carries in
+    its own rows — what the runtime actually competes with.
+    """
     from training.eval import score_one
     from training.predict import _baseline
 
@@ -437,8 +476,19 @@ def evaluate(ranker: Ranker, rows: Sequence[Dict[str, Any]],
         expected = row.get("expected") or {}
         model.append(score_one("ndcg", expected,
                                {"ranking": ranker.rank(payload)}))
-        base.append(score_one("ndcg", expected,
-                              _baseline("exploit", payload)))
+        if baseline == "production":
+            scoring = deterministic_ranking(row)
+            if scoring is None:
+                # Unreachable from `main`, which refuses the whole run up
+                # front. A silent fallback here would label a training-
+                # baseline number as a production one, which is the defect
+                # this argument exists to close.
+                raise ValueError(
+                    f"row {index} carries no deterministic ordering, so the "
+                    f"gate cannot be measured against production")
+        else:
+            scoring = _baseline("exploit", payload)
+        base.append(score_one("ndcg", expected, scoring))
         ids.append(str(row.get("id") or index))
     return model, base, ids
 
@@ -489,6 +539,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "score: exit 3 when no row offers an ordering or "
                              "when a non-zero weight names an id the corpus "
                              "never offered")
+    parser.add_argument("--baseline", default="training",
+                        choices=("training", "production"),
+                        help="which competitor the GATE measures against and "
+                             "the manifest records: `training` is the "
+                             "heuristic the corpus is labelled with; "
+                             "`production` is the deterministic ordering "
+                             "carried by the corpus rows (the runtime's "
+                             "actual competitor). `production` REFUSES the "
+                             "run (exit 4) when the corpus records no such "
+                             "ordering, instead of silently measuring the "
+                             "training one")
     args = parser.parse_args(argv)
 
     train_rows, test_rows = rows_for(args.phase, ratio=args.ratio,
@@ -499,9 +560,32 @@ def main(argv: Optional[List[str]] = None) -> int:
                 else "run `python -m training.holdout --write` first")
         print(f"no rows for corpus {args.corpus!r}: {hint}")
         return 2
+    if args.baseline == "production":
+        # A production baseline cannot be approximated: either the corpus
+        # states the deterministic ordering, or the comparison is not a
+        # production comparison and writing `production` in the manifest
+        # would be a lie. Refuse BEFORE training, so a refused run costs
+        # nothing and leaves no artifact behind.
+        everything = list(train_rows) + list(test_rows)
+        missing = [str(row.get("id") or index)
+                   for index, row in enumerate(everything)
+                   if deterministic_ranking(row) is None]
+        if missing:
+            shown = ", ".join(missing[:6])
+            print("REFUSED: --baseline production needs the deterministic "
+                  "ordering in every corpus row (deterministic_rank / "
+                  "deterministic / oracle / baseline_rank / production_rank), "
+                  "and this corpus does not carry it.", file=sys.stderr)
+            print(f"  {len(missing)} of {len(everything)} row(s) have none: "
+                  f"{shown}", file=sys.stderr)
+            print("  nothing was trained or written; use the default "
+                  "`--baseline training`, and read the manifest's "
+                  "baseline.kind as the honest description of what was "
+                  "compared", file=sys.stderr)
+            return 4
     epochs = args.epochs
     ranker = train(train_rows, epochs=epochs)
-    model, base, ids = evaluate(ranker, test_rows)
+    model, base, ids = evaluate(ranker, test_rows, baseline=args.baseline)
 
     from training.gate import MIN_ROWS, decide
     # WHICH measurement the gate may use (measured 2026-11-03). The holdout is
@@ -530,7 +614,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 continue
             fold_model = train(fit_rows, epochs=epochs)
             fold_scores, fold_base, _fold_ids = evaluate(fold_model,
-                                                         validation_rows)
+                                                         validation_rows,
+                                                         baseline=args.baseline)
             pooled.extend(zip(fold_scores, fold_base))
         if pooled:
             pairs = pooled
@@ -634,7 +719,23 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "val_ratio": VAL_RATIO,
                          "decide_delta": decision.get("decide_delta")},
             "eval": {"ndcg": round(sum(model) / len(model), 6)},
-            "baseline": {"ndcg": round(sum(base) / len(base), 6)},
+            # WHICH competitor the number above was measured against. Until
+            # 2026-11-05 the manifest carried a bare score, so a reader could
+            # only assume it was the runtime's scorer — it was the training
+            # heuristic, and the shipped model merely TIED production
+            # (0.9950 vs 0.9972 on 28 out-of-fold rows). `kind` makes the
+            # comparison auditable instead of assumed.
+            "baseline": {
+                "ndcg": round(sum(base) / len(base), 6),
+                "kind": args.baseline,
+                "score": round(sum(base) / len(base), 6),
+                "note": (
+                    "compared against the deterministic ordering carried by "
+                    "the corpus rows (the production competitor)"
+                    if args.baseline == "production" else
+                    "compared against training.predict._baseline (the "
+                    "training-time heuristic), NOT the production scorer"),
+            },
             "eval_gate": decision,
             # Provenance of the NUMBER the gate decided on: a grouped-CV
             # verdict is not the same evidence as a held-out one, and a report

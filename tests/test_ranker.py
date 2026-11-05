@@ -216,6 +216,92 @@ def test_the_runtime_refuses_a_manifest_without_a_passed_gate(tmp_path):
     assert loaded is not None and loaded.rank(["a", "b"], {})[0] == "a"
 
 
+def _promote_verdict(*args, **kwargs):
+    """A neutral `promote` gate, so these tests measure PROVENANCE, not luck."""
+    return {"verdict": "promote", "delta": 0.2, "ci_low": 0.15,
+            "ci_high": 0.25, "n": 40, "score": 1.0, "baseline": 0.8,
+            "reasons": [], "decide_delta": 0.06}
+
+
+def test_the_manifest_records_which_baseline_was_measured(tmp_path, monkeypatch):
+    """A promotion must say WHAT it beat, not only by how much.
+
+    The shipped ranker was promoted against the training heuristic while the
+    reader assumed the production scorer, and the two numbers differ (0.9950
+    vs 0.9972 measured 2026-11-05). A manifest that carries only a score
+    cannot be audited; `baseline.kind` makes the comparison explicit.
+    """
+    rows = []
+    for _ in range(3):
+        row = _row(["web_rce", "scan_tcp"], ["scan_tcp", "web_rce"])
+        row["deterministic_rank"] = ["scan_tcp", "web_rce"]
+        rows.append(row)
+    monkeypatch.setattr(training_ranker, "rows_for",
+                        lambda *a, **k: (list(rows), list(rows)))
+    monkeypatch.setattr("training.gate.decide", _promote_verdict)
+
+    manifest = tmp_path / "manifest.json"
+    code = training_ranker.main([
+        "--baseline", "production",
+        "--out", str(tmp_path / "ranker.json"),
+        "--write-manifest", str(manifest)])
+    assert code == 0
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["baseline"]["kind"] == "production"
+    assert payload["baseline"]["score"] == payload["baseline"]["ndcg"]
+    assert "production" in payload["baseline"]["note"]
+
+
+def test_the_default_baseline_is_the_training_heuristic(tmp_path, monkeypatch):
+    """The default path is unchanged — and says out loud what it compared."""
+    rows = [_row(["web_rce", "scan_tcp"], ["scan_tcp", "web_rce"])
+            for _ in range(3)]
+    monkeypatch.setattr(training_ranker, "rows_for",
+                        lambda *a, **k: (list(rows), list(rows)))
+    monkeypatch.setattr("training.gate.decide", _promote_verdict)
+
+    manifest = tmp_path / "manifest.json"
+    code = training_ranker.main([
+        "--out", str(tmp_path / "ranker.json"),
+        "--write-manifest", str(manifest)])
+    assert code == 0
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["baseline"]["kind"] == "training"
+    assert "NOT the production scorer" in payload["baseline"]["note"]
+
+
+def test_production_baseline_refuses_a_corpus_without_the_ordering(
+        tmp_path, monkeypatch, capsys):
+    """Never fall back silently: the run is refused, nothing is written."""
+    rows = [_row(["web_rce", "scan_tcp"], ["scan_tcp", "web_rce"])]
+    monkeypatch.setattr(training_ranker, "rows_for",
+                        lambda *a, **k: (list(rows), list(rows)))
+
+    out = tmp_path / "ranker.json"
+    code = training_ranker.main(["--baseline", "production", "--out", str(out)])
+    assert code == 4
+    err = capsys.readouterr().err
+    assert "REFUSED" in err
+    assert "nothing was trained or written" in err
+    assert not out.exists()
+
+
+def test_deterministic_ranking_reads_the_corpus_not_the_model():
+    row = {"expected": {"ranking": ["a", "b"],
+                        "deterministic_rank": ["b", "a"]}}
+    assert training_ranker.deterministic_ranking(row) == {
+        "ranking": ["b", "a"]}
+    assert training_ranker.deterministic_ranking(
+        {"expected": {"ranking": ["a", "b"]}}) is None
+
+
+def test_evaluate_refuses_a_row_without_a_production_ordering():
+    rows = [_row(["web_rce", "scan_tcp"], ["scan_tcp", "web_rce"])]
+    ranker = training_ranker.train(rows, epochs=5)
+    with pytest.raises(ValueError):
+        training_ranker.evaluate(ranker, rows, baseline="production")
+
+
 def test_the_installed_ranker_is_measurable_end_to_end():
     """The shipped artefact must be a promoted, gate-passed score.
 
