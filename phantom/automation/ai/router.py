@@ -55,6 +55,33 @@ class AIResult:
     latency_ms: int = 0
 
 
+#: Counts every ``ask()`` ATTEMPT, including the ones refused because the
+#: layer is off, the schema is missing or the transport failed. A benchmark
+#: that reports goal rates without saying whether the AI was ever consulted
+#: cannot tell an AI-assisted run from a deterministic one (measured
+#: 2026-11-05: `PHANTOM_AI_MODE=off` and `integrated` produced byte-identical
+#: reports). The counter is what makes that gap visible instead of implied.
+_CALLS = 0
+_LAST_MODE = ""
+
+
+def reset_counters() -> None:
+    """Zero the consultation counter (a benchmark run starts here)."""
+    global _CALLS, _LAST_MODE
+    _CALLS = 0
+    _LAST_MODE = ""
+
+
+def calls() -> int:
+    """How many times this process has attempted an AI call."""
+    return _CALLS
+
+
+def last_mode() -> str:
+    """The mode the last attempt used (empty before the first attempt)."""
+    return _LAST_MODE
+
+
 def ai_enabled(phase: str = "") -> bool:
     return config.enabled(phase)
 
@@ -199,6 +226,9 @@ def ask(phase: str, payload: Dict[str, Any], *, schema: str = "",
     name = str(phase or "").strip()
     schema_key = str(schema or name).strip()
     mode = config.mode(name)
+    global _CALLS, _LAST_MODE
+    _CALLS += 1
+    _LAST_MODE = mode
 
     def _done(result: AIResult, prompt: str, response: str = "") -> AIResult:
         result.latency_ms = int((time.perf_counter() - started) * 1000)

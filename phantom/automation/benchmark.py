@@ -876,12 +876,49 @@ def rates(rows: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
     }
 
 
+def _ai_report() -> Dict[str, Any]:
+    """Whether the AI layer was consulted at all during this run.
+
+    Measured 2026-11-05: `PHANTOM_AI_MODE=off` and `PHANTOM_AI_MODE=integrated`
+    produced byte-identical reports (85.7% goal, 9.1% no-intervention). That is
+    not evidence the AI does not help — it is evidence the benchmark never asks
+    it. Reporting the count makes the gap explicit instead of letting two
+    identical reports imply a measured equivalence.
+    """
+    try:
+        from phantom.automation.ai import config as _ai_config
+        from phantom.automation.ai import router as _router
+        consulted = int(_router.calls())
+        mode = _router.last_mode() or str(_ai_config.mode(""))
+    except Exception as exc:  # the layer is optional; never fail a run for it
+        return {"mode": "unknown", "consulted": None,
+                "changed_decisions": None,
+                "note": f"the ai layer could not be inspected ({exc}), so its "
+                        f"contribution to this run is unknown"}
+    if consulted:
+        note = (f"the AI layer was consulted {consulted} time(s); "
+                f"changed_decisions is not recorded yet, so the effect on the "
+                f"plan is still unmeasured")
+    else:
+        note = (f"the benchmark runner does not consult the AI layer: this "
+                f"run with mode={mode} is indistinguishable from a run with "
+                f"--ai off. That is the measurement gap, not a success")
+    return {"mode": mode, "consulted": consulted,
+            "changed_decisions": None, "note": note}
+
+
 def run_suite(scenarios: Optional[Sequence[Scenario]] = None,
               max_iterations: int = 20) -> Dict[str, Any]:
     """Run every scenario, score it, and check its expectations."""
     chosen = tuple(scenarios) if scenarios else suite()
     rows: List[Dict[str, Any]] = []
     violations: List[str] = []
+    try:
+        from phantom.automation.ai import router as _router
+
+        _router.reset_counters()
+    except Exception:
+        pass  # the AI layer is optional; the report says so
     for scenario in chosen:
         metrics = run_scenario(scenario, max_iterations=max_iterations)
         broken = check_expectations(scenario, metrics)
@@ -894,7 +931,8 @@ def run_suite(scenarios: Optional[Sequence[Scenario]] = None,
         row["goal"] = scenario.goal
         rows.append(row)
     return {"scenarios": rows, "violations": violations,
-            "passed": not violations, "rates": rates(rows)}
+            "passed": not violations, "rates": rates(rows),
+            "ai": _ai_report()}
 
 
 def format_table(report: Mapping[str, Any]) -> str:

@@ -259,6 +259,27 @@ class TestTheStandardSuite(unittest.TestCase):
         self.assertEqual(row["terminal_handoffs"], 1)
         self.assertEqual(row["midrun_interventions"], 0)
 
+    def test_the_report_always_carries_the_ai_section(self):
+        ai = self.report["ai"]
+        for key in ("mode", "consulted", "changed_decisions", "note"):
+            self.assertIn(key, ai)
+
+    def test_an_unconsulted_ai_is_reported_as_a_gap_not_a_success(self):
+        """`--ai off` and `--ai integrated` must stop looking equivalent."""
+        ai = self.report["ai"]
+        self.assertEqual(ai["consulted"], 0)
+        self.assertIn("indistinguishable", ai["note"])
+
+
+class TestTheAICounter(unittest.TestCase):
+    def test_every_ask_attempt_is_counted_even_when_the_layer_is_off(self):
+        from phantom.automation.ai import router
+        router.reset_counters()
+        self.assertEqual(router.calls(), 0)
+        router.ask("exploit", {})
+        self.assertGreaterEqual(router.calls(), 1)
+        self.assertTrue(router.last_mode())
+
 
 class TestOneScenarioAtATime(unittest.TestCase):
     def test_a_single_scenario_can_be_run_on_its_own(self):
