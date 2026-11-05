@@ -12,11 +12,24 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from unittest import mock
 
 import pytest
 
 from phantom.utils import build_helper as bh
+
+# The subject is the WINDOWS bootstrap: a winget install of the MinGW
+# cross-compiler, and the "a fresh install does not update PATH" fix. Those
+# assertions describe `C:\\mingw64\\bin` and winget's exit contract, which no
+# POSIX runner can satisfy. CI runs the suite on ubuntu-latest, so eight of
+# these tests failed there while passing on the operator host — a red build
+# that said nothing about the product. The module is skipped off Windows
+# rather than the assertions being weakened.
+pytestmark = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="winget/MinGW bootstrap is Windows-only; nothing to assert on POSIX",
+)
 
 
 def _fake_package_tree(tmp_path, compiler=True):

@@ -24,6 +24,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          # The dev set is pinned and changes rarely: restoring the wheel
+          # cache turns the install step from tens of seconds into ~2 s on
+          # every leg of the matrix.
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install dependencies
         run: |
@@ -62,7 +69,10 @@ jobs:
           # HERMETIC gate: tool-dependent tests are deselected and run in the
           # separate `integration-tools` job below, so a missing binary never
           # masquerades as a product regression here.
-          python -m pytest $TEST_FILES -m "not integration_tool" -v --timeout=120 --maxfail=25 2>&1 \
+          # `-q` instead of `-v`: the verbose per-test lines were 6k+ lines of
+          # I/O per leg and bought nothing (the failing IDs are annotated by
+          # the next step anyway). Same tests, same gate, less wall clock.
+          python -m pytest $TEST_FILES -m "not integration_tool" -q --tb=short --timeout=120 --maxfail=25 2>&1 \
             | tee /tmp/pytest.out | tail -200
 
       - name: Surface the failing tests as annotations

@@ -29,6 +29,11 @@ pytest-mock>=3.12
 setuptools>=70.0
 pyyaml>=6.0
 bandit>=1.7
+# tests/test_net_ranker.py imports the trainer, which imports numpy. It was
+# present on the operator box (2.2.6) and absent from this pinned set, so the
+# 3.12 leg of the matrix failed five tests with "No module named 'numpy'" —
+# a red build that measured the CI image, not the code.
+numpy>=1.26
 # static-analysis gates (ruff.toml + mypy.ini, CI job `static-analysis`).
 # Upper bounds on purpose: both gates are RATCHETS seeded from the rules /
 # modules that are green TODAY, and either tool adding a check in a new minor
