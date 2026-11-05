@@ -4,6 +4,86 @@ All notable changes to Phantom.
 
 ---
 
+## [3.0.0] — 2026-11-05
+
+Release cut from the audit of 5 Nov 2026. Every entry below has a measurement
+behind it; the ones that were not measured are named as such.
+
+### Security
+
+- **The staging channel no longer executes unverified bytes.** The Windows PIC
+  stager set `ServerCertificateValidationCallback={$true}` before the download
+  and then mapped the result in memory: any certificate was accepted, so a MITM
+  of the staging hop was code execution. It now pins the SHA-1 thumbprints of
+  the C2's own certificates (`builder._stager_cert_pin_statement`), keeping the
+  self-signed workflow and rejecting everything else.
+- **Last shell-string execution removed** from the delivery path: the RCE
+  upload payload built `os.system('(echo … | base64 -d | sh)')`; it now uses an
+  argv `subprocess.Popen` with `start_new_session`, same bytes on the target.
+- Lab admin token reads `ADMIN_TOKEN` instead of carrying a literal.
+
+### OSINT: page furniture is not a person
+
+- Measured defect: a personal handle came back as `platform=telegram
+  bio=Fast._Secure._Powerful.` — Telegram's own tagline, attributed to the
+  target. `is_platform_boilerplate()` now drops it before it can become a bio
+  or a link.
+- `profile_recon` returns `(False, [])` when a pass produced no evidence; the
+  old `(True, [])` made "no account" indistinguishable from "nothing found".
+- `correlate_accounts()` is wired into the pass: a link is stated only with the
+  field that proves it (avatar hash, or a genuinely shared bio), otherwise the
+  verdict is `unknown` with the reason.
+
+### AI: measured instead of assumed
+
+- The benchmark now **consults** the AI layer and records `consulted` and
+  `changed_decisions`, so a run with `--ai integrated` can no longer be
+  silently identical to `--ai off`. When the layer is never consulted the
+  report says so and calls it a measurement gap.
+
+### ML: the gate records what it compared against
+
+- `manifest.baseline` carries `{kind, score, note}`. `--baseline production`
+  scores a candidate against the deterministic production ordering, not the
+  training heuristic; refused (exit 4) when no ordering exists, never a silent
+  fallback.
+- The production corpus is stamped with `deterministic_rank` (28/28 rows),
+  computed by calling the runtime scorer. The gate thresholds are unchanged.
+
+### Beacon and delivery
+
+- Client certificate key is bound to the context before the handshake
+  (`CERT_KEY_CONTEXT_PROP_ID` after `CryptAcquireCertificatePrivateKey`) — the
+  measured `GLE=12018` path. Windows PE and Linux ELF both build.
+- The stager keeps the host alive after the in-memory thread starts, and the
+  payload XOR went from a per-byte pipeline (>90 s bootstrap) to an index loop
+  (~6 s).
+
+### Operations
+
+- `phantom --doctor` counts installed tools from **one** authority and reports
+  `host` vs `wsl`: `7/20 installed (host 3, wsl 4)`. The previous double count
+  could contradict itself.
+- Persisted C2 state is bounded (200 beacons / 2000 tasks / 2000 results,
+  oldest by `last_seen`) with `compacted()`/`stats()` reporting the drops.
+- Every declared automation phase is mapped to the module that really
+  implements it (`phases.IMPLEMENTATIONS`); `unimplemented_phases()` names the
+  rest instead of leaving the layer looking covered.
+- First monolith extraction: target resolution moved to
+  `guidance/target_kit.py`, telemetry helpers to `agent_telemetry.py`, with
+  re-exports so no call site changes.
+- CI: `numpy` added to the pinned dev set, the Windows compiler-bootstrap tests
+  scoped to Windows with a stated reason, pip wheel cache and quieter pytest
+  output.
+
+### Not claimed
+
+- The beacon check-in has not been observed live in this cycle.
+- `--ai integrated` is consulted but has not been shown to change a decision.
+- The phishing chain has never been exercised end-to-end; see
+  `docs/PHISHING_STATUS.md` for what works, what needs credentials and what is
+  absent.
+
 ## [Unreleased] — current development (v3.0.0 line)
 
 ### AI: from "authority" to an effect you can measure — 2026-11-03
