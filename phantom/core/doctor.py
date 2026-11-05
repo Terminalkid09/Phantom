@@ -700,6 +700,84 @@ def _quiet_check() -> Check:
                  hint=f"optional layers degraded, not fatal: {worst}")
 
 
+# ── tool provenance (host vs bridged) ────────────────────────────────────
+
+def _tool_name(entry) -> str:
+    """A tool row is a name or an object carrying one (the wizard's entries)."""
+    return entry if isinstance(entry, str) else str(getattr(entry, "name", entry))
+
+
+def _default_bridged_probe():
+    """`name -> bool` through the WSL/Kali bridge, built ONCE.
+
+    One registry reused for every name keeps the probe budget bounded: on a
+    native Linux host the bridge is never consulted at all.
+    """
+    try:
+        from phantom.automation.runtime.toolchain import ToolRegistry
+
+        return ToolRegistry(wsl=True).has
+    except Exception:
+        return lambda name: False
+
+
+def tool_sources(names, *, native=None, bridged=None) -> List[Tuple[str, str]]:
+    """Where each tool actually lives: ``host``, ``wsl`` or ``missing``.
+
+    Measured 2026-11-05: `phantom --doctor` printed `tools: 5/20 installed`
+    and did NOT list `nmap`, while `command -v nmap` on the operator host
+    found nothing. The registry resolves the Kali WSL distro, so the count
+    was right — but a bridged tool and a host tool read identically, and an
+    operator could not tell what was installed where.
+
+    `native`/`bridged` are injectable so the split is testable without
+    spawning a WSL probe per tool. Duplicate names are collapsed: a tool can
+    only be missing once.
+    """
+    if native is None:
+        native = shutil.which
+    if bridged is None:
+        bridged = _default_bridged_probe()
+    rows: List[Tuple[str, str]] = []
+    seen = set()
+    for entry in names:
+        name = _tool_name(entry)
+        if name in seen:
+            continue
+        seen.add(name)
+        try:
+            on_host = bool(native(name))
+        except Exception:
+            on_host = False
+        if on_host:
+            rows.append((name, "host"))
+            continue
+        try:
+            via_bridge = bool(bridged(name))
+        except Exception:
+            via_bridge = False
+        rows.append((name, "wsl" if via_bridge else "missing"))
+    return rows
+
+
+def tools_summary(names, *, native=None, bridged=None) -> str:
+    """The doctor's one-line tool state WITH its provenance.
+
+    Shape: ``tools: 5/20 installed (host 2, wsl 3) — missing: nc, hydra``.
+    The installed count is the sum of the split by construction, so the line
+    cannot contradict itself the way a bare total can.
+    """
+    rows = tool_sources(names, native=native, bridged=bridged)
+    host = [n for n, source in rows if source == "host"]
+    via_bridge = [n for n, source in rows if source == "wsl"]
+    missing = [n for n, source in rows if source == "missing"]
+    out = (f"tools: {len(host) + len(via_bridge)}/{len(rows)} installed "
+           f"(host {len(host)}, wsl {len(via_bridge)})")
+    if missing:
+        out += " — missing: " + ", ".join(missing)
+    return out
+
+
 # ── runner ───────────────────────────────────────────────────────────────
 
 def run_doctor(net: bool = False) -> DoctorReport:

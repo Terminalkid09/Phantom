@@ -111,16 +111,23 @@ def doctor(say: Say = print) -> Dict[str, object]:
     # answer is unchanged and the WSL probe never even runs.
     try:
         from phantom.automation.runtime.toolchain import ToolRegistry
+        from phantom.core.doctor import tools_summary
         reg = ToolRegistry()
         found = [e for e in tools if reg.has(e.name)]
         missing = [e for e in tools if not reg.has(e.name)]
+        # `reg.has` answers "installed", not WHERE. On Windows the toolbox
+        # lives in the Kali distro and `which` cannot see it, so a bridged
+        # tool and a host tool read identically — measured 2026-11-05: the
+        # line did not list nmap while `command -v nmap` found nothing, and
+        # the operator could not tell which half of the install was missing.
+        tool_line = tools_summary(tools, native=shutil.which, bridged=reg.has)
     except Exception:
         found = [e for e in tools if shutil.which(e.name)]
         missing = [e for e in tools if not shutil.which(e.name)]
-    say(f"{STEP_OK if not missing else STEP_WARN} tools: "
-        f"{len(found)}/{len(tools)} installed"
-        + (f" — missing: {', '.join(e.name for e in missing)}"
-           if missing else ""))
+        tool_line = (f"tools: {len(found)}/{len(tools)} installed"
+                     + (f" — missing: {', '.join(e.name for e in missing)}"
+                        if missing else ""))
+    say(f"{STEP_OK if not missing else STEP_WARN} {tool_line}")
     if missing:
         # A missing tool is an OPERATOR ACTION, and the wizard is the door
         # that performs it (asks once, no silent installs). Saying only what

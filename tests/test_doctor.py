@@ -230,3 +230,39 @@ def test_doctor_net_flag_parses(tmp_path, monkeypatch):
 
     system.cmd_doctor(None, "--net")
     assert printed
+
+
+# ── tool provenance: host vs WSL bridge ────────────────────────────────
+
+def test_tool_sources_separate_host_from_bridge():
+    rows = doctor.tool_sources(
+        ["nmap", "hydra", "nc"],
+        native=lambda name: name == "hydra",
+        bridged=lambda name: name == "nmap")
+    assert rows == [("nmap", "wsl"), ("hydra", "host"), ("nc", "missing")]
+
+
+def test_a_bridged_tool_is_not_reported_as_missing():
+    summary = doctor.tools_summary(
+        ["nmap", "hydra"],
+        native=lambda name: False,
+        bridged=lambda name: name == "nmap")
+    assert "wsl 1" in summary
+    absent = summary.split("missing:")[1]
+    assert "hydra" in absent
+    assert "nmap" not in absent
+
+
+def test_the_summary_counts_add_up_and_name_each_missing_once():
+    summary = doctor.tools_summary(
+        ["nmap", "hydra", "nc", "nc"],
+        native=lambda name: name == "hydra",
+        bridged=lambda name: name == "nmap")
+    assert summary == "tools: 2/3 installed (host 1, wsl 1) — missing: nc"
+
+
+def test_the_wizard_prints_the_source_split():
+    from phantom.utils import setup_wizard
+    import inspect
+    src = inspect.getsource(setup_wizard.doctor)
+    assert "tools_summary" in src
