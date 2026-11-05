@@ -548,13 +548,30 @@ def build_rows() -> List[Dict[str, Any]]:
             "metric": METRIC,
             "label_basis": RUBRIC_VERSION,
         })
-    return rows
+    # The gate's competitor is the RUNTIME scorer, so the generator stamps the
+    # ordering that scorer would produce instead of leaving the field for
+    # someone to hand-write later (a hand-written baseline is an unmeasured
+    # number). Stamped HERE, not at write time, so `rows_digest` and the
+    # `--check` mode describe the same bytes that land on disk.
+    from training import prod_baseline
+
+    return prod_baseline.stamp_rows(rows)
 
 
 
 def rows_digest(rows: Sequence[Dict[str, Any]]) -> str:
-    """SHA-256 of the rendered rows: what ``--check`` compares."""
-    payload = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
+    """SHA-256 of the rendered rows: what ``--check`` compares.
+
+    ``deterministic_rank`` is EXCLUDED: it is derived by calling the runtime
+    scorer, so a regenerated (or newly stamped) baseline must not make an
+    otherwise unchanged corpus look like a different label set. ``--check``
+    answers "are the labels what the generator produces", not "is the derived
+    baseline byte-identical".
+    """
+    payload = "".join(
+        json.dumps({k: v for k, v in row.items()
+                    if k != "deterministic_rank"}, sort_keys=True) + "\n"
+        for row in rows)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

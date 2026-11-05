@@ -477,15 +477,27 @@ def evaluate(ranker: Ranker, rows: Sequence[Dict[str, Any]],
         model.append(score_one("ndcg", expected,
                                {"ranking": ranker.rank(payload)}))
         if baseline == "production":
-            scoring = deterministic_ranking(row)
-            if scoring is None:
-                # Unreachable from `main`, which refuses the whole run up
-                # front. A silent fallback here would label a training-
-                # baseline number as a production one, which is the defect
-                # this argument exists to close.
-                raise ValueError(
-                    f"row {index} carries no deterministic ordering, so the "
-                    f"gate cannot be measured against production")
+            from training import prod_baseline
+
+            stored = deterministic_ranking(row)
+            if stored is not None:
+                # A stored ordering is the corpus's CLAIM, so it is accepted
+                # only when it is a permutation of that row's candidates. A
+                # rank naming a candidate the row never offered would score
+                # the model against something that does not exist.
+                scoring = prod_baseline.validated_ranking(row)
+            else:
+                # No stored ordering: CALL the production scorer rather than
+                # fall back to the training heuristic. A silent fallback here
+                # would label a training-baseline number as a production one,
+                # which is the defect this argument exists to close.
+                ranking = prod_baseline.production_ranking(row)
+                if not ranking:
+                    raise ValueError(
+                        f"row {index} carries no deterministic ordering and "
+                        f"no candidates to derive one from, so the gate "
+                        f"cannot be measured against production")
+                scoring = {"ranking": ranking}
         else:
             scoring = _baseline("exploit", payload)
         base.append(score_one("ndcg", expected, scoring))
@@ -550,7 +562,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "run (exit 4) when the corpus records no such "
                              "ordering, instead of silently measuring the "
                              "training one")
+    parser.add_argument("--stamp-corpus", action="store_true",
+                        help="write the ordering the RUNTIME would produce "
+                             "into the shipped corpus "
+                             "(training/golden/<phase>.production.jsonl) and "
+                             "exit; this is what makes --baseline production "
+                             "reproducible instead of hand-written")
     args = parser.parse_args(argv)
+
+    if args.stamp_corpus:
+        from training import prod_baseline
+
+        written, total = prod_baseline.stamp_corpus(phase=args.phase)
+        print(f"stamped {written} of {total} row(s) with the production "
+              f"ordering: {prod_baseline.corpus_path(args.phase)}")
+        return 0
 
     train_rows, test_rows = rows_for(args.phase, ratio=args.ratio,
                                      corpus=args.corpus)
@@ -567,15 +593,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         # would be a lie. Refuse BEFORE training, so a refused run costs
         # nothing and leaves no artifact behind.
         everything = list(train_rows) + list(test_rows)
+        from training import prod_baseline
+
+        # A row either STATES its deterministic ordering or its candidates can
+        # be scored by the production function. Only a row with neither is a
+        # reason to refuse: stamping is reproducible, guessing is not.
         missing = [str(row.get("id") or index)
                    for index, row in enumerate(everything)
-                   if deterministic_ranking(row) is None]
+                   if deterministic_ranking(row) is None
+                   and not prod_baseline.production_ranking(row)]
         if missing:
             shown = ", ".join(missing[:6])
             print("REFUSED: --baseline production needs the deterministic "
-                  "ordering in every corpus row (deterministic_rank / "
-                  "deterministic / oracle / baseline_rank / production_rank), "
-                  "and this corpus does not carry it.", file=sys.stderr)
+                  "ordering in every corpus row, and these rows carry "
+                  "neither a stored one (deterministic_rank / deterministic "
+                  "/ oracle / baseline_rank / production_rank) nor candidates "
+                  "the production scorer can order.", file=sys.stderr)
             print(f"  {len(missing)} of {len(everything)} row(s) have none: "
                   f"{shown}", file=sys.stderr)
             print("  nothing was trained or written; use the default "

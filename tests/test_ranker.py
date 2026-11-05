@@ -41,7 +41,11 @@ def test_training_is_deterministic_and_learns_the_order():
 
 
 def test_the_exported_weights_reproduce_the_training_score(tmp_path):
-    rows = [_row(["web_rce", "scan_tcp"], ["scan_tcp", "web_rce"])]
+    # No candidates at all: there is no ordering to compare against, so the
+    # refusal path still has to fire (the old fixture used real ids, which
+    # the production scorer can now order on its own — that fallback is the
+    # feature, not the refusal).
+    rows = [_row([], [])]
     trained = training_ranker.train(rows, epochs=20)
     path = tmp_path / "ranker.json"
     path.write_text(json.dumps(trained.to_dict()), encoding="utf-8")
@@ -273,7 +277,11 @@ def test_the_default_baseline_is_the_training_heuristic(tmp_path, monkeypatch):
 def test_production_baseline_refuses_a_corpus_without_the_ordering(
         tmp_path, monkeypatch, capsys):
     """Never fall back silently: the run is refused, nothing is written."""
-    rows = [_row(["web_rce", "scan_tcp"], ["scan_tcp", "web_rce"])]
+    # No candidates at all: there is no ordering to compare against, so the
+    # refusal path still has to fire (the old fixture used real ids, which
+    # the production scorer can now order on its own — that fallback is the
+    # feature, not the refusal).
+    rows = [_row([], [])]
     monkeypatch.setattr(training_ranker, "rows_for",
                         lambda *a, **k: (list(rows), list(rows)))
 
@@ -296,7 +304,11 @@ def test_deterministic_ranking_reads_the_corpus_not_the_model():
 
 
 def test_evaluate_refuses_a_row_without_a_production_ordering():
-    rows = [_row(["web_rce", "scan_tcp"], ["scan_tcp", "web_rce"])]
+    # No candidates at all: there is no ordering to compare against, so the
+    # refusal path still has to fire (the old fixture used real ids, which
+    # the production scorer can now order on its own — that fallback is the
+    # feature, not the refusal).
+    rows = [_row([], [])]
     ranker = training_ranker.train(rows, epochs=5)
     with pytest.raises(ValueError):
         training_ranker.evaluate(ranker, rows, baseline="production")
@@ -393,3 +405,60 @@ def test_the_promoted_ranker_corrects_a_production_ordering():
     assert [c.id for c in result.ordered] == expected
     assert deterministic != expected
     assert result.applied
+
+
+def test_the_shipped_corpus_is_orderable_by_the_production_scorer():
+    """Every row can be measured against the REAL competitor, not a hand note.
+
+    The baseline is computed by calling the runtime's own
+    ``AccessCandidate.score_for`` on the row's candidates, so it cannot drift
+    away from the code it names.
+    """
+    from training import prod_baseline
+
+    rows = prod_baseline.load_corpus(prod_baseline.corpus_path("exploit"))
+    assert rows, "the shipped production corpus is empty"
+    for row in rows:
+        ids = prod_baseline.candidate_ids(row)
+        ranking = prod_baseline.production_ranking(row)
+        assert ranking, row.get("id")
+        assert sorted(ranking) == sorted(ids), row.get("id")
+
+
+def test_a_stamp_written_to_the_corpus_matches_what_the_runtime_would_do():
+    from training import prod_baseline
+
+    rows = prod_baseline.load_corpus(prod_baseline.corpus_path("exploit"))
+    stamped = prod_baseline.stamp_rows(rows)
+    for row in stamped:
+        assert row["deterministic_rank"] == prod_baseline.production_ranking(row)
+        # and it must survive the same validation the gate applies
+        assert prod_baseline.validated_ranking(row)["ranking"] == \
+            row["deterministic_rank"]
+
+
+def test_a_stored_ranking_naming_an_unknown_candidate_is_rejected():
+    """A corrupt baseline must fail loudly, not move the measured delta."""
+    from training import prod_baseline
+
+    row = {
+        "id": "corrupt",
+        "input": {"mode": "balanced",
+                  "candidates": [{"id": "a"}, {"id": "b"}]},
+        "expected": {"ranking": ["a", "b"]},
+        "deterministic_rank": ["a", "ghost"],
+    }
+    with pytest.raises(ValueError):
+        prod_baseline.validated_ranking(row)
+
+
+def test_the_gate_can_measure_against_production_end_to_end():
+    """`--baseline production` completes on the shipped corpus."""
+    from training import prod_baseline
+    from training import ranker as ranker_module
+
+    rows = prod_baseline.load_corpus(prod_baseline.corpus_path("exploit"))
+    model = ranker_module.train(rows, epochs=1)
+    got, base, ids = ranker_module.evaluate(model, rows, baseline="production")
+    assert len(got) == len(base) == len(ids) == len(rows)
+    assert all(0.0 <= value <= 1.0 for value in base)
