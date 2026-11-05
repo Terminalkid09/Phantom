@@ -111,16 +111,22 @@ def doctor(say: Say = print) -> Dict[str, object]:
     # answer is unchanged and the WSL probe never even runs.
     try:
         from phantom.automation.runtime.toolchain import ToolRegistry
-        from phantom.core.doctor import tools_summary
-        reg = ToolRegistry()
-        found = [e for e in tools if reg.has(e.name)]
-        missing = [e for e in tools if not reg.has(e.name)]
-        # `reg.has` answers "installed", not WHERE. On Windows the toolbox
-        # lives in the Kali distro and `which` cannot see it, so a bridged
-        # tool and a host tool read identically — measured 2026-11-05: the
-        # line did not list nmap while `command -v nmap` found nothing, and
-        # the operator could not tell which half of the install was missing.
-        tool_line = tools_summary(tools, native=shutil.which, bridged=reg.has)
+        from phantom.core.doctor import tool_sources, tools_summary_from
+        # ONE probe feeds every number on the line. Before this, the total
+        # came from `ToolRegistry.has` and the host/wsl split from a second
+        # `shutil.which` pass — measured 2026-11-05: the same box printed
+        # `5/20 installed` in one field and `3/20 (host 3, wsl 0)` in another.
+        # `wsl=False` is the same detector without the bridge, so "host" means
+        # "on PATH" and "wsl" means "only the Kali distro has it".
+        reg = ToolRegistry(wsl=True)
+        reg_native = ToolRegistry(wsl=False)
+        rows = tool_sources(tools, native=reg_native.has, bridged=reg.has)
+        source = {name: where for name, where in rows}
+        found = [e for e in tools
+                 if source.get(getattr(e, "name", e)) != "missing"]
+        missing = [e for e in tools
+                   if source.get(getattr(e, "name", e)) == "missing"]
+        tool_line = tools_summary_from(rows)
     except Exception:
         found = [e for e in tools if shutil.which(e.name)]
         missing = [e for e in tools if not shutil.which(e.name)]

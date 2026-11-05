@@ -760,14 +760,16 @@ def tool_sources(names, *, native=None, bridged=None) -> List[Tuple[str, str]]:
     return rows
 
 
-def tools_summary(names, *, native=None, bridged=None) -> str:
-    """The doctor's one-line tool state WITH its provenance.
+def tools_summary_from(rows) -> str:
+    """Format the rows `tool_sources` produced — the only place they are counted.
 
-    Shape: ``tools: 5/20 installed (host 2, wsl 3) — missing: nc, hydra``.
-    The installed count is the sum of the split by construction, so the line
-    cannot contradict itself the way a bare total can.
+    Everything an operator reads (installed total, host/wsl split, missing
+    list) is derived from ONE row list, so the three numbers cannot disagree.
+    Measured 2026-11-05: the wizard took the total from `ToolRegistry.has`
+    and the split from a second probe, and the same run printed `5/20
+    installed` in one place and `3/20 (host 3, wsl 0)` in another.
     """
-    rows = tool_sources(names, native=native, bridged=bridged)
+    rows = list(rows or ())
     host = [n for n, source in rows if source == "host"]
     via_bridge = [n for n, source in rows if source == "wsl"]
     missing = [n for n, source in rows if source == "missing"]
@@ -776,6 +778,18 @@ def tools_summary(names, *, native=None, bridged=None) -> str:
     if missing:
         out += " — missing: " + ", ".join(missing)
     return out
+
+
+def tools_summary(names, *, native=None, bridged=None) -> str:
+    """The doctor's one-line tool state WITH its provenance.
+
+    Shape: ``tools: 5/20 installed (host 2, wsl 3) — missing: nc, hydra``.
+    Delegates the counting to `tools_summary_from` so a caller that already
+    has the rows (the wizard) and a caller that does not (tests, API) produce
+    the identical line.
+    """
+    return tools_summary_from(tool_sources(names, native=native,
+                                           bridged=bridged))
 
 
 # ── runner ───────────────────────────────────────────────────────────────
