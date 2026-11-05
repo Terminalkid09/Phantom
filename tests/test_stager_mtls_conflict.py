@@ -14,8 +14,13 @@ from unittest import mock
 
 from phantom.utils.builder import stager_mtls_conflict
 
-STRICT_ENV = {"PHANTOM_MTLS_REQUIRE_CLIENT_CERT": "1"}
-LAX_ENV = {"PHANTOM_MTLS_REQUIRE_CLIENT_CERT": "0"}
+#: `PHANTOM_MTLS_REQUIRED` is pinned because the persisted flag file can say
+#: otherwise (`guardrails disable mtls` on the operator's machine) and then
+#: `use_mtls()` short-circuits the warning for reasons that have nothing to do
+#: with what this test is measuring.
+TRUST_TRANSPORT = {"PHANTOM_MTLS_REQUIRED": "1"}
+STRICT_ENV = {**TRUST_TRANSPORT, "PHANTOM_MTLS_REQUIRE_CLIENT_CERT": "1"}
+LAX_ENV = {**TRUST_TRANSPORT, "PHANTOM_MTLS_REQUIRE_CLIENT_CERT": "0"}
 
 
 class TestStagerMtlsConflict(unittest.TestCase):
@@ -40,7 +45,8 @@ class TestStagerMtlsConflict(unittest.TestCase):
     def test_a_config_read_failure_warns_rather_than_stays_silent(self):
         """"I could not read the config" must not be reported as "all good" —
         the failure mode we are fixing is precisely a silent green light."""
-        with mock.patch("phantom.utils.config.get_bool",
-                        side_effect=RuntimeError("boom")):
+        with mock.patch.dict(os.environ, TRUST_TRANSPORT, clear=False), \
+                mock.patch("phantom.utils.config.get_bool",
+                           side_effect=RuntimeError("boom")):
             msg = stager_mtls_conflict("windows", True)
         self.assertNotEqual(msg, "")
