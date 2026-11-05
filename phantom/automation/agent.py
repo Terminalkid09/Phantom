@@ -61,34 +61,19 @@ from phantom.automation.agent_support import (
     _best_origin,
 )
 
-
-def _audit_decision(kind: str, **fields: Any) -> None:
-    """Best-effort decision telemetry (never takes the planner down)."""
-    try:
-        from phantom.automation import decision_audit as _audit
-        _audit.record(kind, **fields)
-    except Exception:
-        pass
-
-
-def _health_enabled() -> bool:
-    try:
-        from phantom.utils import config as cfg
-        return cfg.get_bool("automation.capability_health", True,
-                            env="PHANTOM_CAPABILITY_HEALTH")
-    except Exception:
-        return True
+# Telemetry helpers moved to `agent_telemetry` (2026-11-05) and re-exported:
+# same contract (a sink never takes the planner down), one small file instead
+# of the middle of a 5.2k-line agent.
+from phantom.automation.agent_telemetry import (  # noqa: F401
+    _audit_decision,
+    _health_enabled,
+    _record_health,
+)
 
 
-def _record_health(cap_id: str, ok: bool, reason: str = "") -> None:
-    """Best-effort per-capability health ledger update (never fatal)."""
-    if not _health_enabled():
-        return
-    try:
-        from phantom.automation import capability_health as _ch
-        _ch.instance().record(cap_id, ok, reason)
-    except Exception:
-        pass
+# `_audit_decision` / `_health_enabled` / `_record_health` are defined in
+# `automation/agent_telemetry.py` and imported above; the names stay in this
+# module's namespace because the agent loop and the tests call them here.
 
 # Bump when a checkpoint field changes MEANING (not when one is added):
 # from_state reads every field defensively, so a mismatch is a warning to
