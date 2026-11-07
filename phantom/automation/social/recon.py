@@ -1252,24 +1252,71 @@ def is_platform_boilerplate(text: str, platform: str = "") -> bool:
     return False
 
 
+def _identity_view(result: ReconResult) -> dict:
+    """One `ReconResult` in the shape `identity_confidence.score_lead` reads.
+
+    The graph and the outbound handles are already in the collected leads, so
+    they are passed on instead of being recomputed differently in two places.
+    """
+    graph = {str(l.value).lstrip("@").lower() for l in result.leads
+             if l.kind in ("commenter", "tagged", "account_link") and l.value}
+    outbound = {str(l.value).lstrip("@").lower() for l in result.leads
+                if l.kind == "account_link" and l.value}
+    if result.link:
+        outbound.add(str(result.link).lstrip("@").lower())
+    return {
+        "username": result.username, "bio": result.bio,
+        "avatar_hash": result.avatar_hash,
+        "avatar_dhash": result.avatar_dhash, "link": result.link,
+        "outbound": sorted(outbound), "full_name": result.full_name,
+        "emails": list(result.emails), "graph": sorted(graph),
+    }
+
+
 def correlate_accounts(results: List[ReconResult]) -> List[Lead]:
-    """Cross-result correlation: same-avatar-hash or high bio-similarity
-    between two platforms = same person with different handles."""
+    """Cross-platform correlation, scored by the ONE identity model.
+
+    This function used to carry its own numbers: a shared avatar hash was
+    emitted at confidence **0.85**, a bio overlap at 0.65. That contradicted
+    the rule the rest of the code is built on — the operator's own rule is
+    that an avatar proves nothing alone, and `identity_confidence` encodes it
+    (avatar = 0.40, supporting only). Two scorers meant the same pair of
+    accounts could be "0.85 linked" here and `UNRELATED` in the
+    `IDENTITY_CONF` marker printed by `recon()`, and the first number is the
+    one a report quotes.
+
+    So the score now comes from `score_lead`: a lone avatar or a shared handle
+    stays below `PROBABLE_THRESHOLD` and cannot authorise contact, while a
+    bidirectional cross-link can reach `CONFIRMED`. The signal names stay in
+    the evidence (the interpreter and the tests read them), and the tier is
+    appended so a human sees which claim the number supports.
+    """
+    from phantom.automation.social.identity_confidence import score_lead
+
     leads: List[Lead] = []
     for i, a in enumerate(results):
+        primary = _identity_view(a)
         for b in results[i + 1:]:
             if a.platform == b.platform:
                 continue
-            if (a.avatar_hash and b.avatar_hash
-                    and a.avatar_hash == b.avatar_hash):
-                leads.append(Lead(
-                    "account_link", b.username, b.platform,
-                    f"avatar_match:{a.platform}", 0.85))
-            sim = _bio_similarity(a.bio, b.bio)
-            if sim >= 0.55 and a.bio and b.bio:
-                leads.append(Lead(
-                    "account_link", b.username, b.platform,
-                    f"bio_sim:{sim:.2f}:{a.platform}", 0.65))
+            scored = score_lead(a.platform, primary, _identity_view(b))
+            kinds = [kind for kind, _ in scored.signals]
+            if not kinds:
+                continue
+            # Keep the historical prefixes (`avatar_match:`, `bio_sim:`) —
+            # the social interpreter and existing tests match on them — and
+            # add the tier so the confidence can be read against its ceiling.
+            if "avatar_match" in kinds:
+                prefix = f"avatar_match:{a.platform}"
+            elif "bio_sim" in kinds:
+                prefix = f"bio_sim:{_bio_similarity(a.bio, b.bio):.2f}:{a.platform}"
+            else:
+                prefix = "+".join(kinds)
+            tier = scored.tier
+            leads.append(Lead(
+                "account_link", b.username, b.platform,
+                f"{prefix} tier={tier} signals={'+'.join(kinds)}",
+                scored.score))
     return leads
 
 

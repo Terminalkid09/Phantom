@@ -76,6 +76,21 @@ PROBABLE_CEILING = 0.75
 # bio jaccard at/above this counts as strong (still capped, never alone)
 BIO_SIM_STRONG = 0.75
 BIO_SIM_CAP = 0.70
+#: Words that carry no identity: "student gamer" is thousands of people, and
+#: a bio made only of these scores 1.0 against another friendly bio. A strong
+#: bio signal needs at least this many DISTINCTIVE shared tokens (measured
+#: 2026-11-06: an identical two-word bio reached PROBABLE on Jaccard alone).
+BIO_DISTINCTIVE_MIN = 2
+_GENERIC_BIO_TOKENS = {
+    "student", "gamer", "player", "love", "lover", "life", "living",
+    "official", "follow", "followers", "followme", "instagram", "insta",
+    "tiktok", "twitter", "facebook", "youtube", "linked", "link",
+    "links", "page", "account", "profile", "world", "dream", "dreamer",
+    "music", "sport", "sports", "travel", "food", "coffee", "tech",
+    "developer", "coder", "designer", "artist", "photographer", "freelance",
+    "based", "living", "passion", "passionate", "about", "contact", "mail",
+    "business", "online", "digital", "italy", "italia", "milano", "rome",
+}
 # perceptual-hash hamming distance at/below this counts as "same picture"
 DHASH_MAX_DISTANCE = 10
 
@@ -138,6 +153,43 @@ def _bio_similarity(a: str, b: str) -> float:
 def _name_tokens(name: str) -> set:
     return {w for w in (name or "").lower().replace(".", " ").replace(
         "_", " ").split() if len(w) > 1}
+
+
+def _outbound_handles(values) -> set:
+    """Handles in an outbound reference, bare (`@bob`) or a URL.
+
+    `from_primary` used to compare the candidate's handle against the RAW
+    outbound strings, so `https://tiktok.com/@bob` never matched "bob": a real
+    bidirectional link — the strongest proof this module has — was downgraded
+    to a one-way mention whenever the collection produced a URL instead of a
+    bare handle, which is exactly what `recon._outbound_of` does with a
+    profile's own link (measured 2026-11-06 through a profile-link fixture).
+    """
+    out = set()
+    for value in values or ():
+        text = str(value or "").strip().lower().rstrip("/")
+        if not text:
+            continue
+        if "://" in text or "/" in text:
+            text = text.rsplit("/", 1)[-1]
+        text = text.lstrip("@").split("?")[0].split("#")[0]
+        if text:
+            out.add(text)
+    return out
+
+
+def _distinctive_shared_tokens(a: str, b: str) -> int:
+    """How many NON-generic words two bios genuinely share.
+
+    Jaccard alone rates "student gamer" against "gamer student" at 1.0, which
+    is a coincidence of vocabulary, not a person. Only distinctive overlap
+    may produce the strong bio signal; the raw similarity is still reported
+    in the evidence for a human to judge.
+    """
+    ta = {w.lower().strip(".,#@!?-") for w in (a or "").split() if len(w) > 2}
+    tb = {w.lower().strip(".,#@!?-") for w in (b or "").split() if len(w) > 2}
+    shared = (ta & tb) - _GENERIC_BIO_TOKENS
+    return len({w for w in shared if w.isalnum() or "_" in w})
 
 
 def dhash_distance(a: str, b: str) -> Optional[int]:
@@ -211,7 +263,7 @@ def score_lead(primary_platform: str, primary: Dict, candidate: Dict
     p_outbound = {str(h).lower().lstrip("@")
                   for h in (primary.get("outbound") or []) if h}
     to_primary = bool(pu and (pu in link or pu in cbio))
-    from_primary = bool(cu and cu in p_outbound)
+    from_primary = bool(cu and cu in _outbound_handles(primary.get("outbound")))
     if to_primary and from_primary:
         lead.signals.append(("cross_link_bidi",
                              SIGNAL_STRENGTH["cross_link_bidi"]))
@@ -247,6 +299,11 @@ def score_lead(primary_platform: str, primary: Dict, candidate: Dict
     #    alone (common templates, fan pages) never confirm by themselves.
     sim = _bio_similarity(str(primary.get("bio", "")),
                           str(candidate.get("bio", "")))
+    distinctive = _distinctive_shared_tokens(str(primary.get("bio", "")),
+                                             str(candidate.get("bio", "")))
+    if distinctive < BIO_DISTINCTIVE_MIN:
+        # similar wording, generic vocabulary: not a signal at all
+        sim = 0.0
     if sim >= BIO_SIM_STRONG:
         lead.signals.append(("bio_sim", BIO_SIM_CAP))
         lead.evidence += f"bio similarity {sim:.2f}; "
