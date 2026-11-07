@@ -152,6 +152,81 @@ def _win_paths_to_wsl(cmd: str) -> str:
     return re.sub(r"(?<![\w/])([A-Za-z]):[\\/]([^\s'\"]*)", _sub, cmd)
 
 
+#: Shell syntax that cmd.exe cannot run even when the FIRST word of the line
+#: is a native executable: POSIX filters, `/dev/null`, command substitution.
+#: Measured 2026-11-06: an auto-mode run on Windows executed `curl_probe` four
+#: times and every attempt failed, because the capability emits
+#: `echo ==CURLPROBE 21== & curl ... | head -12 & ...` — `curl.exe` IS on the
+#: Windows PATH, so `_rewrite_wsl` (which decided per TOOL) left the line
+#: native and cmd.exe had no `head`. The run honestly reported "partial", but
+#: it had executed nothing, on a lab whose ports answer fine.
+_POSIX_ONLY_RE = re.compile(
+    r"(?:\|\s*(?:head|tail|grep|egrep|fgrep|awk|sed|cut|sort|uniq|tr|wc|tee"
+    r"|xargs|base64|xxd|strings)\b"
+    r"|\b(?:head|tail|awk|sed|xargs|wc)\s+-\d"
+    r"|2?>\s*/dev/null"
+    r"|\$\(|`)")
+
+
+#: The subset of the above that cmd.exe genuinely CANNOT emulate. A
+#: `/dev/null` redirect is NOT here on purpose: `_to_cmd_redirects` turns it
+#: into `2>NUL`, so it is a translation, not a reason to cross into the
+#: distro (that mistake sent `C:\...\python.exe -c "..." 2>/dev/null` to the
+#: Kali shell, which answered exit 127 for a binary that runs fine natively).
+_POSIX_STRICT_RE = re.compile(
+    r"(?:\|\s*(?:head|tail|grep|egrep|fgrep|awk|sed|cut|sort|uniq|tr|wc|tee"
+    r"|xargs|base64|xxd|strings)\b"
+    r"|\b(?:head|tail|awk|sed|xargs|wc)\s+-\d"
+    r"|\$\(|`)")
+
+
+def _needs_posix_shell(cmd: str) -> bool:
+    """True when this line needs a POSIX shell, whatever its first word is.
+
+    Deliberately NARROW: a pipe into a POSIX-only filter, a `/dev/null`
+    redirect, command substitution, a backtick. `tasklist | findstr x` stays
+    native (findstr is a Windows program), and so does any Windows command
+    with none of these constructs.
+    """
+    return bool(_POSIX_ONLY_RE.search(str(cmd or "")))
+
+
+def _needs_linux_shell(cmd: str) -> bool:
+    """True when a NATIVE binary still cannot run this line on cmd.exe.
+
+    Used only where the tool itself resolved on the Windows PATH: there the
+    bar is syntax Windows cannot express (`curl ... | head -12`), not a
+    redirect that the executor rewrites anyway.
+    """
+    return bool(_POSIX_STRICT_RE.search(str(cmd or "")))
+
+
+def _wsl_shell_line(cmd: str) -> str:
+    """The whole line through a distro shell, quoting-proof (base64)."""
+    import base64 as _b64
+    payload = _b64.b64encode(cmd.encode()).decode()
+    try:
+        from phantom.automation.runtime.toolchain import _wsl_distro_list
+        distros = _wsl_distro_list()
+        for distro in ("kali-linux", "kali", "Ubuntu"):
+            if distro in distros:
+                return f'wsl -d {distro} sh -c "echo {payload} | base64 -d | sh"'
+    except Exception:
+        pass
+    return f'wsl sh -c "echo {payload} | base64 -d | sh"'
+
+
+#: A deploy line chains WSL-side tools with shell syntax:
+#:   setsid sshpass ... ssh ... "... </dev/null >/dev/null 2>&1 &"
+#: Rewriting only its FIRST token breaks (wrong distro, mangled quoting) — the
+#: whole line goes through the distro shell.
+_DEPLOY_CHAIN_TOKENS = ("sshpass", "ssh ", "scp ", "setsid")
+
+
+def _is_deploy_chain(cmd: str) -> bool:
+    return any(t in cmd for t in _DEPLOY_CHAIN_TOKENS)
+
+
 def _rewrite_wsl(cmd: str) -> str:
     """Route a command through the WSL toolbox when the binary is only
     available there (Windows native miss, Kali distro hit).
@@ -166,33 +241,31 @@ def _rewrite_wsl(cmd: str) -> str:
     prefix, tool, rest = _command_head(cmd)
     if not tool:
         return cmd
+    # A deploy CHAIN is not decided by its first word: `setsid sshpass … ssh
+    # … "… </dev/null >/dev/null 2>&1 &"` mixes a Linux-only tool with POSIX
+    # redirections and a backgrounded remote command. `ssh.exe`/`scp.exe` DO
+    # exist on Windows, so the native lookup would answer "run it here" and
+    # cmd.exe would choke on `</dev/null`. This check therefore comes BEFORE
+    # the lookup, but only for lines that carry the syntax.
+    if _needs_posix_shell(cmd) and _is_deploy_chain(cmd):
+        return _wsl_shell_line(cmd)
     # Tools already native on Windows must keep running natively: WSL interop
     # lists Windows exes inside the distro (via /mnt/c), so a naive WSL probe
     # "finds" docker.exe and rewrites it into a Linux invocation that dies
     # with execvpe() failure. Only route through WSL when the tool is NOT on
     # the Windows PATH.
     if shutil.which(tool) is not None:
+        # ...but a POSIX-only PIPE still cannot run there: a native `curl.exe`
+        # cannot consume `| head`. That is the one reason a found tool still
+        # crosses over. A `/dev/null` redirect is NOT one (see
+        # `_needs_linux_shell`).
+        if _needs_linux_shell(cmd):
+            return _wsl_shell_line(cmd)
         return cmd
-    # The deploy line chains WSL-side tools with shell syntax:
-    #   setsid sshpass ... ssh ... "... </dev/null >/dev/null 2>&1 &"
-    # Rewriting only the first token breaks (wrong distro / mangled quoting);
-    # route the WHOLE line through the distro shell instead.
-    if any(t in cmd for t in ("sshpass", "ssh ", "scp ", "setsid")):
-        from phantom.automation.runtime.toolchain import _wsl_distro_list
-        # cmd.exe (shell=True) eats double quotes before wsl.exe sees them, so
-        # the remote-command quoting is destroyed. base64 is quoting-proof:
-        # the Linux side decodes and executes the EXACT original line.
-        import base64 as _b64
-        payload = _b64.b64encode(cmd.encode()).decode()
-        try:
-            distros = _wsl_distro_list()
-            # prefer a distro that actually has sshpass (kali), else default
-            for d in ("kali-linux", "kali", "Ubuntu"):
-                if d in distros:
-                    return f'wsl -d {d} sh -c "echo {payload} | base64 -d | sh"'
-        except Exception:
-            pass
-        return f'wsl sh -c "echo {payload} | base64 -d | sh"'
+    # No native binary: POSIX-only shell syntax is then a reason to route the
+    # whole line into the distro shell by itself.
+    if _needs_posix_shell(cmd) or _is_deploy_chain(cmd):
+        return _wsl_shell_line(cmd)
     try:
         from phantom.automation.runtime.toolchain import _wsl_which
         wrapper = _wsl_which(tool) if tool else None

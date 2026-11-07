@@ -24,6 +24,7 @@ from phantom.core.executor import (
     QuietResult,
     _command_head,
     _is_tool_installed,
+    _needs_posix_shell,
     _wrap_wsl_redirects,
     _win_paths_to_wsl,
 )
@@ -110,8 +111,48 @@ class TestWrapWslRedirects(unittest.TestCase):
         self.assertEqual(_wrap_wsl_redirects(cmd), cmd)
 
 
+class TestPosixOnlySyntax(unittest.TestCase):
+    """A native FIRST WORD is not enough: the SHELL has to be able to run it.
+
+    Measured 2026-11-06: an auto-mode run on Windows issued the anomaly probe
+    `echo ==CURLPROBE 21== & curl ... | head -12 & ...` four times and every
+    attempt failed. `curl.exe` is on the Windows PATH, so the bridge (which
+    decided per TOOL) left the line native and cmd.exe has no `head`: the run
+    honestly said "partial" while having executed nothing.
+    """
+
+    def test_pipe_into_a_posix_filter_needs_the_posix_shell(self):
+        self.assertTrue(_needs_posix_shell(
+            "curl -s http://x/ | head -12"))
+        self.assertTrue(_needs_posix_shell(
+            "echo a & curl -s -v telnet://127.0.0.1:21 2>&1 | head -12"))
+
+    def test_dev_null_and_command_substitution_need_it(self):
+        self.assertTrue(_needs_posix_shell("nmap -sV x 2>/dev/null"))
+        self.assertTrue(_needs_posix_shell("rm -rf $(pwd)/build"))
+        self.assertTrue(_needs_posix_shell("echo `id`"))
+
+    def test_windows_commands_stay_native(self):
+        self.assertFalse(_needs_posix_shell("tasklist | findstr python"))
+        self.assertFalse(_needs_posix_shell("powershell -c Get-Process"))
+        self.assertFalse(_needs_posix_shell("where nmap"))
+        self.assertFalse(_needs_posix_shell("curl -s http://127.0.0.1:8081/"))
+        self.assertFalse(_needs_posix_shell(""))
+
+
 @unittest.skipUnless(os.name == "nt", "the WSL bridge only rewrites on Windows")
 class TestRewriteWsl(unittest.TestCase):
+
+    def test_posix_syntax_through_a_native_tool_still_goes_to_the_distro(self):
+        with mock.patch("phantom.core.executor.shutil.which",
+                        return_value=r"C:\Windows\System32\curl.exe"), \
+             mock.patch("phantom.automation.runtime.toolchain._wsl_distro_list",
+                        return_value=["kali-linux"]):
+            from phantom.core.executor import _rewrite_wsl
+            got = _rewrite_wsl("curl -s http://x/ | head -12")
+        self.assertTrue(got.startswith("wsl -d kali-linux sh -c"), got)
+        self.assertIn("base64 -d | sh", got)
+
     """Windows: a Linux-only tool is routed through the distro."""
 
     def _rewrite(self, cmd, wrapper="wsl -d kali-linux nmap"):
@@ -152,6 +193,50 @@ class TestRewriteWsl(unittest.TestCase):
                         return_value=r"C:\Windows\System32\where.exe"):
             from phantom.core.executor import _rewrite_wsl
             self.assertEqual(_rewrite_wsl("where nmap"), "where nmap")
+
+    def test_a_dev_null_redirect_does_not_ship_a_native_binary_to_wsl(self):
+        """Measured 2026-11-07: exit 127 for a binary that runs fine.
+
+        `sys.executable` with `2>/dev/null` is a NATIVE line: the executor
+        rewrites the redirect to `2>NUL` immediately after this function
+        (`_to_cmd_redirects`). Counting the redirect as "needs a POSIX shell"
+        sent the Windows path itself into the Kali shell, which answered
+        `127` — a working command reported as a missing tool.
+        """
+        cmd = r'C:\Python310\python.exe -c "import sys; print(7)" 2>/dev/null'
+        with mock.patch("phantom.core.executor.shutil.which", return_value=cmd.split()[0]):
+            from phantom.core.executor import _rewrite_wsl
+            self.assertEqual(_rewrite_wsl(cmd), cmd)
+
+    def test_a_native_tool_with_a_posix_pipe_still_crosses(self):
+        # the redirect is translatable, `| head` is not: this one must route
+        with mock.patch("phantom.core.executor.shutil.which",
+                        return_value=r"C:\Windows\System32\curl.exe"):
+            from phantom.core.executor import _rewrite_wsl
+            got = _rewrite_wsl("curl -s http://x | head -3")
+        self.assertIn("sh -c", got)
+
+    def test_a_deploy_chain_crosses_even_when_ssh_is_native(self):
+        """`ssh.exe` exists on Windows; the CHAIN still cannot run there.
+
+        `</dev/null >/dev/null 2>&1 &` is not cmd.exe syntax, so a native
+        first word must not win over the line. This is the case the `/dev/null`
+        fix must keep protecting.
+        """
+        cmd = ('setsid sshpass -p pw ssh -o StrictHostKeyChecking=no root@1.2.3.4 '
+               '"mkdir -p /tmp/x </dev/null >/dev/null 2>&1 &"')
+        with mock.patch("phantom.core.executor.shutil.which",
+                        return_value=r"C:\Windows\System32\OpenSSH\ssh.exe"):
+            from phantom.core.executor import _rewrite_wsl
+            got = _rewrite_wsl(cmd)
+        self.assertIn("sh -c", got)
+
+    def test_a_plain_native_ssh_command_stays_native(self):
+        with mock.patch("phantom.core.executor.shutil.which",
+                        return_value=r"C:\Windows\System32\OpenSSH\ssh.exe"):
+            from phantom.core.executor import _rewrite_wsl
+            self.assertEqual(_rewrite_wsl("ssh root@1.2.3.4 id"),
+                             "ssh root@1.2.3.4 id")
 
 
 class TestQuietBudget(unittest.TestCase):
