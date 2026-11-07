@@ -39,6 +39,65 @@ def _header_runner(hits):
     return runner
 
 
+class TestTheTransportParity(unittest.TestCase):
+    """The fast path and the fallback must be the SAME observation.
+
+    `curl_runner` now goes through a pooled keep-alive session and keeps the
+    subprocess as a fallback. A hunt is only as honest as its transport: if the
+    two disagree about status, body or headers, a finding changes depending on
+    which one happened to answer. Measured 2026-11-06: the header_ssti hunt
+    dropped from 90.9 s to 15.0 s and the fuzz pass from 105 s to 1.5 s, so
+    this parity is the guard on the speed-up.
+    """
+
+    def test_session_and_subprocess_agree_on_a_real_response(self):
+        import http.server
+        import shutil
+        import threading
+
+        from phantom.automation.exploit import anomaly
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = b"result: 49" if "{{7*7}}" in self.headers.get(
+                    "User-Agent", "") else b"<html>hello</html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("X-Injected", "1")
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{port}/"
+        try:
+            fast = anomaly._session_runner(
+                "GET", url, headers={"User-Agent": "{{7*7}}"})
+            self.assertEqual(fast.status, 200)
+            self.assertEqual(fast.body, "result: 49")
+            self.assertEqual(fast.headers.get("x-injected"), "1")
+            if not shutil.which("curl"):
+                self.skipTest("no curl on this host: fallback not exercisable")
+            slow = anomaly._curl_subprocess_runner(
+                "GET", url, headers={"User-Agent": "{{7*7}}"})
+            self.assertEqual((fast.status, fast.body, fast.size),
+                             (slow.status, slow.body, slow.size))
+            self.assertEqual(fast.headers.get("x-injected"),
+                             slow.headers.get("x-injected"))
+        finally:
+            srv.shutdown()
+
+    def test_the_runner_never_raises_on_a_dead_host(self):
+        from phantom.automation.exploit.anomaly import curl_runner
+        result = curl_runner("GET", "http://127.0.0.1:9/", timeout=2)
+        self.assertEqual(result.status, 0)
+        self.assertEqual(result.body, "")
+
+
 class TestProbeLibrary(unittest.TestCase):
 
     def test_all_classes_have_baseline_and_payloads(self):
