@@ -17,9 +17,18 @@ tunnel, read back the assigned hostname, and (through `c2.front`) make the
 next generated artefact use it. `start()` deliberately performs the listener
 restart too, because an HTTPS listener behind a tunnel cannot work: the edge
 terminates TLS with a certificate it owns and forwards PLAIN HTTP to us.
+
+The download is AUTHENTICATED: the asset comes from a pinned release tag and
+every byte is checked against that release's published SHA-256 before it is
+extracted or replaces anything. It used to come from `releases/latest`, where
+"it runs" was the only check and upstream could change the binary under us at
+any time. Upgrading cloudflared is therefore a deliberate act — bump
+`_PINNED_VERSION` and the digests together, in one commit — not something a
+remote `latest` can do to an engagement.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import platform
 import re
@@ -47,8 +56,30 @@ _URL_RE = re.compile(r"https://([a-z0-9][a-z0-9-]{2,60})\.trycloudflare\.com",
 #: 45s is the point where "slow network" becomes "something is wrong".
 START_TIMEOUT_S = 45.0
 
-_RELEASE_URL = ("https://github.com/cloudflare/cloudflared/releases/latest/"
-                "download/{asset}")
+#: The release this module installs. PINNED, never `latest`: a URL that
+#: resolves to whatever upstream published this morning is a mutable
+#: dependency, and "the downloaded file runs" is not evidence that it is
+#: cloudflared. Bump this and `_PINNED_SHA256` together.
+_PINNED_VERSION = "2026.10.7"
+
+#: Per-asset SHA-256 of that release, taken from the GitHub release API
+#: (`assets[].digest`, measured 2026-11-06). A digest is the only check that
+#: survives a hijacked or corrupted download; executing `--version` does not.
+_PINNED_SHA256 = {
+    "cloudflared-windows-amd64.exe":
+        "2493dbc168923bb3e59e5e7716f71deced92992eea9acd6e9d74f84ac7751343",
+    "cloudflared-darwin-amd64.tgz":
+        "02f3edfd87684dd5b705607688e4eb4b323f6e777b81e7b3a85af556aa356848",
+    "cloudflared-darwin-arm64.tgz":
+        "3586ccf397e98e5f437e60e7c307ca6ac463e110580503af8bb8e6f9ebf831bd",
+    "cloudflared-linux-amd64":
+        "1f99fb518b83dec2ba8d870a7cc991d82a77e6196295a3d2754ba17ab9f91872",
+    "cloudflared-linux-arm64":
+        "3df43aedc9ff291d1735b5cb576cb97e0b157488796db2e32b28aecabb445775",
+}
+
+_RELEASE_URL = ("https://github.com/cloudflare/cloudflared/releases/download/"
+                "{version}/{asset}")
 
 #: Smallest plausible release. A 404 page or an HTML redirect stub carries the
 #: right URL and the wrong size, and an install that "succeeded" with one of
@@ -70,6 +101,15 @@ def _asset_name() -> str:
 
 def binary_name() -> str:
     return "cloudflared.exe" if sys.platform == "win32" else "cloudflared"
+
+
+def pinned_digest(asset: str) -> str:
+    """The pinned SHA-256 for ``asset`` ("" = this build has no pin for it)."""
+    return str(_PINNED_SHA256.get(str(asset), "") or "").strip().lower()
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def find_binary() -> str:
@@ -118,7 +158,15 @@ def install(timeout: float = 300.0) -> Tuple[str, str]:
 
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     asset = _asset_name()
-    url = _RELEASE_URL.format(asset=asset)
+    expected = pinned_digest(asset)
+    if not expected:
+        # No pin means no verification, and an unverified download is not an
+        # install. Refuse by name instead of quietly trusting the network.
+        return "", (f"no pinned SHA-256 for asset {asset!r} (cloudflared "
+                    f"{_PINNED_VERSION}) — refusing an unverified download. "
+                    f"Add the asset's digest to _PINNED_SHA256, or point "
+                    f"PHANTOM_CLOUDFLARED at a copy you already trust.")
+    url = _RELEASE_URL.format(version=_PINNED_VERSION, asset=asset)
     target = BIN_DIR / binary_name()
     tmp = target.with_suffix(target.suffix + ".part")
     try:
@@ -130,6 +178,15 @@ def install(timeout: float = 300.0) -> Tuple[str, str]:
         # A 404 page or a redirect stub has the right URL and the wrong size.
         return "", (f"download from {url} returned {len(data)} bytes — "
                     f"not a binary (asset name {_asset_name()!r})")
+    actual = _sha256(data)
+    if actual != expected:
+        # Nothing has been written to `target` yet, and nothing will be: the
+        # bytes are discarded here, including any leftover partial file from a
+        # previous attempt, so a later `find_binary()` cannot pick it up.
+        tmp.unlink(missing_ok=True)
+        return "", (f"SHA-256 mismatch for cloudflared {_PINNED_VERSION} "
+                    f"({asset}): expected {expected}, got {actual} — nothing "
+                    f"was installed and the download was discarded")
     try:
         tmp.write_bytes(data)
         if asset.endswith((".tgz", ".tar.gz")):

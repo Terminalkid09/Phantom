@@ -13,6 +13,7 @@ wired up by hand:
     the listener's own address, so the front never entered the typed command);
   * no bogus "port mismatch" warning when the port belongs to the edge.
 """
+import hashlib
 import io
 import tarfile
 import urllib.request
@@ -22,6 +23,16 @@ from phantom.utils import tunnel as tn
 from phantom.utils.short_stager import hid_download_command
 
 FRONT = "quiet-river-9081.trycloudflare.com"
+
+
+class _Bytes(io.BytesIO):
+    """A urlopen response over fixed bytes (context-manager shape included)."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 def _tarball(member: str, payload: bytes) -> bytes:
@@ -93,12 +104,18 @@ def test_install_extracts_a_tarball_asset(monkeypatch, tmp_path):
     success and every `tunnel start` then said "not found". The extraction
     branch must write the MEMBER, not the archive.
     """
+    asset = "cloudflared-darwin-arm64.tgz"
     monkeypatch.setattr(tn, "BIN_DIR", tmp_path)
-    monkeypatch.setattr(tn, "_asset_name",
-                        lambda: "cloudflared-darwin-arm64.tgz")
+    monkeypatch.setattr(tn, "_asset_name", lambda: asset)
     monkeypatch.setattr(tn, "_runs", lambda path: True)
     monkeypatch.setattr(tn, "_MIN_INSTALL_BYTES", 1)  # a fixture-sized tarball
     blob = _tarball("cloudflared", b"#!/bin/sh\necho cloudflared version 1\n")
+    # The download is authenticated against the pinned release, so this fixture
+    # pins ITS OWN digest. The check is not disabled: the bytes below must be
+    # the bytes the (patched) table names, exactly as a real release is.
+    monkeypatch.setattr(tn, "_PINNED_SHA256",
+                        {**tn._PINNED_SHA256,
+                         asset: hashlib.sha256(blob).hexdigest()})
 
     class _Resp(io.BytesIO):
         def __enter__(self):
@@ -115,6 +132,75 @@ def test_install_extracts_a_tarball_asset(monkeypatch, tmp_path):
     # the EXECUTABLE, not the archive that wrapped it
     assert written.startswith(b"#!/bin/sh")
     assert b"\x1f\x8b" not in written[:4]
+
+
+def test_install_writes_exactly_the_verified_bytes(monkeypatch, tmp_path):
+    """A digest check that is followed by writing DIFFERENT bytes is theatre."""
+    asset = "cloudflared-linux-amd64"
+    blob = b"\x7fELF" + b"\x00" * 64
+    monkeypatch.setattr(tn, "BIN_DIR", tmp_path)
+    monkeypatch.setattr(tn, "_asset_name", lambda: asset)
+    monkeypatch.setattr(tn, "_runs", lambda path: True)
+    monkeypatch.setattr(tn, "_MIN_INSTALL_BYTES", 1)
+    monkeypatch.setattr(tn, "_PINNED_SHA256",
+                        {**tn._PINNED_SHA256,
+                         asset: hashlib.sha256(blob).hexdigest()})
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: _Bytes(blob))
+
+    path, err = tn.install()
+    assert err == ""
+    assert open(path, "rb").read() == blob
+
+
+def test_install_refuses_bytes_that_do_not_match_the_pinned_digest(
+        monkeypatch, tmp_path):
+    """The whole point of the pin: a substituted asset installs nothing.
+
+    Before this check the only test was "the file runs", which a hijacked
+    download can satisfy. Here the bytes are valid-looking and still rejected,
+    no executable is left behind for `find_binary()` to pick up, and no `.part`
+    survives to be resumed.
+    """
+    asset = "cloudflared-linux-amd64"
+    monkeypatch.setattr(tn, "BIN_DIR", tmp_path)
+    monkeypatch.setattr(tn, "_asset_name", lambda: asset)
+    monkeypatch.setattr(tn, "_MIN_INSTALL_BYTES", 1)
+
+    def _must_not_run(path):
+        raise AssertionError("a rejected download must never be executed")
+
+    monkeypatch.setattr(tn, "_runs", _must_not_run)
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: _Bytes(b"#!/bin/sh\necho not it\n"))
+
+    path, err = tn.install()
+    assert path == ""
+    assert "SHA-256 mismatch" in err
+    assert tn._PINNED_VERSION in err
+    assert hashlib.sha256(b"#!/bin/sh\necho not it\n").hexdigest() in err
+    assert not (tmp_path / tn.binary_name()).exists()
+    assert list(tmp_path.glob("*.part")) == []
+
+
+def test_an_asset_with_no_pinned_digest_is_refused_outright(
+        monkeypatch, tmp_path):
+    """No pin, no download: falling back to an unverified fetch defeats it."""
+    monkeypatch.setattr(tn, "BIN_DIR", tmp_path)
+    monkeypatch.setattr(tn, "_asset_name",
+                        lambda: "cloudflared-freebsd-amd64")
+
+    def _no_download(*a, **k):
+        raise AssertionError("an unpinned asset must not even be downloaded")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _no_download)
+
+    path, err = tn.install()
+    assert path == ""
+    assert "no pinned SHA-256" in err
+    assert tn._PINNED_VERSION in err
+    assert "cloudflared-freebsd-amd64" in err
+    assert not (tmp_path / tn.binary_name()).exists()
 
 
 def test_apply_and_clear_front(monkeypatch):
