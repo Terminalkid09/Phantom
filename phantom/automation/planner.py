@@ -206,6 +206,13 @@ class Planner:
         # persist_learning is on). Equal-viability moves are reordered by
         # earned success rate against this target fingerprint class.
         self.priors: Any = None
+        # capability-level AI arbitration (optional; set by the agent). It
+        # receives ONLY the moves whose preconditions are met right now, so it
+        # can choose among permitted moves and can never authorise a new one.
+        # `last_verdict` exposes the decision (accepted/rejected + reason) so
+        # the run can report it instead of guessing whether the AI was heard.
+        self.arbiter: Any = None
+        self.last_verdict: Any = None
 
     def plan(self, wm: WorldModel, goal: str = "complete_kill_chain",
              max_steps: int = 12, dead: Optional[frozenset] = None,
@@ -463,8 +470,12 @@ class Planner:
                 # WorldModel knows at least one service.
                 if not wm.has_any("service"):
                     first_scan = [c for c in ready if "service" in c.effects]
+                    # Narrow the set instead of returning straight away: an
+                    # early return here bypassed the arbiter entirely, so an
+                    # accepted AI proposal could never choose among the scans
+                    # (measured by tests/test_ai_arbiter.py).
                     if first_scan:
-                        return first_scan[0]
+                        ready = first_scan
                 # cross-session priors: among equally-ready moves, prefer
                 # the techniques that historically worked against this
                 # fingerprint class (multiplier 1.0 for unknown = no-op,
@@ -502,7 +513,25 @@ class Planner:
                                            _rank(c), order_idx[id(c)]))
                     else:
                         ready = sorted(ready, key=_rank)
-                return ready[0]
+                # AI arbitration: the model may choose a DIFFERENT move from
+                # the ready set, never an unready one and never a new one.
+                # A broken arbiter degrades to the deterministic pick, because
+                # planning must not depend on the AI plane being healthy.
+                pick = ready[0]
+                if self.arbiter is not None:
+                    try:
+                        verdict = self.arbiter.adjudicate(
+                            fact, ready, pick,
+                            noise_breaker=bool(getattr(
+                                wm, "noise_breaker_tripped", lambda: False)()),
+                            source="planner")
+                        self.last_verdict = verdict
+                        candidate = getattr(verdict, "chosen", None)
+                        if candidate is not None and candidate in ready:
+                            pick = candidate
+                    except Exception:
+                        pick = ready[0]
+                return pick
         return candidates[0]
 
     @staticmethod

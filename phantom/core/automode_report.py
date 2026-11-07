@@ -104,6 +104,17 @@ def ai_participation(agent) -> str:
                 f"{p}={m}" for p, m in sorted(active.items())))
             parts.append(_ai_last_call())
 
+    arbiter = getattr(getattr(agent, "planner", None), "arbiter", None)
+    if arbiter is not None:
+        try:
+            summary = arbiter.summary()
+            parts.append(
+                f"arbiter: {summary['accepted']} accepted / "
+                f"{summary['rejected']} rejected / {summary['changed']} "
+                f"changed — {summary['note']}")
+        except Exception as exc:
+            parts.append(f"arbiter: unreadable ({exc})")
+
     advisor = getattr(agent, "llm_advisor", None)
     if advisor is not None and getattr(advisor, "enabled", False):
         parts.append(_advisor_line(advisor))

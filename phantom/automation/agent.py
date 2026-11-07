@@ -307,6 +307,20 @@ class AutonomousAgent:
         self.planner = Planner(
             self.registry, self.stealth_engine,
             value_weight=1.0 if reason_profile == "evidence_first" else 0.0)
+        # capability-level AI arbitration (--ai local|cloud|integrated): the
+        # model proposes WHICH permitted move to run, `Arbiter` accepts or
+        # rejects every proposal under the earned authority, and the verdict
+        # is reported (accepted / rejected / abstained) instead of vanishing
+        # into a preference list. `--ai off` attaches nothing at all.
+        self.ai_arbiter = None
+        try:
+            from phantom.automation.ai import config as _ai_config
+            if _ai_config.mode("planner") != "off":
+                from phantom.automation.ai.arbiter_factory import for_engagement
+                self.ai_arbiter = for_engagement(self.wm)
+                self.planner.arbiter = self.ai_arbiter
+        except Exception:
+            self.ai_arbiter = None
         self.reasoning = ReasoningEngine(self.registry, paranoid=paranoid)
         self.enterprise = EnterpriseBrain(profile, threat_intel=threat_intel)
         # R1/R2/R3 reasoning core: a named objective (the profile) plus the

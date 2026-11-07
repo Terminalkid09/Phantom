@@ -26,7 +26,8 @@ FINDING_KINDS = frozenset({
     "hostname", "origin", "note",
 })
 
-PHASES = ("exploit", "finding", "osint", "social", "scan_parse", "evolution")
+PHASES = ("exploit", "finding", "osint", "social", "scan_parse",
+          "evolution", "planner")
 
 
 def _walk_keys(data: Any, seen: List[str]) -> None:
@@ -82,6 +83,49 @@ def validate_exploit(data: Dict[str, Any]) -> List[str]:
                 row.get("expected_success"), 0.0, 1.0):
             errors.append(
                 f"ranked[{index}].expected_success must be 0..1")
+    notes = data.get("notes")
+    if notes is not None and not isinstance(notes, str):
+        errors.append("notes must be a string")
+    extra = set(data) - {"ranked", "notes"}
+    if extra:
+        errors.append("unknown keys: " + ", ".join(sorted(extra)))
+    return errors
+
+
+def validate_planner(data: Dict[str, Any]) -> List[str]:
+    """``{"ranked": [{"id", "confidence", "reason"}], "notes": str}``.
+
+    A capability-level proposal: which move the planner should run next, with
+    how strongly the model believes it. Shape only — membership in the
+    eligible set is enforced by ``ai.arbiter.Arbiter``, which also applies the
+    authority bound. Confidence is REQUIRED here (unlike the exploit schema):
+    the arbiter's floor is the whole point, and an absent number would silently
+    read as 0.0 and be refused with a misleading reason.
+    """
+    errors: List[str] = _no_exec(data)
+    if not isinstance(data, dict):
+        return errors + ["payload must be an object"]
+    ranked = data.get("ranked")
+    if not isinstance(ranked, list):
+        return errors + ["ranked must be a list"]
+    if len(ranked) > 30:
+        errors.append("ranked has more than 30 entries")
+    for index, row in enumerate(ranked):
+        if not isinstance(row, dict):
+            errors.append(f"ranked[{index}] must be an object")
+            continue
+        cid = row.get("id", row.get("capability_id"))
+        if not isinstance(cid, str) or not cid.strip():
+            errors.append(f"ranked[{index}].id must be a non-empty string")
+        if not _num(row.get("confidence"), 0.0, 1.0):
+            errors.append(f"ranked[{index}].confidence must be 0..1")
+        reason = row.get("reason")
+        if reason is not None and (not isinstance(reason, str)
+                                   or len(reason) > 200):
+            errors.append(f"ranked[{index}].reason must be a short string")
+        extra = set(row) - {"id", "capability_id", "confidence", "reason"}
+        if extra:
+            errors.append("unknown keys: " + ", ".join(sorted(extra)))
     notes = data.get("notes")
     if notes is not None and not isinstance(notes, str):
         errors.append("notes must be a string")
@@ -230,6 +274,7 @@ def validate_evolution(data: Dict[str, Any]) -> List[str]:
 
 SCHEMAS = {
     "exploit": validate_exploit,
+    "planner": validate_planner,
     "finding": validate_finding,
     "osint": validate_osint,
     "social": validate_social,

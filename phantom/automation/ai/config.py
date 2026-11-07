@@ -20,7 +20,8 @@ from typing import Dict
 from phantom.utils import config as cfg
 
 MODES = ("off", "local", "cloud", "integrated")
-PHASES = ("exploit", "finding", "osint", "social", "scan_parse", "evolution")
+PHASES = ("exploit", "finding", "osint", "social", "scan_parse", "evolution",
+          "planner")
 
 _PHASE_ENV: Dict[str, str] = {
     "exploit": "PHANTOM_AI_EXPLOIT_MODE",
@@ -29,6 +30,9 @@ _PHASE_ENV: Dict[str, str] = {
     "social": "PHANTOM_AI_SOCIAL_MODE",
     "scan_parse": "PHANTOM_AI_SCAN_PARSE_MODE",
     "evolution": "PHANTOM_AI_EVOLUTION_MODE",
+    # capability-level planning (which move next), separate from `exploit`
+    # (which access path to try): different question, different model.
+    "planner": "PHANTOM_AI_PLANNER_MODE",
 }
 
 
