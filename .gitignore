@@ -382,3 +382,6 @@ data/exploit_decisions.jsonl
 
 # Assistant/chat transcripts pasted into the working copy
 freebuff-chat-*.md
+
+# Artefacts from `python scripts/ci_local.py` (bandit / model-integrity reports)
+/.ci-local/
