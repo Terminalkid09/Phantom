@@ -41,6 +41,10 @@ from phantom.utils import toolchain as tc
 _NO_INSTALL = frozenset({
     "powershell", "powershell.exe", "cmd", "cmd.exe", "bash", "sh",
     "python", "python3", "echo", "curl", "wget", "start", "open", "xdg-open",
+    # Shell keywords: a module may emit a `for p in …; do …; done` loop, and
+    # its head is a keyword, not something an operator could install.
+    "for", "if", "while", "until", "case", "do", "done", "then", "fi",
+    "esac", "elif", "else",
 })
 
 # The managers `detect_env` can report; a package mapped to anything else would
@@ -98,6 +102,10 @@ def test_every_module_binary_is_a_known_tool(monkeypatch):
     # A module's plan is target-dependent; give it one so the state-aware
     # groups are produced instead of silently empty.
     monkeypatch.setattr(session, "target", "10.0.0.5", raising=False)
+    # …and give it no RESULTS: another test in the same session may have left
+    # services behind, which changed which suggestion groups are emitted and
+    # made this test order-dependent (it passed alone, failed in the suite).
+    monkeypatch.setattr(session, "results", {}, raising=False)
     unknown = {}
     for name, instance in _module_instances():
         for binary in _binaries(instance):
