@@ -22,6 +22,12 @@ class TestTheAIBenchmarkCanMeasureAdvice(unittest.TestCase):
             self.assertIn(key, agreement)
         self.assertGreaterEqual(agreement["deterministic_pct"], 0.0)
         self.assertLessEqual(agreement["deterministic_pct"], 100.0)
+        # A net delta can hide one win and one loss, so both are reported.
+        for key in ("ai_wins", "ai_losses", "neutral", "mean_scoreable_pct"):
+            self.assertIn(key, agreement)
+        self.assertEqual(agreement["ai_wins"] + agreement["ai_losses"]
+                         + agreement["neutral"],
+                         agreement["scenarios_with_ground_truth"])
 
     def test_off_runs_consult_nothing_and_have_no_delta(self):
         report = bench._run_with_provider_mode("off", (bench.OPEN_TARGET,), 5)
@@ -38,7 +44,13 @@ class TestTheAIBenchmarkCanMeasureAdvice(unittest.TestCase):
         self.assertEqual(report["baseline"]["mode"], "off")
 
     def test_ground_truth_prefers_a_known_credential_over_a_web_probe(self):
-        self.assertEqual(bench._ground_truth_best(bench.OPEN_TARGET), "ssh:22")
+        # The id is the PRODUCTION one (`noncve:service:<svc>:<port>`), because
+        # the promoted ranker is keyed by that vocabulary: an answer key in a
+        # private namespace cannot be compared with a prediction.
+        self.assertEqual(bench._ground_truth_best(bench.OPEN_TARGET),
+                         "noncve:service:ssh:22")
+        self.assertEqual(bench._ground_truth_best(bench.OPEN_TARGET),
+                         bench._candidate_ids(bench.OPEN_TARGET)[0])
         # an unreachable host has no right answer: "" is not a missing value,
         # it is the absence of a claim.
         self.assertEqual(bench._ground_truth_best(bench.FORTRESS), "")

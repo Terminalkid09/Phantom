@@ -285,29 +285,121 @@ class TestTheAICounter(unittest.TestCase):
 class TestTheAIConsultation(unittest.TestCase):
     """A run with the layer ON must actually ASK it, and record the answer.
 
-    Reporting `consulted == 0` made the gap visible; these tests close it: the
-    advisor is consulted at the ordering point, a different top move is counted
-    in `changed_decisions`, and an `off` run is never asked at all.
+    The contract changed on 2026-11-05 and this file did not keep up: in
+    ``integrated`` mode the ordering point consults the ADVISOR
+    (`advisors.exploit.rerank`), which answers IN-PROCESS from the promoted
+    CPU ranker — the chat router is deliberately NOT called. The old mock of
+    `router.ask` therefore proved nothing: it patched a transport this mode no
+    longer uses, the real ranker answered `ssh:22`, and `changed_decisions`
+    was legitimately 0. Two properties are tested separately now:
+
+      * WIRING   — integrated asks the promoted in-process model, not the router;
+      * ACCOUNTING — a disagreement the trust-bounded re-rank can actually
+        apply is counted and recorded with both orders.
     """
 
-    def test_an_enabled_layer_is_consulted_and_a_different_top_is_counted(self):
+    def test_integrated_mode_asks_the_in_process_model_not_the_chat_router(self):
         from phantom.automation.ai import config as ai_config
         from phantom.automation.ai import router as router
 
-        class _Result:
-            ok = True
-            data = {"ranking": ["beacon_deploy", "http:80", "ssh:22"]}
+        class _Ranker:
+            version = "test-ranker"
+
+            def __init__(self):
+                self.asked = []
+
+            def rank(self, ids, contexts=None):
+                self.asked.append(list(ids))
+                return list(ids)
+
+        ranker = _Ranker()
+
+        def _refuse(*a, **k):
+            raise AssertionError("integrated mode must not call the chat router")
 
         with mock.patch.object(ai_config, "mode", return_value="integrated"), \
-                mock.patch.object(router, "ask", return_value=_Result()):
+                mock.patch("phantom.automation.ai.linear.promoted",
+                           return_value=ranker), \
+                mock.patch.object(router, "ask", side_effect=_refuse):
             report = bench.run_suite(scenarios=(OPEN_TARGET,),
                                      max_iterations=12)
         ai = report["ai"]
         self.assertGreaterEqual(ai["consulted"], 1)
-        self.assertIsInstance(ai["changed_decisions"], int)
+        self.assertTrue(ranker.asked, "the promoted ranker was never asked")
+        self.assertEqual(ai["router_calls"], 0,
+                         "integrated mode reached the chat transport")
+        self.assertEqual(ai["mode"], "integrated")
+
+    def test_a_disagreement_the_rerank_can_apply_is_counted(self):
+        """Accounting: a different top the trust bound ACCEPTS is logged.
+
+        The synthetic candidate table scores the ground-truth move at 90 and
+        the rest at 40, and a `nudge` refuses to invert a 50-point gap — that
+        is the model's authority working, not a benchmark bug. Flattening the
+        scores here isolates the BOOKKEEPING: with no gap to respect, the
+        advice must be able to move the top and `changed_decisions` must say
+        so, with both orders recorded.
+        """
+        from phantom.automation.ai import config as ai_config
+        from phantom.automation.ai import router as router
+
+        class _Flat(bench._BenchCandidate):
+            def __init__(self, cid, success=0.5):
+                super().__init__(cid, success)
+                self.score = 50.0
+
+        beacon = "noncve:foothold:beacon:"
+
+        class _Ranker:
+            version = "test-ranker"
+
+            def rank(self, ids, contexts=None):
+                return ([beacon] + [i for i in ids if i != beacon])
+
+        def _refuse(*a, **k):
+            raise AssertionError("integrated mode must not call the chat router")
+
+        with mock.patch.object(bench, "_BenchCandidate", _Flat), \
+                mock.patch.object(ai_config, "mode", return_value="integrated"), \
+                mock.patch("phantom.automation.ai.linear.promoted",
+                           return_value=_Ranker()), \
+                mock.patch.object(router, "ask", side_effect=_refuse):
+            report = bench.run_suite(scenarios=(OPEN_TARGET,),
+                                     max_iterations=12)
+        ai = report["ai"]
         self.assertEqual(ai["changed_decisions"], 1)
-        self.assertEqual(ai["changed"][0]["ai"], "beacon_deploy")
-        self.assertEqual(ai["changed"][0]["deterministic"], "ssh:22")
+        self.assertEqual(ai["changed"][0]["ai"], beacon)
+        self.assertEqual(ai["changed"][0]["deterministic"],
+                         "noncve:service:ssh:22")
+
+    def test_local_mode_still_uses_the_router_as_a_transport(self):
+        """The chat transport must not disappear with the integrated fix."""
+        from phantom.automation.ai import config as ai_config
+
+        class _Result:
+            ok = True
+            data = {"ranked": [{"id": "beacon_deploy"}, {"id": "ssh:22"},
+                               {"id": "http:80"}]}
+            model = "chat-transport"
+
+        asked = mock.Mock(return_value=_Result())
+        # The advisor binds `ask` at import time
+        # (`from phantom.automation.ai.router import ask`), so patching
+        # `router.ask` would leave the advisor calling the real transport and
+        # the assertion below would fail for the patch, not the code. The name
+        # that must be replaced is the one the advisor actually calls.
+        with mock.patch.object(ai_config, "mode", return_value="local"), \
+                mock.patch("phantom.automation.ai.advisors.exploit.ask",
+                           asked):
+            report = bench.run_suite(scenarios=(OPEN_TARGET,),
+                                     max_iterations=12)
+        ai = report["ai"]
+        self.assertGreaterEqual(ai["consulted"], 1)
+        # The TRANSPORT is what is under test here. `router_calls` counts real
+        # `ask()` calls, and a mock replaces them, so it would read 0 no
+        # matter what: the mock's own call count is the honest assertion.
+        self.assertTrue(asked.called,
+                        "local mode never reached the chat transport")
 
     def test_an_off_layer_is_never_consulted(self):
         from phantom.automation.ai import config as ai_config

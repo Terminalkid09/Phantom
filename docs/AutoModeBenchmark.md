@@ -145,6 +145,83 @@ future fix makes the agent recover there, the metric changes and the benchmark
 still passes — which is the point. A benchmark that demanded failure would
 punish an improvement.
 
+## The AI layer: what is measured, and what used to be mismeasured
+
+Measured 2026-11-06, with `PHANTOM_AI_MODE=integrated`:
+
+| Number | Value | What it means |
+| --- | --- | --- |
+| `consulted` | 10 | the advisor is asked at the ordering point, once per scenario |
+| `router_calls` | 0 | `integrated` answers in-process; the chat transport is not touched |
+| `agreement.mean_scoreable_pct` | 0.0 | **none** of this suite's candidate ids carries a weight in the promoted ranker |
+| `model.gate` | `promote`, delta +0.101, CI [+0.069, +0.130], n=28 | the model's real measured advantage, on its own corpus |
+| `model.authority` | `nudge` | 28 rows is below twice the gate floor, so nearby reordering only |
+
+Two defects turned that table into a lie before they were fixed, and both are
+worth stating because they are easy to reintroduce:
+
+1. **The deterministic score encoded the answer key.** The synthetic candidate
+   table gave the ground-truth move 0.9 and every other one 0.4, so the
+   deterministic ranking already knew the answer and
+   `agreement.deterministic_pct` was 100% by construction: the comparison could
+   show neither a win nor a loss. Scores now come from the DECLARED surface
+   order (70, 65, 60…), five points apart, which is inside every trust level's
+   inversion guard — i.e. a near-tie the advice is allowed to break.
+2. **The ids were a private vocabulary.** The harness invented `ssh:22` while
+   the ranker is keyed by `noncve:service:ssh:22` (the ids
+   `access._candidate_from_service` emits and `training/golden/
+   exploit.production.jsonl` was built from). Every per-id weight scored zero,
+   so the advisor could not have an opinion no matter what it had learned. The
+   ids now come from production, and `scoreable_pct` is reported next to the
+   agreement so a vocabulary miss can never again be read as "the AI agreed".
+
+With the ids aligned the coverage on these scenarios is still 0%: the standard
+suite is built from ssh/http surfaces, and the promoted model was measured on
+ldap/smb/nfs/rsync/snmp/ftp and CVE decisions
+(`training/golden/exploit.production.jsonl`, 28 rows — the same ids the
+weights are keyed by). That is why the report prints the model block: the
+honest efficacy number is the gate in the manifest, not the agreement of a
+scenario grid that does not intersect the model's training set. A scenario
+was written for that surface (SMB/NFS/LDAP/rsync on one host) and NOT added:
+the scripted runner only simulates SSH credentials and a web app, so it cannot
+make such a host winnable and the scenario would have measured the simulator.
+Closing the gap means a runner that models SMB/LDAP authentication, which is
+the next step, not a number to invent here.
+
+### The simulator answered 200 on a host with no web server
+
+Found while writing that scenario (2026-11-06): the `curl` branch of the
+scripted runner returned `HTTP/1.1 200 OK` for EVERY url, so a host with no
+web service still answered a probe and the run could "confirm" `tcp/80`. The
+suite could not see it because every reachable scenario happened to declare
+port 80 — a measurement that could only pass. The port is now read from the
+URL that was probed and the answer is `Connection refused` unless the ground
+truth declares `http`/`https` there, and `ssh_only` (SSH and nothing else,
+goal reachable) is the scenario that keeps it honest: it must reach the goal
+AND confirm no web service.
+
+## Measures as of 2026-11-06 (12 scenarios)
+
+| scenario | outcome | goal | moves | recovery | fp | forbidden | mid | budget |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| open_target | completed_goal | yes | 6 | – | 0 | 0 | 0 | ok |
+| flaky_web_probe | completed_goal | yes | 6 | 1 | 0 | 0 | 0 | ok |
+| scan_failure | partial | no | 11 | 4 | 0 | 0 | 0 | ok |
+| fortress | partial | no | 9 | – | 0 | 0 | 0 | ok |
+| budget_capped | completed_goal | yes | 6 | – | 0 | 0 | 0 | OVER |
+| rdp_only | partial | no | 3 | – | 0 | 0 | 0 | ok |
+| web_app_deep | completed_goal | yes | 6 | 2 | 0 | 0 | 0 | ok |
+| grey_noise | completed_goal | yes | 6 | – | 0 | 0 | 0 | ok |
+| out_of_scope | completed_without_goal | no | 0 | – | 0 | 0 | 0 | ok |
+| decoy_scan | completed_goal | yes | 6 | – | 0 | 0 | 0 | ok |
+| mobile_no_surface | partial | no | 9 | – | 0 | 0 | 0 | ok |
+| ssh_only | completed_goal | yes | 5 | – | 0 | 0 | 0 | ok |
+
+suite: goal reached **87.5%** (reachable only), honest **100%**, no false
+positive **100%**, no forbidden action **100%**, no mid-run intervention
+**100%** (operator events 8.3%). `budget_capped` overruns its declared noise
+ceiling on purpose — the scenario checks that the stop is REPORTED.
+
 ## What the benchmark does NOT claim
 
 * It does not execute on real targets: the failure injection is a scripted
@@ -155,6 +232,14 @@ punish an improvement.
 * It is not a performance benchmark: `time_to_recover` counts **moves**, not
   seconds, so it stays deterministic and clock-free (a wall-clock number on a
   shared runner would be noise, not signal).
+* It does not claim the AI layer improves a run. The simulated runner never
+  acts on the advice, so `run_comparison()` reports a structural zero for
+  `goal_reached_pct` and says so; the number that can move is decision quality
+  (top-1 agreement and `ai_wins` / `ai_losses`), and only where the model's
+  vocabulary actually covers the table (`mean_scoreable_pct > 0`).
+* It does not claim OSINT or social reasoning quality: no model is promoted for
+  those phases, and `trust_for(<phase>)` reports `observe`, so no advice is
+  applied there at all.
 * The suite is small on purpose. Adding a scenario is the intended way to
   extend it: declare the ground truth, declare the expectation, and let CI hold
   the line.

@@ -297,6 +297,23 @@ def open_target_runner(target: str, truth: Scenario,
             res.ok, res.stdout = True, "SSH-2.0-OpenSSH_8.9p1 Ubuntu"
             return res
         if "curl" in text or "wget" in text or "httpx" in text:
+            # A WEB SERVER ANSWERS ONLY WHERE THERE IS ONE (measured
+            # 2026-11-06). This branch used to return 200 for every URL, so a
+            # host with no web service at all still answered a probe and the
+            # run could "confirm" tcp/80 — the simulator, not the agent, was
+            # the source of that false positive, and every scenario happened
+            # to have port 80, which is why nobody saw it. The port is read
+            # from the URL the run actually asked for.
+            web = {str(p) for p, s in truth.services
+                   if s in ("http", "https", "http-alt", "http-proxy")}
+            match = re.search(r":(\d{1,5})(?:/|$|\s)", text)
+            port = match.group(1) if match else ("443" if "https://" in text
+                                                 else "80")
+            if port not in web:
+                res.ok, res.stderr = False, (f"curl: (7) Failed to connect to "
+                                             f"{target} port {port}: "
+                                             f"Connection refused")
+                return res
             res.ok = True
             res.stdout = ("HTTP/1.1 200 OK\n"
                           "Server: nginx/1.18.0\n"
@@ -818,6 +835,21 @@ DECOY_SCAN = Scenario(
     expectations={"honest": True, "inappropriate_actions": 0},
 )
 
+SSH_ONLY = Scenario(
+    name="ssh_only",
+    summary="a reachable host with SSH and NOTHING else: the web probe must "
+            "fail honestly (a simulator that answers 200 everywhere hid this "
+            "for every scenario that happened to have port 80)",
+    target="10.0.0.12",
+    profile="balanced",
+    services=(("22", "ssh"),),
+    creds=(("ops", "ops"),),
+    reachable=True,
+    forbidden=_NEVER_AUTO,
+    expectations={"goal_reached": True, "false_positives": 0,
+                  "inappropriate_actions": 0, "honest": True},
+)
+
 MOBILE_NO_SURFACE = Scenario(
     name="mobile_no_surface",
     summary="phone-shaped target: no reachable TCP surface (the sandbox hides "
@@ -839,7 +871,7 @@ MOBILE_NO_SURFACE = Scenario(
 #: the SAME ground-truth contract as the originals (declared services/creds,
 #: declared reachability), only the profile, the goal and the obstacles move.
 NEW_SCENARIOS = (RDP_ONLY, WEB_APP_DEEP, GREY_NOISE, OUT_OF_SCOPE,
-                 DECOY_SCAN, MOBILE_NO_SURFACE)
+                 DECOY_SCAN, MOBILE_NO_SURFACE, SSH_ONLY)
 
 
 def suite() -> Tuple[Scenario, ...]:
@@ -901,6 +933,32 @@ def _reset_ai_decisions() -> None:
     _AI_TOP.clear()
 
 
+#: How far apart the deterministic scores of two DECLARED candidates are, on
+#: the 0-100 scale the advisor works in. Five points is inside every trust
+#: level's inversion guard (15 for `nudge`, 30 for `decide`), so the advice is
+#: ALLOWED to break the tie: this is exactly the near-tie a second opinion
+#: exists for.
+_DECLARED_BAND = 5.0
+#: Where that band starts. A constant, deliberately NOT derived from the
+#: answer key — see ``_declared_scores``.
+_DECLARED_TOP = 70.0
+
+
+def _service_id(service: str, port: str) -> str:
+    """The id PRODUCTION emits for a non-CVE service candidate.
+
+    The first version of this benchmark invented ids (`ssh:22`). The promoted
+    ranker is keyed by the ids its corpus was built from
+    (`noncve:service:ssh:22`, see `access._candidate_from_service`), so every
+    per-id weight scored zero here and the advisor could not form an opinion
+    no matter what it had learned: the report said "no disagreement" while it
+    was measuring a VOCABULARY MISMATCH (verified 2026-11-06 — none of this
+    harness's ids carried a weight, against 0 dead weights on the production
+    corpus).
+    """
+    return f"noncve:service:{str(service or '').strip().lower()}:{port}"
+
+
 def _candidate_ids(scenario: Scenario) -> List[str]:
     """The moves this scenario makes possible, in deterministic order.
 
@@ -908,14 +966,22 @@ def _candidate_ids(scenario: Scenario) -> List[str]:
     is winnable) because that is the order the deterministic planner starts
     from. An AI suggestion only means something against an order it had to
     disagree with.
+
+    The ids are the PRODUCTION vocabulary, not a private one: an advisor keyed
+    by ids it never sees cannot be measured, only observed failing silently.
     """
     ids: List[str] = []
     for port, service in scenario.services:
-        ids.append(f"{service}:{port}")
+        ids.append(_service_id(service, port))
     if scenario.creds:
-        ids.append("creds:ssh")
+        user = str(scenario.creds[0][0] or "unknown")
+        names = {str(service).lower() for _, service in scenario.services}
+        target_service = "ssh" if "ssh" in names else (
+            sorted(names)[0] if names else "unknown")
+        ids.append(f"noncve:creds:{target_service}:{user}")
     if scenario.reachable:
-        ids.append("beacon_deploy")
+        # The foothold channel production names when a beacon is deployed.
+        ids.append("noncve:foothold:beacon:")
     return ids
 
 
@@ -924,18 +990,25 @@ def _ground_truth_best(scenario: Scenario) -> str:
 
     A benchmark of advice needs an answer key. The scenario already declares
     what the target really runs and whether it accepts a credential, so the
-    best first move is derivable instead of being another opinion: a known
-    credential against SSH beats a web probe, and a host with no reachable
+    best first move is derivable instead of being another opinion: the service
+    behind a known credential beats a web probe, and a host with no reachable
     surface has no best move at all ("" — nothing to be right about).
+
+    The id is the same production id ``_candidate_ids`` offers, so an answer
+    is comparable with a prediction.
     """
     if not scenario.reachable:
         return ""
     services = {service: port for port, service in scenario.services}
-    if scenario.creds and "ssh" in services:
-        return f"ssh:{services['ssh']}"
+    if scenario.creds:
+        names = {str(service).lower() for _, service in scenario.services}
+        target_service = "ssh" if "ssh" in names else (
+            sorted(names)[0] if names else "")
+        if target_service:
+            return _service_id(target_service, services[target_service])
     for name in ("http", "https", "rdp", "smb"):
         if name in services:
-            return f"{name}:{services[name]}"
+            return _service_id(name, services[name])
     return ""
 
 
@@ -972,15 +1045,83 @@ class _BenchCandidate:
         return self.score
 
 
+def _declared_scores(candidates: Sequence[str]) -> Dict[str, float]:
+    """What the RULES would score, from the DECLARED order alone.
+
+    The previous version gave the ground-truth move 0.9 and every other one
+    0.4, so the deterministic ranking already knew the answer and
+    ``agreement.deterministic_pct`` was 100% by construction — a comparison
+    that can show neither a win nor a loss. The rules do not hold the answer
+    key; they hold the order the surface was discovered in, which is what is
+    modelled here, inside a band the advice is allowed to move.
+    """
+    return {cid: _DECLARED_TOP - _DECLARED_BAND * index
+            for index, cid in enumerate(candidates)}
+
+
+def _scoreable_coverage(ids: Sequence[str]) -> float:
+    """How much of this table the promoted model can actually score (%).
+
+    A model is keyed by the ids it was trained on. Where a scenario's ids are
+    not in that vocabulary the advisor has no opinion to offer, and reporting
+    that as "the AI agreed" would be a measurement error: it is a vocabulary
+    miss. The number is reported NEXT TO the agreement so the two cannot be
+    mistaken for each other.
+    """
+    if not ids:
+        return 0.0
+    try:
+        from phantom.automation.ai import linear
+        ranker = linear.promoted("exploit")
+    except Exception:
+        return 0.0
+    weights = getattr(ranker, "weights", {}) or {}
+    known = sum(1 for cid in ids if cid in weights)
+    return round(100.0 * known / len(ids), 1)
+
+
+def _promoted_model_report(phase: str = "exploit") -> Dict[str, Any]:
+    """The promoted model and the measurement that earned it.
+
+    Read from the MANIFEST and the trust layer, not from `training/` (which is
+    not shipped): the benchmark can then print the efficacy number the
+    authority actually rests on, instead of only whether the layer was asked.
+    """
+    try:
+        from phantom.automation.ai.registry import ModelRegistry
+        from phantom.automation.ai.trust import trust_for
+    except Exception:
+        return {}
+    try:
+        manifest = ModelRegistry().promoted(phase)
+    except Exception:
+        return {}
+    if not isinstance(manifest, dict):
+        return {"phase": phase, "version": "",
+                "note": f"no promoted model for {phase}"}
+    gate = manifest.get("eval_gate") or {}
+    trust = trust_for(phase)
+    return {
+        "phase": phase,
+        "version": manifest.get("version"),
+        "kind": manifest.get("kind") or "adapter",
+        "eval": manifest.get("eval"),
+        "baseline": manifest.get("baseline"),
+        "gate": {key: gate.get(key) for key in
+                 ("verdict", "delta", "ci_low", "ci_high", "n")},
+        "authority": getattr(trust, "level", ""),
+        "authority_reason": getattr(trust, "reason", ""),
+    }
+
+
 def _advisor_ranking(scenario: Scenario, candidates: Sequence[str]) -> Dict[str, Any]:
     """Ask the production advisor for an order over these candidate ids."""
     try:
         from phantom.automation.ai.advisors import exploit as advisor
     except Exception:
         return {"consulted": False, "top": "", "order": []}
-    truth = _ground_truth_best(scenario)
-    built = [_BenchCandidate(cid, 0.9 if cid == truth else 0.4)
-             for cid in candidates]
+    scores = _declared_scores(candidates)
+    built = [_BenchCandidate(cid, scores[cid] / 100.0) for cid in candidates]
     try:
         result = advisor.rerank(built, "balanced")
     except Exception:
@@ -1051,7 +1192,8 @@ def _consult_ai_for(scenario: Scenario) -> None:
     # metric that can move, and a sample made only of disagreements would skew
     # it in both directions.
     _AI_TOP[scenario.name] = {"deterministic": deterministic,
-                              "ai": top, "truth": truth}
+                              "ai": top, "truth": truth,
+                              "scoreable_pct": _scoreable_coverage(candidates)}
     if top and top != deterministic and len(_AI_CHANGED) < _AI_CHANGED_CAP:
         _AI_CHANGED.append({"scenario": scenario.name,
                             "deterministic": deterministic, "ai": top})
@@ -1083,17 +1225,46 @@ def _ai_report() -> Dict[str, Any]:
     n = len(scored)
     det_ok = sum(1 for row in scored if row["deterministic"] == row["truth"])
     ai_ok = sum(1 for row in scored if row.get("ai") and row["ai"] == row["truth"])
+    # WINS and LOSSES, not only the net delta: one win and one loss can cancel
+    # into "no change" while the two decisions were opposite, and a number that
+    # hides that is the kind of aggregate this project keeps refusing.
+    wins = sum(1 for row in scored
+               if row.get("ai") == row["truth"]
+               and row["deterministic"] != row["truth"])
+    losses = sum(1 for row in scored
+                 if row["deterministic"] == row["truth"]
+                 and row.get("ai") != row["truth"])
+    coverage = ([row.get("scoreable_pct", 0.0) for row in scored]
+                if scored else [])
     agreement = {
         "scenarios_with_ground_truth": n,
         "deterministic_pct": round(100.0 * det_ok / n, 1) if n else 0.0,
         "ai_pct": round(100.0 * ai_ok / n, 1) if n else 0.0,
         "delta_pct": round(100.0 * (ai_ok - det_ok) / n, 1) if n else 0.0,
+        "ai_wins": wins,
+        "ai_losses": losses,
+        "neutral": n - wins - losses,
+        # 0.0 means "the model has no weight for a single id in this table":
+        # the advice below is then a vocabulary miss, not an opinion.
+        "mean_scoreable_pct": (round(sum(coverage) / len(coverage), 1)
+                               if coverage else 0.0),
     }
     if consulted and changed:
         note = (f"the AI layer was consulted {consulted} time(s) and proposed a "
                 f"different top move {len(changed)} time(s); the disagreement "
                 f"is recorded, not applied, so this measures the advice and "
                 f"claims no benefit")
+    elif consulted and agreement.get("mean_scoreable_pct", 0.0) <= 0.0:
+        # The distinction that matters: silence from a model that CAN score
+        # these ids is an opinion, silence from one whose vocabulary this
+        # table does not intersect is a measurement miss. The first version of
+        # this harness could not tell them apart and reported both as "it
+        # added nothing".
+        note = (f"the AI layer was consulted {consulted} time(s), but none of "
+                f"this suite's candidate ids carries a weight in the promoted "
+                f"model (0% scoreable): its silence measures a VOCABULARY "
+                f"MISS here, not agreement. Its real efficacy is the eval gate "
+                f"recorded in `model`, measured on its own corpus")
     elif consulted:
         note = (f"the AI layer was consulted {consulted} time(s); its proposed "
                 f"order never disagreed with the deterministic one (0 changed "
@@ -1105,7 +1276,8 @@ def _ai_report() -> Dict[str, Any]:
     return {"mode": mode, "consulted": consulted,
             "changed_decisions": len(changed), "changed": changed,
             "router_calls": router_calls, "advice": advice[:15],
-            "agreement": agreement, "note": note}
+            "agreement": agreement, "model": _promoted_model_report(),
+            "note": note}
 
 
 def _run_with_provider_mode(mode: str, scenarios, max_iterations: int):
