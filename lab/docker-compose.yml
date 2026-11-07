@@ -34,6 +34,21 @@ services:
         ipv4_address: 172.28.0.20
     restart: "no"
 
+  phone:
+    # A managed phone: MDM on 8443 (the endpoints mobile_probe looks for),
+    # adbd on 5555 speaking the REAL wire protocol, and an app sandbox with
+    # one exported component that escapes its own data directory.
+    build: ./phone
+    container_name: phantom-lab-phone
+    hostname: phone
+    ports:
+      - "5555:5555"    # adb (TCP)
+      - "8443:8443"    # MDM / mobile web (also the standard TLS port)
+    networks:
+      lab_net:
+        ipv4_address: 172.28.0.40
+    restart: "no"
+
   dc:
     build: ./dc
     container_name: phantom-lab-dc

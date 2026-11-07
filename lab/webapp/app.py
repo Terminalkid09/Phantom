@@ -17,11 +17,66 @@ import hashlib
 import os
 import sqlite3
 import subprocess
+import threading
+import time
 import urllib.request
 
 from flask import Flask, request, render_template_string, redirect
 
 app = Flask(__name__)
+
+# ── defender behaviour (realistic, and it exercises de-escalation) ────────
+# A real intranet locks an account/IP out after repeated failures. Without
+# this the lab answered an unlimited password spray, so the agent's noise
+# breaker had nothing observable to react to.
+_LOCKOUT_AFTER = 5
+_LOCKOUT_WINDOW = 60.0
+_FAILS = {}
+_FAILS_LOCK = threading.Lock()
+
+
+def _client_ip() -> str:
+    return (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+            or request.remote_addr or "?")
+
+
+def _locked(ip: str) -> int:
+    """Seconds left in the lockout, or 0 when the client may try."""
+    now = time.time()
+    with _FAILS_LOCK:
+        entry = _FAILS.get(ip)
+        if not entry:
+            return 0
+        started, count = entry
+        if now - started > _LOCKOUT_WINDOW:
+            _FAILS.pop(ip, None)
+            return 0
+        if count < _LOCKOUT_AFTER:
+            return 0
+        return max(1, int(_LOCKOUT_WINDOW - (now - started)))
+
+
+def _note_failure(ip: str) -> None:
+    now = time.time()
+    with _FAILS_LOCK:
+        started, count = _FAILS.get(ip, (now, 0))
+        if now - started > _LOCKOUT_WINDOW:
+            started, count = now, 0
+        _FAILS[ip] = (started, count + 1)
+
+
+def _clear_failures(ip: str) -> None:
+    with _FAILS_LOCK:
+        _FAILS.pop(ip, None)
+
+
+@app.after_request
+def _corp_headers(resp):
+    resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("X-Powered-By", "CorpIntranet/2.4")
+    return resp
 DB = "/opt/corp/intranet.db"
 UPLOAD_DIR = "/opt/corp/uploads"
 
@@ -74,6 +129,13 @@ def index():
 
 @app.route("/login", methods=["POST"])
 def login():
+    ip = _client_ip()
+    wait = _locked(ip)
+    if wait:
+        _note_failure(ip)          # hammering keeps the lock alive
+        resp = render_template_string(
+            LOGIN_PAGE, err=f"too many attempts: retry in {wait}s")
+        return resp, 429, {"Retry-After": str(wait)}
     user = request.form.get("username", "")
     pw = request.form.get("password", "")
     # INTENTIONAL: raw string interpolation -> UNION-based SQLi
@@ -88,10 +150,12 @@ def login():
     except Exception as e:
         return render_template_string(LOGIN_PAGE, err=f"db error: {e}")
     if rows:
+        _clear_failures(ip)
         row = rows[0]
         if row["role"] == "administrator":
             return redirect("/admin")
         return f"Welcome {row['username']} ({row['role']})"
+    _note_failure(ip)
     return render_template_string(LOGIN_PAGE, err="invalid credentials")
 
 
