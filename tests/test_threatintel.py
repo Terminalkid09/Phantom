@@ -25,11 +25,28 @@ class TestThreatIntelFeedInit(unittest.TestCase):
         self.assertIsInstance(threat_intel, ThreatIntelFeed)
 
     def test_cache_dir_creation(self):
-        feed = ThreatIntelFeed()
-        feed.clear_cache()
-        feed._ensure_cache()
+        """`_ensure_cache()` creates the directory the feed writes into.
+
+        Asserted on a directory this test OWNS (measured 2026-11-06: this test
+        failed once in a full parallel run and passed in isolation). The old
+        version asserted on the shared `phantom/data/threatintel_cache`, and
+        `clear_cache()` deletes that directory: another worker doing it between
+        the `_ensure_cache()` and the assertion left the test red for a race
+        that says nothing about the code. A test that can only pass when no
+        other test runs is a flaky test, not a contract.
+        """
         import os
-        self.assertTrue(os.path.isdir(feed._cache_path_test("x").rsplit(os.sep, 1)[0]))
+        import tempfile
+        from phantom.core import threatintel
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = os.path.join(tmp, "threatintel_cache")
+            with patch.object(threatintel, "CACHE_DIR", cache):
+                feed = ThreatIntelFeed()
+                feed._ensure_cache()
+                self.assertTrue(os.path.isdir(cache))
+                self.assertTrue(
+                    feed._cache_path_test("x").startswith(cache + os.sep))
 
 
 class TestRecentlyExploitedCheck(unittest.TestCase):

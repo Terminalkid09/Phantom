@@ -269,10 +269,21 @@ class ThreatIntelFeed:
         return result
 
     def clear_cache(self) -> None:
-        """Clear all cached threat intel data."""
+        """Clear all cached threat intel data (best effort, never raises).
+
+        `rmtree` walks the directory and unlinks as it goes, so a file that
+        disappears between the walk and the unlink raises FileNotFoundError.
+        That is not hypothetical: the cache lives in the shared
+        `phantom/data/` and TWO Phantom processes (the CLI and the API
+        desktop, or two test workers) can clear or refill it at once. A cache
+        clear cannot fail on a race — the next write recreates the directory —
+        so the raise is swallowed here instead of surfacing as a failed
+        command in an engagement. Measured 2026-11-06: a full parallel test
+        run failed in `clear_cache` on exactly this window.
+        """
         if os.path.exists(CACHE_DIR):
             import shutil
-            shutil.rmtree(CACHE_DIR)
+            shutil.rmtree(CACHE_DIR, ignore_errors=True)
         _ensure_cache_dir()
         notifier.info("Threat intelligence cache cleared")
 
