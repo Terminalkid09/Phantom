@@ -86,6 +86,238 @@ behind it; the ones that were not measured are named as such.
 
 ## [Unreleased] — current development (v3.0.0 line)
 
+### AI in the live run: measured, and what it is not — 2026-11-07
+
+- **The two live runs are identical, and that is now stated instead of
+  implied.** `--auto 127.0.0.1 --goal deliver` with `--ai off` and with
+  `--ai integrated` both end `services=11, creds=2, 5 actions` on the lab.
+  Reading the code, this is not a wiring accident of the kind fixed on
+  2026-11-03: the auto-mode planner (`automation/planner.py`,
+  `brain/plan_graph.py`, `brain/plan_arbiter.py`) contains no AI call at all —
+  action selection is deterministic by design — and the promoted ranker is
+  consulted by `exploit.sweep` and `social.engine` only.
+- **Even on the list it is wired into, it cannot move this decision.** The
+  benchmark reports `mean_scoreable_pct: 0.0` for every scenario: the model's
+  vocabulary is service-fingerprint ids, while the planner asks about
+  capability ids (`noncve:foothold:beacon:` and friends), so no weight
+  applies and the honest answer is "no opinion". A second wire into the
+  planner would change nothing until the training corpus speaks that
+  vocabulary. Recorded here so the next session works on DATA, not on another
+  call site.
+
+### The toolset that was there and was reported missing — 2026-11-07
+
+- **A tool could be "missing" because of the ORDER it was asked about.**
+  `_wsl_which` probed a distro once per tool, ~2 s each: a twenty-binary
+  toolbelt spent the whole 20 s WSL budget and every tool asked for after that
+  came back "unavailable". Live library, `--auto 127.0.0.1`: `scan_tcp` failed
+  with `tool unavailable: nmap, masscan, nc` and the whole run collapsed to
+  `0 services` on a lab whose ports answer. Three defects, all measured:
+  `docker-desktop` (Docker's own utility distro, no toolset) was probed and
+  ate 15.6 s of the budget; `wsl -e` started a Stopped Ubuntu (>10 s cold
+  boot) before Kali was ever asked; and a NEGATIVE availability answer was
+  memoised for the life of the process, so one slow cold start hid every tool
+  for the rest of the run.
+- The resolver now lists each distro's executables ONCE (`ls` over
+  `/usr/bin /usr/sbin /bin /sbin /usr/local/bin`, ~2 s, 2775 names on Kali),
+  caches that inventory in memory and in `data/cache/wsl_inventory.json` (6 h
+  TTL, invalidated by `install <tool>`), skips Docker's distros, asks
+  security distros first, and only falls back to `wsl -e` when there is no
+  registered list. A negative availability answer expires after 60 s (max 3
+  attempts) instead of being final. Measured after the fix: the toolbelt
+  resolves nmap/hydra/msfconsole/nikto/gobuster in 2.6 s from the cache
+  (18 s cold, budget left 12.7 s instead of exhausted).
+
+### The lab could not be seen by a normal scan — 2026-11-07
+
+- The DMZ published only `2121/2222/8081`. A default sweep (`--top-ports
+  1000`, what every real tool starts with) does not look at those, so
+  auto-mode on this lab honestly reported `0 services` and the chain stopped
+  at `curl_probe`. The compose file now ALSO maps the standard ports
+  (`21:21`, `22:2222`, `80:8081`) while keeping the non-standard ones, which
+  is what a target looks like. After it: `services=11`, `creds=2` (real
+  `web_creds` success against the lab app), 13 hypotheses (8 confirmed),
+  5 actions — and `scripts/live_benchmark.py` still PASSes (6 ports, 100%
+  recall/identification, 0 false positives).
+
+### Windows: a redirect is not a reason to leave Windows — 2026-11-07
+
+- **A binary that exists was reported as missing.**
+  `execute_quiet('C:\\…\\python.exe -c "…" 2>/dev/null')` came back
+  `returncode=127, stdout=''`: `_rewrite_wsl` consulted `_needs_posix_shell`
+  BEFORE the native lookup, `2>/dev/null` matched, and the whole line — the
+  `C:\…` path included — was handed to the Kali shell, where that path is not
+  a program. The redirect is not a Linux-only construct here: the executor
+  rewrites it to `2>NUL` on the next line (`_to_cmd_redirects`). Routing now
+  resolves the tool FIRST; a native tool crosses over only for syntax Windows
+  truly cannot express (`_needs_linux_shell`: a pipe into a POSIX filter,
+  `$( )`, a backtick), which keeps the `curl … | head -12` fix from 2026-11-06
+  intact. Two regression tests pin both directions
+  (`tests/test_executor_wsl_bridge.py`).
+- The three remaining failures in the full run were the harness, not the code:
+  `wsl -d kali-linux` was wedged with `HCS_E_CONNECTION_TIMEOUT` (recovered
+  with `wsl --shutdown`, no Phantom change), and two process-spawning tests
+  failed only under `-n auto` contention and pass serially. Recorded here so a
+  red run is not mistaken for a regression next time.
+
+### Supply chain: a model must be the bytes that were measured — 2026-11-06
+
+- **The manifest's `sha256` was never computed by anything.** `models/exploit/
+  ranker-2026-11-03/manifest.json` declared `ba9023a2…` while the artifact in
+  git hashed `b7e3b978…`; `ModelRegistry` checked that the file EXISTED and
+  nothing else, so a ranker edited after its evaluation kept being served as
+  the promoted model and `trust_for('exploit')` kept granting `nudge`. The
+  registry now reproduces the digest on load (`artifact_digest`, and
+  `digest_problem` refuses a mismatch naming both values), `ai.linear.promoted`
+  re-checks the exact file it is about to load, and `scripts/
+  verify_model_integrity.py` is the build-time gate (new `model-integrity` CI
+  job, stdlib-only, seconds long). A single-file ranker is hashed as bytes; an
+  adapter directory as a deterministic tree (sorted relative path + size +
+  bytes), so a renamed weight file cannot keep its digest.
+- **The mismatch was a checkout artefact, not tampering — and that was worse.**
+  `* text=auto` stored LF and checked out CRLF, so the same ranker was 5799
+  bytes in git and 6002 on Windows: the digest depended on the host OS.
+  `.gitattributes` now marks `models/** -text`, and `training/ranker.py`,
+  `training/net.py`, `training/manifest.py` write with `newline="\n"`. The
+  manifest was regenerated to the digest of the LF bytes, which is what both a
+  Linux and a Windows clone now produce.
+- **`training/train_lora.py` hashed ONE file of a multi-file adapter**
+  (`adapter_model.safetensors`) while the runtime hashes the tree, so every
+  promoted LoRA would have been refused. The trainer records `sha256_tree`; a
+  test compares the trainer's scheme with the registry's on the same fixture,
+  because two schemes that disagree are the same bug in a new place.
+- **cloudflared is downloaded from a pinned release and verified.**
+  `phantom/utils/tunnel.py` fetched `releases/latest/download/…` and accepted
+  any bytes that were big enough and executable — a mutable dependency behind
+  a check that proves nothing. It now pins `2026.10.7` and the per-asset
+  SHA-256 of all five platforms (verified against the GitHub release API on
+  2026-11-06), refuses an asset with no pin instead of trusting the network,
+  and discards the download on a mismatch. Upgrading is a deliberate commit.
+
+### AI: the efficacy number was measuring a vocabulary mismatch — 2026-11-06
+
+- **The benchmark invented its own candidate ids.** `services` became
+  `ssh:22`, `beacon_deploy`, `creds:ssh`, while production emits
+  `noncve:service:ssh:22`, `noncve:foothold:beacon:`, `noncve:creds:ssh:<user>`
+  (`access._candidate_from_service`). Every per-id weight in the promoted
+  ranker therefore scored zero here, so the advisor could not form an opinion
+  and the report read "no disagreement" — a measurement error reported as a
+  property of the model. The harness now uses the production vocabulary and
+  publishes `mean_scoreable_pct` NEXT TO the agreement, so "0% scoreable"
+  can never again be quoted as "the AI added nothing".
+- **The answer key was inside the deterministic scores.** The truth move got
+  0.9 and every other one 0.4, so `deterministic_pct` was 100% by
+  construction and the comparison could show neither a win nor a loss. The
+  rules now hold the discovery ORDER (a 5-point band, inside every trust
+  level's inversion guard) and the advice is allowed to break the near-tie it
+  exists for.
+- `agreement` gained `ai_wins`, `ai_losses` and `neutral`: one win and one loss
+  can cancel into "no change" while the two decisions were opposite.
+- **The scripted runner answered `HTTP 200` on hosts with no web server.** The
+  `curl` branch returned success for every URL, so a run could "confirm"
+  `tcp/80` on a host that does not run it: the simulator, not the agent, was
+  the source of that false positive, and no scenario could see it because every
+  reachable one declared port 80. The port is read from the URL and the answer
+  is `Connection refused` unless the ground truth declares `http`/`https`
+  there. The new `ssh_only` scenario (SSH and nothing else, goal reachable)
+  keeps it honest — it must win AND confirm no web service: 5 moves, goal
+  reached, 0 false positives.
+- The report carries the `model` block read from the MANIFEST (`eval`,
+  `baseline`, `eval_gate`, `authority`, `authority_reason`), so a run states
+  the efficacy the authority rests on instead of only whether the layer was
+  asked.
+
+### Identity: two scorers for the same pair of accounts — 2026-11-06
+
+- **`correlate_accounts` carried its own numbers**: a shared avatar hash was
+  emitted at confidence **0.85**, contradicting the rule the rest of the code
+  is built on (an avatar proves nothing alone = 0.40). The same pair could be
+  "0.85 linked" in one line and `UNRELATED` in the `IDENTITY_CONF` marker next
+  to it, and the first number is the one a report quotes. Correlation now goes
+  through `identity_confidence.score_lead` for BOTH paths.
+- **A bidirectional cross-link was downgraded to a one-way mention.**
+  `from_primary` compared the candidate's handle against the RAW outbound
+  strings, so `https://tiktok.com/@bob` never matched `bob` — and a profile's
+  own link is exactly what `recon._outbound_of` collects. `_outbound_handles`
+  normalises `@handle` and URL forms, which is the difference between
+  `CONFIRMED` and `PROBABLE` on real evidence.
+- **A generic bio scored as a strong signal.** Jaccard rates "student gamer"
+  against "gamer student" at 1.0; `BIO_DISTINCTIVE_MIN` now requires two
+  non-generic shared tokens before a bio similarity counts at all, and the
+  raw similarity stays in the evidence for a human to judge.
+- `tests/test_identity_precision.py` is the precision harness: a fixture of
+  same-person and different-person pairs, asserting that no different-person
+  pair reaches `CONFIRMED` and that the same-person pairs that SHOULD confirm
+  still do. Precision is the metric that matters when a wrong answer means
+  contacting a stranger.
+
+### Anomaly hunt: one process per probe — 2026-11-06
+
+- `anomaly.curl_runner` spawned a `curl` subprocess for EVERY probe: a full
+  hunt over one endpoint measured **90 s**, and under a loaded parallel test
+  run the per-request timeout expired and the hunt reported no signal on a
+  target that had one. It now uses a pooled keep-alive `requests` session
+  (same `ProbeResult`, same never-raises contract, `verify=False` matching
+  curl's `-k`, redirects left to requests so POST→GET still happens), with the
+  subprocess kept as `_curl_subprocess_runner` — the fallback, and the
+  reference the parity is contract-tested against.
+
+### Windows: a native first word is not a native command — 2026-11-06
+
+- **Auto-mode executed nothing on this Windows host and said so.** Live run
+  against the docker lab (`--auto 127.0.0.1 --goal deliver`): 4 actions, all
+  the same `curl_probe`, all failed, `services=0`, outcome `partial`. The
+  capability emits
+  `echo ==CURLPROBE 21== & curl ... | head -12 & ...`; `curl.exe` IS on the
+  Windows PATH, so `_rewrite_wsl` (which decided per TOOL) left the line
+  native and cmd.exe has no `head`. `_needs_posix_shell` now routes a line
+  through the distro shell (quoting-proof base64, the mechanism the
+  sshpass path already used) when it contains a pipe into a POSIX filter,
+  `2>/dev/null`, `$( )` or a backtick. `tasklist | findstr x`, `powershell -c`
+  and `where nmap` stay native, pinned by `tests/test_executor_wsl_bridge.py`.
+- **The rest of that failure was environmental, not Phantom.**
+  `wsl -d kali-linux …` fails on this box with `WSL_E_CONNECTION_TIMEOUT`
+  (both distros are Stopped and cannot be started), so the tool backend does
+  not exist — a run in that state can only be honest about it, and it was
+  (`partial`, beacon False, checkpoint and both reports written).
+
+### The lab's own FTP never started — 2026-11-06
+
+- `lab/Dockerfile` wrote `PORT=YES` (not a vsftpd option; the real one is
+  `port_enable`), so vsftpd rejected the config and exited before binding.
+  The lab advertised anonymous FTP on 2121 and answered an empty banner;
+  `docker exec phantom-lab-dmz pgrep -a vsftpd` found nothing. Fixed, with
+  an explicit `listen_port=21` (the container publishes 2121:21).
+- `scripts/live_benchmark.py` then measured the lab for real and PASSED:
+  ftp/ssh/http identified from their own banners, 100% recall, 100%
+  identification, Phantom's nmap parser 100%, 0 false positives on control
+  ports. Three defects in the harness itself had to be fixed first:
+  discovery read only `docker port` (Docker Desktop proxies the port while
+  reporting no mapping, so the benchmark said SKIP with the lab up — it now
+  falls back to `HostConfig.PortBindings`, and still TCP-probes every port
+  before it counts); `recall` was `len(truth)/len(truth)`, i.e. 100% by
+  construction (it is now confirmed / DECLARED, so a published port that
+  does not answer is a failure); and `identify()` had no FTP branch, so a
+  real FTP service was reported `unknown`.
+
+### CI and reproducibility — 2026-11-06
+
+- `numpy` is pinned in `constraints.txt` (it was `>=1.26` in
+  `requirements-dev.txt` and absent from the pinned set, which failed five
+  trainer tests on the 3.12 leg).
+- `README.md` states 439 test files (was 435, then 437 as two harnesses landed)
+  and `docs/README.md` indexes `PHISHING_STATUS.md`, which existed but was
+  unreachable from the index.
+- `tests/test_threatintel.py::test_cache_dir_creation` was a shared-directory
+  race: it asserted on `phantom/data/threatintel_cache`, which `clear_cache()`
+  DELETES, so another xdist worker could remove it between the call and the
+  assertion. It failed once in the full run and passed in isolation. The test
+  now owns a temporary directory and patches `CACHE_DIR`, which is what it
+  meant to check all along.
+- New `model-integrity` CI job (see above); `docs/AutoModeBenchmark.md`
+  documents what the agreement numbers do and do not prove, including the
+  scoreable-coverage column.
+
 ### AI: from "authority" to an effect you can measure — 2026-11-03
 
 - **The model was never in the decision path.** `next_moves.rank_next_moves`

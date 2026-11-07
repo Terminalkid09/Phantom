@@ -22,6 +22,7 @@ repository root.
 | [`AutoModeBenchmark.md`](AutoModeBenchmark.md) | How auto-mode is MEASURED (ground-truth scenarios, failure injection, what the numbers do and do not prove) and how to run the suite. |
 | [`service_units.md`](service_units.md) | `--print-service` / `--install-service` / `--uninstall-service`: how a run survives a reboot, and what the install writes, audits and verifies. |
 | [`c2d.md`](c2d.md) | The Go data plane (`c2d/`): what it ports, what stays in Python (answered `501`), and how to run it. |
+| [`PHISHING_STATUS.md`](PHISHING_STATUS.md) | What the phishing surface does today, what is credential-gated, and what is explicitly out of scope (SPF/DKIM/DMARC, end-to-end delivery). |
 | [`COMMAND_REFERENCE.md`](COMMAND_REFERENCE.md) | Every shell, module, C2 and AUTO-MODE command with what it does. **Generated** from the live registries — regenerate it, never hand-edit it. |
 
 **Test counts.** Only the repository root [`README.md`](../README.md) states a

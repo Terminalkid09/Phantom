@@ -48,5 +48,9 @@ pytest-mock==3.13.0
 setuptools==84.0.0
 PyYAML==6.0.3
 bandit==1.7.5
+# tests/test_net_ranker.py and tests/test_ranker.py import the trainer, which
+# imports numpy; the 3.12 CI leg failed five tests when it was absent from the
+# pinned set. Pinned to the version the suite was verified against (2026-11-06).
+numpy==2.2.6
 ruff==0.6.8
 mypy==2.2.0
