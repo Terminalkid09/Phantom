@@ -7,9 +7,19 @@ services:
     container_name: phantom-lab-dmz
     hostname: dmz
     ports:
+      # STANDARD ports too. A scanner's default sweep (`--top-ports 1000`,
+      # which is what Phantom and every real tool start with) does NOT include
+      # 2121/2222/8081 — measured 2026-11-07, auto-mode against this lab
+      # honestly reported "0 services" because nothing it looks at first was
+      # listening. The non-standard mappings stay (they exercise port
+      # detection and `_service_port`), and these make the lab reachable the
+      # way a real target is.
+      - "22:2222"     # SSH on the standard port
+      - "21:21"       # FTP anonymous on the standard port
+      - "80:8081"     # Web app on the standard port
       - "2222:2222"   # SSH (non-standard)
-      - "2121:21"     # FTP anonymous
-      - "8081:8081"   # Web app
+      - "2121:21"     # FTP anonymous (non-standard)
+      - "8081:8081"   # Web app (non-standard)
     networks:
       lab_net:
         ipv4_address: 172.28.0.10

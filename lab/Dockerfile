@@ -49,8 +49,15 @@ RUN mkdir -p /home/backup/.backup \
     && chmod 600 /home/backup/.backup/pivot.txt
 
 # ── FTP anonymous (hint pointing at the web app) ─────────────────────────
+# CAREFUL: `PORT=YES` is NOT a vsftpd option (the real one is `port_enable`).
+# vsftpd rejected the file and exited before binding, so the lab advertised an
+# anonymous FTP on 2121 that answered an empty banner (measured 2026-11-06:
+# `docker exec phantom-lab-dmz pgrep -a vsftpd` found nothing, and the live
+# surface benchmark identified the port as `unknown`). `listen_port=21` is
+# explicit because the container publishes 2121:21 and the client-side port is
+# not the server-side one.
 RUN mkdir -p /srv/ftp/pub /var/run/vsftpd/empty \
-    && printf 'PORT=YES\nlisten=YES\nanonymous_enable=YES\nlocal_enable=NO\nwrite_enable=YES\nanon_root=/srv/ftp\ndirmessage_enable=YES\nseccomp_sandbox=NO\nsecure_chroot_dir=/var/run/vsftpd/empty\n' > /etc/vsftpd.conf \
+    && printf 'listen=YES\nlisten_port=21\nanonymous_enable=YES\nlocal_enable=NO\nwrite_enable=YES\nanon_root=/srv/ftp\ndirmessage_enable=YES\nseccomp_sandbox=NO\nsecure_chroot_dir=/var/run/vsftpd/empty\n' > /etc/vsftpd.conf \
     && printf 'credentials are internal-only. get them from the intranet app /export. ssh /etc/passwd note: backup account.\n' > /srv/ftp/pub/note.txt \
     && printf 'Authorized testing only.\n' > /srv/ftp/pub/README.txt
 

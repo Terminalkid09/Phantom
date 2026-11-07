@@ -46,6 +46,7 @@ CONTAINER_PREFIX = "phantom-lab-"
 HTTP_HINT = {80, 443, 8000, 8080, 8081, 8443, 3000}
 REDIS_HINT = {6379}
 SSH_HINT = {22, 2222}
+FTP_HINT = {21, 2121}
 
 
 def _docker(args: List[str]) -> str:
@@ -57,19 +58,49 @@ def _docker(args: List[str]) -> str:
     return out.stdout if out.returncode == 0 else ""
 
 
+def _declared_ports(name: str) -> List[int]:
+    """Host ports a container DECLARES, from `docker port` then its config.
+
+    `docker port` is the normal answer, but it is not the only one: on Docker
+    Desktop/WSL2 a container can proxy a port to the host while reporting no
+    port mapping at all (measured 2026-11-06: 127.0.0.1:8081 answered 200 on
+    the lab's dmz, `docker port phantom-lab-dmz` printed nothing, and this
+    script reported SKIP while the lab was up). `HostConfig.PortBindings`
+    still holds the declared HostPort, so it is the fallback.
+
+    A declared port is NOT trusted: every one of them is TCP-probed before it
+    counts (see `run`), so a stale declaration cannot invent a service.
+    """
+    ports: List[int] = []
+    for line in _docker(["port", name]).splitlines():
+        match = re.search(r"->\s*(?:0\.0\.0\.0|\[::\]):(\d+)", line)
+        if match:
+            ports.append(int(match.group(1)))
+    if ports:
+        return sorted(set(ports))
+    raw = _docker(["inspect", "--format",
+                   "{{json .HostConfig.PortBindings}}", name]).strip()
+    try:
+        bindings = json.loads(raw) if raw else {}
+    except ValueError:
+        return []
+    for entries in (bindings or {}).values():
+        for entry in entries or []:
+            host_port = str((entry or {}).get("HostPort") or "").strip()
+            if host_port.isdigit():
+                ports.append(int(host_port))
+    return sorted(set(ports))
+
+
 def discover() -> List[Dict[str, Any]]:
     """Running lab containers and the host ports they publish."""
     names = [n for n in _docker(["ps", "--format", "{{.Names}}"]).split()
              if n.startswith(CONTAINER_PREFIX)]
     found: List[Dict[str, Any]] = []
     for name in names:
-        ports: List[int] = []
-        for line in _docker(["port", name]).splitlines():
-            match = re.search(r"->\s*(?:0\.0\.0\.0|\[::\]):(\d+)", line)
-            if match:
-                ports.append(int(match.group(1)))
+        ports = _declared_ports(name)
         if ports:
-            found.append({"container": name, "ports": sorted(set(ports))})
+            found.append({"container": name, "ports": ports})
     return found
 
 
@@ -117,6 +148,18 @@ def _probe_redis(port: int, host: str = "127.0.0.1") -> Optional[str]:
 
 def identify(port: int) -> Tuple[str, str]:
     """``(service, evidence)`` for a REAL open port, from what it answers."""
+    if port in FTP_HINT:
+        # An FTP server speaks FIRST ("220 …"), and the lab's anonymous-FTP on
+        # 2121 answered `220` while this function called it `unknown`: the
+        # benchmark failed on its own missing branch, not on the service
+        # (measured 2026-11-06).
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+                banner = sock.recv(128).decode("latin-1", errors="replace")
+            if banner.startswith("220"):
+                return "ftp", banner.strip()[:40]
+        except OSError:
+            pass
     if port in REDIS_HINT:
         reply = _probe_redis(port)
         if reply and "PONG" in reply.upper():
@@ -171,7 +214,15 @@ def run(require: bool = False) -> Dict[str, Any]:
 
     control_open = [p for p in control_ports if _probe_tcp(p)]
 
-    recall = (len(truth) / len(truth) * 100.0) if truth else 0.0
+    # RECALL is confirmed / DECLARED, not confirmed / confirmed. The old
+    # expression was `len(truth) / len(truth)`, which is 100% by construction:
+    # a published port the lab does not actually answer on (a container that
+    # came up without its service) disappeared from the denominator and the
+    # number could only pass. A declared port that does not answer is now a
+    # recall failure, which is what "the lab is up" means.
+    declared = {port for entry in containers for port in entry["ports"]}
+    recall = (100.0 * len(set(truth) & declared) / len(declared)
+              if declared else 0.0)
     identified = sum(1 for service in truth.values() if service != "unknown")
     identification = (100.0 * identified / len(truth)) if truth else 0.0
     parse_pct = (100.0 * len(parsed_ports & {str(p) for p in truth})
