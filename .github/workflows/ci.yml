@@ -192,7 +192,10 @@ jobs:
         # skip becomes a real run (audit §4.3.4).
         run: |
           python -m pip install --upgrade pip
-          pip install pytest
+          # pytest-xdist too: `pytest.ini` sets `-n auto` in addopts, so a bare
+          # `pip install pytest` makes this step die with "unrecognized
+          # arguments: -n" before it runs a single test (measured 2026-11-07).
+          pip install pytest pytest-xdist
           python -m pytest tests/test_electron_job_state.py \
             tests/test_electron_schema_mismatch.py -v
 

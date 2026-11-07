@@ -54,19 +54,45 @@ def _fail(message: str) -> int:
     return 1
 
 
-def _read_head(path: str, size: int = _SCAN_BYTES) -> bytes:
+def _read_head(path: str, size: int = _SCAN_BYTES,
+               data: "bytes | None" = None) -> bytes:
+    if data is not None:
+        return data[:size]
     with open(path, "rb") as handle:
         return handle.read(size)
 
 
-def artefact_machine(path: str, container: str) -> int:
+def _artefact_bytes(path: str) -> "bytes | None":
+    """The artefact's PLAINTEXT bytes, sealed or not.
+
+    `compile_beacon` seals its output at rest (``.enc``) so an on-access
+    antivirus cannot quarantine the operator's build; the smoke script has
+    always read through `beacon_artifacts`, and this one read the container
+    on disk with `open()`. Measured 2026-11-07 on the windows CI leg: the
+    build printed `SMOKE OK (windows): beacon.pe (1594368 bytes, PE)` and the
+    very next step reported "no windows/x86_64 PE artefact matches the grid",
+    because `beacon.pe` existed only as `beacon.pe.enc` and the only plaintext
+    file left in the directory was the XOR-wrapped shellcode.
+    """
+    try:
+        from phantom.utils import beacon_artifacts
+        return beacon_artifacts.payload(path)
+    except Exception:
+        try:
+            with open(path, "rb") as handle:
+                return handle.read()
+        except OSError:
+            return None
+
+
+def artefact_machine(path: str, container: str, data=None) -> int:
     """The architecture field of an ELF/PE/Mach-O, or -1 when unreadable.
 
     One function per container so the caller can say WHICH check failed (the
     smoke script learned that lesson: "it is not an ELF" and "it is an ELF of
     the wrong architecture" are different bugs).
     """
-    head = _read_head(path)
+    head = _read_head(path, data=data)
     if container == "ELF":
         if len(head) < 20 or head[:4] != b"\x7fELF":
             return -1
@@ -93,11 +119,14 @@ def artefact_machine(path: str, container: str) -> int:
 
 def _candidates(beacon_dir: str, platform: str, explicit=None) -> list:
     from phantom.utils.beacon_matrix import ARTEFACTS
+    from phantom.utils import beacon_artifacts
     names = [str(explicit)] if explicit else list(ARTEFACTS.get(platform, ()))
     out = []
     for name in names:
         candidate = name if os.path.isabs(name) else os.path.join(beacon_dir, name)
-        if os.path.exists(candidate):
+        # `present()` counts the sealed `.enc` as present: a build that seals
+        # its output has still produced the artefact
+        if os.path.exists(candidate) or beacon_artifacts.present(candidate):
             out.append(candidate)
     return out
 
@@ -136,17 +165,21 @@ def verify_cell(platform: str, arch: str, beacon_dir: str = "",
                 {a: machine_for(platform, a) for a in ARCHES[platform]})
     checked = []
     for path in paths:
-        size = os.path.getsize(path)
+        data = _artefact_bytes(path)
+        if data is None:
+            checked.append(f"{os.path.basename(path)}=unreadable")
+            continue
+        size = len(data)
         if size < 1024:
             checked.append(f"{os.path.basename(path)}={size}B (too small)")
             continue
-        head = _read_head(path)
+        head = _read_head(path, data=data)
         magic_ok = any(head.startswith(magic) for magic, _ in _MAGIC[container])
         if not magic_ok:
             checked.append(f"{os.path.basename(path)}={size}B "
                            f"(magic={head[:4]!r}, want {container})")
             continue
-        machine = artefact_machine(path, container)
+        machine = artefact_machine(path, container, data=data)
         matched = next((a for a, (_, value) in accepted.items()
                         if value == machine), "")
         if not matched:
