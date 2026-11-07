@@ -268,8 +268,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(ranker.to_dict(), indent=2, sort_keys=True) + "\n",
-                   encoding="utf-8")
+    # newline="\n" keeps the artifact byte-identical on every host: the
+    # manifest records the sha256 of these exact bytes, and the registry now
+    # refuses a manifest whose digest does not match the installed file.
+    # Without it a Windows-trained net hashes CRLF bytes that git normalises
+    # away on commit (same defect as training/ranker.py, measured 2026-11-06).
+    with open(out, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(ranker.to_dict(), indent=2, sort_keys=True) + "\n")
     print(f"net -> {out}")
 
     # A model trained under the data floor is written for inspection and
@@ -291,8 +296,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         }
         target = Path(args.write_manifest)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-                          encoding="utf-8")
+        with open(target, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         print(f"promoted -> {target}")
         return 0
     return 0 if (decision["verdict"] == "promote" and not under_floor) else 1

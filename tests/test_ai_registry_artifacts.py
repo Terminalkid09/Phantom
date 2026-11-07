@@ -20,6 +20,7 @@ that, because tightening it would fail the fixtures rather than a real model.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -64,6 +65,22 @@ def _write(folder: Path, version: str = "v1", **overrides) -> dict:
     return data
 
 
+def _sync_digest(folder: Path) -> None:
+    """Rewrite the manifest with the REAL digest of the artifact on disk.
+
+    Since 2026-11-06 a promoted manifest's sha256 is ENFORCED, so a fixture
+    that writes its artifact after the manifest has to update the claim —
+    otherwise the registry refuses it for a digest mismatch and the test
+    measures the fixture instead of the rule it is about.
+    """
+    manifest_path = folder / "manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    artifact = folder / "ranker.json"
+    if artifact.is_file():
+        data["sha256"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(data), encoding="utf-8")
+
+
 def test_a_promoted_ranker_without_its_artifact_is_not_promoted(tmp_path):
     """The exact 2026-11-02 shape: manifest on disk, ranker.json gone."""
     folder = _manifest_folder(tmp_path)
@@ -77,6 +94,7 @@ def test_the_same_manifest_is_promoted_once_the_artifact_exists(tmp_path):
     _write(folder)
     (folder / "ranker.json").write_text(json.dumps(RANKER_WEIGHTS),
                                         encoding="utf-8")
+    _sync_digest(folder)
     promoted = ModelRegistry(tmp_path).promoted("exploit")
     assert promoted is not None and promoted["version"] == "v1"
 
@@ -157,6 +175,7 @@ def test_trust_demotes_when_the_artifact_is_taken_away(tmp_path, monkeypatch):
 
     (folder / "ranker.json").write_text(json.dumps(RANKER_WEIGHTS),
                                         encoding="utf-8")
+    _sync_digest(folder)
     back = trust_for("exploit", registry=ModelRegistry(tmp_path))
     assert back.level == "nudge"
     assert back.source == "manifest"

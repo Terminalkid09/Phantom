@@ -7,6 +7,7 @@ manifest did not pass the gate (a JSON file in ``models/`` is not a promotion).
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -201,8 +202,12 @@ def test_the_runtime_refuses_a_manifest_without_a_passed_gate(tmp_path):
     folder.mkdir(parents=True)
     (folder / "ranker.json").write_text(json.dumps(
         {"weights": {"a": 1.0}, "context": {}, "bias": 0.0}), encoding="utf-8")
+    # The manifest's digest is now ENFORCED, so this fixture has to carry the
+    # real one: a placeholder would make the second half of this test fail for
+    # a reason that has nothing to do with the eval gate it is measuring.
+    digest = hashlib.sha256((folder / "ranker.json").read_bytes()).hexdigest()
     manifest = {"phase": "exploit", "version": "v1",
-                "base_model": "linear-pairwise-ranker", "sha256": "0" * 64,
+                "base_model": "linear-pairwise-ranker", "sha256": digest,
                 "trained_at": "2026-10-29T00:00:00Z",
                 "eval": {"ndcg": 0.9}, "baseline": {"ndcg": 0.8},
                 "kind": "linear-ranker", "ranker": "ranker.json",

@@ -646,6 +646,37 @@ jobs:
           print('No unbaselined high-severity issues found')
           "
 
+  model-integrity:
+    # The promoted model must be the bytes that were MEASURED.
+    #
+    # Measured defect (2026-11-06): `models/exploit/ranker-2026-11-03/
+    # manifest.json` declared `sha256: ba9023a2…` while the artifact in git
+    # hashed `b7e3b978…`, and nothing in the repository ever computed either
+    # number — so a ranker edited after its evaluation kept being served as
+    # the promoted model. The runtime registry now reproduces the digest on
+    # load; this job is the build-time counterpart, and it fails on a
+    # mismatch instead of warning.
+    #
+    # No `pip install`: `phantom.automation.ai.registry` is stdlib-only, so
+    # this gate costs seconds. Speed is the point — an integrity check that
+    # is slow enough gets skipped.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Recompute every promoted artifact's digest
+        run: python scripts/verify_model_integrity.py --json model-integrity.json
+      - name: Upload the integrity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-integrity
+          path: model-integrity.json
+          if-no-files-found: ignore
+
   static-analysis:
     # ruff + mypy — the quality gate the tree never had. Both are RATCHETS,
     # not full-tree cleanups: `ruff.toml` / `mypy.ini` start from the rules

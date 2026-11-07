@@ -33,10 +33,25 @@ A manifest that names no artifact at all (``ranker``/``adapter`` absent) is
 still validated by its measurement alone: those are hand-written test and
 benchmark manifests, and refusing them would test the rule rather than the
 model. A manifest that NAMES an artifact owes that file.
+
+THE ARTIFACT MUST BE THE BYTES THAT WERE MEASURED (measured 2026-11-06). The
+manifest carried a ``sha256`` that nothing ever computed: a ranker.json
+edited after evaluation kept being served as the promoted model, because
+"promoted" only checked that the file EXISTED. It now means measured AND
+installed AND byte-identical to what the gate measured — ``artifact_digest``
+reproduces the digest for a single-file ranker and for a directory of adapter
+weights, and ``digest_problem`` refuses a mismatch with both digests named.
+
+The digest is computed over the INSTALLED bytes, so those bytes have to be
+stable across hosts: ``.gitattributes`` marks ``models/**`` as binary and the
+trainers write with ``newline="\n"``. Without both, a Windows checkout hashed
+CRLF (6002 bytes) where git stored LF (5799) and every Windows install would
+have been refused for a difference that is not tampering.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -117,6 +132,79 @@ def artifact_problem(manifest: Dict[str, Any],
             f"owes the model it names)")
 
 
+def _file_digest(path: Path) -> str:
+    """sha256 of one file ("" when unreadable — never a guess)."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return ""
+
+
+def _tree_digest(directory: Path) -> str:
+    """Deterministic digest of a directory of adapter weights.
+
+    Order is not left to the filesystem: entries are sorted by their relative
+    POSIX path, and each one contributes its path, its size and its bytes.
+    Including the size separates ``ab`` from ``a`` + ``b``, and including the
+    path means renaming ``adapter_model.safetensors`` cannot keep the digest.
+    """
+    try:
+        files = sorted(
+            (p for p in directory.rglob("*") if p.is_file()),
+            key=lambda p: p.relative_to(directory).as_posix())
+    except OSError:
+        return ""
+    if not files:
+        return ""
+    digest = hashlib.sha256()
+    for path in files:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return ""
+        rel = path.relative_to(directory).as_posix().encode("utf-8")
+        digest.update(rel + b"\0" + str(len(data)).encode("ascii") + b"\0")
+        digest.update(data)
+    return digest.hexdigest()
+
+
+def artifact_digest(manifest: Dict[str, Any],
+                    root: Optional[Path] = None) -> str:
+    """sha256 of the artifact this manifest names ("" = none or unreadable).
+
+    A single-file ranker is hashed as bytes; an adapter directory is hashed
+    as the deterministic tree above. Both are reproducible on any host, which
+    is the point: the value is compared against ``manifest['sha256']``.
+    """
+    reference, is_file = _artifact_reference(manifest)
+    if not reference:
+        return ""
+    path = artifact_path(manifest, root)
+    if path is None:
+        return ""
+    return _file_digest(path) if is_file else _tree_digest(path)
+
+
+def digest_problem(manifest: Dict[str, Any],
+                   root: Optional[Path] = None) -> str:
+    """Why the installed artifact is not the one that was measured ("" = ok)."""
+    declared = str(manifest.get("sha256") or "").strip().lower()
+    if not declared:
+        return ""                     # shape validation already refuses this
+    actual = artifact_digest(manifest, root)
+    if not actual:
+        return ""                     # missing/unreadable is artifact_problem's
+    if actual == declared:
+        return ""
+    return (f"artifact digest mismatch: manifest declares {declared} but the "
+            f"installed file hashes {actual} — the model was changed after "
+            f"it was measured, so it may not serve this phase")
+
+
 def manifest_errors(manifest: Dict[str, Any], phase: str = "",
                     root: Optional[Path] = None) -> List[str]:
     """Why this manifest may not serve ``phase`` (empty = acceptable).
@@ -148,6 +236,12 @@ def manifest_errors(manifest: Dict[str, Any], phase: str = "",
         problem = artifact_problem(manifest, root)
         if problem:
             errors.append(problem)
+        else:
+            # Only meaningful once the file is known to exist: a missing
+            # artifact already has its own, more actionable message.
+            mismatch = digest_problem(manifest, root)
+            if mismatch:
+                errors.append(mismatch)
     return errors
 
 

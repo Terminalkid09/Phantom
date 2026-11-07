@@ -209,8 +209,15 @@ def promoted(phase: str = "exploit",
     manifest without ``eval``/``baseline`` numbers is refused here exactly as
     it is for an adapter, and a gate that has not passed cannot be smuggled in
     by dropping a JSON file in ``models/``.
+
+    The DIGEST is checked again here, on the exact file that is about to be
+    loaded. The registry already refuses a mismatch, so this is defence in
+    depth rather than the only check: a caller that builds a manifest dict in
+    memory (a benchmark, an API body) never passes through the registry's
+    directory scan, and serving weights nobody hashed is the failure this
+    layer exists to prevent.
     """
-    from phantom.automation.ai.registry import ModelRegistry
+    from phantom.automation.ai.registry import ModelRegistry, artifact_digest
 
     registry = ModelRegistry(models_dir.parent) if models_dir else ModelRegistry()
     manifest = registry.promoted(phase)
@@ -231,4 +238,9 @@ def promoted(phase: str = "exploit",
         base = Path(str(manifest.get("_manifest_dir") or ""))
         candidates = [base / reference, PROJECT_ROOT / reference]
         path = next((p for p in candidates if p.is_file()), candidates[-1])
+    declared = str(manifest.get("sha256") or "").strip().lower()
+    if declared:
+        actual = artifact_digest(manifest)
+        if actual and actual != declared:
+            return None
     return load(path)

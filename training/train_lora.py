@@ -44,7 +44,7 @@ from typing import Any, Dict, List, Optional
 
 from training.manifest import (
     build_manifest,
-    sha256_file,
+    sha256_tree,
     validate_manifest,
     write_manifest,
 )
@@ -336,7 +336,10 @@ def train(args: argparse.Namespace) -> int:
 
     manifest = build_from_report(
         args.phase, args.version, args.base_model, str(adapter_dir),
-        sha256=sha256_file(adapter_dir / "adapter_model.safetensors"),
+        # The WHOLE adapter directory, not only the weights file: the runtime
+        # verifies the tree digest, and a manifest that hashed one file while
+        # the registry hashed the tree would refuse every promoted adapter.
+        sha256=sha256_tree(adapter_dir),
         eval_json=args.eval_json, baseline_json=args.baseline_json,
         golden_json=args.golden, dataset=str(args.dataset),
     )

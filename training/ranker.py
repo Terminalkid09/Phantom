@@ -729,8 +729,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     # itself as the previous one — "which model is live" was unanswerable
     # from the runtime side.
     exported["version"] = args.version
-    out.write_text(json.dumps(exported, indent=2, sort_keys=True) + "\n",
-                   encoding="utf-8")
+    # newline="\n" is NOT cosmetic here: the manifest below records the
+    # sha256 of THIS file, and `write_text` without it translates every "\n"
+    # to os.linesep. A Windows-trained ranker then hashed 203 bytes of CRLF
+    # that `* text=auto` strips again on commit, so the declared digest never
+    # matched the installed artifact (measured 2026-11-06: ba9023a2… on disk
+    # vs b7e3b978… in git). The digest must not depend on the host OS.
+    with open(out, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(exported, indent=2, sort_keys=True) + "\n")
     print(f"ranker -> {out}")
 
     if args.write_manifest and decision["verdict"] == "promote":
@@ -783,8 +789,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         }
         target = Path(args.write_manifest)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-                          encoding="utf-8")
+        with open(target, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         print(f"promoted -> {target}")
     return 0 if decision["verdict"] == "promote" else 1
 

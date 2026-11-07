@@ -1,2 +1,11 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Model artifacts are HASHED, not read: a manifest carries the sha256 of the
+# exact bytes it measured, and `* text=auto` above rewrites those bytes on
+# checkout (LF in the blob, CRLF on Windows). That made the declared digest
+# differ from the installed file on every Windows clone — measured 2026-11-06:
+# ranker.json was 5799 bytes in git (b7e3b978…) and 6002 on a Windows checkout
+# (ba9023a2…). `-text` means "no conversion in either direction".
+models/** -text
+models/**/*.safetensors binary

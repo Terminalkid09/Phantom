@@ -85,6 +85,42 @@ def sha256_file(path: str | Path) -> str:
         return ""
 
 
+def sha256_tree(directory: str | Path) -> str:
+    """Deterministic SHA-256 of a directory of adapter weights.
+
+    A LoRA artifact is not one file: ``save_pretrained`` writes the weights
+    plus the tokenizer and the adapter config, and any of them can change the
+    model that is actually served. The MIRROR of this function lives in
+    ``phantom.automation.ai.registry._tree_digest`` (the runtime cannot import
+    ``training/``, which is not shipped); ``tests/test_model_integrity.py``
+    compares the two on the same fixture, because a trainer that records one
+    scheme and a registry that checks another would refuse every promoted
+    adapter.
+
+    Entries are sorted by relative POSIX path and each contributes its path,
+    its size and its bytes (the size is what separates ``ab`` from ``a`` +
+    ``b``; the path is what stops a rename from keeping the digest).
+    """
+    base = Path(directory)
+    try:
+        files = sorted((p for p in base.rglob("*") if p.is_file()),
+                       key=lambda p: p.relative_to(base).as_posix())
+    except OSError:
+        return ""
+    if not files:
+        return ""
+    digest = hashlib.sha256()
+    for path in files:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return ""
+        rel = path.relative_to(base).as_posix().encode("utf-8")
+        digest.update(rel + b"\0" + str(len(data)).encode("ascii") + b"\0")
+        digest.update(data)
+    return digest.hexdigest()
+
+
 def manifest_dir(root: str | Path, phase: str, version: str) -> Path:
     return Path(root) / "models" / phase / version
 
@@ -247,10 +283,17 @@ def _as_float(value: object) -> float:
 
 
 def write_manifest(manifest: Dict[str, object], directory: str | Path) -> Path:
+    """Write the manifest with LF on every host.
+
+    The digest inside it is computed over the ARTIFACT, not this file, but a
+    manifest that changes bytes with the operating system shows up as a diff
+    on every Windows checkout for no reason — and `models/**` is now marked
+    binary in `.gitattributes`, so the bytes here are the bytes everywhere.
+    """
     path = Path(directory) / MANIFEST_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8")
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return path
 
 
