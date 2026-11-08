@@ -17,7 +17,8 @@ What it mirrors, job by job, from `.github/workflows/ci.yml`:
   model-integrity   scripts/verify_model_integrity.py
   offline-sims      coverage_matrix_sim, hardened_target_sim, automode_benchmark
   c2-test           the C2 glob + the real end-to-end beacon smoke
-  electron-build    npm ci, tsc --noEmit, vite build, renderer contracts
+  electron-build    npm ci, tsc --noEmit, vite build, renderer contracts in a
+                    venv that has ONLY pytest/xdist (like the GitHub step)
   beacon-lint       scripts/ci_beacon_lint.py
   beacon-smoke      the release-path build + grid verify FOR THIS OS only
   docker-test       skipped unless a daemon answers (with the reason)
@@ -57,22 +58,25 @@ PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 
 
 def _resolve(cmd: List[str]) -> List[str]:
-    """Find bare command names the way a shell would.
+    """Find the bare executable name the way a shell would.
 
     On Windows `npm`, `npx` and `tsc` are `.cmd` shims: `CreateProcess` (what
     ``subprocess`` calls without a shell) cannot execute them, so the Electron
     job failed with ``WinError 2`` while the GitHub runner — a shell — worked.
-    Absolute paths and ``python -m`` invocations are left untouched.
+
+    ONLY the first token is resolved. Resolving every token rewrote ordinary
+    arguments through PATH: `pip install pytest` became
+    `pip C:\\Program Files\\Git\\usr\\bin\\install.EXE pytest`, because this
+    box has Git's `install.exe` (measured 2026-11-08). Absolute paths and
+    `python -m` invocations keep their first token as-is.
     """
-    out: List[str] = []
-    previous = ""
-    for token in (str(c) for c in cmd):
-        is_module = previous in ("-m", "-c")
-        if (os.name == "nt" and not is_module and not os.path.dirname(token)
-                and not token.lower().endswith(".exe")):
-            token = shutil.which(token) or token
-        out.append(token)
-        previous = token
+    out = [str(c) for c in cmd]
+    if not out:
+        return out
+    first = out[0]
+    if (os.name == "nt" and not os.path.dirname(first)
+            and not first.lower().endswith(".exe")):
+        out[0] = shutil.which(first) or first
     return out
 
 
@@ -294,10 +298,33 @@ def job_electron() -> List[Tuple[str, str, str, str]]:
     ok, out, dur = _run(["npx", "vite", "build"], cwd=root)
     rows.append(("vite build", PASS if ok else FAIL, f"{dur:.0f}s",
                  "" if ok else _tail(out, 20)))
-    ok, out, dur = _run([PY, "-m", "pytest",
+    # GitHub's electron job installs pytest and pytest-xdist ONLY: no rich, no
+    # project requirements. Running the contracts with the developer's full
+    # interpreter hid exactly that difference on 2026-11-08 (a conftest import
+    # of phantom.core.session failed on the runner with ModuleNotFoundError:
+    # rich, while this job passed). A fresh venv with the same two packages is
+    # the only local run that can see it.
+    venv = ARTIFACTS / "electron-contracts-venv"
+    shutil.rmtree(venv, ignore_errors=True)
+    ok, out, dur = _run([PY, "-m", "venv", str(venv)], timeout=120)
+    if not ok:
+        rows.append(("renderer contracts venv", FAIL, f"{dur:.0f}s",
+                     _tail(out, 20)))
+        return rows
+    vpy = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    ok, out, dur = _run([str(vpy), "-m", "pip", "install", "-q",
+                         "--disable-pip-version-check", "pytest",
+                         "pytest-xdist"], timeout=600)
+    if not ok:
+        rows.append(("renderer contracts deps", FAIL, f"{dur:.0f}s",
+                     _tail(out, 20)))
+        return rows
+    ok, out, dur = _run([str(vpy), "-m", "pytest",
                          "tests/test_electron_job_state.py",
-                         "tests/test_electron_schema_mismatch.py", "-q"])
-    rows.append(("renderer contracts", PASS if ok else FAIL, f"{dur:.0f}s",
+                         "tests/test_electron_schema_mismatch.py",
+                         *CI_WORKERS, "-q"], timeout=300)
+    rows.append(("renderer contracts (minimal venv)",
+                 PASS if ok else FAIL, f"{dur:.0f}s",
                  "" if ok else _tail(out, 25)))
     return rows
 
