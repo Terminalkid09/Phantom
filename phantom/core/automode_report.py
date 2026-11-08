@@ -108,10 +108,20 @@ def ai_participation(agent) -> str:
     if arbiter is not None:
         try:
             summary = arbiter.summary()
+            # `accepted/rejected` alone reads as "the model had no effect"
+            # even when it was never asked. `asked` and `proposals` separate
+            # "consulted and abstained" from "consulted and agreed", and
+            # `abstained` makes a silent run visible (measured 2026-11-08:
+            # the live line said only "0 accepted / 0 rejected / 0 changed"
+            # while telemetry named the missing planner manifest).
             parts.append(
-                f"arbiter: {summary['accepted']} accepted / "
-                f"{summary['rejected']} rejected / {summary['changed']} "
-                f"changed — {summary['note']}")
+                f"arbiter: {summary.get('asked', 0)} asked / "
+                f"{summary.get('proposals', 0)} proposal(s) / "
+                f"{summary.get('accepted', 0)} accepted / "
+                f"{summary.get('rejected', 0)} rejected / "
+                f"{summary.get('changed', 0)} changed / "
+                f"{summary.get('abstained', 0)} abstained — "
+                f"{summary.get('note', '')}")
         except Exception as exc:
             parts.append(f"arbiter: unreadable ({exc})")
 

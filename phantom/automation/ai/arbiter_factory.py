@@ -35,7 +35,7 @@ def for_engagement(wm: Any, *, goal: str = "", phase: str = "planner",
             try:
                 from phantom.utils.notifier import notifier
                 notifier.info(
-                    "AI arbiter: no measured advantage for phase 'planner', "
+                    f"AI arbiter: no measured advantage for phase {phase!r}, "
                     "so it runs at the 'nudge' profile (at most 2 positions) "
                     "because the operator enabled the plane explicitly.")
             except Exception:

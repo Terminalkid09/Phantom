@@ -144,6 +144,23 @@ class TestAgentSingleTail(unittest.TestCase):
         self.assertTrue(m_info.called)  # the tail still completed
 
 
+class TestAiParticipation(unittest.TestCase):
+    def test_arbiter_counts_separate_asked_from_proposals(self):
+        summary = {"asked": 3, "proposals": 0, "accepted": 0, "rejected": 0,
+                   "changed": 0, "abstained": 3, "unavailable": 0,
+                   "note": "the model was asked and returned no usable proposal"}
+        arbiter = Mock()
+        arbiter.summary.return_value = summary
+        agent = Mock()
+        agent.planner.arbiter = arbiter
+        agent.llm_advisor = None
+        line = rep.ai_participation(agent)
+        self.assertIn("3 asked", line)
+        self.assertIn("0 proposal(s)", line)
+        self.assertIn("3 abstained", line)
+        self.assertIn("returned no usable proposal", line)
+
+
 class TestCampaignTail(unittest.TestCase):
     def test_totals_and_report_paths(self):
         campaign = {"beacons": 1, "persistent": 1, "compromised_creds": 4}
