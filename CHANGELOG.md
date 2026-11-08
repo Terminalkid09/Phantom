@@ -86,6 +86,75 @@ behind it; the ones that were not measured are named as such.
 
 ## [Unreleased] — current development (v3.0.0 line)
 
+### Review verification: seven warnings were nineteen — 2026-11-08
+
+- **The review was checked claim by claim, not accepted.** The previous `dev`
+  head (`3d2810d`) had a green GitHub CI (run `42376614153`, 21/21 jobs); model
+  integrity reported `checked:1, failures:[]`; the 12-scenario benchmark was
+  PASS (87.5% reachable, 100% honest, 0 false positives, 0 forbidden); and
+  `utils/tunnel.py` did pin the cloudflared SHA. The count of invalid escape
+  sequences was wrong: they were **19, not 7** (the shell usage line, the
+  defender docstring, one exploit test and 8+8 in the two real-deploy test
+  modules), because Python 3.10 reports them as `DeprecationWarning` rather
+  than the `SyntaxWarning` seen on 3.12. All are fixed, and
+  `tests/test_source_hygiene.py` now compiles `phantom/`, `tests/`, `scripts/`
+  and `training/` and fails on any invalid escape on 3.10 too.
+- **`C2Server.stop()` leaked a coroutine when the loop was already gone.** The
+  cleanup coroutine was created before `run_coroutine_threadsafe` could accept
+  it; a stopped loop raised and left it unawaited (the `test_aitm.py` warning).
+  The coroutine is now built only on a running loop, closed if scheduling still
+  fails, and covered by `tests/test_c2_stop_cleanup.py`.
+- **The mobile probe could not see the surface it exists to find.** It
+  hardcoded `http://` and dropped the target's own port, so the lab MDM on
+  `127.0.0.1:8443` produced zero findings; on Windows its `&`-joined records,
+  single quotes and `/dev/null` produced an unparseable line, and the MDM
+  fingerprint used a POSIX `for … do … done` that cmd.exe cannot parse. The
+  adapter now builds up to four candidate base URLs from the target and the
+  scanned services, chooses TLS by port (443/8443/9443/10443), writes explicit
+  curl commands with the platform's null device and `;` record separator, and
+  sends both an iOS and an Android user agent. The lab phone smoke is 19/19;
+  both capabilities get a 90 s budget.
+- **The arbiter line hid an abstention.** `0 accepted / 0 rejected / 0 changed`
+  read as agreement even when the model was never asked, while telemetry named
+  a missing `planner` manifest. The line now reports `asked / proposal(s) /
+  accepted / rejected / changed / abstained`, and the factory's fallback
+  notice names the actual phase.
+- **The local CI was not the GitHub CI.** `scripts/ci_local.py` used `-n auto`:
+  16 workers on this box against the four-core `ubuntu-latest` runner. Two
+  real agent tests take ~110 s each, so under that load they crossed the 120 s
+  global timeout, pytest-timeout killed their workers, and the run reported
+  five failures (three as crashes) that all passed serially. The runner now
+  uses `-n 4`; the two agent tests have an explicit 240 s per-test bound; the
+  POSIX stager watchdog is 60 s; the PoC fixture gets 30 s; and the beacon
+  matrix lists tracked headers with one `git ls-files` instead of ~90. Final
+  local run: **12 jobs, 24 steps, 0 failed, 731 s**.
+
+#### Measured end-to-end on 2026-11-08
+
+- Lab phone: `scripts/lab_phone_smoke.py` 19/19; the web lab lockout returns
+  `429` with `Retry-After: 59` on the fifth attempt.
+- `--auto 127.0.0.1:8443 --goal mobile --ai off`: goal reached in 19 s, two
+  actions, `simplemdm` and both platform user agents observed.
+- The same run with `--ai integrated`: goal reached, arbiter line
+  `2 asked / 0 proposal(s) / 0 accepted / 0 rejected / 0 changed / 6 abstained`,
+  telemetry `failed: integrated: no promoted manifest for phase 'planner'`.
+- `--auto 127.0.0.1 --goal deliver` with `--ai off` and `--ai integrated`: both
+  `partial (goal not reached)` because nmap/masscan/nc are absent on this host;
+  the integrated run says `3 asked / 0 proposal(s) / 18 abstained` instead of
+  pretending to differ from `--ai off`.
+- Full suite: **6446 passed, 6 skipped, 16 warnings, 115 subtests, 380.43 s**.
+
+#### Not changed, deliberately
+
+- A `planner` ranker was probed on the `exploit` corpus: NDCG 0.9379 vs 0.9021
+  and a bootstrap CI of +0.0095…+0.0628, but the top weight was
+  `ssh_banner +0.98` for a different question. Promoting it would have been
+  theatre; the probe is not committed, and the missing `planner` manifest
+  remains the honest limit named in telemetry.
+- No model was invented for mobile: the probe was made TLS-aware and
+  cross-platform instead. The lab is protocol-level, not a real device; the
+  deliver path was not re-run with nmap installed.
+
 ### AI in the live run: measured, and what it is not — 2026-11-07
 
 - **The two live runs are identical, and that is now stated instead of
