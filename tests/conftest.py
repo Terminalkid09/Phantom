@@ -55,7 +55,11 @@ def _restore_session_knowledge_base():
     KB this one found — the same order-independence rule as the singleton
     cleanups below.
     """
-    from phantom.core.session import session
+    try:
+        from phantom.core.session import session
+    except Exception:  # pragma: no cover - renderer contracts run without deps
+        yield
+        return
 
     saved = copy.deepcopy(session.knowledge_base)
     yield
