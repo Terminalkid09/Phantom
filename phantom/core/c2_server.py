@@ -2381,20 +2381,38 @@ class C2Server:
         # it or to close the engagement. Flush before any of that work can be
         # mistaken for "nothing happened".
         c2_state.flush()
-        if self.loop and self.runner:
-            async def cleanup():
-                await self.runner.cleanup()
-            try:
-                future = asyncio.run_coroutine_threadsafe(cleanup(), self.loop)
-                future.result(timeout=2)
-            except Exception:
-                pass
-            self.loop.call_soon_threadsafe(self.loop.stop)
-            if self.thread:
-                self.thread.join(timeout=2)
-                self.thread = None
-            self.loop = None
-            self.runner = None
+        loop, runner = self.loop, self.runner
+        if loop and runner:
+            # A coroutine created for a loop that is no longer running can
+            # never be awaited: run_coroutine_threadsafe raises and the
+            # coroutine is collected with "RuntimeWarning: coroutine
+            # 'C2Server.stop.<locals>.cleanup' was never awaited" (measured
+            # 2026-11-08 under tests/test_aitm.py). Create it ONLY when the
+            # loop can accept it, and close it if scheduling still fails —
+            # the loop can stop between the check and the call.
+            if loop.is_running():
+                async def cleanup():
+                    await runner.cleanup()
+
+                coro = cleanup()
+                try:
+                    future = asyncio.run_coroutine_threadsafe(coro, loop)
+                except Exception:
+                    coro.close()
+                else:
+                    try:
+                        future.result(timeout=2)
+                    except Exception:
+                        pass
+                try:
+                    loop.call_soon_threadsafe(loop.stop)
+                except RuntimeError:
+                    pass
+        if self.thread:
+            self.thread.join(timeout=2)
+            self.thread = None
+        self.loop = None
+        self.runner = None
 
 
 server_instance = C2Server()
