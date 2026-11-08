@@ -221,6 +221,45 @@ class TestMdmPlatformProbe:
 
 # ───────────────────────────── android build target ─────────────────────────
 
+class TestMobileProbeScheme:
+    """The lab phone (and every real MDM) serves TLS on 8443.
+
+    The old probe hardcoded http:// and dropped the target's own port, so it
+    could not see the surface it exists to find. These tests pin the scheme
+    choice and the dual-user-agent loop.
+    """
+
+    def test_service_target_keeps_its_port_and_uses_https(self):
+        from phantom.automation.guidance import kit
+        wm = WorldModel(target="127.0.0.1:8443", target_type="ip")
+        assert kit._mobile_base_urls(wm)[0] == "https://127.0.0.1:8443"
+        cmd = kit._mobile_probe_adapter(wm, {})
+        assert "https://127.0.0.1:8443/api/v2/mdm" in cmd
+        assert "http://127.0.0.1/api/v2/mdm" not in cmd
+
+    def test_scanned_tls_service_is_probed(self):
+        from phantom.automation.guidance import kit
+        wm = WorldModel(target="10.0.0.5", target_type="ip")
+        wm.add_finding("service", "tcp/8443",
+                       {"port": 8443, "service": "https"}, source="scan_tcp")
+        assert "https://10.0.0.5:8443" in kit._mobile_base_urls(wm)
+
+    def test_plain_http_port_is_not_upgraded(self):
+        from phantom.automation.guidance import kit
+        wm = WorldModel(target="10.0.0.5", target_type="ip")
+        wm.add_finding("service", "tcp/8081",
+                       {"port": 8081, "service": "http"}, source="scan_tcp")
+        assert "http://10.0.0.5:8081" in kit._mobile_base_urls(wm)
+
+    def test_mdm_probe_tests_both_user_agents_on_tls(self):
+        from phantom.automation.guidance import kit
+        wm = WorldModel(target="127.0.0.1:8443", target_type="ip")
+        cmd = kit._mdm_fingerprint_adapter(wm, {})
+        assert "https://127.0.0.1:8443" in cmd
+        assert 'PLAT:ios:PATH:/' in cmd
+        assert 'PLAT:android:PATH:/' in cmd
+
+
 class TestIosTarget:
     def test_builder_registers_ios_outputs(self):
         from phantom.utils.builder import _PLATFORM_OUT, _REMOTE_OUT

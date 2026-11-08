@@ -144,7 +144,7 @@ class TestMobileProbe(unittest.TestCase):
         self.assertIn("/api/v2/mdm", cmd)
         self.assertIn("/enroll", cmd)
         self.assertIn("/v1/push", cmd)
-        self.assertIn("__MOBILE_WEB__", cmd)
+        self.assertIn("home-mobile;", cmd)
 
     def test_endpoint_hits_parsed(self):
         out = ("000:/api/v2/mdm;200:/api/v2/mdm;000:/enroll;301:/enroll;"

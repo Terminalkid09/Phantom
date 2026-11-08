@@ -3536,24 +3536,79 @@ def _cloud_s3_interp(output, wm, slots):
 # mobile / device-management surface
 # ---------------------------------------------------------------------------
 
+#: Ports whose mobile/MDM surface is served over TLS. Every real MDM
+#: (Jamf, Intune, SimpleMDM) terminates TLS on 443/8443, and so does the
+#: phone lab; the probe used to hardcode http:// and drop the target's port,
+#: so it could not see the very surface it exists to find (measured
+#: 2026-11-08 against 127.0.0.1:8443: zero findings).
+_MOBILE_TLS_PORTS = frozenset({"443", "8443", "9443", "10443"})
+#: Ports that are expected to answer plain HTTP.
+_MOBILE_HTTP_PORTS = frozenset({"80", "8080", "8081", "8000", "8888"})
+
+
+def _mobile_base_urls(wm, slots=None):
+    """Candidate absolute base URLs for a mobile/MDM surface, TLS-aware.
+
+    The target's OWN port wins (a service target such as
+    ``127.0.0.1:8443`` must not be probed on 80), scanned services add the
+    ports the scan actually saw, and an unscanned host falls back to the two
+    defaults that matter (443 then 80). TLS is chosen by port, never assumed
+    from the presence of a certificate: an MDM on 8080 is still HTTP.
+
+    Bounded to four URLs: every probe here runs against the target, and an
+    unbounded port list would turn a bounded recon step into a scan.
+    """
+    override = str((slots or {}).get("base_url") or "").strip().rstrip("/")
+    if override:
+        if "://" in override:
+            return [override]
+        _, own = split_host_port(override)
+        scheme = "https" if str(own or "") in _MOBILE_TLS_PORTS else "http"
+        return [f"{scheme}://{override}"]
+
+    host = _effective_target(wm)
+    _, own = split_host_port(str(getattr(wm, "target", "") or ""))
+    ports = [str(own)] if own else []
+    try:
+        for finding in wm.find("service"):
+            value = finding.value if isinstance(finding.value, dict) else {}
+            port = str(value.get("port", "") or "")
+            if port in _MOBILE_TLS_PORTS or port in _MOBILE_HTTP_PORTS:
+                ports.append(port)
+    except Exception:
+        pass
+    if not ports:
+        # TLS first: an MDM is almost never plain HTTP.
+        ports = ["443", "80"]
+    out = []
+    for port in ports:
+        scheme = "https" if port in _MOBILE_TLS_PORTS else "http"
+        url = f"{scheme}://{_hport(host, port)}"
+        if url not in out:
+            out.append(url)
+    return out[:4]
+
+
 def _mobile_probe_adapter(wm, slots):
     """Probe for mobile or device-management infrastructure: MDM endpoints,
     push gateways (APNS/GCM), and mobile-web user agents."""
-    target = _effective_target(wm)
+    ua = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+          "AppleWebKit/605.1.15")
+    # cmd.exe has no /dev/null, single quotes are literal, and `grep` is not
+    # guaranteed on PATH: the probe must run on the OPERATOR's shell too.
+    null = "NUL" if os.name == "nt" else "/dev/null"
+    err = "2>NUL" if os.name == "nt" else "2>/dev/null"
     cmds = []
-    for ep in ("/api/v2/mdm", "/enroll", "/api/device", "/config/mobile",
-               "/v1/push", "/push", "/apns", "/gcm", "/fcm"):
-        cmds.append(f"curl -m 3 -sk -A 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 "
-                    f"like Mac OS X) AppleWebKit/605.1.15' "
-                    f"http://{target}{ep} -o /dev/null -w '%{{http_code}}:{ep}' "
-                    f"2>/dev/null")
-    cmds.append(
-        f"curl -m 3 -sk -A 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac "
-        f"OS X) AppleWebKit/605.1.15' http://{target}/ -o /dev/null "
-        f"-w '%{{http_code}}:home-mobile' 2>/dev/null "
-        f"| grep -E ':200|:302|:301' "
-        f"&& echo __MOBILE_WEB__")
-    # common mobile port classes only probed if the scanner did not see them
+    for base in _mobile_base_urls(wm, slots):
+        for ep in ("/api/v2/mdm", "/enroll", "/api/device", "/config/mobile",
+                   "/v1/push", "/push", "/apns", "/gcm", "/fcm"):
+            # The trailing `;` is the RECORD separator the interpreter
+            # splits on; without it Windows' `&` join concatenated every code
+            # into one unparseable line (measured 2026-11-08).
+            cmds.append(f'curl -m 2 -sk -A "{ua}" {base}{ep} -o {null} '
+                        f'-w "%{{http_code}}:{ep};" {err}')
+        cmds.append(f'curl -m 2 -sk -A "{ua}" {base}/ -o {null} '
+                    f'-w "%{{http_code}}:home-mobile;" {err}')
     return _join_local_shell(cmds)
 
 
@@ -3604,22 +3659,34 @@ def _mdm_fingerprint_adapter(wm, slots):
     take. Server-side platform signals are the only non-intrusive way to
     learn the platform before any victim contact.
     """
-    target = slots.get("base_url") or _effective_target(wm)
     ua_ios = "MDM/1.0 (Macintosh; Mac OS X)"
     ua_android = ("MDM/1.0 (Linux; Android 14; Pixel 8) "
                   "Android-MDM-Agent/1.0")
-    return (
-        "echo __MDM_START__; "
-        f"for p in / /enroll /mypolicies /api/v1 /api/mdm /BYOD /discovery; do "
-        f"for ua in '{ua_ios}::{ua_android}'; do "
-        "plat=${ua%%::*}; agent=${ua##*::}; "
-        f"code=$(curl -m 4 -sk -A \"$agent\" -o /tmp/_mdm_probe -w '%{{http_code}}' "
-        f"\"http://{target}$p\" 2>/dev/null); "
-        "case $agent in *Android*) tag=android ;; *) tag=ios ;; esac; "
-        "echo \"PLAT:$tag:PATH:$p:CODE:$code\"; "
-        "head -c 240 /tmp/_mdm_probe 2>/dev/null; echo; done; done; "
-        "echo __MDM_END__"
-    )
+    import tempfile
+
+    # Explicit commands, not a POSIX `for` loop: the adapter runs on the
+    # OPERATOR's shell, and cmd.exe cannot parse `for ... do ... done` at all
+    # (measured 2026-11-08: the loop produced zero MDM lines on Windows). One
+    # bounded request per (base, path, platform), each labelled before its
+    # body so the interpreter never has to correlate separate streams.
+    tmp = os.path.join(tempfile.gettempdir(), f"_phantom_mdm_{os.getpid()}.txt")
+    body = f'type "{tmp}"' if os.name == "nt" else f'cat "{tmp}"'
+    newline = "echo." if os.name == "nt" else "echo"
+    err = "2>NUL" if os.name == "nt" else "2>/dev/null"
+    segments = ["echo __MDM_START__"]
+    for base in _mobile_base_urls(wm, slots)[:3]:
+        for path in ("/", "/enroll", "/mypolicies", "/api/v1", "/api/mdm",
+                     "/BYOD", "/discovery"):
+            for plat, ua in (("ios", ua_ios), ("android", ua_android)):
+                segments.append(
+                    f'curl -m 2 -sk -A "{ua}" -o "{tmp}" '
+                    f'-w "PLAT:{plat}:PATH:{path}:CODE:%{{http_code}}" '
+                    f'"{base}{path}" {err}')
+                segments.append(newline)
+                segments.append(body)
+                segments.append(newline)
+    segments.append("echo __MDM_END__")
+    return _join_local_shell(segments)
 
 
 def _mdm_fingerprint_interp(output, wm, slots):
@@ -4921,7 +4988,7 @@ CAPABILITIES = [
         "gateways, mobile-web user-agents), so the engagement branches into "
         "the mobile attack surface",
         [], ["mobile"], _mobile_probe_adapter, _mobile_probe_interp,
-        opsec_cost=0.6, detection_risk=0.1, stealth_level="passive", timeout=30,
+        opsec_cost=0.6, detection_risk=0.1, stealth_level="passive", timeout=90,
         preconditions=[_has_network_host()], banner="mobile surface probe"),
 
     _mk("mobile_mdm_fingerprint", "recon",
@@ -4933,7 +5000,7 @@ CAPABILITIES = [
         [_mk_slot("base_url", "str", False, "MDM base URL (default: target)")],
         ["mobile", "mdm_vendor"], _mdm_fingerprint_adapter,
         _mdm_fingerprint_interp,
-        opsec_cost=0.8, detection_risk=0.2, stealth_level="active", timeout=40,
+        opsec_cost=0.8, detection_risk=0.2, stealth_level="active", timeout=90,
         preconditions=[_has_network_host()], banner="MDM vendor fingerprint"),
 
     _mk("k8s_escape", "post",
