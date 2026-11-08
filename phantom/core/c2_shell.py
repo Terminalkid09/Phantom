@@ -424,7 +424,7 @@ class C2Shell(cmd.Cmd):
             notifier.info(f"cloudflared: {tun.tail()}")
         # Brackets are RICH MARKUP: an unescaped `[port]` is parsed as a tag
         # and swallowed, which is how this line shipped as "tunnel start  |".
-        notifier.info("Usage: tunnel start \[port] | tunnel install | tunnel stop")
+        notifier.info(r"Usage: tunnel start \[port] | tunnel install | tunnel stop")
 
     def do_certs(self, arg):
         """certs [status|uninstall] - Inspect or remove the TLS certificate pair."""

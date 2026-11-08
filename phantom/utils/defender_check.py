@@ -1,7 +1,7 @@
 """Which antivirus is in the way, and what that means for a drop.
 
 MEASURED 2026-11-03 on the operator's own Windows 11 box: this module was
-Defender-only, and that was wrong twice over. ``root\SecurityCenter2::
+Defender-only, and that was wrong twice over. ``root\\SecurityCenter2::
 AntiVirusProduct`` reported TWO registered products — ``Windows Defender`` and
 ``McAfee`` — while ``Get-Service`` showed only ``McAfee WebAdvisor`` running and
 ``WinDefend`` STOPPED. The warning was therefore built on a service that was
