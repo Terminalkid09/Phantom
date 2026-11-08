@@ -119,6 +119,16 @@ behind it; the ones that were not measured are named as such.
   a missing `planner` manifest. The line now reports `asked / proposal(s) /
   accepted / rejected / changed / abstained`, and the factory's fallback
   notice names the actual phase.
+- **An order-dependent CI failure was a test leak, not a product bug.** The
+  Python 3.11 GitHub job ran `test_enterprise_kb_fields_accessible` after a
+  test that applied a `.pm` bundle to the global `session` without restoring
+  its knowledge base, so it saw `{'creds_found': [], 'os_info': {},
+  'target_type': None}` and reported the enterprise fields missing; 3.10 and
+  3.12 happened to distribute the tests differently and passed. The suite-wide
+  fixture in `tests/conftest.py` now snapshots and restores
+  `session.knowledge_base` around every test, the same order-independence rule
+  already used for the process-wide server singletons. The assertion was not
+  weakened.
 - **The local CI was not the GitHub CI.** `scripts/ci_local.py` used `-n auto`:
   16 workers on this box against the four-core `ubuntu-latest` runner. Two
   real agent tests take ~110 s each, so under that load they crossed the 120 s

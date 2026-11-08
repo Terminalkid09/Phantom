@@ -17,6 +17,7 @@ Two responsibilities:
    symptom in the individual tests.
 """
 import atexit
+import copy
 import os
 import shutil
 import tempfile
@@ -38,6 +39,27 @@ _C2_TEST_STATE_DIR = tempfile.mkdtemp(prefix="phantom-c2-state-")
 os.environ.setdefault("PHANTOM_C2_STATE_PATH",
                       os.path.join(_C2_TEST_STATE_DIR, "c2_state.json"))
 atexit.register(shutil.rmtree, _C2_TEST_STATE_DIR, True)
+
+
+@pytest.fixture(autouse=True)
+def _restore_session_knowledge_base():
+    """Restore the singleton's KB after every test.
+
+    Measured 2026-11-08 on GitHub's Python 3.11 job:
+    ``test_enterprise_kb_fields_accessible`` saw
+    ``{'creds_found': [], 'os_info': {}, 'target_type': None}`` because an
+    earlier test in the same xdist worker had applied a .pm bundle to the
+    global ``session`` without restoring it. The worker layout differs by
+    Python version, so 3.10 and 3.12 passed while 3.11 failed. Tests that
+    intentionally mutate the KB still do, but the next test starts from the
+    KB this one found — the same order-independence rule as the singleton
+    cleanups below.
+    """
+    from phantom.core.session import session
+
+    saved = copy.deepcopy(session.knowledge_base)
+    yield
+    session.knowledge_base = saved
 
 
 @pytest.fixture(autouse=True)
