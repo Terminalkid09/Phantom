@@ -167,17 +167,17 @@ class TestTheRetryLoopIsBounded:
                                     attempts=2)
         env = dict(os.environ)
         env["PATH"] = str(stub_dir) + os.pathsep + env.get("PATH", "")
-        # 30s, not 15: the property under test is "the loop GIVES UP, it does
+        # 60s, not 15: the property under test is "the loop GIVES UP, it does
         # not hang", and with attempts=2 + retry_s=1 the honest run finishes
-        # in ~2s. The 15s bound made the test fail under a loaded parallel run
-        # (`-n auto` on a 16-worker box) while passing alone — a red build that
-        # measured CPU contention, not the loop. A loop with no budget still
-        # trips this in seconds, which is what the assertion is for.
-        proc = subprocess.run([watchdog, "30", shell, "-c", cmd],
+        # in seconds (measured 9.5s at 4 workers, which is process startup on
+        # this Windows box, not the loop). A 30s bound still tripped under a
+        # loaded 17-worker run; a loop with no budget trips 60s just as well,
+        # and that is what the assertion is for.
+        proc = subprocess.run([watchdog, "60", shell, "-c", cmd],
                               cwd=str(tmp_path), env=env, capture_output=True,
                               text=True, timeout=90)
         assert proc.returncode != 124, (
-            "the loop was STILL polling when the 15s watchdog fired: it has "
+            "the loop was STILL polling when the 60s watchdog fired: it has "
             "no attempt budget")
         assert proc.returncode != 0, (
             "the loop must EXIT non-zero once the budget is spent, not keep "

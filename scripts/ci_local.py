@@ -43,6 +43,12 @@ from typing import Dict, List, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 PY = sys.executable
+#: GitHub's ubuntu-latest runner has 4 cores, so its `-n auto` resolves to 4
+#: workers. On a 16-core box the same setting spawns 16, and a loaded 16-way
+#: run turns legitimate ~100s agent tests into pytest-timeout worker kills
+#: (measured 2026-11-08: 5 red tests and 3 worker crashes, all green serially).
+#: Mirror the runner, not the developer's core count.
+CI_WORKERS = ["-n", "4"]
 # Job artefacts (bandit/model reports) land here, never in the tree: a local CI
 # run must not leave untracked files behind that the next commit sweeps up.
 ARTIFACTS = ROOT / ".ci-local"
@@ -142,7 +148,7 @@ def job_lint_and_test() -> List[Tuple[str, str, str, str]]:
                  "" if ok else _tail(out)))
 
     files = _test_files()
-    ok, out, dur = _run([PY, "-m", "pytest", *files,
+    ok, out, dur = _run([PY, "-m", "pytest", *files, *CI_WORKERS,
                          "-m", "not integration_tool", "-q", "--tb=short",
                          "--timeout=120", "--maxfail=25"])
     rows.append((f"pytest suite ({len(files)} files)",
@@ -228,7 +234,7 @@ def job_security_sweep() -> List[Tuple[str, str, str, str]]:
     files = _security_tests()
     if not files:
         return [("security sweep", FAIL, "0s", "no security test file found")]
-    ok, out, dur = _run([PY, "-m", "pytest", *files,
+    ok, out, dur = _run([PY, "-m", "pytest", *files, *CI_WORKERS,
                          "-m", "not integration_tool", "-q", "--tb=short",
                          "--timeout=120"])
     return [(f"security sweep ({len(files)} files)",
@@ -263,8 +269,8 @@ def job_c2() -> List[Tuple[str, str, str, str]]:
                   "tests/test_manual_core.py"):
         if (ROOT / extra).exists():
             files.append(extra)
-    ok, out, dur = _run([PY, "-m", "pytest", *sorted(set(files)), "-q",
-                         "--tb=short", "--timeout=60"])
+    ok, out, dur = _run([PY, "-m", "pytest", *sorted(set(files)), *CI_WORKERS,
+                         "-q", "--tb=short", "--timeout=60"])
     rows = [(f"c2 tests ({len(set(files))} files)", PASS if ok else FAIL,
              f"{dur:.0f}s", "" if ok else _tail(out, 30))]
     ok, out, dur = _run([PY, "scripts/e2e_c2_beacon_smoke.py"])

@@ -3,6 +3,8 @@ mutation escalation, and its wiring into the agent chain."""
 import unittest
 from unittest.mock import Mock, patch
 
+import pytest
+
 from phantom.automation.belief import WorldModel
 from phantom.automation.exploit.anomaly import (
     HuntEngine, Probe, ProbeResult, hunt_target, mutate_probe,
@@ -525,6 +527,10 @@ class TestAgentChain(unittest.TestCase):
         self.assertEqual(f.value["cls"], "traversal")
         self.assertEqual(f.confidence, 0.6)
 
+    # The real agent loop takes ~110s on a loaded Windows box; the global
+    # 120s bound killed the xdist worker and was reported as a crash. The test
+    # still has a hard bound and its assertions are unchanged.
+    @pytest.mark.timeout(240)
     def test_agent_executes_hunt_and_records_finding(self):
         from phantom.automation.agent import AutonomousAgent
         from phantom.automation.guidance.stealth import (

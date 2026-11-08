@@ -3,6 +3,8 @@ parameter injection, session cookies, validation pass (confirmed/severity)
 and the stealth delay_fn, plus their wiring in the agent/report/harvest."""
 import unittest
 
+import pytest
+
 from phantom.automation.belief import WorldModel
 from phantom.automation.exploit.anomaly import (
     Endpoint, HuntEngine, Probe, ProbeResult, _MAX_ENDPOINTS, _parse_crawl,
@@ -226,6 +228,10 @@ class TestAgentWiring(unittest.TestCase):
     def setUp(self):
         self.wm = WorldModel(target=TARGET, target_type="ip")
 
+    # The real agent loop takes ~100s on a loaded Windows box; the global
+    # 120s bound killed the xdist worker and was reported as a crash. The test
+    # still has a hard bound and its assertions are unchanged.
+    @pytest.mark.timeout(240)
     def test_hunt_uses_stolen_cookies_and_delay(self):
         from phantom.automation.agent import AutonomousAgent
         from phantom.automation.guidance.stealth import (

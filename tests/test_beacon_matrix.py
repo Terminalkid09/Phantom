@@ -242,6 +242,13 @@ class TestTheGridMatchesTheSource(unittest.TestCase):
         """
         if shutil.which("git") is None:
             self.skipTest("git not installed — cannot prove what a clone has")
+        # ONE call, not one per header: the per-header form spawned ~90 git
+        # processes, and under a loaded xdist run that cost 27s and could trip
+        # the worker timeout. The set is the same statement about the clone.
+        listing = subprocess.run(
+            ["git", "ls-files", "phantom/payloads/beacon/src"],
+            cwd=_ROOT, capture_output=True, text=True)
+        known = set(listing.stdout.splitlines())
         missing, untracked = [], []
         for feature in bm.FEATURES:
             for header in bm.source_headers(feature):
@@ -249,9 +256,7 @@ class TestTheGridMatchesTheSource(unittest.TestCase):
                 if not (_SRC / header).exists():
                     missing.append(f"{rel} ({feature.name})")
                     continue
-                if subprocess.run(["git", "ls-files", "--error-unmatch", rel],
-                                  cwd=_ROOT, capture_output=True,
-                                  text=True).returncode != 0:
+                if rel not in known:
                     untracked.append(f"{rel} ({feature.name})")
         self.assertEqual(missing, [],
                          "the grid names source headers this tree does not "
