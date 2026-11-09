@@ -14,7 +14,16 @@ from types import SimpleNamespace
 from phantom.api.backend import BackendDispatcher
 
 
+def _mock_wsl_present(monkeypatch):
+    # The parser contract is host-independent: CI runners do not ship
+    # wsl.exe, but that must not stop these tests from exercising _describe.
+    monkeypatch.setattr(
+        "phantom.api.backend.shutil.which", lambda name: "wsl.exe"
+    )
+
+
 def test_utf16_wsl_listing_is_decoded_without_nul_bytes(monkeypatch):
+    _mock_wsl_present(monkeypatch)
     raw = "Ubuntu\r\ndocker-desktop\r\nkali-linux\r\n".encode("utf-16-le")
     monkeypatch.setattr(
         "phantom.api.backend.subprocess.run",
@@ -27,6 +36,7 @@ def test_utf16_wsl_listing_is_decoded_without_nul_bytes(monkeypatch):
 
 
 def test_utf16_bom_and_utf8_listing_are_both_accepted(monkeypatch):
+    _mock_wsl_present(monkeypatch)
     for raw in (
         "\ufeffUbuntu\r\nkali-linux\r\n".encode("utf-16"),
         b"Ubuntu\r\nkali-linux\r\n",
@@ -47,6 +57,7 @@ def test_a_registered_but_hung_distro_is_not_advertised(monkeypatch):
     return an available backend anyway, so every routed command waited for
     its full timeout. The probe must turn that into an honest "no backend".
     """
+    _mock_wsl_present(monkeypatch)
     raw = "Ubuntu\r\nkali-linux\r\n".encode("utf-16-le")
 
     def fake_run(argv, **kwargs):
@@ -62,6 +73,7 @@ def test_a_registered_but_hung_distro_is_not_advertised(monkeypatch):
 
 
 def test_docker_desktop_alone_is_not_an_execution_backend(monkeypatch):
+    _mock_wsl_present(monkeypatch)
     raw = "docker-desktop\r\ndocker-desktop-data\r\n".encode("utf-16-le")
     monkeypatch.setattr(
         "phantom.api.backend.subprocess.run",
