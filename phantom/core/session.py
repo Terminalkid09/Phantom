@@ -327,7 +327,11 @@ class Session:
                     pass
             console.print(f"[green][+] Session loaded: {path}[/]")
             return
-        console.print(f"[red]Session '{name}' not found.[/]")
+        # Callers must be able to tell success from failure: the shell used to
+        # print "Session loaded: nope" immediately after this line printed
+        # "not found", and the API's existing FileNotFoundError branch could
+        # never run.
+        raise FileNotFoundError(name)
 
     @staticmethod
     def list_saved() -> List[str]:

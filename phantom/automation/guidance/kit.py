@@ -897,6 +897,9 @@ _SOCIAL_MARKERS = {
     "recon_state": "RECON_STATE:",
     "commenter": "COMMENTER:",
     "tagged": "TAGGED_IN:",
+    "trace": "TRACE:",
+    "mention": "MENTION:",
+    "co_commenter": "CO_COMMENTER:",
     "search_hit": "SEARCH_HIT:",
     "wayback": "WAYBACK:",
     "surface_domain": "SURFACE_DOMAIN:",
@@ -1058,6 +1061,38 @@ def _social_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[F
                        "relation": "tagged",
                        "evidence": kv.get("evidence", "")},
                 confidence=0.45, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["trace"])
+        if kv.get("handle"):
+            findings.append(Finding(
+                kind="account_link",
+                key=f"account_link:{kv['handle']}:{kv.get('platform', 'social')}:trace",
+                value={"handle": kv.get("handle"),
+                       "platform": kv.get("platform", ""),
+                       "relation": "trace",
+                       "on": kv.get("on", ""),
+                       "evidence": kv.get("evidence", "")},
+                confidence=0.6, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["mention"])
+        if kv.get("handle"):
+            findings.append(Finding(
+                kind="account_link",
+                key=f"account_link:{kv['handle']}:{kv.get('platform', 'social')}:mention",
+                value={"handle": kv.get("handle"),
+                       "platform": kv.get("platform", ""),
+                       "relation": "mention",
+                       "mentions": kv.get("mentions", ""),
+                       "evidence": kv.get("evidence", "")},
+                confidence=0.55, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["co_commenter"])
+        if kv.get("handle"):
+            findings.append(Finding(
+                kind="account_link",
+                key=f"account_link:{kv['handle']}:{kv.get('platform', 'social')}:co_commenter",
+                value={"handle": kv.get("handle"),
+                       "platform": kv.get("platform", ""),
+                       "relation": "co_commenter",
+                       "evidence": kv.get("evidence", "")},
+                confidence=0.55, source="deep_recon", target=wm.target))
         kv = _parse_marker_line(line, _SOCIAL_MARKERS["identity_conf"])
         if kv.get("handle") and kv.get("tier"):
             try:

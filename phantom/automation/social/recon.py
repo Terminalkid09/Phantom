@@ -280,6 +280,20 @@ _JUNK_TOKENS = {
     "pure", "private", "public", "abstract", "type", "param", "license",
     "flow", "ts-check", "ts-ignore", "ts-expect-error", "jsx", "deprecated",
     "example", "example.com", "media.css", "gmail.com", "outlook.com",
+    # Platform/site chrome. A GitHub profile page contains `@github` in its
+    # own footer and `@media`-style tokens in bundled CSS; those are not
+    # people and used to enter the graph as TAGGED_IN leads.
+    "github", "githubusercontent", "githubassets", "gitlab", "instagram",
+    "tiktok", "telegram", "twitter", "facebook", "linkedin", "youtube",
+    "discord", "reddit", "pinterest", "tumblr", "medium", "keybase",
+    "www", "http", "https", "avatars", "usercontent", "raw", "blob",
+    "tree", "issues", "pulls", "actions", "sponsors", "marketplace",
+    "notifications", "settings", "login", "join", "signup", "explore",
+    "search", "topics", "trending", "collections", "events", "about",
+    "pricing", "features", "enterprise", "security", "site", "docs",
+    "support", "blog", "readme", "license", "commit", "commits",
+    "compare", "releases", "packages", "codespaces", "projects", "wiki",
+    "discussions",
 }
 # A handle never ends in one of these: `@media.css`, `@x.js`, `@site.com`
 # are URLs, file names and mail domains, not accounts.
@@ -302,6 +316,10 @@ def _is_real_handle(handle: str) -> bool:
     if len(h) < 3 or h in _CSS_AT_RULES or h in _JUNK_TOKENS:
         return False
     if h.rsplit(".", 1)[-1] in _HANDLE_TAIL_JUNK:
+        return False
+    # A 10+ hex string is an asset/hash id, not a handle. GitHub pages carry
+    # these next to avatar URLs; they were becoming circle members.
+    if re.fullmatch(r"[0-9a-f]{10,}", h):
         return False
     return True
 
@@ -386,6 +404,19 @@ class ReconResult:
             elif l.kind == "tagged":
                 out.append(f"TAGGED_IN: handle={l.value} platform={l.platform} "
                            f"evidence={l.evidence}")
+            elif l.kind == "trace":
+                # The target's OWN comment on somebody else's post. `value`
+                # is that post's author: the useful fact is not "a comment
+                # exists" but WHO the target chose to interact with.
+                out.append(f"TRACE: handle={l.value} platform={l.platform} "
+                           f"on={l.value} evidence={l.evidence}")
+            elif l.kind == "mention":
+                # Somebody else's post/comment names the target.
+                out.append(f"MENTION: handle={l.value} platform={l.platform} "
+                           f"mentions={self.username} evidence={l.evidence}")
+            elif l.kind == "co_commenter":
+                out.append(f"CO_COMMENTER: handle={l.value} "
+                           f"platform={l.platform} evidence={l.evidence}")
             elif l.kind == "search_hit":
                 # the network label travels with the hit: "found elsewhere"
                 # is only useful if the operator can see WHERE.
@@ -415,7 +446,12 @@ def _q(arg: str) -> str:
 
 
 #: Sentinel curl appends (with `-w`) before the final HTTP status code.
-_STATUS_MARK = "@@PHANTOM_STATUS@@"
+#: It must NOT start with `@`: curl reads `-w @file` as "read the format
+#: from this file" and exits 26 before making the request. Measured
+#: 2026-11-08: the old `@@PHANTOM_STATUS@@` made EVERY `_fetch_ex` return an
+#: empty body, so a real GitHub profile was voted `unknown` and the whole
+#: OSINT pass silently read nothing.
+_STATUS_MARK = "PHANTOM_STATUS_MARK"
 
 
 def _split_headers(raw: str) -> Tuple[str, str]:
@@ -793,6 +829,164 @@ def _auth_wall(platform: str, html: str) -> bool:
     return False
 
 
+@dataclass
+class CommentTrace:
+    """One comment/reply and its AUTHOR.
+
+    The old miner scanned the comment TEXT for `@handles`. That finds people
+    the commenter mentioned, but never the commenter: on Instagram/TikTok the
+    author is a structured `owner.username`, and dropping it made the target's
+    own comments on other people's posts invisible.
+    """
+
+    actor: str
+    text: str
+    post_id: str = ""
+    post_author: str = ""
+    likes: str = ""
+    taken_at: str = ""
+
+
+_COMMENT_KEYS = {
+    "commentlist", "comments", "edge_media_to_comment",
+    "edge_media_to_parent_comment", "children", "replies",
+}
+
+
+def _comment_traces(blobs: Any, *, post_author: str = "") -> List[CommentTrace]:
+    """Extract comment authors from already-fetched JSON (never fetches).
+
+    Bounded to 120 comments and conservative about what counts as a comment:
+    a node with text is accepted only inside a comment container or when it
+    carries a parent/link id. A post caption also has `text`, and treating it
+    as a comment invented an interaction nobody made.
+    """
+    out: List[CommentTrace] = []
+    seen: set = set()
+
+    def _actor(node: Dict[str, Any]) -> str:
+        for key in ("owner", "user", "author"):
+            value = node.get(key)
+            if isinstance(value, dict):
+                for name_key in ("username", "unique_id", "handle", "nickname"):
+                    name = value.get(name_key)
+                    if isinstance(name, str) and name.strip():
+                        return name.strip().lstrip("@")
+            elif isinstance(value, str) and value.strip():
+                return value.strip().lstrip("@")
+        for name_key in ("username", "unique_id", "author"):
+            name = node.get(name_key)
+            if isinstance(name, str) and name.strip():
+                return name.strip().lstrip("@")
+        return ""
+
+    def _text(node: Dict[str, Any]) -> str:
+        for key in ("text", "body", "comment_text", "content"):
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _count(value: Any) -> str:
+        if isinstance(value, dict):
+            value = value.get("count", "")
+        return "" if value in (None, "") else str(value)
+
+    def walk(obj: Any, depth: int = 0, in_comments: bool = False) -> None:
+        if depth > 12 or len(out) >= 120:
+            return
+        if isinstance(obj, dict):
+            actor = _actor(obj)
+            text = _text(obj)
+            parent = str(obj.get("parent_id") or obj.get("link_id") or "")
+            if text and actor and actor.lower() not in ("[deleted]", "automoderator") \
+                    and (in_comments or parent):
+                post_id = str(obj.get("post_id") or obj.get("media_id")
+                              or parent or "")
+                key = (actor.lower(), text[:160], post_id)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(CommentTrace(
+                        actor=actor, text=text, post_id=post_id,
+                        post_author=post_author,
+                        likes=_count(obj.get("edge_liked_by")
+                                    or obj.get("like_count")
+                                    or obj.get("score")),
+                        taken_at=_count(obj.get("created_at")
+                                        or obj.get("created_utc")
+                                        or obj.get("timestamp"))))
+            for key, value in obj.items():
+                if key in ("edge_media_to_caption", "caption"):
+                    continue
+                walk(value, depth + 1,
+                     in_comments or key.lower() in _COMMENT_KEYS)
+        elif isinstance(obj, list):
+            for value in obj[:80]:
+                walk(value, depth + 1, in_comments)
+
+    walk(blobs)
+    return out
+
+
+def _mentions_handle(text: str, handle: str) -> bool:
+    """True when `text` names `handle` as a person, not as a substring."""
+    low = (text or "").lower()
+    h = (handle or "").lower().lstrip("@")
+    if not h:
+        return False
+    if f"@{h}" in low:
+        return True
+    return bool(re.search(rf"(?<![\w.]){re.escape(h)}(?![\w.])", low))
+
+
+def _trace_leads(primary: str, platform: str, html: str,
+                 page_author: str, primary_circle: set) -> List["Lead"]:
+    """Interaction traces from ONE already-fetched page.
+
+    Three distinct facts, each with its own evidence:
+
+    * `trace`        — the target COMMENTED on this page's author's post;
+    * `mention`      — an author in this thread named the target explicitly;
+    * `co_commenter` — a person who also comments on the target's page.
+
+    None of them is identity proof. They are pivots: the first two show who
+    the target actually talks to, the third is a circle member worth a look.
+    """
+    subject = (primary or "").lstrip("@").lower()
+    author = (page_author or "").lstrip("@").lower()
+    if not subject or not author:
+        return []
+    traces = _comment_traces(_extract_json_blobs(html), post_author=author)
+    out: List[Lead] = []
+    seen: set = set()
+    for trace in traces:
+        actor = trace.actor.lstrip("@").lower()
+        if not actor:
+            continue
+        if actor == subject:
+            key = ("trace", author)
+            if key not in seen:
+                seen.add(key)
+                out.append(Lead(
+                    "trace", author, platform,
+                    f"comment_on:{author}:post:{trace.post_id or '?'}", 0.7))
+        if actor != subject and _mentions_handle(trace.text, subject):
+            # The person who NAMED the target is the comment's author, not
+            # necessarily the page owner (a third commenter can mention them).
+            key = ("mention", actor)
+            if key not in seen:
+                seen.add(key)
+                out.append(Lead("mention", actor, platform,
+                                f"mentions:{subject}:on:{author}", 0.6))
+        if actor not in (subject, author) and actor in primary_circle:
+            key = ("co_commenter", actor)
+            if key not in seen:
+                seen.add(key)
+                out.append(Lead("co_commenter", actor, platform,
+                                f"co_comment_with:{author}", 0.55))
+    return out
+
+
 def _mine_all(username: str, platform: str, html: str,
               result: ReconResult, jar=None) -> None:
     """`_mine_graph` plus the per-post layer (never fetches anything extra).
@@ -868,11 +1062,11 @@ def _mine_graph(username: str, platform: str, html: str,
                           ("followingCount", "following")):
             if getattr(result, attr, ""):
                 continue
-            vals: List = []
+            vals_t: List = []
             for b in blobs:
-                _walk(b, key, vals)
-            if vals:
-                v = vals[0]
+                _walk(b, key, vals_t)
+            if vals_t:
+                v = vals_t[0]
                 if isinstance(v, dict):
                     v = v.get("count", "")
                 if v not in ("", None):
@@ -928,11 +1122,18 @@ def _mine_graph(username: str, platform: str, html: str,
         raw = _fetch(imgs[0], timeout=10.0,
                      cookies=_jar_for(imgs[0], jar or {}))
         if raw:
-            result.avatar_hash = hashlib.md5(raw[:100000]).hexdigest()[:16]
+            # `_fetch` returns TEXT (the executor decodes curl output), while
+            # md5/dhash need bytes. The old call raised "Strings must be
+            # encoded before hashing" and the exception escaped _mine_graph,
+            # aborting the whole pass the moment an avatar was actually
+            # readable (measured live 2026-11-08 on github.com/torvalds).
+            blob = raw[:100000].encode("utf-8", "ignore") \
+                if isinstance(raw, str) else bytes(raw[:100000])
+            result.avatar_hash = hashlib.md5(blob).hexdigest()[:16]
             try:
                 from phantom.automation.social.identity_confidence import (
                     compute_dhash)
-                result.avatar_dhash = compute_dhash(raw)
+                result.avatar_dhash = compute_dhash(blob)
             except Exception:
                 result.avatar_dhash = ""
     # emails visible in the profile's OWN bio/page (identity-confidence
@@ -940,8 +1141,18 @@ def _mine_graph(username: str, platform: str, html: str,
     if html:
         result.emails = list(dict.fromkeys(
             _EMAIL_RE.findall(html[:40000])))[:3]
-    # commenters + tagged handles from media JSON
+    # commenters + tagged handles from media JSON. The structured AUTHOR is
+    # the primary evidence; the old text-only scan below still catches
+    # @mentions inside a comment, but a commenter who wrote no @handle was
+    # invisible before this.
     seen = {l.value for l in result.leads}
+    for trace in _comment_traces(blobs, post_author=username):
+        actor = trace.actor.lstrip("@")
+        if (actor and actor.lower() != username.lower()
+                and len(actor) >= 3 and actor not in seen
+                and _is_real_handle(actor)):
+            seen.add(actor)
+            result.leads.append(Lead("commenter", actor, platform, ev, 0.55))
     comments: List = []
     for b in blobs:
         _walk(b, "edge_media_to_comment", comments)
@@ -1032,6 +1243,13 @@ def _second_hop(primary: "ReconResult", platform: str, jar) -> List["Lead"]:
             _mine_graph(handle, platform, html, second, jar)
         except Exception:
             continue
+        # The target's OWN comments under this circle member's posts, and the
+        # circle member's posts naming the target, are the interaction trail
+        # the flat graph could not see. Add them before the mutual check.
+        for lead in _trace_leads(primary.username, platform, html, handle,
+                                 primary_graph):
+            if lead not in out:
+                out.append(lead)
         mutual = sorted(primary_graph & _graph_handles(second))
         for h in mutual[:5]:
             out.append(Lead("commenter", h, platform,
@@ -1132,11 +1350,14 @@ def _dork_queries(username: str, full_name: str = "", scope: str = "auto",
              f'OR hotmail.com)')
     q.append(f'"{username}" (site:linkedin.com OR site:github.com '
              f'OR site:reddit.com)')
+    # Traces in OTHER people's threads: "comment", "reply" and "mentioned"
+    # are how a comment/post by a third party surfaces the handle.
+    q.append(f'"{username}" (comment OR reply OR mentioned OR "tagged")')
     if name:
         q.append(f'"{name}" "{username}"')
         q.append(f'"{name}" (site:linkedin.com OR site:facebook.com '
                  f'OR site:reddit.com)')
-    return q[:5]
+    return q[:6]
 
 
 def _platform_of_url(url: str) -> str:
@@ -1151,9 +1372,64 @@ def _platform_of_url(url: str) -> str:
     return ""
 
 
+def _profile_handle(url: str) -> Tuple[str, str]:
+    """(platform, handle) when `url` IS a profile URL, else ("", "").
+
+    A dork hit used to be stored only as a URL. For account discovery the
+    useful part is the account in the path: `linkedin.com/in/mario-rossi`
+    and `reddit.com/user/mrossi` are secondary-account candidates, not just
+    pages. Reserved paths (`/p/`, `/status/`, `/groups/`) are content, not a
+    person, and are rejected.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return "", ""
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(raw if "://" in raw else "https://" + raw)
+    except ValueError:
+        return "", ""
+    platform = _platform_of_url(raw)
+    host = (parts.hostname or "").lower().lstrip("www.")
+    segments = [s for s in (parts.path or "").split("/") if s]
+    if not segments:
+        return platform, ""
+    reserved = {"p", "reel", "reels", "video", "videos", "stories",
+                "explore", "about", "share", "status", "groups", "pages",
+                "in", "user", "u", "company", "school", "channel", "c",
+                "watch", "hashtag", "search", "settings", "login",
+                "popular", "discover", "directory", "accounts", "tags",
+                "orgs", "users", "home", "intent", "joinchat", "addstickers",
+                "proxy", "s"}
+    handle = ""
+    if host.endswith("linkedin.com") or host.endswith("reddit.com"):
+        # /in/<h> or /user/<h>
+        if len(segments) >= 2 and segments[0].lower() in ("in", "user", "u"):
+            handle = segments[1]
+    elif host.endswith("t.me") or host.endswith("telegram.me"):
+        handle = segments[0] if segments[0].lower() not in reserved else ""
+    elif host.endswith("tiktok.com") and segments[0].startswith("@"):
+        # /@user is a profile; /@user/video/<id> is one video, not the
+        # account page (the dork hit was being promoted to an account).
+        if len(segments) >= 2 and segments[1].lower() in (
+                "video", "photo", "playlist"):
+            return platform, ""
+        handle = segments[0]
+    elif host.endswith(("stackoverflow.com", "github.com")):
+        # github.com/<owner>/<repo>: the account is the owner, never the repo
+        handle = segments[0] if segments[0].lower() not in reserved else ""
+    else:
+        first = segments[0].lstrip("@")
+        handle = first if first.lower() not in reserved else ""
+    handle = handle.strip().lstrip("@").rstrip(".,;")
+    if not handle or not _is_real_handle(handle):
+        return platform, ""
+    return platform, handle
+
+
 def _search_dorks(username: str, full_name: str = "",
                   scope: str = "auto", platform: str = "") -> List[Lead]:
-    """DuckDuckGo HTML dork search (no API key) — bounded to 5 queries.
+    """DuckDuckGo HTML dork search (no API key) — bounded to 6 queries.
 
     Scope-aware: a PINNED pass stays inside that one site; the "other"
     scope EXCLUDES the five top socials and looks everywhere else, and
@@ -1162,6 +1438,7 @@ def _search_dorks(username: str, full_name: str = "",
     from urllib.parse import quote_plus
     leads: List[Lead] = []
     seen_urls = set()
+    seen_accounts = set()
     for tpl in _dork_queries(username, full_name, scope, platform):
         html = _fetch(
             f"https://html.duckduckgo.com/html/?q={quote_plus(tpl)}",
@@ -1178,12 +1455,23 @@ def _search_dorks(username: str, full_name: str = "",
                 continue
             seen_urls.add(url)
             plat = _platform_of_url(url)
+            # A profile URL carries an ACCOUNT. Emitting only the URL made
+            # every dork hit a dead end for the identity graph; extract the
+            # handle so `linkedin.com/in/<other>` becomes a candidate.
+            profile_platform, handle = _profile_handle(url)
+            if handle and handle.lower() != (username or "").lower():
+                key = (profile_platform or plat, handle.lower())
+                if key not in seen_accounts:
+                    seen_accounts.add(key)
+                    leads.append(Lead("account_link", handle,
+                                      profile_platform or plat,
+                                      "dork_profile_url", 0.5))
             leads.append(Lead("search_hit", url, plat, "ddg_dork",
                               0.5 if plat else 0.4))
-        if len(leads) >= 8:
+        if len(leads) >= 10:
             break
         time.sleep(random.uniform(1.0, 2.5))
-    return leads[:8]
+    return leads[:10]
 
 
 def _bio_similarity(a: str, b: str) -> float:
@@ -1508,8 +1796,28 @@ def deep_recon(username: str, platform: str = "",
                         rv.bio = _extract_bio(h2)
                         _mine_all(v, platform, h2, rv, jar)
                     results.append(rv)
-                    primary.leads.append(Lead(
-                        "account_link", v, platform, "variant_probe", 0.55))
+                    # A probe that found a public PAGE is not proof of a
+                    # secondary account. Score the variant against the
+                    # primary with the same identity model used for every
+                    # other cross-account claim; the handle variant alone is
+                    # weak, so a namesake stays at 0.25 instead of the old
+                    # hard-coded 0.55.
+                    try:
+                        from phantom.automation.social.identity_confidence import (
+                            score_lead as _score_variant)
+                        scored_variant = _score_variant(
+                            platform, _identity_view(primary), {
+                                **_identity_view(rv), "platform": platform})
+                        if scored_variant.score > 0:
+                            primary.leads.append(Lead(
+                                "account_link", v, platform,
+                                "variant_probe tier=%s signals=%s"
+                                % (scored_variant.tier,
+                                   "+".join(k for k, _ in
+                                            scored_variant.signals) or "none"),
+                                scored_variant.score))
+                    except Exception:
+                        pass
 
         # wayback + dorks run against the PRIMARY only (bounded budget)
         if wayback:
@@ -1540,6 +1848,16 @@ def deep_recon(username: str, platform: str = "",
             lines.append(
                 "RECON_SCOPE: mode=other excluded=%s platforms=%s"
                 % (",".join(TOP_SOCIALS), ",".join(ALT_PLATFORMS)))
+        trace_counts = {
+            kind: len({str(l.value).lower() for l in primary.leads
+                       if l.kind == kind and l.value})
+            for kind in ("trace", "mention", "co_commenter")
+        }
+        if any(trace_counts.values()):
+            lines.append(
+                "SOCIAL_TRACE: comments=%d mentions=%d co_commenters=%d"
+                % (trace_counts["trace"], trace_counts["mention"],
+                   trace_counts["co_commenter"]))
         lines.extend(primary.markers())
         for r in results[1:]:
             if r.state == "public" or r.bio:

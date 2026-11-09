@@ -56,18 +56,25 @@ class LinearRanker:
     def __init__(self, weights: Dict[str, float],
                  context: Optional[Dict[str, float]] = None,
                  interactions: Optional[Dict[str, Dict[str, float]]] = None,
-                 bias: float = 0.0, version: str = "") -> None:
+                 bias: float = 0.0, version: str = "",
+                 context_keys: Optional[Iterable[str]] = None) -> None:
         self.weights = {str(k): float(v) for k, v in (weights or {}).items()}
         self.context = {str(k): float(v) for k, v in (context or {}).items()}
         self.interactions = {str(cid): {str(k): float(v) for k, v in row.items()}
                              for cid, row in (interactions or {}).items()}
         self.bias = float(bias)
         self.version = str(version or "")
+        # A planner ranker uses its own feature vocabulary (category, effects,
+        # goal interactions), not the exploit CONTEXT tuple. The keys travel
+        # WITH the weights so the runtime does not have to know which phase
+        # produced them; an older file without the field keeps CONTEXT.
+        self.context_keys = tuple(str(k) for k in
+                                  (context_keys or CONTEXT))
 
     def score(self, cid: str, context: Dict[str, float]) -> float:
         cid = str(cid)
         total = self.weights.get(cid, 0.0) + self.bias
-        for key in CONTEXT:
+        for key in self.context_keys:
             value = float(context.get(key, 0.0))
             total += self.context.get(key, 0.0) * value
             total += (self.interactions.get(cid) or {}).get(key, 0.0) * value
@@ -100,7 +107,8 @@ class LinearRanker:
                    context=data.get("context") or {},
                    interactions=data.get("interactions") or {},
                    bias=float(data.get("bias") or 0.0),
-                   version=str(data.get("version") or ""))
+                   version=str(data.get("version") or ""),
+                   context_keys=data.get("context_keys"))
 
 
 def context_from_candidates(candidates, *, mode: str = "", goal: str = "",

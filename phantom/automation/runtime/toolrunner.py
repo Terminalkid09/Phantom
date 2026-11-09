@@ -126,10 +126,31 @@ class ToolRunner:
 
 
 def _require_tool(names: List[str]) -> str:
+    """Resolve a listener binary the SAME way the planner does.
+
+    `shutil.which` only sees Windows PATH. On this project's primary Windows
+    deployment the offensive toolbox lives in a WSL distro, so a native-only
+    check reported `none of ['nc', ...] installed` for a netcat that the
+    executor can run through `wsl -d kali-linux nc ...` (it rewrites the line
+    itself). Native paths still win; a WSL-only tool returns its bare name so
+    `execute_quiet_bg` can add the distro wrapper.
+    """
     for name in names:
         path = shutil.which(name)
         if path:
             return path
+    try:
+        from phantom.automation.runtime.toolchain import ToolRegistry
+        registry = ToolRegistry()
+    except Exception:
+        registry = None
+    if registry is not None:
+        for name in names:
+            try:
+                if registry.has(name):
+                    return name
+            except Exception:
+                continue
     raise ToolMissingError(f"none of {names} installed on attacker host")
 
 

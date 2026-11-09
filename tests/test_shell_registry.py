@@ -64,6 +64,22 @@ def test_quit_delegates_to_exit_help():
     assert shell.do_quit.__doc__ == shell.do_exit.__doc__
 
 
+def test_plan_accepts_every_registered_goal(monkeypatch):
+    """`plan deliver` used to say "Unknown goal" for a real auto-mode goal."""
+    from phantom.automation.goals import GOAL_FACTS
+    from phantom.core.shell.commands import run as run_cmds
+    from phantom.core.session import session
+    from phantom.utils.notifier import notifier
+
+    errors = []
+    monkeypatch.setattr(notifier, "error",
+                        staticmethod(lambda msg, *a, **k: errors.append(str(msg))))
+    monkeypatch.setattr(session, "target", "")
+    for goal in GOAL_FACTS:
+        run_cmds.cmd_plan(None, goal)
+    assert not any("Unknown goal" in message for message in errors), errors
+
+
 def test_show_defaults_to_the_session_and_reads_the_mode(monkeypatch):
     """A bare `show` must print the session (its own usage line says so),
     and `show mode` must read back what `set mode` wrote."""

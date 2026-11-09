@@ -61,6 +61,7 @@ SIGNAL_STRENGTH = {
     "avatar_similar": 0.35,   # perceptual hash close (re-encoded same pic)
     "name_in_bio": 0.45,      # real name from primary platform in bio
     "same_handle": 0.20,      # username equality alone — weak on purpose
+    "handle_variant": 0.25,   # mario.rossi / mario_rossi / mario.rossi1
     "interest_match": 0.35,   # shared niche interests (dossier vs bio)
     "contact_overlap": 0.0,   # scaled: mutuals/graph overlap
 }
@@ -192,6 +193,36 @@ def _distinctive_shared_tokens(a: str, b: str) -> int:
     return len({w for w in shared if w.isalnum() or "_" in w})
 
 
+def _handle_variant(a: str, b: str) -> bool:
+    """Is `b` a plausible SECONDARY handle of `a` (or vice versa)?
+
+    Secondary accounts often differ only by separator or one digit
+    (`mario.rossi` -> `mario_rossi` -> `mario.rossi1`). This is deliberately
+    a weak signal, never identity proof, and it is bounded so two unrelated
+    five-letter names one edit apart do not qualify.
+    """
+    def norm(value: str) -> str:
+        return "".join(ch for ch in str(value or "").lower()
+                       if ch.isalnum())
+
+    x, y = norm(a), norm(b)
+    if not x or not y:
+        return False
+    if x == y:
+        # `mario.rossi` and `mario_rossi` normalize to the same string; the
+        # separator is exactly the variation a second account introduces.
+        return str(a or "").lower() != str(b or "").lower()
+    shorter, longer = sorted((x, y), key=len)
+    if len(shorter) >= 5 and longer.startswith(shorter) \
+            and len(longer) - len(shorter) <= 3:
+        return True
+    # one substitution is enough only for longer handles: "marco" vs "mario"
+    # is a different person, not a typo.
+    if len(shorter) >= 6 and len(x) == len(y):
+        return sum(1 for c1, c2 in zip(x, y) if c1 != c2) <= 1
+    return False
+
+
 def dhash_distance(a: str, b: str) -> Optional[int]:
     """Hamming distance between two hex perceptual hashes (None when
     either side is missing/unparseable)."""
@@ -213,9 +244,9 @@ def compute_dhash(raw: bytes) -> str:
             return ""
         from PIL import Image
         import io
-        img = Image.open(io.BytesIO(bytes(raw[:300000])))
-        img = img.convert("L").resize((9, 8))
-        px = list(img.getdata())
+        opened = Image.open(io.BytesIO(bytes(raw[:300000])))
+        gray = opened.convert("L").resize((9, 8))
+        px = list(gray.getdata())
         bits = "".join(
             "1" if px[r * 9 + c] > px[r * 9 + c + 1] else "0"
             for r in range(8) for c in range(8))
@@ -326,10 +357,14 @@ def score_lead(primary_platform: str, primary: Dict, candidate: Dict
                              SIGNAL_STRENGTH["interest_match"]))
         lead.evidence += f"interests {sorted(pi & ci)}; "
 
-    # 7. same handle — always recorded, deliberately weak
+    # 7. same handle / plausible secondary variant — always weak, recorded
     if pu and cu == pu:
         lead.signals.append(("same_handle", SIGNAL_STRENGTH["same_handle"]))
         lead.evidence += "same handle (weak alone); "
+    elif _handle_variant(pu, cu):
+        lead.signals.append(("handle_variant",
+                             SIGNAL_STRENGTH["handle_variant"]))
+        lead.evidence += "handle variant (weak alone); "
 
     # 8. CONTACT-GRAPH OVERLAP (mutuals) — the same strangers interact
     #    with BOTH accounts. Two random people rarely share a meaningful

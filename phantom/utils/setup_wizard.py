@@ -123,9 +123,9 @@ def doctor(say: Say = print) -> Dict[str, object]:
         rows = tool_sources(tools, native=reg_native.has, bridged=reg.has)
         source = {name: where for name, where in rows}
         found = [e for e in tools
-                 if source.get(getattr(e, "name", e)) != "missing"]
+                 if source.get(str(getattr(e, "name", ""))) != "missing"]
         missing = [e for e in tools
-                   if source.get(getattr(e, "name", e)) == "missing"]
+                   if source.get(str(getattr(e, "name", ""))) == "missing"]
         tool_line = tools_summary_from(rows)
     except Exception:
         found = [e for e in tools if shutil.which(e.name)]
@@ -338,7 +338,16 @@ def tools_step(say: Say, ask: Ask, assume_yes: bool = False) -> None:
         return
     family = _linux_family()
     tools = capability_tools()
-    missing = [e for e in tools if not shutil.which(e.name)]
+    # Resolve through the registry, not raw `which`: on Debian/Kali impacket
+    # installs `impacket-GetNPUsers` while the manifest names
+    # `GetNPUsers.py`, so a fully provisioned box used to be told the AD
+    # chain was missing and sent to install the package again.
+    try:
+        from phantom.automation.runtime.toolchain import ToolRegistry
+        _reg = ToolRegistry(wsl=False)
+        missing = [e for e in tools if not _reg.has(e.name)]
+    except Exception:
+        missing = [e for e in tools if not shutil.which(e.name)]
     if not missing:
         say(f"{STEP_OK} tools present: {len(tools)}/{len(tools)} — "
             "toolbox complete")
@@ -359,11 +368,18 @@ def tools_step(say: Say, ask: Ask, assume_yes: bool = False) -> None:
         _dnf_install(pkgs, say)
     elif family == "pacman":
         _pacman_install(pkgs, say)
-    # pip-only entries that had no distro package
-    still = [e for e in missing if not shutil.which(e.name)]
+    # pip-only entries that had no distro package. Probe through the same
+    # alias-aware registry: an `impacket-*` entry point satisfies the .py name.
+    try:
+        from phantom.automation.runtime.toolchain import ToolRegistry
+        _after = ToolRegistry(wsl=False)
+        still = [e for e in missing if not _after.has(e.name)]
+        final = [e.name for e in tools if not _after.has(e.name)]
+    except Exception:
+        still = [e for e in missing if not shutil.which(e.name)]
+        final = [e.name for e in tools if not shutil.which(e.name)]
     if still:
         _pip_fallback(still, say)
-    final = [e.name for e in tools if not shutil.which(e.name)]
     if final:
         say(f"{STEP_WARN} still missing after setup: {', '.join(final)} — "
             "phantom plans around missing tools (capabilities with "

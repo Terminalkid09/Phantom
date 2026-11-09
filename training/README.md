@@ -59,6 +59,38 @@ Dataset labels are the **runtime** schema (`ranked`, `findings`, `links`,
 `{"chosen": ...}` would be rejected by `validate_exploit` on every call.
 `tests/test_training_schemas.py` pins the two sides together.
 
+## 2c. The planner ranker (CPU, promotable)
+
+The planner asks a different question from `exploit`: which CAPABILITY
+(`scan_tcp`, `web_creds`, `beacon_deploy`) to run next for a fact, goal and
+profile. It has its own corpus in that vocabulary, generated from the real
+capability table and the static reverse index:
+
+```bash
+python -m training.planner_vocab --write     # training/golden/planner.jsonl
+python -m training.planner_vocab --check
+```
+
+The label is a **declared rubric** (control > information, passive under
+stealth/noise, goal-relevant effects first, already-held facts worth less);
+the recorded baseline is the static `_FACT_SOURCES` order. The gate therefore
+measures context-aware reordering of the same eligible set, not a comparison
+with a different question.
+
+```bash
+python -m training.planner_ranker --write-manifest \
+    models/planner/planner-2026-11-08/manifest.json
+```
+
+The export is a `kind: linear-ranker` manifest with the sha256 of the installed
+weights. Features are defined once in
+`phantom/automation/ai/planner_features.py`, imported by both the trainer and
+the runtime advisor; `tests/test_planner_ranker.py` pins the two together.
+
+Limits: the rows are declared scenarios, not engagement logs. They prove the
+doctrine is learnable and the wiring is real; field superiority still needs
+`training.from_decisions`-style outcome data in the capability vocabulary.
+
 ## 3. Train one phase (GPU)
 
 ```bash

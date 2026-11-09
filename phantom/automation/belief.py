@@ -219,6 +219,12 @@ class WorldModel:
     def __init__(self, target: str = "", target_type: str = "ip"):
         self.target = target
         self.target_type = target_type
+        # Engagement context the planner-phase advisor reads. The agent stamps
+        # these when it is constructed / when a run starts; they are plain
+        # attributes (not beliefs) because they describe the QUESTION, not
+        # something observed about the target.
+        self.goal = ""
+        self.profile = ""
         self._findings: Dict[tuple, Finding] = {}
         self.hypotheses: List[Hypothesis] = []
         self.opsec_spent = 0.0
@@ -475,6 +481,8 @@ class WorldModel:
         return {
             "target": self.target,
             "target_type": self.target_type,
+            "goal": self.goal,
+            "profile": self.profile,
             "findings": [f.to_dict() for f in self.all_findings()],
             "hypotheses": [h.to_dict() for h in self.hypotheses],
             "opsec_spent": self.opsec_spent,

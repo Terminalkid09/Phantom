@@ -103,15 +103,20 @@ def cmd_suggest(shell, arg: str):
 def cmd_plan(shell, arg: str):
     """plan <goal> — the reasoning engine lays out the chain to a goal.
 
-    Goals: beacon | creds | lateral | ad | identity | deep
+    Goals: every key in ``GOAL_FACTS`` (beacon, creds, deliver, web,
+    footprint, mobile, identity, …); `plan` with no argument means beacon.
     Shows the ordered steps the planner would take with the facts each
     step needs and produces; `suggest` then highlights where you are.
     Nothing is executed.
     """
     from phantom.core.suggest_meta import _wm_evidence
+    from phantom.automation.goals import GOAL_FACTS
+
     goal = (arg.strip().lower() or "beacon")
-    valid = {"beacon", "creds", "lateral", "ad", "identity", "deep",
-             "footprint", "post_exploit", "crack", "cloud"}
+    # The goal table is the authority. The old hard-coded set drifted: it
+    # omitted `deliver`, `mobile`, `web`, `harvest` and others, so `plan
+    # deliver` answered "Unknown goal" to a goal auto-mode accepts.
+    valid = set(GOAL_FACTS)
     if goal not in valid:
         notifier.error(f"Unknown goal '{goal}'. Goals: {', '.join(sorted(valid))}")
         return
@@ -155,7 +160,11 @@ def cmd_plan(shell, arg: str):
             _sh.console.print(f"  [dim](+{len(plan.rejected) - 8} more "
                               "rejected candidates)[/]")
         return
-    for i, s in enumerate(plan.steps, 1):
+    # `Planner.plan` builds a BACKWARD chain (goal first, then the moves that
+    # unlock it). Printing it as-is showed `beacon_deploy` before the scan that
+    # makes it possible. The executable order is the reverse, which is also
+    # what the planner tests use (`reversed(plan.steps)`).
+    for i, s in enumerate(reversed(plan.steps), 1):
         cap = s.capability
         why = s.reason or ""
         _sh.console.print(

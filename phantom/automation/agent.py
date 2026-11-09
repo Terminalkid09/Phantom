@@ -282,6 +282,10 @@ class AutonomousAgent:
         # source of truth. Contact stays a separate, explicit choice.
         self.wm.identity_consent = {"active": self.identity_active,
                                     "contact": False}
+        # Stamp the decision context on the WorldModel so the planner-phase
+        # advisor can see it even though the arbiter is built here, before a
+        # run names its goal. `run_autonomous` updates `goal`.
+        self.wm.profile = profile
         # port-scan coverage per run profile: default keeps the top-1000;
         # stealth sweeps the full range up front with a BOUNDED rate (the
         # old unbounded -T2 sweep never reached the high ports); speed and
@@ -3462,6 +3466,7 @@ class AutonomousAgent:
         credentials + lateral movement) and hands the beacon over once.
         """
         self.goal = goal
+        self.wm.goal = goal
         # every run gets a fresh per-run human-wait budget, not the remainder
         # of a previous stage that happened to use the same agent object.
         self._social_run_deadline = None

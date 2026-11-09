@@ -676,9 +676,12 @@ def cmd_coverage(shell, arg: str):
                 notifier.warn("Profile gap: the plan cannot reach every "
                               "phase this class declares.")
             return
-        report = format_report(audit())
-        _sh.console.print(report, markup=False)
-        if report.ok:
+        # `format_report` returns text; the verdict lives on the audit.
+        # Checking `.ok` on the string raised AFTER the correct report had
+        # already been printed, so the command ended in a misleading error.
+        result = audit()
+        _sh.console.print(format_report(result), markup=False)
+        if result.ok:
             notifier.success("All declared paths resolve.")
         else:
             notifier.warn("Declaration gaps found — see the report above.")

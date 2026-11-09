@@ -43,6 +43,7 @@ never loaded "just to try it": that is how a regression ships.
 | phase | task | primary metric |
 | --- | --- | --- |
 | `exploit` | rank eligible access candidates | `ndcg` |
+| `planner` | rank eligible capability moves (CPU linear ranker) | `ndcg` |
 | `finding` | observation → typed finding | `exact_match` |
 | `osint` | same-person signal proposal | `brier` |
 | `social` | one plausible message | `rubric` |
@@ -52,6 +53,9 @@ never loaded "just to try it": that is how a regression ships.
 ## Operator workflow
 
 1. `training/README.md` builds the dataset and trains the adapter on a GPU.
+   The `planner` phase is the CPU exception: `training.planner_ranker` fits a
+   pairwise linear model over `training/golden/planner.jsonl` and writes the
+   weights next to its manifest (see `models/planner/planner-2026-11-08/`).
 2. `training.eval` writes the eval JSON; the trainer embeds it in the
    manifest and refuses promotion below baseline.
 3. `training.export` merges and prints the GGUF command.

@@ -122,15 +122,22 @@ class TestShellCommand(unittest.TestCase):
         self.assertTrue((cmd_coverage.__doc__ or "").strip())
 
     def test_coverage_command_renders_without_raising(self):
-        from phantom.core.shell.commands.system import cmd_coverage
+        from unittest import mock
+
+        from phantom.core.shell.commands import system as shell_system
         from phantom.core.session import session
 
         class _Shell:
             pass
 
-        cmd_coverage(_Shell(), "")
-        cmd_coverage(_Shell(), "mobile")
-        cmd_coverage(_Shell(), "not-a-profile")
+        # cmd_coverage catches its own exceptions, so "did not raise" proved
+        # nothing: the bug printed the correct report and then called
+        # notifier.error("Coverage audit failed: 'str' object has no ...").
+        with mock.patch.object(shell_system.notifier, "error") as error:
+            shell_system.cmd_coverage(_Shell(), "")
+            shell_system.cmd_coverage(_Shell(), "mobile")
+            shell_system.cmd_coverage(_Shell(), "not-a-profile")
+        error.assert_not_called()
         self.assertIsNotNone(session)
 
 

@@ -390,12 +390,29 @@ def cmd_social(shell, arg: str):
                 jar = session_jar(session_wm())
             except Exception:
                 jar = {}
-            notifier.status(f"Deep recon on {handle} (this makes network calls)")
-            ok, lines = deep_recon(handle, jar=jar or None, graph=graph)
+            def _flag(name: str) -> str:
+                if name in parts:
+                    index = parts.index(name)
+                    if index + 1 < len(parts):
+                        return parts[index + 1]
+                return ""
+            platform = _flag("--platform")
+            scope = _flag("--scope")
+            notifier.status(
+                f"Deep recon on {handle}"
+                + (f" platform={platform}" if platform else "")
+                + (f" scope={scope}" if scope else "")
+                + " (this makes network calls)")
+            ok, lines = deep_recon(handle, platform=platform, scope=scope,
+                                   jar=jar or None, graph=graph)
             for line in lines:
-                if line.startswith(("SOCIAL_GRAPH:", "SAME_PERSON:",
-                                    "GRAPH_PIVOT:", "POST_TOPIC:",
-                                    "RECON_STATE:")):
+                if line.startswith(("SOCIAL_GRAPH:", "SOCIAL_TRACE:",
+                                    "SAME_PERSON:", "GRAPH_PIVOT:",
+                                    "POST_TOPIC:", "RECON_STATE:",
+                                    "ACCOUNT_LINK:", "SEARCH_HIT:",
+                                    "WAYBACK:", "TRACE:", "MENTION:",
+                                    "CO_COMMENTER:", "COMMENTER:",
+                                    "TAGGED_IN:")):
                     Console().print("  " + line)
             # PERSIST what the run found, not just what it printed. The
             # per-item markers are the recon's real output (auto mode turns

@@ -97,6 +97,12 @@ class TestSession:
         assert self.session.mode == "recon"
         assert self.session.scope == ["10.0.0.0/24"]
 
+    def test_load_missing_raises_instead_of_silently_succeeding(self, monkeypatch):
+        """The CLI printed "not found" and then "loaded" for the same name."""
+        monkeypatch.setattr("os.path.exists", lambda p: False)
+        with pytest.raises(FileNotFoundError):
+            self.session.load("definitely-not-a-session")
+
     def test_list_saved_returns_only_json_names(self, monkeypatch):
         """List_saved should return saved session names without file extensions."""
         monkeypatch.setattr(os, "makedirs", lambda *args, **kwargs: None)

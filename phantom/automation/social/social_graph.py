@@ -51,6 +51,9 @@ EDGE_KINDS = (
     "username_variant",   # near-identical handle, weaker than same_person
     "tagged_in",          # A tagged/mentioned B
     "comments_on",        # A commented on B's content
+    "commented_on",       # A's OWN comment appeared under B's post (trace)
+    "mentioned_by",       # B named A in a post/comment (trace)
+    "co_commented",       # A and B comment on the same thread (circle)
     "follows",            # A follows B
     "followed_by",        # A is followed by B
     "same_avatar",        # avatar hash match
@@ -717,6 +720,12 @@ _LEAD_EDGE = {
     "account_link": ("handle", "second_hop", 0.6),
     "commenter": ("handle", "comments_on", 0.5),
     "tagged": ("handle", "tagged_in", 0.45),
+    # Interaction traces are PIVOTS, not identity proofs: they say the
+    # target spoke to this person / was named by them, never that the two
+    # accounts are the same human.
+    "trace": ("handle", "commented_on", 0.6),
+    "mention": ("handle", "mentioned_by", 0.55),
+    "co_commenter": ("handle", "co_commented", 0.55),
 }
 
 
@@ -924,7 +933,9 @@ def _link_shared_emails(g: SocialGraph) -> int:
     return made
 
 
-_RELATION_EDGE = {"commenter": "comments_on", "tagged": "tagged_in"}
+_RELATION_EDGE = {"commenter": "comments_on", "tagged": "tagged_in",
+                  "trace": "commented_on", "mention": "mentioned_by",
+                  "co_commenter": "co_commented"}
 
 
 def graph_from_wm(wm: Any, *, graph: Optional[SocialGraph] = None) -> SocialGraph:

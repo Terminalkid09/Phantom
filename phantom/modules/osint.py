@@ -192,14 +192,73 @@ class OsintModule(BaseModule):
                            "refused).")
             return
         
+        # Tool management: `sherlock` is an optional external binary. On a
+        # box where it is absent (or only present in WSL and mis-detected),
+        # the old path ran a command that failed and reported "no profiles",
+        # which reads as "this person has no accounts". Use the in-process
+        # deep-recon engine instead: same public pages, no external tool.
+        try:
+            import shutil as _shutil
+            from phantom.automation.runtime.toolchain import ToolRegistry
+            has_sherlock = ToolRegistry().has("sherlock")
+        except Exception:
+            has_sherlock = bool(_shutil.which("sherlock"))
+        if not has_sherlock:
+            notifier.warn("sherlock is not available — using Phantom's built-in "
+                          "deep recon (curl, no external tool)")
+            from phantom.automation.social.recon import deep_recon, session_jar
+            from phantom.automation.guidance.kit import store_social_markers
+            from phantom.core.knowledge import session_wm
+            try:
+                jar = session_jar(session_wm())
+            except Exception:
+                jar = {}
+            ok, lines = deep_recon(username, jar=jar or None)
+            for line in lines:
+                if line.startswith(("ACCOUNT_LINK:", "SEARCH_HIT:",
+                                    "TRACE:", "MENTION:",
+                                    "CO_COMMENTER:", "SOCIAL_TRACE:")):
+                    console.print("  " + line)
+            if ok:
+                try:
+                    store_social_markers("\n".join(lines), session_wm())
+                except Exception:
+                    pass
+                existing = session.get_result("osint") or {}
+                existing["social_profiles"] = [
+                    l.split("url=", 1)[1].split()[0]
+                    for l in lines if l.startswith("SEARCH_HIT:") and "url=" in l
+                ][:50]
+                session.add_result("osint", existing)
+                notifier.info("Built-in recon finished; findings are in the "
+                              "identity graph (`social graph`).")
+            else:
+                notifier.error("Built-in recon failed: "
+                               + (lines[-1] if lines else "unknown"))
+            return
+
         notifier.status(f"Running Sherlock for username: {username}...")
         cmd = f"sherlock {username} --timeout 5 --print-found"
         output = run_command(cmd)
         
-        # Parse output for found social links
-        links = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', output)
+        # Parse only PROFILE URLs, and turn each into an account candidate.
+        # The old regex stored every link as a "social profile" and never
+        # extracted the handle, so a hit could not enter the identity graph.
+        from phantom.automation.social.recon import _profile_handle
+        links = []
+        accounts = []
+        seen = set()
+        for raw in re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', output):
+            link = raw.rstrip(".,;)")
+            if link not in seen:
+                seen.add(link)
+                links.append(link)
+            platform, handle = _profile_handle(link)
+            if handle:
+                accounts.append((handle, platform, link))
         if links:
-            notifier.success(f"Found {len(links)} social profiles!")
+            notifier.success(f"Found {len(links)} link(s), "
+                             f"{len(accounts)} account candidate(s)!")
             existing = session.get_result("osint") or {}
             existing["social_profiles"] = links
             session.add_result("osint", existing)
@@ -207,6 +266,18 @@ class OsintModule(BaseModule):
                 console.print(f"  [cyan]{link}[/]")
             if len(links) > 10:
                 notifier.info(f"... and {len(links)-10} more.")
+            try:
+                from phantom.core.knowledge import session_wm
+                wm = session_wm()
+                for handle, platform, link in accounts:
+                    wm.add_finding(
+                        "account_link", f"{handle}:{platform or 'unknown'}",
+                        {"handle": handle, "platform": platform,
+                         "url": link, "relation": "sherlock",
+                         "evidence": "sherlock_profile_url"},
+                        confidence=0.5, source="sherlock")
+            except Exception:
+                pass
             self._harvest_identity()
             notifier.info("Profiles written to shared knowledge (show knowledge).")
         else:

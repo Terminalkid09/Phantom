@@ -145,22 +145,122 @@ behind it; the ones that were not measured are named as such.
   `429` with `Retry-After: 59` on the fifth attempt.
 - `--auto 127.0.0.1:8443 --goal mobile --ai off`: goal reached in 19 s, two
   actions, `simplemdm` and both platform user agents observed.
-- The same run with `--ai integrated`: goal reached, arbiter line
-  `2 asked / 0 proposal(s) / 0 accepted / 0 rejected / 0 changed / 6 abstained`,
-  telemetry `failed: integrated: no promoted manifest for phase 'planner'`.
-- `--auto 127.0.0.1 --goal deliver` with `--ai off` and `--ai integrated`: both
-  `partial (goal not reached)` because nmap/masscan/nc are absent on this host;
-  the integrated run says `3 asked / 0 proposal(s) / 18 abstained` instead of
-  pretending to differ from `--ai off`.
+- The same run with `--ai integrated`, BEFORE the planner ranker below: goal
+  reached, arbiter line `2 asked / 0 proposal(s) / 0 accepted / 0 rejected /
+  0 changed / 6 abstained`, telemetry `failed: integrated: no promoted manifest
+  for phase 'planner'`. The next section replaces that result.
+- `--auto 127.0.0.1 --goal deliver` with `--ai off` and `--ai integrated`, also
+  before the ranker: both `partial (goal not reached)` because nmap/masscan/nc
+  are absent; the integrated run said `3 asked / 0 proposal(s) / 18 abstained`
+  instead of pretending to differ from `--ai off`.
 - Full suite: **6446 passed, 6 skipped, 16 warnings, 115 subtests, 380.43 s**.
+
+### OSINT: interaction traces, secondary handles and two live defects — 2026-11-08
+
+- **The live OSINT path was reading nothing.** `_fetch_ex` used
+  `@@PHANTOM_STATUS@@` as its `curl -w` sentinel; curl treats `-w @file` as
+  "read the format from this file" and exited 26 before the request. Every
+  fetch returned an empty body, and a real `github.com/torvalds` profile was
+  voted `unknown`. The sentinel no longer starts with `@`; a regression test
+  pins it and a live run now returns `state=public conf=1.00` with the real bio
+  and avatar.
+- **A readable avatar aborted the whole pass.** `_mine_graph` passed the
+  decoded text from `_fetch` straight to `hashlib.md5`, raising "Strings must
+  be encoded before hashing" the moment an avatar was actually fetched. It is
+  encoded once and the same bytes feed the perceptual hash; the failure is
+  covered by a test.
+- **Comment authors are first-class now.** The old miner scanned comment TEXT
+  for `@handles`, so the person who wrote the comment was invisible. New
+  `_comment_traces()` reads the structured author (`owner.username`,
+  `user.unique_id`, Reddit `author`) and yields three separate pivots:
+  **TRACE** (the target commented under another profile's post),
+  **MENTION** (an author named the target) and **CO_COMMENTER** (a person who
+  also comments on the target's page). They flow through the social
+  interpreter into `account_link` findings and the graph edges
+  `commented_on` / `mentioned_by` / `co_commented`; none is an identity proof.
+- **Dork hits became secondary-account candidates.** A profile URL is reduced
+  to `(platform, handle)` (`linkedin.com/in/x`, `reddit.com/user/x`,
+  `github.com/x/repo`) and emitted as `ACCOUNT_LINK ... dork_profile_url`;
+  content paths (`/p/`, `/popular/`, `/status/`, TikTok `/@user/video/...`)
+  are rejected. A handle variant is scored as a weak 0.25 signal by the same
+  identity model instead of the old hard-coded 0.55, so a namesake cannot
+  become a probable account from the handle alone.
+- **GitHub page chrome polluted the graph.** `@github` and 12-character asset
+  hashes were entering as `TAGGED_IN` people. Platform names and hex ids are
+  rejected by `_is_real_handle`.
+- **Tool management used two resolvers.** `ToolRunner._require_tool` called
+  `shutil.which` directly while the rest of Phantom resolves aliases + WSL;
+  on a Windows box whose netcat is in Kali, the listener path reported the tool
+  missing even though the executor could run it. It now falls back to
+  `ToolRegistry`; `setup` also counts `impacket-GetNPUsers` as satisfying
+  `GetNPUsers.py` instead of reinstalling the AD package.
+- **HID verification:** all 335 HID tests pass; a real Leonardo sketch was
+  generated (115 lines, IT layout, 6.76 s typing budget). The flash path
+  correctly refuses to guess: COM3/COM4 expose no board descriptor, so it
+  reports that a port and FQBN/board id are required. Physical upload remains
+  unverified until a board is identified — the build and API paths are.
+
+### The planner ranker is real, promoted and consulted — 2026-11-08
+
+- **The missing model was a DATA gap, not a wiring gap.** The old probe fitted
+  the `exploit` question (access ids) and produced `ssh_banner +0.98`; the
+  planner asks about capability ids with goal/profile/noise context. New
+  `training/planner_vocab.py` generates 60 rows from the REAL capability table
+  and `_FACT_SOURCES`, in the planner's vocabulary, with a declared rubric
+  (control > information, passive under stealth/noise, goal-relevant effects,
+  already-held facts worth less) and the static reverse index as the recorded
+  baseline.
+- **Promotion, measured on a holdout the model never trained on:**
+  `training/planner_ranker.py` trains a pairwise linear model over 34 rows and
+  measures 26: NDCG **0.9945 vs 0.8854**, delta **+0.1091**, bootstrap CI
+  **[+0.0792, +0.1379]** -> `promote`. The manifest is
+  `models/planner/planner-2026-11-08/manifest.json` (sha256 verified by the
+  registry). Features live once in
+  `phantom/automation/ai/planner_features.py`; the runtime `LinearRanker` now
+  reads the model's own `context_keys`, so a planner model is not forced
+  through the exploit feature tuple.
+- **The advisor now passes context per candidate.** `planning.propose` used
+  `score(cid, {})` / `rank(ids)`, so every goal/profile/effect interaction was
+  multiplied by zero; `for_engagement(self.wm)` also built the proposer before
+  a run had a goal. The WorldModel carries `goal`/`profile`, stamped by the
+  agent, and the advisor builds `planner_features.contexts(rows)`.
+- **Live proof:** lab phone smoke 19/19; `--auto 127.0.0.1:8443 --goal mobile
+  --ai integrated` reaches the goal in 20 s and the arbiter reports
+  `2 asked / 3 proposal(s) / 6 accepted / 3 rejected / 0 changed / 0
+  abstained` (the previous run reported `0 proposal(s)` and "no promoted
+  manifest for phase 'planner'"). `--goal deliver` on the lab reports
+  `3 asked / 6 proposal(s) / 24 accepted / 9 rejected / 0 changed`; it remains
+  `partial` because nmap/masscan/nc are absent, not because the AI is silent.
+- **Release check after the change:** `scripts/ci_local.py` -> 12 jobs,
+  24 steps, 0 failed, 731 s; `docker-test` skipped (hadolint absent) and
+  `integration-tools` skipped (nmap is installed only on the Linux runner).
+  Electron `npm ci`, `lint`, `tsc --noEmit`, `vite build` and the renderer
+  contract tests all pass.
+- **Limits:** the corpus is declared, not a log of field outcomes. It proves
+  the doctrine is learnable and the wiring is real; it does not prove field
+  superiority. The next data step is outcome-labelled capability rows, not a
+  larger rubric.
+
+### Shell and release checks found four real defects — 2026-11-08
+
+- `coverage` printed the correct audit and then failed with `'str' object has
+  no attribute 'ok'`: the verdict lives on `CoverageAudit`, not on the
+  formatted string. The command now checks `result.ok`.
+- `plan deliver` answered "Unknown goal" because `cmd_plan` carried a hard-coded
+  set that had drifted from `GOAL_FACTS`; it now uses the goal table itself.
+  The same command printed the backward chain as if it were execution order
+  (`beacon_deploy` before the scan), so it now renders `reversed(plan.steps)`.
+- `load-session nope` printed "not found" and then "loaded": `Session.load`
+  returned `None` on both paths. It now raises `FileNotFoundError`, which the
+  shell and the API already knew how to report.
+- `electron/npm run lint` could never run: the script existed but `eslint`, its
+  TypeScript parser/plugin and a config were absent. Added the devDependencies
+  and `.eslintrc.cjs`; removed two stale Next.js `no-img-element` pragmas and
+  an unnecessary regex escape. `lint`, `typecheck` and `build` now pass, as do
+  the 12 renderer contract tests.
 
 #### Not changed, deliberately
 
-- A `planner` ranker was probed on the `exploit` corpus: NDCG 0.9379 vs 0.9021
-  and a bootstrap CI of +0.0095…+0.0628, but the top weight was
-  `ssh_banner +0.98` for a different question. Promoting it would have been
-  theatre; the probe is not committed, and the missing `planner` manifest
-  remains the honest limit named in telemetry.
 - No model was invented for mobile: the probe was made TLS-aware and
   cross-platform instead. The lab is protocol-level, not a real device; the
   deliver path was not re-run with nmap installed.

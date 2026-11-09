@@ -32,20 +32,42 @@ def _row(cap: Any) -> Dict[str, Any]:
         "opsec_cost": round(float(getattr(cap, "opsec_cost", 0.0) or 0.0), 2),
         "detection_risk": round(
             float(getattr(cap, "detection_risk", 0.0) or 0.0), 2),
+        "forceful": bool(getattr(cap, "forceful", False)),
         "effects": [str(e) for e in (getattr(cap, "effects", ()) or ())],
     }
 
 
 def payload(wm: Any, fact: str, capabilities: Sequence[Any],
             goal: str = "") -> Dict[str, Any]:
-    """The request body for the ``planner`` phase (data only)."""
+    """The request body for the ``planner`` phase (data only).
+
+    The goal/profile/noise fields are new and not cosmetic: the promoted
+    planner ranker was trained with them, and the first wiring passed neither
+    (``for_engagement(self.wm)`` at construction time, before a run had a
+    goal), so every context term was zero at runtime and the model could only
+    reproduce its global id order. They fall back to the WorldModel, which is
+    stamped by the agent when the run starts.
+    """
+    effective_goal = str(goal or getattr(wm, "goal", "") or "")
+    profile = str(getattr(wm, "profile", "") or "")
+    try:
+        noise = bool(wm.noise_breaker_tripped())
+    except Exception:
+        noise = False
+    tried = [str(h.get("capability") or "") for h in
+             (getattr(wm, "actions_taken", []) or [])
+             if isinstance(h, dict)]
     return {
-        "goal": str(goal or ""),
-        "target_type": str(getattr(wm, "target_type", "") or ""),
+        "goal": effective_goal,
+        "profile": profile,
+        "fact": str(fact or ""),
         "fact_to_produce": str(fact or ""),
+        "noise_breaker": noise,
+        "target_type": str(getattr(wm, "target_type", "") or ""),
         "known_facts": sorted(
             str(getattr(f, "kind", "")) for f in
             (getattr(wm, "findings", []) or []))[:40],
+        "already_tried": sorted({cid for cid in tried if cid}),
         "candidates": [_row(c) for c in capabilities],
     }
 
@@ -78,14 +100,22 @@ def propose(wm: Any, fact: str, capabilities: Sequence[Any],
         except Exception:
             ranker = None
         if ranker is not None:
+            from phantom.automation.ai import planner_features
+
+            # The model was trained on candidate facts (category, effects,
+            # stealth, cost/risk) and on the decision context. Passing an empty
+            # dict here was the old bug: every context weight multiplied by
+            # zero, and the ranker degenerated to a frozen id order.
+            contexts = planner_features.contexts(rows)
             ids = ranker.rank([str(getattr(c, "id", "") or "")
-                               for c in capabilities])
+                               for c in capabilities],
+                              contexts=contexts)
             if not ids:
                 return []
             # Confidence from the SPREAD of the learned scores: a model whose
             # weights do not separate these moves has no opinion to express,
             # and saying 0.9 anyway is how a decorative AI looks confident.
-            scores = [ranker.score(cid, {}) for cid in ids]
+            scores = [ranker.score(cid, contexts.get(cid) or {}) for cid in ids]
             spread = max(scores) - min(scores) if len(scores) > 1 else 0.0
             confidence = max(0.0, min(1.0, 0.5 + spread))
             return [Proposal(cid, confidence, "promoted capability ranker")

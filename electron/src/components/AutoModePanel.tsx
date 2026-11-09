@@ -185,7 +185,7 @@ const scopeAria = (s: IdentityScope): string =>
  * wrong guess here changes nothing but what the panel shows.
  */
 const identityLooksLikeUsername = (value: string): boolean =>
-  /^@?[A-Za-z][A-Za-z0-9_.\-]{1,63}$/.test((value || '').trim())
+  /^@?[A-Za-z][A-Za-z0-9_.-]{1,63}$/.test((value || '').trim())
 
 export default function AutoModePanel() {
   const { autoMode, setAutoMode, job, setJob, appendReasoning, updateStep, ensureStep, session, addHandoff,
@@ -745,7 +745,6 @@ export default function AutoModePanel() {
             {idPreview && (
               <div className="rounded border border-surface-border bg-surface p-2.5 flex gap-2.5">
                 {idPreview.avatar_url ? (
-                  // eslint-disable-next-line @next/next/no-img-element
                   <img src={idPreview.avatar_url} alt={`Avatar of @${idPreview.username}`}
                     className="w-12 h-12 rounded-full object-cover flex-shrink-0" />
                 ) : (
@@ -1090,7 +1089,6 @@ export default function AutoModePanel() {
                     {check.candidates.map((c) => (
                       <div key={`${c.platform}:${c.handle}`} className="flex-shrink-0 w-44 rounded border border-surface-border bg-surface-card p-2">
                         {c.avatar_url ? (
-                          // eslint-disable-next-line @next/next/no-img-element
                           <img src={c.avatar_url} alt="avatar"
                             className="w-10 h-10 rounded-full object-cover mb-1" />
                         ) : (
