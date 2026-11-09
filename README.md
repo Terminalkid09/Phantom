@@ -33,19 +33,13 @@ Phantom also includes a **React + TypeScript Electron desktop app** (`electron/`
 
 ### Download Phantom Desktop
 
-<a href="https://github.com/Terminalkid09/Phantom/releases/latest">
-  <img src="electron/assets/icon256.png" alt="Phantom desktop app icon" width="64" height="64" align="right" />
-</a>
-
 [![Latest release](https://img.shields.io/github/v/release/Terminalkid09/Phantom?display_name=release&style=for-the-badge&logo=electron&logoColor=white)](https://github.com/Terminalkid09/Phantom/releases/latest)
 [![Windows x64](https://img.shields.io/badge/Windows_x64-0078D4?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Terminalkid09/Phantom/releases/latest)
 [![macOS](https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/Terminalkid09/Phantom/releases/latest)
 [![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)](https://github.com/Terminalkid09/Phantom/releases/latest)
 
 Installers are produced by the **Electron Release** workflow for Windows
-(NSIS `.exe`), macOS (`.dmg`) and Linux (`.AppImage`). The icon above is the
-real installer/window icon shipped from `electron/assets/icon256.png`, not a
-generic badge.
+(NSIS `.exe`), macOS (`.dmg`) and Linux (`.AppImage`).
 
 ---
 
