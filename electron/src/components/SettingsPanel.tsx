@@ -4,7 +4,7 @@ import { useApi, useApiError, apiError as apiErrorText } from '@/hooks/useApi'
 import { useAppVersion } from '@/hooks/useAppVersion'
 import ExternalTools from '@/components/ExternalTools'
 import {
-  Settings, Cpu, Server, Shield, Key, Eye, EyeOff,
+  Settings, Cpu, Server, Shield,
   RotateCw, CheckCircle2, AlertTriangle, Film, Globe
 } from 'lucide-react'
 
@@ -21,8 +21,6 @@ export default function SettingsPanel() {
   const { settings, setSettings, listener, pushToast } = useStore()
   const { api, pollC2 } = useApi()
   const apiError = useApiError()
-  const [apiToken, setApiToken] = useState('')
-  const [showToken, setShowToken] = useState(false)
   const [saved, setSaved] = useState(false)
   const [apiKeys, setApiKeys] = useState<Record<string, KeyInfo>>({})
   const [keyDrafts, setKeyDrafts] = useState<Record<string, string>>({})
@@ -65,10 +63,11 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
   }
 
   const handleRotateApiToken = async () => {
+    // The backend rotates its state-side token and deliberately does NOT
+    // return it: main.ts reads the new value from the state file, while the
+    // renderer never sees the bearer secret.
     const res = await api('POST', '/api/c2/config/rotate-api-token')
-    if (res.status === 200 && res.data) {
-      const d = res.data as { token: string }
-      setApiToken(d.token)
+    if (res.status === 200) {
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
     } else {
@@ -398,21 +397,6 @@ useEffect(() => { loadKeys(); loadGuardrails() }, [])
                   <RotateCw size={11} aria-hidden="true" /> Rotate
                 </button>
               </div>
-              {apiToken && (
-                <div className="flex items-center gap-1.5 bg-surface rounded px-2 py-1.5 border border-surface-border">
-                  <Key size={11} className="text-text-dim" />
-                  <span className="text-xs font-mono text-text-primary flex-1 truncate">
-                    {showToken ? apiToken : '●●●●●●●●●●●●●●●●●●●●'}
-                  </span>
-                  <button
-                    onClick={() => setShowToken(!showToken)}
-                    aria-pressed={showToken}
-                    aria-label={showToken ? 'Hide the API token' : 'Reveal the API token'}
-                    className="text-text-dim hover:text-text-primary">
-                    {showToken ? <EyeOff size={13} aria-hidden="true" /> : <Eye size={13} aria-hidden="true" />}
-                  </button>
-                </div>
-              )}
               {saved && (
                 <div className="flex items-center gap-1 text-phantom-green text-[10px]">
                   <CheckCircle2 size={11} /> Token rotated

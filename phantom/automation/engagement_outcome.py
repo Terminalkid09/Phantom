@@ -1,7 +1,7 @@
 """
 engagement_outcome.py — JobLifecycle ≠ EngagementOutcome (P0).
 
-The auto-mode job lifecycle (`phantom/api/server.py::AutoJob`, states
+The auto-mode job lifecycle (`phantom/api/automode_jobs.py::AutoJob`, states
 ``planning → running → stopping → cancelled|completed|failed``) answers
 "is the process still working?". It cannot answer the question an operator
 actually has: **did the engagement reach anything?**

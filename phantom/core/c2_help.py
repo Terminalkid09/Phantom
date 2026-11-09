@@ -207,7 +207,7 @@ COMMANDS: List[CommandSpec] = [
 
     # ── ops & audit ──
     CommandSpec("audit [verify|tail N]",
-                "Immutable hash-chained C2 audit log (chain-of-custody)",
+                "HMAC-authenticated hash-chained C2 audit log (chain-of-custody)",
                 GLOBAL_SCOPE, "Audit", handler="audit"),
     CommandSpec("telegram",
                 "Telegram bot channel status (remote C2 control)", GLOBAL_SCOPE,

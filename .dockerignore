@@ -20,10 +20,20 @@
 # ── the operator's own state: never in an image ───────────────────────────
 data/
 .env
+.env.*
 *.env
 !*.env.example
 data/*.pm
 *.pm
+# Local credentials and engagement artefacts. The Dockerfile uses `COPY . .`,
+# so a `.c2_token` or an OSINT/chat dump left in the working tree would land in
+# the build context (and possibly an image layer) even though Git ignores it.
+.c2_token
+.c2_token.*
+someuser.txt
+comando.txt
+.body.ps1
+freebuff-chat-*.md
 
 # ── build output / caches ──────────────────────────────────────────────────
 build/

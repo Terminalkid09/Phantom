@@ -135,6 +135,16 @@ class TestTheCountedClaimsAreReal(unittest.TestCase):
         self.assertFalse(os.path.exists(_ROOT / "phantom" / "_run_c2.py"))
 
 
+class TestTheElectronReleaseSurface(unittest.TestCase):
+    """The desktop download must show the REAL app icon, not a bare link."""
+
+    def test_the_download_section_uses_the_packaged_app_icon(self):
+        text = _readme()
+        self.assertIn("electron/assets/icon256.png", text)
+        self.assertIn("releases/latest", text)
+        self.assertTrue((_ROOT / "electron" / "assets" / "icon256.png").is_file())
+
+
 class TestTheDocsIndexStaysTrue(unittest.TestCase):
     """`docs/README.md` claims to index every document; nothing checked it.
 

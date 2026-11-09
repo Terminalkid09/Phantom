@@ -66,15 +66,21 @@ class TestEncryptedBundle(unittest.TestCase):
 class TestAutoExport(unittest.TestCase):
 
     def setUp(self):
+        # `auto_export` treats module results as engagement content, so a
+        # previous test's scan output made this "empty session" test write a
+        # bundle. Isolate the whole gate, not just target/notes.
         self._old = (session.target, list(session.notes or []),
+                     dict(session.results or {}),
                      getattr(session, "engagement_started", None))
         reset_wm(target="")
         session.notes = []
+        session.results = {}
         session.target = ""
         session.engagement_started = "2026-08-26T10:00:00"
 
     def tearDown(self):
-        session.target, session.notes, session.engagement_started = self._old
+        (session.target, session.notes, session.results,
+         session.engagement_started) = self._old
         reset_wm(target="")
 
     def _run(self, fn):

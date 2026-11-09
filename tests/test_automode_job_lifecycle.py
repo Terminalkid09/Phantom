@@ -126,9 +126,9 @@ def test_a_run_that_ends_on_its_own_is_completed(job):
 def test_the_state_history_is_a_bounded_tail(job, monkeypatch):
     """A long run must not grow the job's memory without limit, and what
     survives must still be the true tail."""
-    import phantom.api.server as server
+    import phantom.api.automode_jobs as jobs
 
-    monkeypatch.setattr(server, "_STATE_HISTORY_LIMIT", 2)
+    monkeypatch.setattr(jobs, "_STATE_HISTORY_LIMIT", 2)
     job.callback("run", {})
     job.request_stop()
     history = [h["state"] for h in job.snapshot()["state_history"]]

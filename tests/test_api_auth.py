@@ -6,6 +6,7 @@ processes or malicious websites cannot read engagement data or revoke
 beacon identities. OPTIONS preflight stays exempt for the CORS handshake.
 """
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -91,6 +92,25 @@ class TestApiAuth(unittest.TestCase):
                 await client.close()
 
         self.assertNotEqual(self._scenario(scenario()), 401)
+
+    def test_rotation_does_not_return_the_new_token(self):
+        """The rotate endpoint is reachable from Electron; its response must
+        not hand the bearer secret to the renderer."""
+        async def scenario():
+            client = TestClient(TestServer(create_app()))
+            await client.start_server()
+            try:
+                token = c2_crypto.get_api_token()
+                resp = await client.post(
+                    "/api/c2/config/rotate-api-token",
+                    headers={"Authorization": f"Bearer {token}"})
+                return resp.status, await resp.text()
+            finally:
+                await client.close()
+
+        status, body = self._scenario(scenario())
+        self.assertEqual(status, 200)
+        self.assertNotIn("token", json.loads(body))
 
     def test_rotation_invalidates_old_token(self):
         async def scenario():

@@ -19,6 +19,9 @@ import unittest
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 _SERVER = (_ROOT / "phantom" / "api" / "server.py").read_text(encoding="utf-8")
+# The job lifecycle moved to its own module; the HTTP stream route did not.
+_JOBS = (_ROOT / "phantom" / "api" / "automode_jobs.py").read_text(
+    encoding="utf-8")
 _STORE = (_ROOT / "electron" / "src" / "store" / "index.ts").read_text(
     encoding="utf-8")
 _PANEL = (_ROOT / "electron" / "src" / "components" /
@@ -27,29 +30,29 @@ _PANEL = (_ROOT / "electron" / "src" / "components" /
 
 class TestJobRecordsTheHandoff(unittest.TestCase):
     def test_the_job_has_a_handoff_list(self):
-        self.assertIn("self.handoffs", _SERVER)
+        self.assertIn("self.handoffs", _JOBS)
 
     def test_the_callback_records_it_not_a_dedicated_hook(self):
         # Recording in callback() means every emitter (agent AND swarm) is
         # covered without anyone remembering to call a second function.
-        block = _SERVER[_SERVER.index("def callback(self, kind: str"):]
+        block = _JOBS[_JOBS.index("def callback(self, kind: str"):]
         block = block[:block.index("def handoff_records")]
         self.assertIn('kind == "handoff"', block)
         self.assertIn('beacon_id', block)
 
     def test_an_empty_beacon_id_is_not_recorded(self):
-        block = _SERVER[_SERVER.index("def callback(self, kind: str"):]
+        block = _JOBS[_JOBS.index("def callback(self, kind: str"):]
         block = block[:block.index("def handoff_records")]
         self.assertIn("if beacon_id and not any(", block)
 
     def test_the_same_beacon_is_not_recorded_twice(self):
-        block = _SERVER[_SERVER.index("def callback(self, kind: str"):]
+        block = _JOBS[_JOBS.index("def callback(self, kind: str"):]
         block = block[:block.index("def handoff_records")]
         self.assertIn("h.get(\"beacon_id\") == beacon_id", block)
 
     def test_the_snapshot_does_not_hand_out_the_live_list(self):
         # A UI poll iterating the job's own list would mutate run state.
-        self.assertIn("return [dict(h) for h in self.handoffs]", _SERVER)
+        self.assertIn("return [dict(h) for h in self.handoffs]", _JOBS)
 
 
 class TestStreamServesHandoffs(unittest.TestCase):

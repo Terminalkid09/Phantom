@@ -216,6 +216,52 @@ class BackendDispatcher:
             duration=time.time() - started,
         )
 
+    @staticmethod
+    def _wsl_probe(wsl: str, distro: str, timeout: float = 3.0) -> bool:
+        """Does this distro actually execute a command?
+
+        `wsl -l -q` only proves that a distro is REGISTERED. A distro can be
+        listed while its VM/service is wedged: every routed command then
+        blocks until the API timeout. Advertising such a backend turns a
+        detection result into a hang, so probe before choosing it.
+        """
+        try:
+            proc = subprocess.run(
+                [wsl, "-d", distro, "-u", "root", "--",
+                 "bash", "-lc", "true"],
+                capture_output=True, timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return proc.returncode == 0
+
+    @staticmethod
+    def _wsl_distros(raw: Any) -> list[str]:
+        """Registered WSL distro names from `wsl -l -q` output.
+
+        Windows PowerShell/WSL writes this listing as UTF-16LE (sometimes
+        with a BOM) while a UTF-8 locale writes plain text. Decoding the
+        bytes as UTF-8 produced names full of NUL characters, so `detect()`
+        chose a non-existent distro and every routed command hung until its
+        timeout. Detect the encoding from the bytes, not from the host
+        locale.
+        """
+        if isinstance(raw, bytes):
+            if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+                text = raw.decode("utf-16", errors="replace")
+            elif b"\x00" in raw:
+                text = raw.decode("utf-16-le", errors="replace")
+            else:
+                text = raw.decode("utf-8", errors="replace")
+        else:
+            text = str(raw or "")
+        out: list[str] = []
+        for line in text.splitlines():
+            name = line.strip().lstrip("\ufeff").strip()
+            if name and name not in out:
+                out.append(name)
+        return out
+
     def _describe(self, kind: str, forced: bool = False) -> dict[str, Any]:
         if kind == "native":
             tools = [tool for tool in ("nmap", "sqlmap", "msfconsole", "hydra") if shutil.which(tool)]
@@ -233,16 +279,37 @@ class BackendDispatcher:
                 return {"kind": kind, "available": False, "details": "WSL2 executable not found.", "tools": []}
             try:
                 proc = subprocess.run(
-                    [wsl, "-l", "-q"], capture_output=True, text=True, timeout=5,
+                    [wsl, "-l", "-q"], capture_output=True, timeout=5,
                 )
-                distros = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-                available = proc.returncode == 0 and bool(distros)
+                distros = self._wsl_distros(proc.stdout)
+                # `docker-desktop` is Docker's utility distro: it exposes no
+                # operator toolset, so it must not become the inferred
+                # backend just because it sorts before the real distro.
+                usable = [d for d in distros
+                          if not d.lower().startswith("docker-desktop")]
+                # Try the configured distro first, then the others. The old
+                # code picked the first registered name and never checked it;
+                # a stale/stopped distro made detect() claim a backend that
+                # could only time out.
+                candidates = ([self.config.distro]
+                              if self.config.distro in usable else [])
+                candidates += [d for d in usable if d not in candidates]
+                chosen = next((d for d in candidates
+                               if self._wsl_probe(wsl, d)), "")
+                available = proc.returncode == 0 and bool(chosen)
+                if available:
+                    self.config.distro = chosen
+                detail = f"WSL2 distributions: {', '.join(distros) or 'none'}"
+                if usable and not chosen:
+                    detail += (" — no distro answered a probe; the registered "
+                               "distros are not executable from this session")
                 return {
                     "kind": kind,
                     "available": available,
-                    "details": f"WSL2 distributions: {', '.join(distros) or 'none'}",
+                    "details": detail,
                     "tools": [],
                     "distros": distros,
+                    "distro": chosen,
                     "forced": forced,
                 }
             except (OSError, subprocess.TimeoutExpired) as exc:

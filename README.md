@@ -5,11 +5,28 @@
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20Android%20%7C%20macOS-lightgrey.svg)]()
 [![CI](https://github.com/Terminalkid09/Phantom/actions/workflows/ci.yml/badge.svg)](https://github.com/Terminalkid09/Phantom/actions/workflows/ci.yml)
-[![Electron Release](https://github.com/Terminalkid09/Phantom/actions/workflows/electron-release.yml/badge.svg)](https://github.com/Terminalkid09/Phantom/actions/workflows/electron-release.yml)
+[![Electron Release](https://img.shields.io/github/actions/workflow/status/Terminalkid09/Phantom/electron-release.yml?label=electron%20release&logo=electron&logoColor=white)](https://github.com/Terminalkid09/Phantom/actions/workflows/electron-release.yml)
+[![Latest Desktop Release](https://img.shields.io/github/v/release/Terminalkid09/Phantom?display_name=release&logo=electron&logoColor=white)](https://github.com/Terminalkid09/Phantom/releases/latest)
 
 **Phantom** is an offensive security framework for red teams that combines a full-featured C2 platform, 12 interactive pentest modules, and an autonomous kill-chain engine — all in one tool. The C2 beacon runs on Windows, Linux, Android, and macOS, using AES-256-GCM + mTLS + per-beacon HMAC authentication.
 
 Phantom also includes a **React + TypeScript Electron desktop app** (`electron/`) for campaign management, and an **autonomous agent** (`phantom/automation/`) that handles the full kill chain from reconnaissance to persistence without an LLM — fully offline, no data leaves your machine.
+
+### Download Phantom Desktop
+
+<a href="https://github.com/Terminalkid09/Phantom/releases/latest">
+  <img src="electron/assets/icon256.png" alt="Phantom desktop app icon" width="64" height="64" align="right" />
+</a>
+
+[![Latest release](https://img.shields.io/github/v/release/Terminalkid09/Phantom?display_name=release&style=for-the-badge&logo=electron&logoColor=white)](https://github.com/Terminalkid09/Phantom/releases/latest)
+[![Windows x64](https://img.shields.io/badge/Windows_x64-0078D4?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Terminalkid09/Phantom/releases/latest)
+[![macOS](https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/Terminalkid09/Phantom/releases/latest)
+[![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)](https://github.com/Terminalkid09/Phantom/releases/latest)
+
+Installers are produced by the **Electron Release** workflow for Windows
+(NSIS `.exe`), macOS (`.dmg`) and Linux (`.AppImage`). The icon above is the
+real installer/window icon shipped from `electron/assets/icon256.png`, not a
+generic badge.
 
 ---
 
@@ -233,10 +250,11 @@ at read time, never while the victim's page loads).
 - `.pm` bundles carry the **C2 engagement intel** too: beacon table, task
   history, collected results (beacon HMAC secrets are NEVER exported and
   any secret-looking field is scrubbed).
-- The C2 writes a **hash-chained append-only audit log**
-  (`data/c2_audit.log`): beacon registrations, queued tasks, results and
-  rejected auth. `audit verify` proves the timeline was not rewritten —
-  show it to the client as chain-of-custody.
+- The C2 writes an **HMAC-authenticated, hash-chained append-only audit
+  log** (`data/c2_audit.log`): beacon registrations, queued tasks, results
+  and rejected auth. Each record carries an HMAC, and a signed head detects
+  a truncated tail. `audit verify` proves the timeline was not rewritten or
+  forged — show it to the client as chain-of-custody.
 
 ### Beacon: EDR awareness + hookless syscalls
 
@@ -1317,7 +1335,7 @@ phantom/                        # repository root
 │   └── bt_scan.h               # Bluetooth scanning
 ├── electron/                   # React + Vite + TypeScript desktop app
 ├── data/                       # Sessions, cache, certs, wordlists
-├── tests/                      # 445 test files
+├── tests/                      # 449 test files
 ├── Dockerfile                  # Multi-stage Kali-based build
 ├── docker-compose.yml          # One-command deployment
 └── .env.example                # External API template
