@@ -60,6 +60,18 @@ class TestRegistryIntegrity(unittest.TestCase):
         self.assertIs(BY_NAME[list(BY_NAME)[0]], COMMANDS[0])
 
 
+class TestCommandDispatch(unittest.TestCase):
+    def test_hyphenated_commands_are_translated_like_the_manual_shell(self):
+        from phantom.core.c2_shell import C2Shell
+
+        shell = C2Shell()
+        self.assertEqual(shell.precmd("beacon-auth status"),
+                         "beacon_auth status")
+        self.assertEqual(shell.precmd("mem-run abc"), "mem_run abc")
+        self.assertEqual(shell.precmd("set-sleep 1000"), "set_sleep 1000")
+        self.assertEqual(shell.precmd(""), "")
+
+
 class TestScopeFiltering(unittest.TestCase):
     def test_the_global_context_offers_no_beacon_only_commands_as_ready(self):
         for spec in commands_for(GLOBAL_SCOPE):

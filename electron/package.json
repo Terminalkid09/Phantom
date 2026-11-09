@@ -2,6 +2,8 @@
   "name": "phantom-electron",
   "version": "3.0.0",
   "description": "Phantom Offensive Security Framework — Electron Desktop App",
+  "author": "Terminalkid09",
+  "license": "MIT",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite",

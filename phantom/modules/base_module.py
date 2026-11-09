@@ -58,6 +58,7 @@ class BaseModule(cmd.Cmd):
             console.print("[red]Usage: show session[/]")
 
     def do_note(self, arg):
+        """note \"<text>\" — add an inline note to the current session."""
         text = arg.strip().strip('"').strip('"')
         if text:
             session.add_note(text)

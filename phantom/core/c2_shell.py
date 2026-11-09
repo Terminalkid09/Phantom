@@ -178,6 +178,22 @@ class C2Shell(cmd.Cmd):
         self._last_status_sig = None
         from phantom.core.shell.ui import build_prompt
         self.prompt = build_prompt("C2", depth=2)
+
+    def precmd(self, line: str) -> str:
+        """Translate the command token so `beacon-auth` reaches do_beacon_auth.
+
+        The manual shell has always done this; the C2 shell did not, while its
+        help registry and README called the commands `beacon-auth`,
+        `mem-run`, `set-sleep`. That made the documented spelling fail before
+        dispatch. Only the first token is rewritten: arguments may contain
+        hyphens.
+        """
+        if not line.strip():
+            return line
+        parts = line.split(maxsplit=1)
+        command = parts[0].replace("-", "_")
+        return f"{command} {parts[1]}" if len(parts) > 1 else command
+
     def preloop(self):
         from datetime import datetime as _dt
         if not getattr(session, "engagement_started", None):

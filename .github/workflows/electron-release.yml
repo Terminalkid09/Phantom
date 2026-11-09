@@ -24,13 +24,10 @@ jobs:
         include:
           - os: windows-latest
             artifact: windows-backend
-            executable: phantom-backend.exe
           - os: macos-latest
             artifact: macos-backend
-            executable: phantom-backend
           - os: ubuntu-latest
             artifact: linux-backend
-            executable: phantom-backend
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -49,17 +46,13 @@ jobs:
         run: |
           python -m PyInstaller --clean --noconfirm phantom/api/phantom-backend-onedir.spec
 
-      - name: Normalize backend artifact
-        shell: bash
-        run: |
-          mkdir -p release-backend
-          cd dist/phantom-backend
-          zip -qr ../../release-backend/${{ matrix.artifact }}.zip .
-
+      # Upload the onedir tree as-is. The artifact service packages it, and
+      # download-artifact extracts it straight into electron/backend, which is
+      # the layout electron-builder's extraResources expects.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
-          path: release-backend/${{ matrix.artifact }}.zip
+          path: dist/phantom-backend
           if-no-files-found: error
 
   electron:
@@ -100,13 +93,6 @@ jobs:
           name: ${{ matrix.backend-artifact }}
           path: electron/backend
 
-      - name: Unpack onedir backend
-        shell: bash
-        run: |
-          cd electron/backend
-          zip -q ${{ matrix.backend-artifact }}.zip
-          rm ${{ matrix.backend-artifact }}.zip
-
       - name: Make backend executable
         if: runner.os != 'Windows'
         run: chmod +x electron/backend/${{ matrix.backend-file }}
@@ -117,10 +103,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Do not upload win-unpacked/ or builder-debug.yml: only the three
+      # installer families belong on the public release.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: phantom-${{ runner.os }}-installer
-          path: electron/dist-release/**
+          path: |
+            electron/dist-release/*.exe
+            electron/dist-release/*.dmg
+            electron/dist-release/*.AppImage
           if-no-files-found: error
 
   release:
@@ -148,9 +139,30 @@ jobs:
             echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Verify tag matches the packaged version
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+
+          tag = os.environ["RELEASE_TAG"]
+          version = json.load(open("electron/package.json", encoding="utf-8"))["version"]
+          if tag.removeprefix("v") != version:
+              raise SystemExit(
+                  f"release tag {tag!r} does not match electron/package.json {version!r}"
+              )
+          print(f"tag {tag} matches package version {version}")
+          PY
+
+      - name: Generate SHA-256 checksums
+        working-directory: release-assets
+        run: sha256sum * > SHA256SUMS.txt
+
       - name: Create release and upload installers
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: release-assets/**

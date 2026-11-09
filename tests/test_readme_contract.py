@@ -14,6 +14,8 @@ COUNTED claims (test files, API routes) must match reality.
 import os
 import pathlib
 import re
+import subprocess
+import sys
 import unittest
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -133,6 +135,19 @@ class TestTheCountedClaimsAreReal(unittest.TestCase):
         self.assertTrue(os.path.exists(_ROOT / "_run_c2.py"))
         # and it is NOT inside the package (that is where the tree used to say)
         self.assertFalse(os.path.exists(_ROOT / "phantom" / "_run_c2.py"))
+
+
+class TestTheCommandReferenceIsCurrent(unittest.TestCase):
+    """The command reference says it is generated; this makes that true."""
+
+    def test_the_checked_in_reference_matches_the_live_registries(self):
+        result = subprocess.run(
+            [sys.executable, str(_ROOT / "scripts" /
+                                "generate_command_reference.py"), "--check"],
+            cwd=_ROOT, capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
 
 
 class TestTheElectronReleaseSurface(unittest.TestCase):

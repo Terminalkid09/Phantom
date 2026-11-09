@@ -1,12 +1,31 @@
-# Phantom
+<p align="center">
+  <img src="electron/assets/icon256.png" alt="Phantom Logo" width="120" />
+</p>
 
-[![Version](https://img.shields.io/badge/version-3.0.0-red.svg)](CHANGELOG.md)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20Android%20%7C%20macOS-lightgrey.svg)]()
-[![CI](https://github.com/Terminalkid09/Phantom/actions/workflows/ci.yml/badge.svg)](https://github.com/Terminalkid09/Phantom/actions/workflows/ci.yml)
-[![Electron Release](https://img.shields.io/github/actions/workflow/status/Terminalkid09/Phantom/electron-release.yml?label=electron%20release&logo=electron&logoColor=white)](https://github.com/Terminalkid09/Phantom/actions/workflows/electron-release.yml)
-[![Latest Desktop Release](https://img.shields.io/github/v/release/Terminalkid09/Phantom?display_name=release&logo=electron&logoColor=white)](https://github.com/Terminalkid09/Phantom/releases/latest)
+<h1 align="center">Phantom</h1>
+<p align="center">
+  <strong>Offensive Security Framework — C2, Pentest Modules &amp; Autonomous Kill-Chain</strong>
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#features">Features</a> •
+  <a href="#electron-desktop-app">Desktop App</a> •
+  <a href="#c2-shell-commands">C2</a> •
+  <a href="#documentation">Documentation</a>
+</p>
+
+<p align="center">
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-3.0.0-red.svg" alt="Version 3.0.0" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License" /></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+" /></a>
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20Android%20%7C%20macOS-lightgrey.svg" alt="Platforms" />
+  <a href="https://github.com/Terminalkid09/Phantom/actions/workflows/ci.yml"><img src="https://github.com/Terminalkid09/Phantom/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/Terminalkid09/Phantom/actions/workflows/electron-release.yml"><img src="https://img.shields.io/github/actions/workflow/status/Terminalkid09/Phantom/electron-release.yml?label=electron%20release&logo=electron&logoColor=white" alt="Electron Release" /></a>
+  <a href="https://github.com/Terminalkid09/Phantom/releases/latest"><img src="https://img.shields.io/github/v/release/Terminalkid09/Phantom?display_name=release&logo=electron&logoColor=white" alt="Latest Desktop Release" /></a>
+</p>
+
+---
 
 **Phantom** is an offensive security framework for red teams that combines a full-featured C2 platform, 12 interactive pentest modules, and an autonomous kill-chain engine — all in one tool. The C2 beacon runs on Windows, Linux, Android, and macOS, using AES-256-GCM + mTLS + per-beacon HMAC authentication.
 
