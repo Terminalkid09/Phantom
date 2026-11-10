@@ -59,6 +59,11 @@ def _bare_host(raw: str) -> str:
     host = host.strip().rstrip(".").lower()
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
+    # A service target (`host:port`) is still a machine plus a port: network
+    # tooling needs the bare host, and the adapter asks for the port
+    # separately. Leaving it attached produced `nc 127.0.0.1:8443 21 22 ...`,
+    # which nc reads as one unresolvable host and the scan reports as dead.
+    host, _ = split_host_port(host)
     return host
 
 

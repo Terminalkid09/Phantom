@@ -137,6 +137,14 @@ class TestUnifiedScanParsing(unittest.TestCase):
         keys = {x["key"] for x in f}
         self.assertEqual(keys, {"tcp/22", "tcp/80", "tcp/445"})
 
+    def test_nc_unassigned_service_port_parses(self):
+        # nc prints `[tcp/*]` when /etc/services has no name for the port;
+        # the connect still SUCCEEDED, so the port is open evidence.
+        f = parse_nmap_ports(
+            "Connection to 10.0.0.9 8443 port [tcp/*] succeeded!", "nc")
+        self.assertEqual([x["key"] for x in f], ["tcp/8443"])
+        self.assertNotEqual(f[0]["value"]["service"], "*")
+
     def test_masscan_output_parses(self):
         out = ("Discovered open port 80/tcp on 10.0.0.9\n"
                "Discovered open port 3306/tcp on 10.0.0.9")

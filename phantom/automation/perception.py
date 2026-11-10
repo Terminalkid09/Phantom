@@ -38,7 +38,7 @@ _NMAP_PORT_RE = re.compile(
 # count as open ports.
 _NC_PORT_RE = re.compile(
     r"(?:Connection to|connect to)[ \t]+[\d\.]+[ \t]+(\d+)[ \t]+port[ \t]+"
-    r"(?:\[tcp/([\w\-]+)\][ \t]+)?succeeded",
+    r"(?:\[tcp/([\w\-\*]+)\][ \t]+)?succeeded",
     re.IGNORECASE,
 )
 # masscan: "Discovered open port 80/tcp on 10.0.0.9"
@@ -96,6 +96,8 @@ def parse_nmap_ports(output: str, source: str = "nmap") -> List[Dict[str, Any]]:
             continue
         seen.add(port)
         svc = m.group(2) or PORT_SERVICE_MAP.get(int(port), "unknown")
+        if svc == "*":       # nc prints [tcp/*] for an unassigned port
+            svc = PORT_SERVICE_MAP.get(int(port), "unknown")
         findings.append(_p(kind="service", key=f"tcp/{port}",
                            value={"port": port, "protocol": "tcp",
                                   "service": svc, "version": "", "product": "",

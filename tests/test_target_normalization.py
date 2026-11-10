@@ -40,6 +40,44 @@ class TestBareHost(unittest.TestCase):
         self.assertEqual(_effective_target(wm), "10.9.9.9")
 
 
+class TestServiceTargetPorts(unittest.TestCase):
+    """`host:port` is a host AND a port, never one string."""
+
+    def test_effective_target_strips_service_port(self):
+        from phantom.automation.guidance.kit import _effective_target
+        self.assertEqual(_effective_target(_wm("127.0.0.1:8081", "ip")),
+                         "127.0.0.1")
+
+    def test_nc_scan_uses_bare_host_and_scans_own_port(self):
+        from phantom.automation.guidance.kit import _port_scan_adapter
+        wm = _wm("127.0.0.1:9443", "ip")
+        wm.chosen_tool = {"capability": "scan_tcp", "tool": "nc"}
+        parts = _port_scan_adapter(wm, {}).split()
+        self.assertEqual(parts[:5], ["nc", "-zv", "-w", "1", "127.0.0.1"])
+        self.assertIn("9443", parts)
+        self.assertNotIn("127.0.0.1:9443", parts)
+
+    def test_explicit_target_port_wins_for_web(self):
+        from phantom.automation.guidance.kit import _web_service_target
+        self.assertEqual(_web_service_target(_wm("10.0.0.9:9443", "ip")),
+                         ("10.0.0.9", "9443"))
+
+    def test_discovered_nonstandard_port_is_used(self):
+        from phantom.automation.guidance.kit import _web_service_target
+        wm = _wm("10.0.0.9", "ip")
+        wm.add_finding("service", "tcp/9091",
+                       {"port": "9091", "protocol": "tcp",
+                        "service": "http-alt", "product": "",
+                        "version": ""}, confidence=0.9, source="test")
+        self.assertEqual(_web_service_target(wm), ("10.0.0.9", "9091"))
+
+    def test_rce_uses_target_port_and_https(self):
+        from phantom.automation.guidance.kit import _web_rce_adapter
+        cmd = _web_rce_adapter(_wm("127.0.0.1:8443", "ip"), {})
+        self.assertIn("https://127.0.0.1:8443/upload", cmd)
+        self.assertNotIn("127.0.0.1:80", cmd)
+
+
 class TestEffectiveUrl(unittest.TestCase):
     def test_bare_host_defaults_http(self):
         from phantom.automation.guidance.kit import _effective_url
