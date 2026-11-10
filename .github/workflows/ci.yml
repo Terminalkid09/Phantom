@@ -842,4 +842,14 @@ jobs:
         # INSIDE the image. The full image (NDK + OpenSSL cross + osxcross) is
         # deliberately NOT built here: it is a 30+ minute job, and it is what
         # `docker compose build` / .gitlab-ci.yml `docker_build` are for.
-        run: docker build --target ci-smoke -t phantom-ci-smoke .
+        # Registry/apt hiccups are infrastructure, not a product regression:
+        # retry the same build instead of failing the run on the first 429.
+        run: |
+          for attempt in 1 2 3; do
+            if docker build --target ci-smoke -t phantom-ci-smoke .; then
+              exit 0
+            fi
+            echo "ci-smoke build attempt ${attempt} failed; retrying"
+            sleep $((attempt * 10))
+          done
+          exit 1

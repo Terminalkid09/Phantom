@@ -41,20 +41,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # broken COPY, an unresolvable requirement or a base image that moved all
 # fail it. The full image is still built by `docker compose build` (operator)
 # and by .gitlab-ci.yml `docker_build`.
-FROM kalilinux/kali-rolling AS ci-smoke
+FROM python:3.12-slim AS ci-smoke
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip ca-certificates \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# This stage is the requirements gate, not the runtime. It used to run on the
+# moving `kalilinux/kali-rolling` tag and install Python/apt first, so a base
+# image refresh or an apt mirror hiccup failed CI without a code change
+# (measured 2026-11-10, run #61). A pinned Python base resolves the SAME
+# requirements deterministically; the Kali runtime is covered by the full
+# image build / docker compose build.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 COPY requirements.txt .
 # resolves (and downloads) every requirement, installing nothing: a pin that
-# the base image cannot satisfy fails the CI here instead of at run time.
-RUN pip install --no-cache-dir --break-system-packages --dry-run \
+# the interpreter cannot satisfy fails the CI here instead of at run time.
+RUN pip install --no-cache-dir --dry-run \
         -r requirements.txt > /dev/null
 
 # ── Stage 2: Final runtime image ────────────────────────────────────────────
