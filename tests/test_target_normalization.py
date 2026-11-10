@@ -75,7 +75,59 @@ class TestServiceTargetPorts(unittest.TestCase):
         from phantom.automation.guidance.kit import _web_rce_adapter
         cmd = _web_rce_adapter(_wm("127.0.0.1:8443", "ip"), {})
         self.assertIn("https://127.0.0.1:8443/upload", cmd)
+        self.assertIn("curl -s -k -m 8", cmd)   # self-signed TLS must work
+        self.assertIn("|| true", cmd)           # a failed decoy path is not fatal
         self.assertNotIn("127.0.0.1:80", cmd)
+
+
+class TestHiddenWebPaths(unittest.TestCase):
+    """The RCE handler may exist only as a quoted path inside a script."""
+
+    @classmethod
+    def setUpClass(cls):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/":
+                    body = b'<script src="/static/app.js"></script>'
+                    ctype = "text/html"
+                elif self.path == "/static/app.js":
+                    body = (b"const api='/internal/v2/report/run';"
+                            b"fetch(api,{method:'POST'});")
+                    ctype = "application/javascript"
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def test_quoted_js_endpoint_is_discovered(self):
+        from phantom.automation.guidance.kit import (
+            _candidate_quoted_paths, _discover_web_paths, _probeable_paths)
+        self.assertIn("/internal/v2/report/run",
+                      _candidate_quoted_paths(
+                          "const api='/internal/v2/report/run';"))
+        found = _discover_web_paths(self.base)
+        self.assertIn("/internal/v2/report/run", found)
+        probe = _probeable_paths(found)
+        self.assertIn("/internal/v2/report/run", probe)
+        self.assertNotIn("/static/app.js", probe)   # assets are not handlers
 
 
 class TestEffectiveUrl(unittest.TestCase):

