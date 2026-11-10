@@ -36,6 +36,20 @@ class TestOSInference(unittest.TestCase):
         ReasoningEngine().run(wm)
         self.assertEqual(wm.find("os_inferred")[0].value["os"], "linux")
 
+    def test_bare_5555_does_not_make_a_linux_web_host_android(self):
+        # A Linux web host can expose a service on 5555 without being an
+        # Android device; port-only inference sent auto-mode to the NDK.
+        wm = _wm(services=[(8081, "Unknown", ""),
+                           (22, "OpenSSH", "OpenSSH 9.6"),
+                           (5555, "Unknown", "")])
+        ReasoningEngine().run(wm)
+        self.assertEqual(wm.find("os_inferred")[0].value["os"], "linux")
+
+    def test_adb_banner_still_infers_android(self):
+        wm = _wm(services=[(5555, "adb", "Android Debug Bridge")])
+        ReasoningEngine().run(wm)
+        self.assertEqual(wm.find("os_inferred")[0].value["os"], "android")
+
     def test_no_os_inference_when_confirmed(self):
         wm = _wm(services=[(445, "Microsoft", "Windows 10")])
         wm.add_finding("os", "detected", {"name": "Windows 11"}, confidence=0.9)

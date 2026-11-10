@@ -368,12 +368,21 @@ class ReasoningEngine:
 
         os_name = ""
         evidence: List[str] = []
+        # Port 5555 alone is not an Android fingerprint: any service can
+        # listen there, and a Linux web host that also exposes it was
+        # classified as Android (auto-mode then tried to build an APK/NDK
+        # beacon for a Linux target). Require an ADB/Android banner before
+        # letting 5555 override the Unix evidence.
+        android_banner = any(
+            token in " ".join(str(s.get(k, "")) for k in
+                              ("version", "product", "service")).lower()
+            for s in services for token in ("adb", "android", "magisk"))
         if ports & _WINDOWS_PORTS:
             os_name = "windows"
             evidence.append("windows ports: " + ",".join(sorted(ports & _WINDOWS_PORTS)))
-        elif ports & _ANDROID_PORTS:
+        elif ports & _ANDROID_PORTS and android_banner:
             os_name = "android"
-            evidence.append("adb port 5555 open")
+            evidence.append("adb port 5555 open with an ADB/Android banner")
         elif ports & _LINUX_PORTS:
             os_name = "linux"
             evidence.append("unix ports: " + ",".join(sorted(ports & _LINUX_PORTS)))
