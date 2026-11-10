@@ -56,11 +56,12 @@ def add_service(port: str, service: str, product: str = "", version: str = "",
 
 
 def add_creds(username: str, password: str, service: str, valid: bool = True,
-              confidence: float = 0.8, source: str = "brute") -> Any:
+              confidence: float = 0.8, source: str = "brute",
+              port: str = "") -> Any:
     return session_wm().add_finding(
         "creds", f"{service}:{username}",
         {"username": username, "password": password, "service": service,
-         "valid": valid},
+         "valid": valid, "port": str(port or "")},
         confidence=confidence, source=source)
 
 

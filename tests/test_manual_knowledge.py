@@ -29,10 +29,11 @@ class TestKnowledgeLayer(unittest.TestCase):
         self.assertEqual(session_wm().target, "10.0.0.5")
 
     def test_creds_written_with_service_key(self):
-        add_creds("admin", "secret", "ssh")
+        add_creds("admin", "secret", "ssh", port="2222")
         f = session_wm().get("creds", "ssh:admin")
         self.assertIsNotNone(f)
         self.assertTrue(f.value["valid"])
+        self.assertEqual(f.value["port"], "2222")
 
     def test_reset_wm_clears_findings(self):
         add_service("22", "ssh")

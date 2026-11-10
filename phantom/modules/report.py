@@ -624,7 +624,23 @@ def _build_operator_markdown() -> str:
 
     # Summary counts
     ranked = _ranked()
-    creds = kb.get("creds_found") or []
+    creds = list(kb.get("creds_found") or [])
+    # The manual modules write credentials to the shared WorldModel, not to
+    # session.knowledge_base. Without this merge `use web` -> `creds` found
+    # real pairs that the operator report then reported as zero.
+    try:
+        from phantom.core.knowledge import session_wm
+        seen = {(c.get("service"), c.get("username"), c.get("password"))
+                for c in creds if isinstance(c, dict)}
+        for finding in session_wm().find("creds"):
+            value = finding.value if isinstance(finding.value, dict) else {}
+            cred_key = (value.get("service"), value.get("username"),
+                        value.get("password"))
+            if cred_key not in seen:
+                creds.append(value)
+                seen.add(cred_key)
+    except Exception:
+        pass
     w("## Summary")
     w()
     w(f"- Services found: **{len(_services())}**")
