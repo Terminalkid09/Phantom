@@ -18,6 +18,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PANEL = os.path.join(ROOT, "electron", "src", "components", "AutoModePanel.tsx")
 STORE = os.path.join(ROOT, "electron", "src", "store", "index.ts")
 API = os.path.join(ROOT, "electron", "src", "lib", "api.ts")
+MODULE_PANEL = os.path.join(ROOT, "electron", "src", "components", "ModulePanel.tsx")
+C2 = os.path.join(ROOT, "electron", "src", "components", "C2Dashboard.tsx")
+TUNNEL = os.path.join(ROOT, "electron", "src", "components", "TunnelHidCard.tsx")
 
 
 def _src(path: str) -> str:
@@ -99,3 +102,22 @@ def test_both_api_payload_types_carry_the_optional_field():
     assert "platform?: string" in src
     # one for the run, one for the dry run
     assert src.count("platform?: string") >= 2
+
+
+def test_module_panel_reloads_commands_when_session_target_changes():
+    src = _src(MODULE_PANEL)
+    assert "}, [moduleId, session.target])" in src
+    # The reset must happen with the reload, not only on a tab switch.
+    effect = src[src.index("useEffect(() => {"):]
+    effect = effect[:effect.index("}, [moduleId, session.target])")]
+    assert "setModule(null)" in effect
+    assert "setSelected('')" in effect
+    assert "load()" in effect
+
+
+def test_tunnel_card_refreshes_when_the_listener_starts_or_stops():
+    tunnel = _src(TUNNEL)
+    c2 = _src(C2)
+    assert "listenerActive: boolean" in tunnel
+    assert "}, [listenerActive]) // eslint-disable-line" in tunnel
+    assert "<TunnelHidCard api={api} listenerActive={listener.active} />" in c2
