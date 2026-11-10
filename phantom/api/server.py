@@ -7,10 +7,12 @@ Talks JSON to Electron, delegates to the existing Phantom modules.
 """
 
 import argparse
+import asyncio
 import contextlib
 import html
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -57,6 +59,86 @@ def _json(data: Any, status: int = 200) -> web.Response:
 
 def _error(msg: str, status: int = 400) -> web.Response:
     return _json({"error": msg}, status=status)
+
+
+# ── Input / output limits ───────────────────────────────────────────────────
+# The API is local and bearer-protected, but "local" is not "trusted": the
+# renderer forwards operator text and the CLI can be scripted. Without a bound,
+# one oversized body (or a tool that prints a 200 MB log) is copied into the
+# event loop, into JSON, and into the Electron renderer three times. These are
+# deliberately generous for real commands and still finite.
+MAX_BODY_BYTES = 2 * 1024 * 1024          # request body, enforced by aiohttp
+MAX_COMMAND_CHARS = 8192                  # one shell line handed to a module
+MAX_TARGET_CHARS = 2048                   # one host / URL / username
+MAX_GROUP_COMMANDS = 200                  # one run-group batch
+MAX_OUTPUT_CHARS = 2_000_000              # stdout+stderr returned per result
+
+
+def _bounded_text(body: dict, key: str, *, default: str = "",
+                  limit: int) -> str:
+    """A stripped text field with a hard ceiling (400, never a 500)."""
+    raw = body.get(key, default)
+    if raw is None:
+        raw = default
+    if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
+        raise web.HTTPBadRequest(text=f"'{key}' must be a string")
+    text = str(raw).strip()
+    if len(text) > limit:
+        raise web.HTTPBadRequest(
+            text=f"'{key}' is too long ({len(text)} > {limit} characters)")
+    return text
+
+
+def _bounded_timeout(raw: Any, default: float, maximum: float) -> float:
+    """A finite timeout in [1, maximum]; bad input falls back to default."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = float(default)
+    if not math.isfinite(value):
+        value = float(default)
+    return max(1.0, min(value, float(maximum)))
+
+
+def _limited_output(text: Any) -> tuple[str, bool]:
+    """Bound one output field; True when characters were omitted."""
+    if not isinstance(text, str):
+        return str(text or ""), False
+    if len(text) <= MAX_OUTPUT_CHARS:
+        return text, False
+    omitted = len(text) - MAX_OUTPUT_CHARS
+    return (text[:MAX_OUTPUT_CHARS]
+            + f"\n[output truncated: {omitted} characters omitted]"), True
+
+
+def _result_payload(result: Any) -> dict:
+    """One backend result as JSON, with every output field bounded."""
+    combined, c_trunc = _limited_output(result.combined)
+    stdout, s_trunc = _limited_output(result.stdout)
+    stderr, e_trunc = _limited_output(result.stderr)
+    return {
+        "command": result.cmd,
+        "stdout": stdout,
+        "stderr": stderr,
+        "combined": combined,
+        "returncode": result.returncode,
+        "timed_out": result.timed_out,
+        "error": result.error,
+        "duration": result.duration,
+        "truncated": c_trunc or s_trunc or e_trunc,
+    }
+
+
+async def _run_blocking(func: Any, /, *args: Any, **kwargs: Any) -> Any:
+    """Run a synchronous backend call OFF the aiohttp event loop.
+
+    `module_run`, `run-group`, `backend_run` and the toolchain installer all
+    shell out for minutes. Calling them inline froze every other route: a real
+    22 s command made `/api/c2/state` exceed the renderer's 15 s IPC timeout,
+    so the UI reported "C2 unavailable" while the backend was healthy. The
+    thread keeps the loop answering polls during a scan.
+    """
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 
 # ── Session auto-persistence ────────────────────────────────────────────────
@@ -200,7 +282,9 @@ routes = web.RouteTableDef()
 async def capabilities_get(_request: web.Request) -> web.Response:
     """Announce which components are available (core / c2 / automode)."""
     from phantom.core.capabilities import available, COMPONENTS
-    return _json({"capabilities": available(),
+    from phantom.version import __version__
+    return _json({"version": __version__,
+                  "capabilities": available(),
                   "components": list(COMPONENTS)})
 
 
@@ -1368,20 +1452,20 @@ async def module_run(request: web.Request) -> web.Response:
     if name not in _MODULES:
         return _error(f"Unknown module: {name}", 404)
     body = await request.json() or {}
-    command = str(body.get("command", "")).strip()
+    command = _bounded_text(body, "command", limit=MAX_COMMAND_CHARS)
     if not command:
         return _error("Missing command")
+    target = _bounded_text(body, "target", default=session.target or "",
+                           limit=MAX_TARGET_CHARS)
+    timeout = _bounded_timeout(body.get("timeout", 120), 120, 3600.0)
     gate = _validate_backend_command(name, command)
     if gate:
         return _error(gate, 403)
-    # argv-only execution: the raw string never reaches a shell
-    result = backend_dispatcher.run_pipeline(
-        command, str(body.get("target", session.target or "")),
-        max(1.0, min(float(body.get("timeout", 120)), 3600.0)))
-    return _json({"module": name, "command": result.cmd, "stdout": result.stdout,
-                  "stderr": result.stderr, "combined": result.combined,
-                  "returncode": result.returncode, "timed_out": result.timed_out,
-                  "error": result.error, "duration": result.duration})
+    # argv-only execution: the raw string never reaches a shell. The call runs
+    # in a worker thread so a five-minute scan cannot freeze the other routes.
+    result = await _run_blocking(
+        backend_dispatcher.run_pipeline, command, target, timeout)
+    return _json({"module": name, **_result_payload(result)})
 
 
 @routes.post("/api/modules/{module_name}/run-group")
@@ -1396,62 +1480,66 @@ async def module_run_group(request: web.Request) -> web.Response:
     if name not in _MODULES:
         return _error(f"Unknown module: {name}", 404)
     body = await request.json() or {}
+    raw_commands = body.get("commands") or []
+    if not isinstance(raw_commands, list):
+        raise web.HTTPBadRequest(text="'commands' must be a list")
+    if len(raw_commands) > MAX_GROUP_COMMANDS:
+        raise web.HTTPBadRequest(
+            text=f"too many commands ({len(raw_commands)} > "
+                 f"{MAX_GROUP_COMMANDS})")
     commands: list[str] = [
-        str(c).strip() for c in (body.get("commands") or [])
+        _bounded_text({"command": item}, "command", limit=MAX_COMMAND_CHARS)
+        for item in raw_commands
     ]
     commands = [c for c in commands if c]
     if not commands:
         return _error("Missing 'commands' list")
-    target = str(body.get("target", session.target or ""))
-    timeout = max(1.0, min(float(body.get("timeout", 300)), 7200.0))
+    target = _bounded_text(body, "target", default=session.target or "",
+                           limit=MAX_TARGET_CHARS)
+    timeout = _bounded_timeout(body.get("timeout", 300), 300, 7200.0)
 
-    results: list[dict] = []
-    total_started = time.time()
-    skipped = 0
-    for i, cmd in enumerate(commands):
-        gate = _validate_backend_command(name, cmd)
-        if gate:
-            # per-command skip (reported, counted) instead of aborting
-            # the whole batch: groups mix backend commands with
-            # CLI-only pseudo-commands the UI now flags upfront.
-            skipped += 1
-            results.append({
-                "index": i,
-                "command": cmd,
-                "stdout": "",
-                "stderr": "",
-                "combined": "",
-                "returncode": None,
-                "timed_out": False,
-                "error": f"skipped: {gate}",
-                "duration": 0.0,
-            })
-            continue
-        step_start = time.time()
-        result = backend_dispatcher.run_pipeline(cmd, target, timeout)
-        results.append({
-            "index": i,
-            "command": result.cmd,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "combined": result.combined,
-            "returncode": result.returncode,
-            "timed_out": result.timed_out,
-            "error": result.error,
-            "duration": result.duration,
-        })
-        # Stop early on fatal errors (scope block / unsafe target)
-        if result.error and result.returncode == -1:
-            break
+    def _run_group() -> dict:
+        results: list[dict] = []
+        total_started = time.time()
+        skipped = 0
+        for i, cmd in enumerate(commands):
+            gate = _validate_backend_command(name, cmd)
+            if gate:
+                # per-command skip (reported, counted) instead of aborting
+                # the whole batch: groups mix backend commands with
+                # CLI-only pseudo-commands the UI now flags upfront.
+                skipped += 1
+                results.append({
+                    "index": i,
+                    "command": cmd,
+                    "stdout": "",
+                    "stderr": "",
+                    "combined": "",
+                    "returncode": None,
+                    "timed_out": False,
+                    "error": f"skipped: {gate}",
+                    "duration": 0.0,
+                    "truncated": False,
+                })
+                continue
+            result = backend_dispatcher.run_pipeline(cmd, target, timeout)
+            payload = {"index": i, **_result_payload(result)}
+            results.append(payload)
+            # Stop early on fatal errors (scope block / unsafe target)
+            if result.error and result.returncode == -1:
+                break
+        return {
+            "module": name,
+            "results": results,
+            "total": len(commands),
+            "completed": len(results),
+            "skipped": skipped,
+            "total_duration": time.time() - total_started,
+        }
 
-    return _json({
-        "module": name,
-        "results": results,
-        "total": len(commands),
-        "completed": len(results),
-        "skipped": skipped,
-        "total_duration": time.time() - total_started,
-    })
+    # The WHOLE sequential batch runs in one worker thread: the loop stays
+    # free to answer status/stream polls for its entire duration.
+    return _json(await _run_blocking(_run_group))
 
 
 # ── Reports ────────────────────────────────────────────────────────────────
@@ -1516,19 +1604,18 @@ async def backend_config_set(request: web.Request) -> web.Response:
 async def backend_run(request: web.Request) -> web.Response:
     """Run one reviewed module command in the selected operator backend."""
     body = await request.json() or {}
-    command = str(body.get("command", "")).strip()
-    target = str(body.get("target", session.target or ""))
-    timeout = max(1.0, min(float(body.get("timeout", 120)), 3600.0))
+    command = _bounded_text(body, "command", limit=MAX_COMMAND_CHARS)
+    target = _bounded_text(body, "target", default=session.target or "",
+                           limit=MAX_TARGET_CHARS)
+    timeout = _bounded_timeout(body.get("timeout", 120), 120, 3600.0)
     if not command:
         return _error("Missing command")
     gate = _validate_backend_command(None, command)
     if gate:
         return _error(gate, 403)
-    result = backend_dispatcher.run_pipeline(command, target, timeout)
-    return _json({"command": result.cmd, "stdout": result.stdout,
-                  "stderr": result.stderr, "combined": result.combined,
-                  "returncode": result.returncode, "timed_out": result.timed_out,
-                  "error": result.error, "duration": result.duration})
+    result = await _run_blocking(
+        backend_dispatcher.run_pipeline, command, target, timeout)
+    return _json(_result_payload(result))
 
 
 # ── Craft lures (IP grabbers / pixels / AiTM relay / beacon delivery) ───────
@@ -3005,10 +3092,47 @@ async def auth_middleware(request: web.Request, handler) -> web.Response:
     return await handler(request)
 
 
+# ── Error envelope ─────────────────────────────────────────────────────────
+
+@web.middleware
+async def error_middleware(request: web.Request, handler) -> web.Response:
+    """Every /api failure is JSON, never an HTML traceback.
+
+    Before this, a malformed body raised aiohttp's own 400 page, a body over
+    the size limit raised a plain-text 413, and an unexpected exception
+    returned an HTML 500 with a stack trace. The renderer parsed all three as
+    "not JSON" and blamed the desktop bridge. The catch-all logs the stack
+    server-side and returns a fact, not the traceback.
+    """
+    try:
+        return await handler(request)
+    except web.HTTPException as exc:
+        if not request.path.startswith("/api/"):
+            raise
+        headers = dict(exc.headers or {})
+        # Keep content-type JSON even when aiohttp built a text response, and
+        # drop the length that belonged to that old body.
+        headers.pop("Content-Type", None)
+        headers.pop("Content-Length", None)
+        message = (getattr(exc, "text", "") or "").strip() or exc.reason
+        return web.json_response(
+            {"error": message or "request rejected"},
+            status=exc.status, headers=headers)
+    except json.JSONDecodeError as exc:
+        return web.json_response(
+            {"error": f"invalid request body: {exc}"}, status=400)
+    except Exception:
+        logging.getLogger("phantom.api").exception(
+            "unhandled error on %s %s", request.method, request.path)
+        return web.json_response({"error": "internal server error"}, status=500)
+
+
 # ── Server lifecycle ───────────────────────────────────────────────────────
 
 def create_app() -> web.Application:
-    app = web.Application(middlewares=[auth_middleware, cors_middleware])
+    app = web.Application(
+        client_max_size=MAX_BODY_BYTES,
+        middlewares=[auth_middleware, cors_middleware, error_middleware])
     app.add_routes(routes)
     app.on_startup.append(_restore_session_on_start)
     app.on_cleanup.append(_persist_session_on_stop)
@@ -3080,7 +3204,10 @@ async def toolchain_post(request: web.Request) -> web.Response:
             "message": "refused: installing " + tool + " needs confirm=true",
             "command": tc.install_command(tool, env) or [],
         })
-    ok, message = tc.install(tool, env, confirm=lambda t, c: True)
+    # A package manager install can legitimately run for many minutes: it
+    # must not hold the event loop while it does.
+    ok, message = await _run_blocking(
+        tc.install, tool, env, confirm=lambda t, c: True)
     return _json({"ok": ok, "message": message, "tool": tool})
 
 def _int_param(raw: Any, default: int) -> int:

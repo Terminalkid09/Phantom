@@ -34,11 +34,10 @@ from typing import Optional
 from phantom.modules.base_module import BaseModule
 from phantom.core.session import session
 from phantom.utils.notifier import notifier
+from phantom.version import __version__ as VERSION
 from rich.console import Console
 
 console = Console()
-
-VERSION = "3.0.0"
 
 # Module -> (kill-chain phase, description) for the methodology section.
 _PHASE_LABELS = {

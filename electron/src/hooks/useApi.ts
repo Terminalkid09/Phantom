@@ -16,6 +16,7 @@ export async function requestApi<T = unknown>(
   method: string,
   endpoint: string,
   body?: unknown,
+  timeoutMs: number = API_TIMEOUT_MS,
 ): Promise<ApiResponse<T>> {
   if (!window.phantom?.request) {
     return { status: 0, data: { error: 'IPC not available' } } as ApiResponse<T>
@@ -26,8 +27,8 @@ export async function requestApi<T = unknown>(
       window.phantom.request(method, endpoint, body),
       new Promise<never>((_, reject) => {
         timer = setTimeout(
-          () => reject(new Error(`IPC timeout after ${API_TIMEOUT_MS}ms`)),
-          API_TIMEOUT_MS,
+          () => reject(new Error(`IPC timeout after ${timeoutMs}ms`)),
+          timeoutMs,
         )
       }),
     ]) as ApiResponse<T>
@@ -80,8 +81,13 @@ export function useApi(enablePolling = false) {
     setC2Connected, setC2Error, setSession
   } = useStore()
 
-  const api = useCallback((method: string, endpoint: string, body?: unknown) =>
-    requestApi(method, endpoint, body), [])
+  // A module run legitimately takes minutes: the generic read timeout (15 s)
+  // is the WRONG bound for it, and it used to make every scan longer than
+  // 15 s surface as "desktop bridge unavailable" while the backend kept
+  // working. Callers that start work pass the bound their request declares.
+  const api = useCallback(
+    (method: string, endpoint: string, body?: unknown, timeoutMs?: number) =>
+      requestApi(method, endpoint, body, timeoutMs), [])
 
   const pollC2 = useCallback(async () => {
     const res = await requestApi<{

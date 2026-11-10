@@ -2025,9 +2025,12 @@ class AutonomousAgent:
             binary = f"/mnt/{drive}{rest}"
         # unique staging path per run: a leftover file owned by another
         # user (or a previous run) would make scp fail with EACCES
-        import random
+        import secrets
         from shlex import quote as _shq
-        stage = f"/tmp/.systemd-proc-{random.randint(10000, 99999)}"
+        # 64 bits of entropy, not a 5-digit guess: the remote path must not be
+        # predictable enough for another local user to pre-create a symlink
+        # at it before scp writes the beacon.
+        stage = f"/tmp/.systemd-proc-{secrets.token_hex(8)}"
         # SECURITY (A-1): credentials harvested ON the target are
         # interpolated into a shell line. Quote every value, and hand the
         # password to sshpass through SSHPASS (`sshpass -e`) so it never

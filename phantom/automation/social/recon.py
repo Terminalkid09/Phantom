@@ -1129,7 +1129,7 @@ def _mine_graph(username: str, platform: str, html: str,
             # readable (measured live 2026-11-08 on github.com/torvalds).
             blob = raw[:100000].encode("utf-8", "ignore") \
                 if isinstance(raw, str) else bytes(raw[:100000])
-            result.avatar_hash = hashlib.md5(blob).hexdigest()[:16]
+            result.avatar_hash = hashlib.md5(blob, usedforsecurity=False).hexdigest()[:16]
             try:
                 from phantom.automation.social.identity_confidence import (
                     compute_dhash)

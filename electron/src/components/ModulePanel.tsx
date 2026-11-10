@@ -117,7 +117,7 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
     setOutput(`$ ${selected}\n\n`)
     const response = await api('POST', `/api/modules/${moduleId}/run`, {
       command: selected, target: effTarget, timeout: 120
-    })
+    }, 150_000)
     setRunning(false)
     const data = response.data as { combined?: string; error?: string; returncode?: number }
     if (response.status !== 200 || data.error) {
@@ -146,7 +146,7 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
     setBatchCompleted(0); setBatchResults([]); setError('')
     const response = await api('POST', `/api/modules/${moduleId}/run-group`, {
       commands: ok, target: effTarget, timeout: 300,
-    })
+    }, 7_200_000)
     setBatchRunning(false)
     const data = response.data as {
       results?: GroupResult[]; total?: number; completed?: number
@@ -185,7 +185,7 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
     }
     const response = await api('POST', `/api/modules/${moduleId}/run-group`, {
       commands: allCommands, target: effTarget, timeout: 600,
-    })
+    }, 7_200_000)
     setBatchRunning(false)
     const data = response.data as {
       results?: GroupResult[]; total?: number; completed?: number

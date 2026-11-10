@@ -44,8 +44,14 @@ _ENGINES = auto_help.ENGINES
 
 def build_auto_banner() -> str:
     """Same PHANTOM wordmark family as core (red) and C2 (magenta),
-    in cyan — AUTO-MODE is the intelligence layer."""
-    return r"""
+    in cyan — AUTO-MODE is the intelligence layer.
+
+    The version is READ, never printed as a literal: the banner used to say
+    v3.5.0 while the package metadata said 3.0.0, so the first screen an
+    operator saw already disagreed with the build they were running.
+    """
+    from phantom.version import __version__ as version
+    return rf"""
 [bold cyan]
   ██████╗ ██╗  ██╗ █████╗ ███╗  ██╗████████╗ ██████╗ ███╗  ███╗
   ██╔══██╗██║  ██║██╔══██╗████╗ ██║╚══██╔══╝██╔═══██╗████╗████║
@@ -55,7 +61,7 @@ def build_auto_banner() -> str:
   ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝
 [/bold cyan]
   [dim]──────────────────────────────────────────────────────────[/dim]
-  [bold cyan]PHANTOM.AUTO — Autonomous Kill Chain Engine[/bold cyan]  [dim]v3.5.0[/dim]
+  [bold cyan]PHANTOM.AUTO — Autonomous Kill Chain Engine[/bold cyan]  [dim]v{version}[/dim]
   [dim]Planner-driven agent · multi-target · sub-agents · checkpoint resume[/dim]
 """
 

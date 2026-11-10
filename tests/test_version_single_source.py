@@ -18,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-_SETUP_RE = re.compile(r'version="([^"]+)"')
+_SETUP_RE = re.compile(r'__version__\s*=\s*"([^"]+)"')
 _BADGE_RE = re.compile(r"badge/version-([0-9][^-)]*)-")
 #: A semver-looking literal printed as text by a component: the shape the About
 #: card used (``<span ...>3.7.3</span>``). The version must come from the hook.
@@ -26,7 +26,9 @@ _LITERAL_IN_UI_RE = re.compile(r">\s*\d+\.\d+\.\d+\s*<")
 
 
 def _setup_version() -> str:
-    match = _SETUP_RE.search((ROOT / "setup.py").read_text(encoding="utf-8"))
+    """The ONE declaration (``phantom/version.py``), not setup.py's copy."""
+    match = _SETUP_RE.search(
+        (ROOT / "phantom" / "version.py").read_text(encoding="utf-8"))
     return match.group(1) if match else ""
 
 
@@ -38,7 +40,10 @@ def _package_version() -> str:
 def test_the_declared_version_is_the_same_everywhere():
     setup_version = _setup_version()
     package_version = _package_version()
-    assert setup_version, "setup.py declares no version"
+    assert setup_version, "phantom/version.py declares no version"
+    setup_py = (ROOT / "setup.py").read_text(encoding="utf-8")
+    assert "version=_version()" in setup_py, (
+        "setup.py must READ the version, not hardcode a second number")
     assert package_version, "electron/package.json declares no version"
     assert setup_version == package_version, (
         f"setup.py says {setup_version!r} and package.json says "
@@ -88,3 +93,20 @@ def test_the_about_card_reads_the_version_instead_of_printing_one():
         .read_text(encoding="utf-8")
     assert "useAppVersion" in source, (
         "SettingsPanel must read the version from the hook, not from a literal")
+
+def test_python_surfaces_read_the_same_version():
+    """The AUTO banner and the report footer are version surfaces too.
+
+    The banner said v3.5.0 while package metadata said 3.0.0; the Electron
+    About card is covered above, but the first screen an operator sees and
+    the report they hand a client must not disagree with the build.
+    """
+    from phantom.version import __version__
+    from phantom.core.auto_shell import build_auto_banner
+    from phantom.modules.report import VERSION
+
+    assert __version__ == _setup_version() == _package_version()
+    assert VERSION == __version__
+    banner = build_auto_banner()
+    assert f"v{__version__}" in banner
+    assert "v3.5.0" not in banner

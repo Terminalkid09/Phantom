@@ -1188,7 +1188,8 @@ def _stager_cert_thumbprints() -> List[str]:
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 pem = fh.read()
-            thumb = hashlib.sha1(ssl.PEM_cert_to_DER_cert(pem)).hexdigest().upper()
+            thumb = hashlib.sha1(ssl.PEM_cert_to_DER_cert(pem),
+                                usedforsecurity=False).hexdigest().upper()
         except Exception:
             continue
         if thumb not in pins:

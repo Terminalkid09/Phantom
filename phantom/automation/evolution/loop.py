@@ -294,7 +294,7 @@ def _sig_hash(pat: Dict) -> str:
     raw = f"{pat.get('signature_summary', '')}|{pat.get('technique', '')}" \
           f"|{pat.get('cause', '')}"
     import hashlib
-    return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:10]
+    return hashlib.sha1(raw.encode("utf-8", "replace"), usedforsecurity=False).hexdigest()[:10]
 
 
 def maybe_spawn(patterns: List[Dict], advisor, wm,

@@ -36,10 +36,19 @@ def runtime_requirements():
     return specs
 
 
+def _version() -> str:
+    """Read the ONE version declaration without importing the package."""
+    namespace: dict = {}
+    with open(os.path.join(os.path.dirname(__file__), "phantom", "version.py"),
+              encoding="utf-8") as handle:
+        exec(handle.read(), namespace)
+    return str(namespace["__version__"])
+
+
 if __name__ == "__main__":
     setup(
         name="phantom",
-        version="3.0.0",
+        version=_version(),
         description="Offensive Security Framework — CLI shell per penetration testing",
         author="Terminalkid09",
         packages=find_packages(),

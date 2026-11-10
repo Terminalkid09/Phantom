@@ -366,8 +366,13 @@ def install_command(tool: str, env: Env) -> Optional[List[str]]:
         cmd = ["zypper", "--non-interactive", "install", package]
     elif env.manager == "brew":
         cmd = ["brew", "install", package]
-    elif env.manager in ("winget", "choco"):
-        cmd = [env.manager, "install", package]
+    elif env.manager == "winget":
+        # Without these flags winget opens an interactive agreement/source
+        # prompt, and the subprocess (no TTY) waits until the timeout.
+        cmd = ["winget", "install", "--silent", "--accept-package-agreements",
+               "--accept-source-agreements", package]
+    elif env.manager == "choco":
+        cmd = ["choco", "install", "-y", package]
     else:
         return None
 
@@ -438,6 +443,21 @@ def install(tool: str, env: Optional[Env] = None, *,
         result = runner(cmd, capture_output=True, text=True, timeout=timeout)
     except Exception as exc:
         return False, f"could not run {' '.join(cmd)}: {exc}"
+    if (result.returncode != 0 and "-m" in cmd and "pip" in cmd):
+        # PEP 668 (Kali/Debian/Ubuntu 23.04+): `pip install --user` is refused
+        # because the interpreter is externally managed. The operator already
+        # confirmed THIS install; retry once with the explicit override instead
+        # of dead-ending every pip-only tool on the distro Phantom targets.
+        detail = (result.stderr or "") + (result.stdout or "")
+        if "externally-managed-environment" in detail:
+            retry = list(cmd) + ["--break-system-packages"]
+            try:
+                result = runner(retry, capture_output=True, text=True,
+                                timeout=timeout)
+            except Exception as exc:
+                return False, f"could not run {' '.join(retry)}: {exc}"
+            if result.returncode == 0:
+                cmd = retry
     if result.returncode != 0:
         tail = (result.stderr or result.stdout or "").strip().splitlines()
         return False, (f"{' '.join(cmd)} failed (exit {result.returncode})"

@@ -132,7 +132,7 @@ class Signature:
         for d in defenses:
             feats.add(f"def:{d}")
         key_raw = f"{cls_}|{product}|{','.join(services)}|{','.join(defenses)}"
-        digest = hashlib.sha1(key_raw.encode("utf-8")).hexdigest()[:16]
+        digest = hashlib.sha1(key_raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
         return cls(cls=cls_, product=product, services=services,
                    defenses=defenses, key=digest,
                    features=frozenset(feats))

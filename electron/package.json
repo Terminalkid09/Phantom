@@ -37,8 +37,8 @@
     "@vitejs/plugin-react": "^4.3.1",
     "autoprefixer": "^10.4.20",
     "concurrently": "^8.2.2",
-    "electron": "^31.3.1",
-    "electron-builder": "^24.13.3",
+    "electron": "^45.2.3",
+    "electron-builder": "^26.18.0",
     "eslint": "^8.57.1",
     "eslint-plugin-react-hooks": "^4.6.2",
     "postcss": "^8.4.41",
@@ -47,5 +47,9 @@
     "vite": "^5.4.2",
     "vite-plugin-electron": "^0.28.7",
     "wait-on": "^7.2.0"
+  },
+  "allowScripts": {
+    "esbuild@0.21.5": true,
+    "electron-winstaller@5.4.0": true
   }
 }

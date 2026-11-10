@@ -614,7 +614,7 @@ def _imported_checkpoint_name(bundle_path: str, data: Dict[str, Any]) -> str:
     tag = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in stem)
     digest = hashlib.sha1(
         f"{stem}|{data.get('engagement_id') or data.get('exported_at') or ''}"
-        .encode("utf-8")).hexdigest()[:8]
+        .encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
     return f"imported_{tag[:40]}_{digest}_checkpoint.json"
 
 

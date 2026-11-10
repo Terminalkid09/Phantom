@@ -388,3 +388,6 @@ freebuff-chat-*.md
 
 # HMAC audit-log heads are runtime state (the log/key are ignored above).
 data/*.log.head
+
+# Local virtualenvs (python -m venv .venv)
+.venv/

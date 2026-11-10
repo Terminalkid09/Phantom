@@ -47,7 +47,7 @@ def _ensure_cache_dir() -> None:
 
 
 def _cache_path(key: str) -> str:
-    safe_key = hashlib.md5(key.encode()).hexdigest()
+    safe_key = hashlib.md5(key.encode(), usedforsecurity=False).hexdigest()
     return os.path.join(CACHE_DIR, f"{safe_key}.json")
 
 

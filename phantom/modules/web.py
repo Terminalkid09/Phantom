@@ -1,14 +1,38 @@
 from phantom.modules.base_module import BaseModule
 from phantom.core.preview import PreviewSession
-from phantom.core.executor import run_commands, run_command
+from phantom.core.executor import quote_arg, run_commands, run_command
 from phantom.core.session import session
 from rich.console import Console
 from rich.table import Table
 from phantom.utils.aggressive import filter_aggressive_commands
 from phantom.utils.notifier import notifier
 import re
+from urllib.parse import urlsplit
 
 console = Console()
+
+
+def _web_url(value: str, fallback: str = "") -> tuple[str, str]:
+    """A URL plus the host the scope check must see.
+
+    `run_command`'s target guard accepts host characters only, so a full URL
+    with a query string (`?id=1&x=2`) is refused before the scan and never
+    reaches the shell. Split it: the URL is quoted as ONE argv for the tool,
+    and the host is what scope/safe-target validation looks at.
+    """
+    raw = (value or fallback).strip()
+    if not raw:
+        raise ValueError("no target")
+    if "://" not in raw:
+        raw = "http://" + raw
+    parts = urlsplit(raw)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError(f"not an http(s) URL: {raw}")
+    host = parts.hostname
+    from phantom.core.executor import _is_safe_target
+    if not _is_safe_target(host):
+        raise ValueError(f"unsafe host: {host}")
+    return raw, host
 
 
 class WebModule(BaseModule):
@@ -16,11 +40,18 @@ class WebModule(BaseModule):
 
     def do_sqlmap(self, args):
         """sqlmap <target_url> — Smarter SQLmap wrapper with --batch."""
-        target = args.strip() or f"http://{session.target}"
+        try:
+            target, host = _web_url(args.strip(), f"http://{session.target}")
+        except ValueError as exc:
+            notifier.error(str(exc))
+            return
         notifier.status(f"Launching SQLmap on {target}...")
-        cmd = f"sqlmap -u {target} --batch --random-agent --threads 1 --delay 2 --level 1 --risk 1"
+        cmd = (f"sqlmap -u {quote_arg(target)} --batch --random-agent "
+               f"--threads 1 --delay 2 --level 1 --risk 1")
         if "--forms" in args: cmd += " --forms"
-        output = run_command(cmd)
+        # target_ip enforces scope; the URL is quoted, so `?a=1&b=2` is one
+        # argument and `&` never becomes a shell operator.
+        output = run_command(cmd, target_ip=host)
         if "is vulnerable" in output.lower() or "sql injection" in output.lower():
             notifier.success(f"VULNERABILITY FOUND: SQL Injection detected on {target}")
             session.add_note(f"Web: SQLMap found vulnerability on {target}")
@@ -34,7 +65,9 @@ class WebModule(BaseModule):
             notifier.error("No target set.")
             return
         notifier.status(f"Starting Nikto scan on {t}...")
-        output = run_command(f"nikto -h {t} -Tuning 123b -Delay 2 -nointeractive")
+        output = run_command(
+            f"nikto -h {quote_arg(t)} -Tuning 123b -Delay 2 -nointeractive",
+            target_ip=t)
         findings = self._extract_nikto_findings(output)
         if findings:
             table = Table(title="Nikto Findings", border_style="red")
@@ -53,7 +86,8 @@ class WebModule(BaseModule):
         if not t:
             notifier.error("No target set.")
             return
-        output = run_command(f"whatweb http://{t} --aggression 1")
+        output = run_command(f"whatweb http://{quote_arg(t)} --aggression 1",
+                             target_ip=t)
         notifier.info(f"Web fingerprint:\n{output[:2000]}")
         session.add_note(f"Web: whatweb fingerprint of {t}")
 
@@ -122,7 +156,9 @@ class WebModule(BaseModule):
         t = session.target
         if not t: return notifier.error("No target set.")
         wl = args.strip() or session.active_wordlist or "/usr/share/wordlists/dirb/common.txt"
-        output = run_command(f"dirsearch -u http://{t} -w {wl} --format plain")
+        output = run_command(
+            f"dirsearch -u http://{quote_arg(t)} -w {quote_arg(wl)} "
+            f"--format plain", target_ip=t)
         urls = re.findall(r'(?m)^\d{3}\s+.*?(http\S+)', output)
         if urls:
             for u in urls: console.print(f"  [green]{u}[/]")
@@ -196,27 +232,36 @@ class WebModule(BaseModule):
         return self._with_suggestions({
             "SCANNING & VULN": [
                 f"creds  # extract leaked creds (SSRF + SQLi + hash-crack)",
-                f"nuclei -u http://{t} -severity critical,high",
-                f"nikto -h {t} -Tuning 123b -Delay 2",
-                f"whatweb http://{t}",
-                f"wafw00f http://{t}",
+                f"nuclei -u http://{quote_arg(t)} -severity critical,high",
+                f"nikto -h {quote_arg(t)} -Tuning 123b -Delay 2",
+                f"whatweb http://{quote_arg(t)}",
+                f"wafw00f http://{quote_arg(t)}",
             ],
             "FUZZING (Dir/File)": [
-                f"ffuf -w {wl} -u http://{t}/FUZZ -mc 200,301,302 -t 50",
-                f"gobuster dir -u http://{t} -w {wl} -x php,html,txt,js,bak -k",
-                f"feroxbuster -u http://{t} -w {wl} --silent",
+                f"ffuf -w {quote_arg(wl)} -u http://{quote_arg(t)}/FUZZ "
+                f"-mc 200,301,302 -t 50",
+                f"gobuster dir -u http://{quote_arg(t)} -w {quote_arg(wl)} "
+                f"-x php,html,txt,js,bak -k",
+                f"feroxbuster -u http://{quote_arg(t)} -w {quote_arg(wl)} "
+                f"--silent",
             ],
             "FUZZING (VHost/DNS)": [
-                f"ffuf -w {wl} -u http://{t} -H 'Host: FUZZ.{t}' -fs 0",
-                f"gobuster vhost -u http://{t} -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt",
+                f"ffuf -w {quote_arg(wl)} -u http://{quote_arg(t)} "
+                f"-H 'Host: FUZZ.{t}' -fs 0",
+                f"gobuster vhost -u http://{quote_arg(t)} -w "
+                f"/usr/share/seclists/Discovery/DNS/"
+                f"subdomains-top1million-5000.txt",
             ],
             "API & PARAMETERS": [
-                f"ffuf -w {wl} -u http://{t}/api/FUZZ",
-                f"arjun -u http://{t} -m GET",
+                f"ffuf -w {quote_arg(wl)} -u http://{quote_arg(t)}/api/FUZZ",
+                f"arjun -u http://{quote_arg(t)} -m GET",
             ],
             "SQL INJECTION": [
-                f"sqlmap -u http://{t} --forms --batch --random-agent --threads 1 --delay 2 --level 2 --risk 2  AGGRESSIVE",
-                f"sqlmap -u http://{t} --dbs --batch --random-agent --threads 1 --delay 2  AGGRESSIVE",
+                f"sqlmap -u http://{quote_arg(t)} --forms --batch "
+                f"--random-agent --threads 1 --delay 2 --level 2 --risk 2  "
+                f"AGGRESSIVE",
+                f"sqlmap -u http://{quote_arg(t)} --dbs --batch "
+                f"--random-agent --threads 1 --delay 2  AGGRESSIVE",
             ],
         }, self.suggest_commands())
 

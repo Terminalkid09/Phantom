@@ -140,7 +140,8 @@ def calendar_invite(subject: str, start: str, end: str, *,
     if not (start or "").strip() or not (end or "").strip():
         return {"error": "calendar invite needs start and end"}
     stamp = hashlib.sha1(
-        f"{subject}|{start}|{url}|{attendee}".encode("utf-8")).hexdigest()
+        f"{subject}|{start}|{url}|{attendee}".encode("utf-8"),
+        usedforsecurity=False).hexdigest()
     uid_value = uid or f"{stamp}@phantom.invalid"
     lines = [
         "BEGIN:VCALENDAR",

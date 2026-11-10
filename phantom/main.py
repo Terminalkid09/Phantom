@@ -25,6 +25,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Phantom offensive Security Framework",
         allow_abbrev=False)
+    from phantom.version import __version__
+    parser.add_argument("--version", action="version",
+                        version=f"Phantom {__version__}",
+                        help="print the application version and exit")
     parser.add_argument("--profile",
                         help="Load engagement profile at startup (manual shell)")
     parser.add_argument("--c2", action="store_true", help="Launch Phantom C2 interface instead of the AUTO-MODE shell")

@@ -216,6 +216,7 @@ _No module-specific commands; use `suggest`, `run` or `preview`._
 
 | Flag | What it does |
 |---|---|
+| `--version` | print the application version and exit |
 | `--profile` | Load engagement profile at startup (manual shell) |
 | `--c2` | Launch Phantom C2 interface instead of the AUTO-MODE shell |
 | `--manual` | Launch the MANUAL module shell instead of AUTO-MODE (the module workflow is also a `manual` mode inside the AUTO shell) |
