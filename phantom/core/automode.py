@@ -738,6 +738,10 @@ def _probe_bind(host: str, port: int) -> bool:
     without touching the real C2 server instance (no half-dead state)."""
     import socket
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # A listener closed seconds ago leaves accepted connections in TIME_WAIT;
+    # without SO_REUSEADDR the probe calls the port busy and auto-mode refuses
+    # to start a second engagement against the same box.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind((host, port))
         return True
