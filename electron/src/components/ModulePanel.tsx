@@ -83,9 +83,14 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
   }
 
   useEffect(() => {
+    // Every panel stays mounted (switching tabs must not lose local state),
+    // so this effect also runs when the session target is hydrated or changed
+    // AFTER the first render. Without session.target here, Scan opened with
+    // "No commands available" even though the target had been set, until the
+    // operator found the refresh icon.
     setModule(null); setSelected(''); setOutput(''); setBatchResults([]); setPreflight(null)
     load()
-  }, [moduleId])
+  }, [moduleId, session.target])
 
   const groups = useMemo(() => {
     if (!module) return []

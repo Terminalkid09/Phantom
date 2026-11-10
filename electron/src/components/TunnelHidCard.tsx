@@ -31,7 +31,7 @@ interface HidState {
  * A parity gap in exactly the place where two operators watching the same
  * screen would otherwise get different answers about what was delivered.
  */
-export default function TunnelHidCard({ api }: { api: Api }) {
+export default function TunnelHidCard({ api, listenerActive }: { api: Api; listenerActive: boolean }) {
   const [tunnel, setTunnel] = useState<TunnelState | null>(null)
   const [hid, setHid] = useState<HidState | null>(null)
   const [busy, setBusy] = useState('')
@@ -47,7 +47,11 @@ export default function TunnelHidCard({ api }: { api: Api }) {
     if (h.status === 200) setHid(h.data as HidState)
   }
 
-  useEffect(() => { refresh().catch(() => undefined) }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  // The endpoint warning depends on whether the listener is alive. This card
+  // is mounted before the first listener start, so a one-shot read left the
+  // red "no listener is running" warning on screen after Start succeeded.
+  // Re-read when the listener transitions, not on every render.
+  useEffect(() => { refresh().catch(() => undefined) }, [listenerActive]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const run = async (action: string, body?: unknown) => {
     setBusy(action)

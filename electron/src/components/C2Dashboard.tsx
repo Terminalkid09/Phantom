@@ -169,7 +169,7 @@ export default function C2Dashboard() {
               An operator watching this screen must see the SAME endpoint the
               terminal would embed — a tunnel nobody started here is exactly
               how two surfaces disagree about where the C2 is. */}
-          <TunnelHidCard api={api} />
+          <TunnelHidCard api={api} listenerActive={listener.active} />
 
           {/* Quick actions */}
           <div className="bg-surface-card border border-surface-border rounded-lg p-3">
