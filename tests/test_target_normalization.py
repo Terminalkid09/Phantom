@@ -73,11 +73,14 @@ class TestServiceTargetPorts(unittest.TestCase):
 
     def test_rce_uses_target_port_and_https(self):
         from phantom.automation.guidance.kit import _web_rce_adapter
-        cmd = _web_rce_adapter(_wm("127.0.0.1:8443", "ip"), {})
-        self.assertIn("https://127.0.0.1:8443/upload", cmd)
+        # A REMOTE host: on a local target the operator's own C2 port is
+        # deliberately excluded, so 127.0.0.1:8443 made this test depend on
+        # whatever data/config.json happened to contain on the machine.
+        cmd = _web_rce_adapter(_wm("10.0.0.9:8443", "ip"), {})
+        self.assertIn("https://10.0.0.9:8443/upload", cmd)
         self.assertIn("curl -s -k -m 8", cmd)   # self-signed TLS must work
         self.assertIn("|| true", cmd)           # a failed decoy path is not fatal
-        self.assertNotIn("127.0.0.1:80", cmd)
+        self.assertNotIn("10.0.0.9:80", cmd)
 
 
 class TestHiddenWebPaths(unittest.TestCase):
