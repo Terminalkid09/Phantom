@@ -71,6 +71,37 @@ class TestRceBridge(unittest.TestCase):
         self.assertIn(TARGET, cmd)                # aimed at the target
         self.assertIn("grep -o 'PHANTOM_RCE_", cmd)  # marker detection
 
+    def test_web_rce_interpreter_records_the_handler_that_fired(self):
+        wm = WorldModel(target=TARGET, target_type="ip")
+        cap = self.reg.get("web_rce")
+        out = ("RCE_HIT:https://10.0.0.5:9443/internal/v2/report/run:"
+               "PHANTOM_RCE_123456:0\n")
+        findings = cap.interpret(out, wm, {})
+        self.assertEqual(len(findings), 1)
+        value = findings[0].value
+        self.assertEqual(value["path"], "/internal/v2/report/run")
+        self.assertEqual(value["scheme"], "https")
+        self.assertEqual(value["port"], "9443")
+        self.assertEqual(value["url"],
+                         "https://10.0.0.5:9443/internal/v2/report/run")
+
+    def test_beacon_via_rce_reuses_the_discovered_handler(self):
+        wm = WorldModel(target=TARGET, target_type="ip")
+        wm.add_finding("service", "tcp/9443",
+                       {"port": "9443", "service": "https"},
+                       confidence=0.9, source="scan_tcp")
+        wm.add_finding("rce_foothold", "web_upload",
+                       {"vector": "arbitrary-file-upload", "uid": "0",
+                        "url": "https://10.0.0.5:9443/internal/v2/report/run",
+                        "path": "/internal/v2/report/run",
+                        "scheme": "https", "port": "9443"},
+                       confidence=0.9, source="web_rce")
+        cap = self.reg.get("beacon_via_rce")
+        self.assertTrue(all(p(wm) for p in cap.preconditions))
+        cmd = cap.make_command(wm, {"command": "echo beacon > /tmp/.b"})
+        self.assertIn("https://10.0.0.5:9443/internal/v2/report/run", cmd)
+        self.assertNotIn("/upload", cmd)
+
     def test_rce_foothold_interpreter_parses_marker(self):
         wm = _wm_with_confirmed_ssti()
         cap = self.reg.get("rce_foothold")
