@@ -27,6 +27,17 @@ def _clean_username(value: str) -> str:
     return candidate if _USERNAME_RE.match(candidate) else ""
 
 
+def _shodan_query(value: str) -> str:
+    """Escape a Shodan query for the surrounding double-quoted argument.
+
+    Several dorks contain their own quotes (`"default password"`,
+    `product:"MongoDB"`). Interpolating them raw closes the shell quote and
+    splits the query into extra argv entries, so `shodan search` receives
+    something the operator never typed.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 class OsintModule(BaseModule):
     module_name = "osint"
 
@@ -78,7 +89,7 @@ class OsintModule(BaseModule):
                 f"shodan search \"net:{infra_target}\"",
                 f"shodan search \"org:'{infra_target}'\"",
                 f"shodan stats \"net:{infra_target}\"",
-            ] + [f"shodan search \"{dork} net:{infra_target}\""
+            ] + [f"shodan search \"{_shodan_query(dork)} net:{infra_target}\""
                  for dork in self.DORKS]
             groups["VULNERABILITY SEARCH"] = [
                 f"shodan search \"vuln:CVE-2024- net:{infra_target}\"",

@@ -5,6 +5,7 @@ executor validates only the TARGET — with no target the command string reaches
 `subprocess.Popen(..., shell=True)` unchecked. A username carrying `;`/`|`/`&`
 therefore becomes shell syntax. These tests pin the fail-closed sanitizer.
 """
+import shlex
 import unittest
 from unittest import mock
 
@@ -71,6 +72,24 @@ class TestUsernameSafety(unittest.TestCase):
         self.assertNotIn("SUBDOMAIN ENUM", groups)
         self.assertIn("damiano.silviotti1",
                       " ".join(groups["USERNAME SEARCH"]))
+
+    def test_shodan_dorks_form_one_query_argument(self):
+        """A dork containing quotes must not split into extra argv entries.
+
+        Raw interpolation produced `shodan search ""default password" ...`:
+        the shell passed `default` and `password ...` as separate arguments,
+        so the query was both wrong and silently different from the preview.
+        """
+        session.target = "example.com"
+        groups = OsintModule().build_commands()
+        dorks = groups["DORKING (Shodan)"]
+        queries = []
+        for command in dorks:
+            parts = shlex.split(command)
+            assert len(parts) == 3, command
+            queries.append(parts[2])
+        assert any('"default password"' in query for query in queries)
+        assert any('product:"MongoDB"' in query for query in queries)
 
     def test_sherlock_refuses_an_unsafe_username(self):
         osint = OsintModule()
