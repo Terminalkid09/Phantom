@@ -470,14 +470,27 @@ def osint_suggestion_group() -> dict:
         return {}
     tt = session_target_type()
     groups = {}
-    if tt in ("email", "username", "phone"):
-        handle = t.split("@")[0] if "@" in t else t
-        groups["SUGGESTED (Identity)"] = [
-            f"sherlock {handle} --timeout 5 --print-found",
-            f"theHarvester -d {handle} -l 200 -b all",
-        ]
+    if tt == "phone":
+        # A phone is not a username: sherlock and theHarvester cannot search
+        # it. The built-in lookup is the only identity command that can.
+        groups["SUGGESTED (Phone)"] = ["phone"]
+    elif tt in ("email", "username"):
+        from phantom.modules.osint import _clean_username
+        raw_handle = t.split("@")[0] if "@" in t else t
+        handle = _clean_username(raw_handle)
+        commands = []
+        if handle:
+            commands.append(f"sherlock {handle} --timeout 5 --print-found")
+        if tt == "email":
+            # theHarvester takes a DOMAIN. The old code passed the local part
+            # (`bob` for bob@corp.com), so the search targeted the wrong name.
+            domain = t.rsplit("@", 1)[-1].strip()
+            if domain:
+                commands.append(f"theHarvester -d {domain} -l 200 -b all")
+        if commands:
+            groups["SUGGESTED (Identity)"] = commands
         emails = session.knowledge_base.get("emails_found") or []
-        if emails:
+        if emails and commands:
             groups["SUGGESTED (Identity)"] += [
                 f"breach-check {' '.join(str(e) for e in emails[:5])}",
             ]

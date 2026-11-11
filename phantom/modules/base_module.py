@@ -107,12 +107,21 @@ class BaseModule(cmd.Cmd):
                 console.print(f"    [green]▶ {command}[/]")
 
     def _with_suggestions(self, groups: dict, suggestions: dict) -> dict:
-        """Merge suggestions ahead of the static groups (SUGGESTED first)."""
+        """Merge suggestions ahead of the static groups (SUGGESTED first).
+
+        Idempotent: module `build_commands()` implementations already merge
+        their suggestions, and `preview` merges again. Extending blindly put
+        the same command in the plan twice (`phone` [1] and [2]); an operator
+        could then run it twice from `run-all`.
+        """
         merged: dict = {}
         for key, cmds in (suggestions or {}).items():
             merged.setdefault(key, []).extend(cmds or [])
         for key, cmds in (groups or {}).items():
-            merged.setdefault(key, []).extend(cmds or [])
+            bucket = merged.setdefault(key, [])
+            for command in cmds or []:
+                if command not in bucket:
+                    bucket.append(command)
         return merged
 
     def show_enter_hint(self) -> None:

@@ -91,6 +91,33 @@ class TestUsernameSafety(unittest.TestCase):
         assert any('"default password"' in query for query in queries)
         assert any('product:"MongoDB"' in query for query in queries)
 
+    def test_phone_target_uses_the_builtin_phone_command(self):
+        session.target = "+393331234567"
+        groups = OsintModule().build_commands()
+        assert groups["SUGGESTED (Phone)"] == ["phone"]
+        assert "SUGGESTED (Identity)" not in groups
+
+    def test_email_suggestions_target_the_domain(self):
+        session.target = "bob@corp.com"
+        commands = OsintModule().build_commands()["SUGGESTED (Identity)"]
+        assert any("sherlock bob " in command for command in commands)
+        assert any("theHarvester -d corp.com" in command for command in commands)
+        assert not any("theHarvester -d bob" in command for command in commands)
+
+    def test_username_does_not_run_theharvester(self):
+        session.target = "mario.rossi"
+        commands = OsintModule().build_commands()["SUGGESTED (Identity)"]
+        assert any("sherlock mario.rossi" in command for command in commands)
+        assert not any("theHarvester" in command for command in commands)
+
+    def test_preview_does_not_duplicate_suggestions(self):
+        from unittest.mock import patch
+        session.target = "+393331234567"
+        with patch("phantom.modules.base_module.PreviewSession") as preview:
+            OsintModule().do_preview("")
+        groups = preview.call_args[0][0]
+        assert groups["SUGGESTED (Phone)"] == ["phone"]
+
     def test_sherlock_refuses_an_unsafe_username(self):
         osint = OsintModule()
         with mock.patch("phantom.modules.osint.run_command") as run, \
