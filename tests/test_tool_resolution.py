@@ -48,7 +48,7 @@ def test_nothing_found_is_still_a_typed_error(monkeypatch):
 def test_setup_accepts_an_impacket_entry_point(monkeypatch, capsys):
     """`impacket-GetNPUsers` satisfies the manifest's `GetNPUsers.py`."""
     monkeypatch.setattr(SW, "PLATFORM", "linux")
-    monkeypatch.setattr(SW, "capability_tools",
+    monkeypatch.setattr(SW, "setup_tools",
                         lambda: [TM.entry("GetNPUsers.py")])
     monkeypatch.setattr(
         "phantom.automation.runtime.toolchain.ToolRegistry",

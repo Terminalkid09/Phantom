@@ -112,10 +112,13 @@ def test_the_api_requires_a_tool_name():
 
 def test_the_api_reports_a_failed_install_instead_of_raising(monkeypatch):
     from phantom.api import server
-    from phantom.utils import toolchain as tc
+    import phantom.core.executor as ex
 
-    monkeypatch.setattr(tc, "install",
-                        lambda tool, env=None, **kw: (False, "boom"))
+    # The API delegates to the executor's backend-aware installer (WSL on
+    # Windows), so the failure is stubbed at that boundary.
+    monkeypatch.setattr(ex, "install_tool",
+                        lambda tool: {"ok": False, "output": "boom",
+                                      "command": ""})
     resp = asyncio.run(server.toolchain_post(_Req({"tool": "nmap",
                                                    "confirm": True})))
     body = _body(resp)

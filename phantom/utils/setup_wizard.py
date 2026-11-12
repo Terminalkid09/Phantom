@@ -31,7 +31,7 @@ import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
 from phantom.utils.tool_manifest import (
-    MANIFEST, ToolEntry, capability_tools, entry, install_plan, package_for,
+    MANIFEST, ToolEntry, entry, install_plan, package_for, setup_tools,
 )
 
 Say = Callable[[str], None]
@@ -100,7 +100,11 @@ def doctor(say: Say = print) -> Dict[str, object]:
     say(f"{STEP_OK if py_ok else STEP_FAIL} python "
         f"{_platform.python_version()} (needs >= 3.10)")
 
-    tools = capability_tools()
+    # The doctor reports the FULL installable surface, not the 20-tool
+    # capability subset. Those 20 are what the autonomous planner can route;
+    # the manual web/AD/lateral/wireless modules need the other rows, and an
+    # operator who saw `/20` reasonably believed the toolbox was complete.
+    tools = setup_tools()
     # Count through the ToolRegistry, NOT raw shutil.which: on Windows the
     # toolbox lives in the Kali WSL distro and `which` cannot see it. The
     # doctor printed "tools: 3/20 installed" on a fully provisioned box while
@@ -212,7 +216,7 @@ def wsl_state_check() -> Optional[Tuple[str, str]]:
     return (READY, f"distro(s): {', '.join(distros)}")
 
 
-def wsl_guided(say: Say, ask: Ask) -> bool:
+def wsl_guided(say: Say, ask: Ask, assume_yes: bool = False) -> bool:
     """The full guided WSL flow. Returns True when a distro is ready."""
     state = wsl_state_check()
     if state is None:
@@ -221,7 +225,7 @@ def wsl_guided(say: Say, ask: Ask) -> bool:
     say(f"WSL state: {detail}")
 
     if kind == READY:
-        return _configure_distro(say, ask)
+        return _configure_distro(say, ask, assume_yes=assume_yes)
 
     # NOT_INSTALLED / NO_DISTRO → the elevated step, explained first
     say("")
@@ -247,10 +251,10 @@ def wsl_guided(say: Say, ask: Ask) -> bool:
     return False
 
 
-def _configure_distro(say: Say, ask: Ask) -> bool:
-    """Distro exists: set up the toolbox (tools) inside it, unattended."""
+def _configure_distro(say: Say, ask: Ask, assume_yes: bool = False) -> bool:
+    """Distro exists: set up the full toolbox inside it, unattended."""
     from phantom.core.executor import install_tool   # WSL-root aware
-    targets = [e for e in capability_tools() if e.wsl_only or True]
+    targets = setup_tools()
     # Registry, not `which`: inside the guided WSL flow the tools being
     # checked live IN the distro, where the Windows `which` can never see
     # them. With `which` the "toolbox already complete" branch was
@@ -268,7 +272,7 @@ def _configure_distro(say: Say, ask: Ask) -> bool:
     say("Packages to install INSIDE the WSL distro (deduplicated):")
     for p in plan:
         say(f"  - {p}")
-    if not ask("Install now?"):
+    if not (assume_yes or ask("Install now?")):
         return False
     fails = []
     for tool in dict.fromkeys(missing):
@@ -337,7 +341,7 @@ def tools_step(say: Say, ask: Ask, assume_yes: bool = False) -> None:
             "toolbox lives in WSL. Run: `phantom setup wsl`")
         return
     family = _linux_family()
-    tools = capability_tools()
+    tools = setup_tools()
     # Resolve through the registry, not raw `which`: on Debian/Kali impacket
     # installs `impacket-GetNPUsers` while the manifest names
     # `GetNPUsers.py`, so a fully provisioned box used to be told the AD
@@ -404,7 +408,7 @@ def run_wizard(arg: str = "", assume_yes: bool = False,
     say("Phantom setup — guided, user-scope, nothing silent")
     say("")
     if arg.strip() == "wsl":
-        return 0 if wsl_guided(say, ask) else 1
+        return 0 if wsl_guided(say, ask, assume_yes=assume_yes) else 1
     if arg.strip():
         say(f"{STEP_FAIL} unknown setup target: {arg} (use 'wsl' or none)")
         return 2
@@ -415,7 +419,7 @@ def run_wizard(arg: str = "", assume_yes: bool = False,
     if PLATFORM == "windows":
         say("")
         say("── WSL toolbox ──")
-        wsl_guided(say, ask)
+        wsl_guided(say, ask, assume_yes=assume_yes)
     say("")
     say(f"{STEP_OK} setup done. Launch with: phantom | phantom.c2 | "
         "phantom.auto — doctor again any time with: phantom doctor")

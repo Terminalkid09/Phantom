@@ -322,7 +322,7 @@ async def c2_artifacts(_request: web.Request) -> web.Response:
                         .strftime("%Y-%m-%d %H:%M:%S"),
                     # P1-11: governance metadata — what class of data this
                     # is and when the TTL policy will remove it
-                    "class": (artifact_class(subdir, name)),
+                    "class": artifact_class(subdir)["class"],
                     "expires_days": ttl_days_for(subdir, st.st_mtime),
                 })
         except OSError:
@@ -3168,10 +3168,18 @@ def main(port: int = 9876):
 
 @routes.get("/api/toolchain")
 async def toolchain_get(_request: web.Request) -> web.Response:
-    """What this machine is missing, and the install command for each."""
+    """What this machine is missing, and the install command for each.
+
+    Presence is resolved through the SAME registry the agent uses, which
+    falls back to the WSL toolbox. Probing raw host PATH said `nmap` was
+    missing on a Windows box where `wsl -d kali-linux nmap` worked, and sent
+    the operator to install a second copy.
+    """
     from phantom.utils import toolchain as tc
     env = tc.detect_env()
-    gone = tc.missing()
+    # tc.missing() itself resolves through the agent's registry (WSL-aware),
+    # so the panel and the planner cannot disagree about what is installed.
+    gone = await _run_blocking(tc.missing)
     return _json({
         "environment": env.label(),
         "os": env.os, "distro": env.distro, "manager": env.manager,
@@ -3204,11 +3212,18 @@ async def toolchain_post(request: web.Request) -> web.Response:
             "message": "refused: installing " + tool + " needs confirm=true",
             "command": tc.install_command(tool, env) or [],
         })
-    # A package manager install can legitimately run for many minutes: it
-    # must not hold the event loop while it does.
-    ok, message = await _run_blocking(
-        tc.install, tool, env, confirm=lambda t, c: True)
-    return _json({"ok": ok, "message": message, "tool": tool})
+    # Install through the executor's backend-aware path: on Windows the
+    # toolbelt lives in WSL, and a host `winget` command cannot satisfy a
+    # capability that executes `wsl -d kali-linux ...`. This also asks for
+    # root inside the distro, so apt never waits for a password.
+    from phantom.core.executor import install_tool
+    res = await _run_blocking(install_tool, tool)
+    output = (res.get("output") or "").strip()
+    message = res.get("ok") and f"installed {tool}" or (
+        output.splitlines()[-1] if output else f"{tool} not installed")
+    return _json({"ok": bool(res.get("ok")), "message": message,
+                  "tool": tool, "command": res.get("command", ""),
+                  "output": output[-4000:]})
 
 def _int_param(raw: Any, default: int) -> int:
     """Query/body int with a fallback (a bad parameter must not 500)."""
@@ -3329,6 +3344,44 @@ async def social_graph_get(request: web.Request) -> web.Response:
         "topics": {n.key: [list(t) for t in graph.interests(n.key)]
                    for n in graph.pivot_leads(("handle",))[:5]},
     })
+
+
+@routes.post("/api/social/recon")
+async def social_recon_post(request: web.Request) -> web.Response:
+    """Run a bounded identity recon from a username or SOCIAL PROFILE URL.
+
+    The URL is normalized to (handle, platform) before any request, so a
+    pasted instagram/tiktok/x/github/telegram/reddit profile never turns into
+    a web scan of the platform. Outbound, therefore confirm=true.
+    """
+    from phantom.automation.guidance.targets import social_profile_target
+    from phantom.automation.guidance.kit import store_social_markers
+    from phantom.automation.social.recon import deep_recon
+    from phantom.core.knowledge import session_wm
+    body = await request.json() or {}
+    target = str(body.get("target", "")).strip()
+    if not target:
+        return _json({"ok": False, "message": "target is required"}, 400)
+    if not body.get("confirm"):
+        return _json({"ok": False, "message": "refused: recon makes network "
+                                                "calls and needs confirm=true"})
+    parsed = social_profile_target(target)
+    if parsed:
+        handle, platform = parsed
+    else:
+        handle = target.lstrip("@")
+        platform = str(body.get("platform") or "").strip()
+    if not handle:
+        return _json({"ok": False, "message": "empty target"}, 400)
+    ok, lines = await _run_blocking(deep_recon, handle, platform)
+    try:
+        stored = store_social_markers("\n".join(lines), session_wm())
+    except Exception:
+        stored = []
+    return _json({"ok": bool(ok), "handle": handle, "platform": platform,
+                  "findings": len(stored),
+                  "lines": lines[-200:],
+                  "message": "" if ok else "recon returned no result"})
 
 
 @routes.get("/api/social/emails/plan")

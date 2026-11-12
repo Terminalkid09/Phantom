@@ -62,7 +62,7 @@ class TestToolsStep:
     def test_decline_installs_nothing(self, capsys):
         printed: list = []
         with patch.object(SW, "PLATFORM", "linux"), \
-             patch.object(SW, "capability_tools",
+             patch.object(SW, "setup_tools",
                           return_value=[TM.entry("nmap")]), \
              patch.object(SW.shutil, "which", return_value=None), \
              patch.object(SW, "_apt_install") as inst:
@@ -76,7 +76,7 @@ class TestToolsStep:
         printed: list = []
         calls = []
         with patch.object(SW, "PLATFORM", "linux"), \
-             patch.object(SW, "capability_tools",
+             patch.object(SW, "setup_tools",
                           return_value=[TM.entry("GetNPUsers.py"),
                                         TM.entry("secretsdump.py")]), \
              patch.object(SW.shutil, "which", return_value=None), \
@@ -94,7 +94,7 @@ class TestToolsStep:
     def test_nothing_missing_is_a_noop(self):
         printed = []
         with patch.object(SW, "PLATFORM", "linux"), \
-             patch.object(SW, "capability_tools",
+             patch.object(SW, "setup_tools",
                           return_value=[TM.entry("nmap")]), \
              patch.object(SW.shutil, "which",
                           return_value="/usr/bin/nmap"):
@@ -153,6 +153,19 @@ class TestDoctor:
         out = capsys.readouterr().out
         assert "python" in out and "tools" in out and "docker" in out
         assert isinstance(snap["tools_missing"], list)
+
+    def test_doctor_counts_the_full_manifest_not_the_capability_subset(
+            self, monkeypatch):
+        printed: list = []
+        from phantom.automation.runtime import toolchain
+        monkeypatch.setattr(SW, "PLATFORM", "linux")
+        monkeypatch.setattr(SW, "setup_tools",
+                            lambda: [TM.entry("nmap")])
+        monkeypatch.setattr(toolchain, "ToolRegistry",
+                            lambda *a, **k: type(
+                                "R", (), {"has": lambda self, name: False})())
+        SW.doctor(say=printed.append)
+        assert "tools: 0/1" in "\n".join(printed)
 
     def test_doctor_never_installs(self):
         with patch.object(SW, "_apt_install") as apt, \

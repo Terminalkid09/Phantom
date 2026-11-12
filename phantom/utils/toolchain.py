@@ -382,14 +382,29 @@ def install_command(tool: str, env: Env) -> Optional[List[str]]:
 
 
 def missing(tools: Iterable[str] = (),
-            which: Callable[[str], Optional[str]] = shutil.which) -> List[str]:
-    """Names of `tools` (default: the whole registry) not found on PATH."""
+            which: Optional[Callable[[str], Optional[str]]] = None) -> List[str]:
+    """Names of `tools` (default: the whole registry) not usable here.
+
+    With no injected `which`, resolution goes through the agent's
+    `ToolRegistry`: on Windows that means a tool present only in the Kali WSL
+    distro counts as installed. Probing raw host PATH (the old default) said
+    `nmap` was missing on a box where `wsl -d kali-linux nmap` worked, and the
+    CLI/API disagreed with the planner. An injected `which` keeps the
+    existing unit tests and offline callers on their explicit answer.
+    """
     wanted = list(tools) or sorted(TOOLS)
-    return [t for t in wanted if which(t) is None]
+    if which is not None:
+        return [t for t in wanted if which(t) is None]
+    try:
+        from phantom.automation.runtime.toolchain import ToolRegistry
+        registry = ToolRegistry()
+        return [t for t in wanted if not registry.has(t)]
+    except Exception:
+        return [t for t in wanted if shutil.which(t) is None]
 
 
 def report(env: Optional[Env] = None,
-           which: Callable[[str], Optional[str]] = shutil.which) -> str:
+           which: Optional[Callable[[str], Optional[str]]] = None) -> str:
     """Human-readable state: the machine, what is missing, and each fix."""
     if env is None:
         env = detect_env(_os_release_text())
