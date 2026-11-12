@@ -97,6 +97,10 @@ const RULES: readonly Rule[] = [
   // Identity graph (SocialGraphPanel). The graph read is pure: it rebuilds the
   // view from findings already in the session and never touches the network.
   { pattern: '/api/social/graph', methods: ['GET'], group: 'readonly' },
+  // Profile recon is OUTBOUND (it probes the named social networks), so it is
+  // mutating even though it changes nothing locally. The panel gates it behind
+  // an explicit checkbox; the URL is normalized to a handle server-side.
+  { pattern: '/api/social/recon', methods: ['POST'], group: 'mutating' },
   // The email PLAN is a read of the rules table (which services, which URLs).
   // It is safe to repeat and it is what the panel shows BEFORE asking for
   // confirmation, so it can inform the decision without making the request.

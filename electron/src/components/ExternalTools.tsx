@@ -34,7 +34,9 @@ export default function ExternalTools() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const res = await requestApi('GET', '/api/toolchain')
+      // First scan may have to list the WSL tool inventory; 15 s was shorter
+      // than a cold Kali boot and surfaced as a false "toolchain unavailable".
+      const res = await requestApi('GET', '/api/toolchain', undefined, 60_000)
       // A failed read answers with an ERROR ENVELOPE, not a Toolchain. Storing
       // it and then reading `data.missing.length` threw and blanked the panel,
       // and because `data` was no longer null the "Loading the tool report…"
@@ -58,7 +60,7 @@ export default function ExternalTools() {
     setBusy(tool)
     setMsg('')
     try {
-      const res = await requestApi('POST', '/api/toolchain', { tool, confirm: true })
+      const res = await requestApi('POST', '/api/toolchain', { tool, confirm: true }, 15 * 60_000)
       const d = (res?.data ?? {}) as { ok?: boolean; message?: string }
       // A failed request used to read "${tool} not installed", which hides WHY
       // (refused without confirmation, no package manager, sudo required).

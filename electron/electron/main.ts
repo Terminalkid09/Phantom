@@ -10,6 +10,13 @@ let tray: Tray | null = null
 let pmSavedOnQuit = false
 
 const API_PORT = 9876
+// The renderer dev server is deliberately NOT 5173: that port is the default
+// for every other Vite project, and when another app already owns it Vite
+// silently moves on while this window still loads whatever is at 5173. The
+// result was Phantom showing a completely different application. One
+// Phantom-owned port, strict in vite.config.ts, shared with E2E.
+const DEV_PORT = Number(process.env.PHANTOM_DEV_PORT || 5178)
+const DEV_URL = `http://127.0.0.1:${DEV_PORT}`
 const isDev = !app.isPackaged || process.env.NODE_ENV === 'development'
 
 /** App icon path: works in dev (electron/assets) and packaged (asar —
@@ -44,7 +51,7 @@ function getApiUrl(): string {
 function buildCsp(): string {
   const scriptSrc = isDev ? "'self' 'unsafe-inline'" : "'self'"
   const connectSrc = isDev
-    ? "'self' http://127.0.0.1:9876 http://localhost:5173 ws://localhost:5173"
+    ? `'self' http://127.0.0.1:9876 ${DEV_URL} ws://localhost:${DEV_PORT}`
     : "'self' http://127.0.0.1:9876"
   return [
     "default-src 'self'",
@@ -130,6 +137,7 @@ function startApiServer(): void {
     process.platform === 'win32' ? 'phantom-backend.exe' : 'phantom-backend',
   )
 
+  // POSIX images often ship only `python3`; `python` is not guaranteed.
   const command = isDev ? (process.platform === 'win32' ? 'python' : 'python3') : packagedBackend
   const args = isDev
     ? ['-u', path.join(projectRoot, 'phantom', 'api', 'launcher.py'), '--port', String(API_PORT)]
@@ -237,15 +245,17 @@ function createWindow(): void {
   // inheriting this window's privileges).
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    const allowed = isDev ? url.startsWith('http://localhost:5173') : false
+    const allowed = isDev ? url.startsWith(DEV_URL) : false
     if (!allowed) {
       event.preventDefault()
     }
   })
 
   if (isDev) {
-    mainWindow.loadURL('http://localhost:5173')
-    mainWindow.webContents.openDevTools({ mode: 'detach' })
+    mainWindow.loadURL(DEV_URL)
+    if (process.env.PHANTOM_E2E !== '1') {
+      mainWindow.webContents.openDevTools({ mode: 'detach' })
+    }
   } else {
     mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
   }
@@ -289,7 +299,9 @@ app.whenReady().then(() => {
 
   startApiServer()
   createWindow()
-  createTray()
+  // A headless E2E runner has no system tray; the tray is not part of the
+  // navigation contract under test and must not fail the app on Xvfb.
+  if (process.env.PHANTOM_E2E !== '1') createTray()
 
   ipcMain.handle('get-api-url', () => getApiUrl())
 
@@ -460,6 +472,11 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     stopApiServer()
+    // A child process or the async before-quit export can keep the app
+    // alive after its last window closed (measured: `app.close()` in E2E
+    // hung for the full 90 s timeout). Ask for a clean quit, then guarantee
+    // one: a window with no UI must never become an invisible process.
+    setTimeout(() => app.exit(0), 3000)
     app.quit()
   }
 })

@@ -21,6 +21,9 @@ import pytest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ELECTRON = os.path.join(REPO_ROOT, "electron")
 API_TS = os.path.join(ELECTRON, "src", "lib", "api.ts")
+# api.ts imports the framework-free activity store from its own directory;
+# an isolated compile needs that file next to the copy.
+ACTIVITY_TS = os.path.join(ELECTRON, "src", "lib", "apiActivity.ts")
 # The renderer's globals (`window.phantom`) live in this declaration file,
 # which the project's tsconfig includes: an isolated compile needs it too.
 DTS = os.path.join(ELECTRON, "vite-env.d.ts")
@@ -103,6 +106,7 @@ def _run_node_harness(tmp_path):
     copy is byte-identical to the file the app compiles — that is the point.
     """
     shutil.copyfile(API_TS, str(tmp_path / "api.ts"))
+    shutil.copyfile(ACTIVITY_TS, str(tmp_path / "apiActivity.ts"))
     cases = ",\n  ".join(
         f"{{ name: {json.dumps(name)}, patch: {json.dumps(patch)} }}"
         for name, patch, _expected in CASES)

@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import { runAsBackgroundRequest } from '@/hooks/apiActivity'
 
 /**
  * Serial background polling: fire immediately, then every `ms`, but
@@ -24,7 +25,10 @@ export function useSerialPoll(
       if (busyRef.current || !alive) return
       busyRef.current = true
       try {
-        await fnRef.current()
+        // Automatic polling must never light the operator-facing "Working"
+        // pill: with all panels mounted, 2/4/5/8 s polls would keep it on
+        // forever and hide the feedback of a real click.
+        await runAsBackgroundRequest(() => fnRef.current())
       } catch {
         // transient backend hiccup — the next tick retries
       } finally {

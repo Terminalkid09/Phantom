@@ -188,7 +188,7 @@ export default function C2Dashboard() {
               <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
                 <Monitor size={13} className="text-phantom-cyan" /> Beacons
               </h2>
-              <button onClick={pollC2} aria-label="Refresh beacon list"
+              <button onClick={() => void pollC2(true)} aria-label="Refresh beacon list"
                 className="text-text-dim hover:text-text-primary transition-colors">
                 <RefreshCw size={13} aria-hidden="true" />
               </button>

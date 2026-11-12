@@ -45,6 +45,8 @@ export interface ApiResponse<T> {
   data: T
 }
 
+import { beginApiActivity, isBackgroundRequest } from './apiActivity'
+
 type Method = 'GET' | 'POST'
 
 /** Cheap reads and single mutations. */
@@ -63,6 +65,15 @@ async function request<T>(
   if (!bridge?.request) {
     return { status: 0, data: { error: 'IPC not available' } as unknown as T }
   }
+  // Status/stream are polled every couple of seconds: showing the global pill
+  // for those would make it blink forever and stop meaning "the operator's
+  // action is running". Every other operation (run, plan, stop, handoff) is
+  // an intentional click and gets feedback.
+  const isPoll = isBackgroundRequest()
+    || /^\/api\/automode\/(status|stream)/.test(endpoint)
+  const finishActivity = isPoll
+    ? () => {}
+    : beginApiActivity(`${method} ${endpoint.split('?')[0]}`)
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     const res = await Promise.race([
@@ -87,6 +98,7 @@ async function request<T>(
     }
   } finally {
     if (timer) clearTimeout(timer)
+    finishActivity()
   }
 }
 

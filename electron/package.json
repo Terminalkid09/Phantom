@@ -9,9 +9,10 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "electron:dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "electron:dev": "concurrently \"vite\" \"wait-on http://127.0.0.1:5178 && electron .\"",
     "electron:build": "vite build && electron-builder --config electron-builder.yml",
     "typecheck": "tsc --noEmit",
+    "test:e2e": "playwright test",
     "lint": "eslint src --ext .ts,.tsx"
   },
   "build": {
@@ -30,6 +31,7 @@
     "zustand": "^4.5.4"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.0",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@typescript-eslint/eslint-plugin": "^7.18.0",

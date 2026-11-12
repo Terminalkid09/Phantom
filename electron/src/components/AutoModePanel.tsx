@@ -187,6 +187,53 @@ const scopeAria = (s: IdentityScope): string =>
 const identityLooksLikeUsername = (value: string): boolean =>
   /^@?[A-Za-z][A-Za-z0-9_.-]{1,63}$/.test((value || '').trim())
 
+const SOCIAL_PROFILE_HOSTS: Record<string, string> = {
+  'instagram.com': 'instagram',
+  'tiktok.com': 'tiktok',
+  'x.com': 'x',
+  'twitter.com': 'x',
+  'github.com': 'github',
+  't.me': 'telegram',
+  'telegram.me': 'telegram',
+  'reddit.com': 'reddit',
+}
+
+/** Parse a pasted social PROFILE URL into the identity it represents. Share
+ *  links, videos and listing pages deliberately return null: they are not an
+ *  account, and scanning their host as a website is the wrong chain. */
+function socialProfileFromUrl(value: string): { handle: string; platform: string } | null {
+  const raw = (value || '').trim()
+  if (!raw) return null
+  const looksSocial = Object.keys(SOCIAL_PROFILE_HOSTS)
+    .some((host) => new RegExp(`^(https?://)?(www\\.)?${host.replace('.', '\\.')}(/|$)`, 'i').test(raw))
+  if (!looksSocial) return null
+  try {
+    const url = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`)
+    const host = url.hostname.toLowerCase().replace(/^www\./, '')
+    const platform = SOCIAL_PROFILE_HOSTS[host]
+      || Object.entries(SOCIAL_PROFILE_HOSTS).find(([h]) => host.endsWith(`.${h}`))?.[1]
+    if (!platform) return null
+    const segments = url.pathname.split('/').filter(Boolean)
+    if (segments.length === 0) return null
+    let handle = ''
+    if (platform === 'reddit') {
+      if (!['user', 'u'].includes(segments[0].toLowerCase()) || segments.length < 2) return null
+      handle = segments[1]
+    } else if (platform === 'tiktok') {
+      if (!segments[0].startsWith('@')) return null
+      if (segments[1] && ['video', 'photo', 'playlist'].includes(segments[1].toLowerCase())) return null
+      handle = segments[0]
+    } else {
+      handle = segments[0]
+      if (['p', 'reel', 'explore', 'stories', 'status', 'login', 'signup', 'search', 'home'].includes(handle.toLowerCase())) return null
+    }
+    handle = handle.replace(/^@/, '')
+    return /^[A-Za-z0-9_.-]{1,64}$/.test(handle) ? { handle, platform } : null
+  } catch {
+    return null
+  }
+}
+
 export default function AutoModePanel() {
   const { autoMode, setAutoMode, job, setJob, appendReasoning, updateStep, ensureStep, session, addHandoff,
     handoffs, setHandoffStatus, beacons, setActiveBeacon, setActiveTab,
@@ -278,7 +325,13 @@ export default function AutoModePanel() {
 
   const handleAddTarget = () => {
     if (!newTarget.trim()) return
-    setAutoMode({ targets: [...autoMode.targets, newTarget.trim()] })
+    const social = socialProfileFromUrl(newTarget)
+    setAutoMode({
+      targets: [...autoMode.targets, social ? `@${social.handle}` : newTarget.trim()],
+      ...(social && !autoMode.identityPlatform
+        ? { identityPlatform: social.platform }
+        : {}),
+    })
     setNewTarget('')
   }
 
@@ -631,10 +684,10 @@ export default function AutoModePanel() {
               <input
                 type="text"
                 value={newTarget}
-                aria-label="Add a target (IP, domain, email, phone)"
+                aria-label="Add a target (IP, domain, URL, email, username, phone)"
                 onChange={(e) => setNewTarget(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleAddTarget()}
-                placeholder="IP, domain, email, phone..."
+                placeholder="IP, domain, URL, email, @username, phone..."
                 disabled={autoMode.running}
                 className="flex-1 bg-surface border border-surface-border rounded px-2.5 py-1.5
                   text-xs font-mono text-text-primary placeholder-text-dim

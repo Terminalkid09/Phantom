@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle, CheckCircle2, CirclePlay, Layers, Loader2, RefreshCw, StopCircle,
   Terminal, Pencil, Wrench, Brain, Play
@@ -49,6 +49,12 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
   const [batchTotal, setBatchTotal] = useState(0)
   const [batchCompleted, setBatchCompleted] = useState(0)
   const [batchResults, setBatchResults] = useState<GroupResult[]>([])
+  const [batchCurrent, setBatchCurrent] = useState('')
+  const [batchStartedAt, setBatchStartedAt] = useState(0)
+  const [batchStopping, setBatchStopping] = useState(false)
+  const [runStartedAt, setRunStartedAt] = useState(0)
+  const [clock, setClock] = useState(() => Date.now())
+  const stopRef = useRef(false)
 
   // Preflight per-module
   const [preflight, setPreflight] = useState<{ missing: Array<{ tool: string; module: string; hint: string }>; ok: boolean; message: string } | null>(null)
@@ -81,6 +87,12 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
     const first = typeof firstItem === 'string' ? firstItem : (firstItem?.command || '')
     setSelected((current) => current || first)
   }
+
+  useEffect(() => {
+    if (!running && !batchRunning) return
+    const timer = window.setInterval(() => setClock(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [running, batchRunning])
 
   useEffect(() => {
     // Every panel stays mounted (switching tabs must not lose local state),
@@ -118,7 +130,7 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
       setError(`Not runnable here: ${selectedItem.reason || 'CLI-only command'}`)
       return
     }
-    setRunning(true); setError('')
+    setRunning(true); setRunStartedAt(Date.now()); setClock(Date.now()); setError('')
     setOutput(`$ ${selected}\n\n`)
     const response = await api('POST', `/api/modules/${moduleId}/run`, {
       command: selected, target: effTarget, timeout: 120
@@ -141,41 +153,71 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
     return { ok, skipped }
   }
 
+  /**
+   * Execute a batch ONE command per request. The old single `/run-group`
+   * request returned nothing for many minutes and only then painted the
+   * whole transcript, so the UI looked frozen at 0/N. A request per command
+   * gives immediate progress, lets Stop take effect between commands, and
+   * keeps one long scan from hiding every earlier result.
+   */
+  const runCommands = async (groupName: string, commands: string[], header: string) => {
+    setBatchRunning(true); setBatchGroup(groupName); setBatchTotal(commands.length)
+    setBatchCurrent(commands[0] || ''); setBatchCompleted(0); setBatchResults([])
+    setBatchStopping(false); setBatchStartedAt(Date.now()); setClock(Date.now())
+    stopRef.current = false; setError('')
+    let out = header
+    setOutput(out)
+    const results: GroupResult[] = []
+    const startedAt = Date.now()
+    for (let i = 0; i < commands.length; i += 1) {
+      if (stopRef.current) break
+      const command = commands[i]
+      setBatchCurrent(command)
+      out += `$ ${command}\n`
+      setOutput(out)
+      const startedOne = Date.now()
+      const response = await api('POST', `/api/modules/${moduleId}/run`, {
+        command, target: effTarget, timeout: 300,
+      }, 330_000)
+      const data = response.data as {
+        combined?: string; error?: string; returncode?: number | null
+        timed_out?: boolean
+      }
+      const result: GroupResult = {
+        index: i,
+        command,
+        combined: data.combined || '',
+        returncode: data.returncode ?? null,
+        timed_out: Boolean(data.timed_out),
+        error: data.error || (response.status !== 200 ? apiError(response) : null),
+        duration: (Date.now() - startedOne) / 1000,
+      }
+      results.push(result)
+      setBatchResults([...results])
+      setBatchCompleted(results.length)
+      out += `${result.combined || '(no output)'}\n`
+      if (result.error) out += `[!] ${result.error}\n`
+      out += `⏱ ${result.duration.toFixed(1)}s`
+      if (result.returncode !== 0) out += `  (exit ${result.returncode})`
+      out += '\n\n'
+      setOutput(out)
+      if (response.status === 0) break
+    }
+    const total = ((Date.now() - startedAt) / 1000).toFixed(1)
+    out += `═══ Total: ${total}s  ·  ${results.length}/${commands.length} completed${stopRef.current ? ' (stopped)' : ''} ═══\n`
+    setOutput(out)
+    setBatchRunning(false)
+    setBatchStopping(false)
+    setBatchCurrent('')
+  }
+
   const runGroup = async (groupName: string, commands: SuggestionItem[]) => {
     const { ok, skipped } = runnableOnly(commands)
     if (ok.length === 0) {
       setError(`Nothing runnable in ${groupName} (${skipped} CLI-only — run them in the Phantom shell)`)
       return
     }
-    setBatchRunning(true); setBatchGroup(groupName); setBatchTotal(ok.length)
-    setBatchCompleted(0); setBatchResults([]); setError('')
-    const response = await api('POST', `/api/modules/${moduleId}/run-group`, {
-      commands: ok, target: effTarget, timeout: 300,
-    }, 7_200_000)
-    setBatchRunning(false)
-    const data = response.data as {
-      results?: GroupResult[]; total?: number; completed?: number
-      total_duration?: number; error?: string
-    }
-    if (response.status !== 200 || data.error) {
-      setError(data.error || (response.status !== 200
-        ? apiError(response)
-        : 'Group execution failed'))
-      return
-    }
-    const results = data.results || []
-    setBatchCompleted(data.completed || results.length)
-    let out = `═══ GROUP: ${groupName} ═══\n\n`
-    for (const r of results) {
-      out += `$ ${r.command}\n${r.combined || '(no output)'}\n`
-      if (r.error) out += `[!] ${r.error}\n`
-      out += `⏱ ${r.duration.toFixed(1)}s`
-      if (r.returncode !== 0) out += `  (exit ${r.returncode})`
-      out += '\n\n'
-    }
-    if (data.total_duration) out += `═══ Total: ${data.total_duration.toFixed(1)}s  ·  ${results.length}/${commands.length} completed ═══\n`
-    setOutput(out)
-    setBatchResults(results)
+    await runCommands(groupName, ok, `═══ GROUP: ${groupName} ═══\n\n`)
   }
 
   /** Run ALL groups sequentially — same as CLI `run-all` (runnable only). */
@@ -183,36 +225,11 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
     const items = groups.flatMap(g => g.commands)
     const { ok: allCommands, skipped } = runnableOnly(items)
     if (allCommands.length === 0) return
-    setBatchRunning(true); setBatchGroup('ALL GROUPS'); setBatchTotal(allCommands.length)
-    setBatchCompleted(0); setBatchResults([]); setError('')
-    if (skipped > 0) {
-      setOutput(`(skipping ${skipped} CLI-only command(s) — run them in the Phantom shell)\n\n`)
-    }
-    const response = await api('POST', `/api/modules/${moduleId}/run-group`, {
-      commands: allCommands, target: effTarget, timeout: 600,
-    }, 7_200_000)
-    setBatchRunning(false)
-    const data = response.data as {
-      results?: GroupResult[]; total?: number; completed?: number
-      total_duration?: number; error?: string
-    }
-    if (response.status !== 200 || data.error) {
-      setError(data.error || 'Run-all failed')
-      return
-    }
-    const results = data.results || []
-    setBatchCompleted(data.completed || results.length)
-    let out = `═══ RUN-ALL (${groups.length} groups) ═══\n\n`
-    for (const r of results) {
-      out += `$ ${r.command}\n${r.combined || '(no output)'}\n`
-      if (r.error) out += `[!] ${r.error}\n`
-      out += `⏱ ${r.duration.toFixed(1)}s`
-      if (r.returncode !== 0) out += `  (exit ${r.returncode})`
-      out += '\n\n'
-    }
-    if (data.total_duration) out += `═══ Total: ${data.total_duration.toFixed(1)}s ═══\n`
-    setOutput(out)
-    setBatchResults(results)
+    const note = skipped > 0
+      ? `(skipping ${skipped} CLI-only command(s) — run them in the Phantom shell)\n\n`
+      : ''
+    await runCommands('ALL GROUPS', allCommands,
+      `${note}═══ RUN-ALL (${groups.length} groups) ═══\n\n`)
   }
 
   const anyRunning = running || batchRunning
@@ -321,18 +338,36 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
         </div>
       )}
 
-      {/* Batch progress bar */}
-      {batchRunning && (
+      {/* Live run status: visible from the first second, for a single command
+          as well as a group. */}
+      {anyRunning && (
         <div className="bg-phantom-magenta/10 border border-phantom-magenta/30 rounded-lg px-3 py-2 flex items-center gap-3 text-xs">
           <Loader2 size={14} className="text-phantom-magenta animate-spin" />
-          <span className="text-phantom-magenta font-medium">Running: {batchGroup}</span>
-          <span className="text-text-dim">({batchCompleted}/{batchTotal})</span>
-          <div className="flex-1 h-1.5 bg-surface-border rounded-full overflow-hidden"
-            role="progressbar" aria-label={`Group execution progress: ${batchGroup}`}
+          <span className="text-phantom-magenta font-medium">
+            Running: {running ? selected : batchGroup}
+          </span>
+          {batchRunning && (
+            <span className="text-text-dim">({batchCompleted}/{batchTotal})</span>
+          )}
+          {batchRunning && batchCurrent && (
+            <span className="text-text-dim truncate max-w-[38%]" title={batchCurrent}>
+              · {batchCurrent}
+            </span>
+          )}
+          {batchStopping && <span className="text-phantom-yellow">· stopping after this command</span>}
+          <span className="ml-auto text-text-dim font-mono">
+            {Math.max(0, Math.floor((clock - (running ? runStartedAt : batchStartedAt)) / 1000))}s
+          </span>
+          <div className="w-40 h-1.5 bg-surface-border rounded-full overflow-hidden"
+            role="progressbar" aria-label={`Execution progress: ${running ? selected : batchGroup}`}
             aria-valuemin={0} aria-valuemax={batchTotal || 0}
             aria-valuenow={batchCompleted}>
-            <div className="h-full bg-phantom-magenta rounded-full transition-all duration-300"
-              style={{ width: batchTotal ? `${(batchCompleted / batchTotal) * 100}%` : '0%' }} />
+            {batchRunning ? (
+              <div className="h-full bg-phantom-magenta rounded-full transition-all duration-300"
+                style={{ width: batchTotal ? `${(batchCompleted / batchTotal) * 100}%` : '0%' }} />
+            ) : (
+              <div className="h-full w-1/3 bg-phantom-magenta rounded-full animate-pulse" />
+            )}
           </div>
         </div>
       )}
@@ -468,9 +503,10 @@ export default function ModulePanel({ moduleId }: { moduleId: string }) {
                 </p>
               )}
               {batchRunning && (
-                <button onClick={() => setBatchRunning(false)}
-                  className="px-3 py-2 rounded bg-phantom-error/20 text-phantom-error text-xs font-semibold hover:bg-phantom-error/30 flex items-center gap-2">
-                  <StopCircle size={13} /> Stop
+                <button onClick={() => { stopRef.current = true; setBatchStopping(true) }}
+                  disabled={batchStopping}
+                  className="px-3 py-2 rounded bg-phantom-error/20 text-phantom-error text-xs font-semibold hover:bg-phantom-error/30 disabled:opacity-50 flex items-center gap-2">
+                  <StopCircle size={13} /> {batchStopping ? 'Stopping…' : 'Stop'}
                 </button>
               )}
             </div>

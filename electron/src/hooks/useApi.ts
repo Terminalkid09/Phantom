@@ -1,11 +1,12 @@
 import { useCallback } from 'react'
 import { useStore, type Beacon, type C2Task } from '@/store'
 import { useSerialPoll } from '@/hooks/useSerialPoll'
+import { beginApiActivity, isBackgroundRequest } from '@/hooks/apiActivity'
 
 // A backend that never answers must not hang an IPC call forever: the
 // serial poll's busy-guard would then stay set and polling would STOP for
 // the rest of the session. The race turns a hang into a structured error.
-const API_TIMEOUT_MS = 15000
+const API_TIMEOUT_MS = 30000
 
 export interface ApiResponse<T = unknown> {
   status: number
@@ -17,10 +18,15 @@ export async function requestApi<T = unknown>(
   endpoint: string,
   body?: unknown,
   timeoutMs: number = API_TIMEOUT_MS,
+  background = false,
 ): Promise<ApiResponse<T>> {
   if (!window.phantom?.request) {
     return { status: 0, data: { error: 'IPC not available' } } as ApiResponse<T>
   }
+  const quiet = background || isBackgroundRequest()
+  const finishActivity = quiet
+    ? () => {}
+    : beginApiActivity(`${method} ${endpoint.split('?')[0]}`)
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     return await Promise.race([
@@ -41,6 +47,7 @@ export async function requestApi<T = unknown>(
     } as ApiResponse<T>
   } finally {
     if (timer) clearTimeout(timer)
+    finishActivity()
   }
 }
 
@@ -89,12 +96,14 @@ export function useApi(enablePolling = false) {
     (method: string, endpoint: string, body?: unknown, timeoutMs?: number) =>
       requestApi(method, endpoint, body, timeoutMs), [])
 
-  const pollC2 = useCallback(async () => {
+  // A poll is background noise; an operator pressing Refresh is not. The
+  // same helper serves both, so the caller says which one this is.
+  const pollC2 = useCallback(async (interactive = false) => {
     const res = await requestApi<{
       listener: { active: boolean; proto: 'HTTP' | 'HTTPS'; host: string; port: number; mtls: boolean; certs_present: boolean }
       beacons: Beacon[]
       tasks: Record<string, C2Task[]>
-    }>('GET', '/api/c2/state')
+    }>('GET', '/api/c2/state', undefined, API_TIMEOUT_MS, !interactive)
     if (res.status === 200 && res.data) {
       const d = res.data
       setC2Connected(true)
@@ -113,7 +122,7 @@ export function useApi(enablePolling = false) {
 
   const pollSession = useCallback(async () => {
     const res = await requestApi<Parameters<typeof setSession>[0]>(
-      'GET', '/api/session')
+      'GET', '/api/session', undefined, API_TIMEOUT_MS, true)
     if (res.status === 200 && res.data) setSession(res.data)
   }, [setSession])
 

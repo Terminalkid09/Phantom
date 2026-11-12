@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useStore, componentForTab } from '@/store'
 import { useApi } from '@/hooks/useApi'
 import { useAppVersion } from '@/hooks/useAppVersion'
+import { useApiActivity } from '@/hooks/apiActivity'
 import Sidebar from '@/components/Sidebar'
 import StatusBar from '@/components/StatusBar'
 import C2Dashboard from '@/components/C2Dashboard'
@@ -27,6 +28,7 @@ export default function App() {
   const { activeTab, setActiveTab, elapsed, setElapsed, setSettings, capabilities, setCapabilities } = useStore()
   const [backendError, setBackendError] = useState<string | null>(null)
   const version = useAppVersion()
+  const activity = useApiActivity()
   useApi(true)
 
   // Surface backend lifecycle failures instead of a silent dead UI
@@ -173,11 +175,34 @@ export default function App() {
         <main
           id="main"
           aria-label={`Phantom panel: ${active?.id ?? 'none'}`}
+          aria-busy={activity.visible}
           className="flex-1 overflow-auto min-h-0"
         >
+          {/* Global request feedback. Every panel shares it, so an action can
+              never look inert just because that panel had no local spinner. */}
+          {activity.visible && (
+            <div
+              data-testid="global-activity"
+              role="status"
+              aria-live="polite"
+              aria-busy="true"
+              aria-label={`Backend working: ${activity.label}`}
+              className="fixed right-4 top-12 z-50 flex items-center gap-2 rounded-full border border-phantom-cyan/40 bg-surface-card/95 px-3 py-1.5 text-[11px] font-medium text-phantom-cyan shadow-lg backdrop-blur"
+            >
+              <span
+                aria-hidden="true"
+                className="h-3 w-3 animate-spin rounded-full border-2 border-phantom-cyan/30 border-t-phantom-cyan"
+              />
+              <span className="max-w-[320px] truncate">Working — {activity.label}</span>
+              {activity.pending > 1 && (
+                <span className="text-text-dim">+{activity.pending - 1}</span>
+              )}
+            </div>
+          )}
           {visible.map((p) => (
             <div
               key={p.id}
+              data-panel={p.id}
               aria-hidden={p.id === active.id ? undefined : true}
               className={p.id === active.id ? 'h-full' : 'hidden'}
             >

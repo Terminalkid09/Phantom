@@ -3,6 +3,12 @@ import react from '@vitejs/plugin-react'
 import electron from 'vite-plugin-electron'
 import path from 'path'
 
+// Phantom's own dev-server port. 5173 is Vite's default and therefore the
+// port every other project on the machine also tries to use; strictPort makes
+// a collision fail loudly instead of serving the WRONG app in the Electron
+// window.
+const DEV_PORT = Number(process.env.PHANTOM_DEV_PORT || 5178)
+
 // Packaged build: the renderer is loaded from file://, where
 // webRequest.onHeadersReceived never fires — so the strict CSP must be baked
 // into the document as a <meta> tag. Kept in sync with buildCsp() in
@@ -40,6 +46,11 @@ export default defineConfig({
     electron([
       {
         entry: 'electron/main.ts',
+        // Vite must build the main process, NOT launch it. `electron:dev`
+        // starts exactly one app after wait-on; the previous default also
+        // started one from the plugin, so two backends fought for :9876 and
+        // the visible window could be the orphaned instance.
+        onstart() { /* started explicitly by electron:dev / Playwright */ },
         vite: {
           build: {
             outDir: 'dist-electron',
@@ -68,6 +79,11 @@ export default defineConfig({
     }
   },
   server: {
-    port: 5173
+    // Explicit IPv4: on Windows Vite otherwise binds [::1], while Electron
+    // and Playwright may ask 127.0.0.1 — the server is up but unreachable
+    // from the window that needs it.
+    host: '127.0.0.1',
+    port: DEV_PORT,
+    strictPort: true
   }
 })

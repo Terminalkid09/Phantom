@@ -21,6 +21,7 @@ import pytest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ELECTRON = os.path.join(REPO_ROOT, "electron")
 API_TS = os.path.join(ELECTRON, "src", "lib", "api.ts")
+ACTIVITY_TS = os.path.join(ELECTRON, "src", "lib", "apiActivity.ts")
 DTS = os.path.join(ELECTRON, "vite-env.d.ts")
 TSC = os.path.join(ELECTRON, "node_modules", "typescript", "bin", "tsc")
 
@@ -77,6 +78,7 @@ main().catch((err: unknown) => {{ console.error(String(err)); process.exit(1) }}
 
 def _run(tmp_path):
     shutil.copyfile(API_TS, str(tmp_path / "api.ts"))
+    shutil.copyfile(ACTIVITY_TS, str(tmp_path / "apiActivity.ts"))
     harness = tmp_path / "harness.ts"
     harness.write_text(_HARNESS.format(api="./api"), encoding="utf-8")
     out_dir = tmp_path / "out"
@@ -165,6 +167,7 @@ def test_the_stop_result_populates_the_fields_its_type_declares(tmp_path):
     payload shape.
     """
     shutil.copyfile(API_TS, str(tmp_path / "api.ts"))
+    shutil.copyfile(ACTIVITY_TS, str(tmp_path / "apiActivity.ts"))
     harness = tmp_path / "stop.ts"
     harness.write_text(_STOP_HARNESS, encoding="utf-8")
     out_dir = tmp_path / "out"

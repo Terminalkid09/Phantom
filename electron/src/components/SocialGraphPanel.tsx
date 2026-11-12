@@ -73,6 +73,10 @@ export default function SocialGraphPanel() {
   const [useReset, setUseReset] = useState(false)
   const [verdicts, setVerdicts] = useState<Verdict[] | null>(null)
   const [msg, setMsg] = useState('')
+  const [reconTarget, setReconTarget] = useState('')
+  const [reconConfirm, setReconConfirm] = useState(false)
+  const [reconBusy, setReconBusy] = useState(false)
+  const [reconMsg, setReconMsg] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -151,6 +155,28 @@ export default function SocialGraphPanel() {
     setVerdicts(data.report?.verdicts ?? [])
     setMsg(data.ok ? 'Done. Only proven results are marked.' : (data.message || 'failed'))
     load()
+  }
+
+  const runRecon = async () => {
+    if (!reconTarget.trim() || !reconConfirm) return
+    setReconBusy(true); setReconMsg('')
+    try {
+      const res = await requestApi('POST', '/api/social/recon', {
+        target: reconTarget.trim(), confirm: true,
+      }, 180_000)
+      const data = (res?.data ?? {}) as {
+        ok?: boolean; handle?: string; platform?: string
+        findings?: number; message?: string
+      }
+      setReconMsg(res?.status === 200
+        ? (data.ok
+          ? `Recon done: @${data.handle || reconTarget} on ${data.platform || 'auto'} — ${data.findings || 0} finding(s).`
+          : (data.message || 'Recon failed'))
+        : `Recon request failed (status ${res?.status ?? 0})`)
+      if (data.ok) await load()
+    } finally {
+      setReconBusy(false)
+    }
   }
 
   const exportGraphml = () => {
@@ -291,9 +317,38 @@ export default function SocialGraphPanel() {
           </section>
         )}
 
+        <section className="rounded border border-cyan-500/25 p-2 space-y-2">
+          <div className="flex items-center gap-1 text-[11px] text-cyan-200">
+            <Fingerprint size={12} /> Profile recon (username or social URL)
+          </div>
+          <p className="text-[10px] text-text-dim">
+            Paste a handle or an instagram / tiktok / x / github / telegram /
+            reddit PROFILE URL. It is normalized to the account, not scanned as
+            a website. Share links and videos are rejected.
+          </p>
+          <div className="flex items-center gap-2">
+            <input value={reconTarget} onChange={e => setReconTarget(e.target.value)}
+              aria-label="Username or social profile URL to recon"
+              placeholder="@handle or https://instagram.com/handle"
+              className="text-[11px] px-2 py-1 rounded bg-black/30 border border-white/15 flex-1 font-mono" />
+            <button onClick={runRecon} disabled={!reconTarget.trim() || !reconConfirm || reconBusy}
+              className="text-[10px] px-2 py-1 rounded border border-cyan-500/40 text-cyan-200 hover:bg-cyan-500/10 disabled:opacity-40">
+              {reconBusy ? 'Working…' : 'Run recon'}
+            </button>
+          </div>
+          <label className="flex items-center gap-2 text-[10px] text-text-secondary">
+            <input type="checkbox" checked={reconConfirm}
+              onChange={e => setReconConfirm(e.target.checked)} />
+            I confirm: this makes outbound profile requests
+          </label>
+          {reconMsg && (
+            <p className="text-[10px] text-text-secondary" role="status" aria-live="polite">{reconMsg}</p>
+          )}
+        </section>
+
         <section className="rounded border border-white/10 p-2 space-y-2">
           <div className="flex items-center gap-1 text-[11px] text-text-secondary">
-            <Mail size={12} /> Account existence (gated)
+            <Mail size={12} /> Account existence (email, gated)
           </div>
           <div className="flex items-center gap-2">
             <input value={address} onChange={e => setAddress(e.target.value)}
