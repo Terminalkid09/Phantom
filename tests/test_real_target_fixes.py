@@ -48,6 +48,15 @@ def test_callback_private_endpoint_on_a_lan_target_is_plausible():
     assert ok and "lan" in reason.lower()
 
 
+def test_callback_private_url_target_is_internal():
+    """A URL carrying a private IP is a LAN target, not an external one."""
+    from phantom.utils.network import callback_plausibility
+    assert callback_plausibility("http://192.168.1.50:8081",
+                                 "192.168.1.10")[0]
+    assert not callback_plausibility("http://example.com:8081",
+                                     "192.168.1.10")[0]
+
+
 def test_callback_internal_name_is_plausible_without_dns():
     from phantom.utils.network import callback_plausibility
     assert callback_plausibility("intranet.corp", "10.0.0.5")[0]

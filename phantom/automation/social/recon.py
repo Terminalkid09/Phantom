@@ -1735,7 +1735,18 @@ def deep_recon(username: str, platform: str = "",
     """
     try:
         lines: List[str] = []
-        username = (username or "").strip().lstrip("@")
+        username = (username or "").strip()
+        # A social profile URL is the form an operator actually copies. Keep
+        # the identity chain, not a web scan of instagram.com.
+        try:
+            from phantom.automation.guidance.targets import social_profile_target
+            parsed_profile = social_profile_target(username)
+        except Exception:
+            parsed_profile = None
+        if parsed_profile:
+            username, inferred_platform = parsed_profile
+            platform = platform or inferred_platform
+        username = username.lstrip("@")
         if not username:
             return False, ["ERROR: deep_recon needs a username"]
         scope, platform = normalize_scope(platform, scope)

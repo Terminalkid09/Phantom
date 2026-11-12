@@ -52,14 +52,17 @@ def cmd_set(shell, arg: str):
 
     if key == "target":
         import re
+        from urllib.parse import urlparse
         # identity targets are accepted too: emails (@), usernames (dots),
         # phones (+39..., dashes/spaces allowed)
         TARGET_REGEX = re.compile(r'^[@+a-zA-Z0-9._\s\-:]+$')
-        URL_TARGET_REGEX = re.compile(r'^https?://[a-zA-Z0-9.\-:/]+$')
 
         is_valid = False
         if value.startswith(("http://", "https://")):
-            is_valid = bool(URL_TARGET_REGEX.match(value))
+            # A real URL has query strings, paths and percent-encoding: the
+            # old character-class regex rejected every useful one.
+            parsed = urlparse(value)
+            is_valid = parsed.scheme in ("http", "https") and bool(parsed.netloc)
         elif TARGET_REGEX.match(value) and '..' not in value:
             is_valid = True
 

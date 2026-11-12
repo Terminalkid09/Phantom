@@ -11,6 +11,19 @@ import pytest
 from phantom.automation.belief import WorldModel
 
 
+def test_scan_parser_normalizes_ssh_on_2222_and_web_on_8081():
+    """nmap's port table mislabels the lab's real services; the planner must
+    still see SSH and HTTP, otherwise leaked web creds can never be reused."""
+    from phantom.automation.perception import parse_nmap_ports
+
+    out = ("21/tcp   open  ftp\n"
+           "2222/tcp open  EtherNetIP-1\n"
+           "8081/tcp open  blackice-icecap")
+    by_port = {f["value"]["port"]: f["value"]["service"]
+               for f in parse_nmap_ports(out)}
+    assert by_port == {"21": "ftp", "2222": "ssh", "8081": "http"}
+
+
 def test_ssh_precondition_accepts_nonstandard_port(tmp_path, monkeypatch):
     from phantom.automation.guidance.kit import _has_service_kind
     wm = WorldModel(target="127.0.0.1")

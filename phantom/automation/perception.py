@@ -32,6 +32,36 @@ def _p(**kw) -> Dict[str, Any]:
 _NMAP_PORT_RE = re.compile(
     r"(\d+)/(tcp|udp)[ \t]+open[ \t]+([\w\-\./]+)(?:[ \t]+([^\n]*))?"
 )
+
+# Ports whose conventional service nmap's /etc/services database gets wrong.
+# The Docker lab exposes SSH on 2222 and HTTP on 8081; nmap labels them
+# `EtherNetIP-1` and `blackice-icecap`, so the planner never saw an SSH or web
+# surface and refused the credentials the app had just leaked. Only replace
+# labels that are known placeholders: a real banner/fingerprint still wins.
+_ALT_PORT_SERVICES = {
+    "2222": "ssh",
+    "22222": "ssh",
+    "2121": "ftp",
+    "8081": "http",
+    "8080": "http",
+    "8443": "https",
+}
+_AMBIGUOUS_SERVICES = {
+    "", "unknown", "ethernetip-1", "blackice-icecap", "http-alt",
+    "https-alt", "tcpwrapped",
+}
+
+
+def normalize_service(port: object, service: str) -> str:
+    """Correct an nmap placeholder label on a conventional alternate port.
+
+    The port number is the only evidence available in a port-only scan; this
+    deliberately does not override an explicit non-placeholder banner.
+    """
+    raw = str(service or "").strip().lower()
+    if raw in _AMBIGUOUS_SERVICES:
+        return _ALT_PORT_SERVICES.get(str(port), service)
+    return service
 # nc -zv floor sweep: "Connection to 10.0.0.9 22 port [tcp/ssh] succeeded!"
 # (BSD netcat) or "connect to 10.0.0.9 22 port 22 tcp: Connection refused"-style
 # open report (traditional / OpenBSD variants). Only SUCCEEDED connects
@@ -80,6 +110,7 @@ def parse_nmap_ports(output: str, source: str = "nmap") -> List[Dict[str, Any]]:
         if (port, proto) in seen:
             continue
         seen.add((port, proto))
+        svc = normalize_service(port, svc)
         value = {"port": port, "protocol": proto, "service": svc,
                  "version": ver, "product": "", "advertised": True}
         if ver:

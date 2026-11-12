@@ -398,6 +398,11 @@ def cmd_social(shell, arg: str):
                 return ""
             platform = _flag("--platform")
             scope = _flag("--scope")
+            from phantom.automation.guidance.targets import social_profile_target
+            parsed_profile = social_profile_target(handle)
+            if parsed_profile:
+                handle, inferred_platform = parsed_profile
+                platform = platform or inferred_platform
             notifier.status(
                 f"Deep recon on {handle}"
                 + (f" platform={platform}" if platform else "")

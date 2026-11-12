@@ -43,6 +43,14 @@ def _looks_internal(name: str) -> bool:
     host = n.split("//")[-1].split("/")[0].split(":")[0]
     if host in ("localhost",):
         return True
+    # A URL carrying a private IP is internal just like the bare IP. The
+    # suffix check below only looked at names, so `http://192.168.1.50:8081`
+    # was classified external and a LAN callback was refused.
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_link_local or ip.is_loopback
+    except ValueError:
+        pass
     if "." not in host:          # single label (srv01, intra, dc)
         return True
     return host.endswith(_INTERNAL_SUFFIXES)

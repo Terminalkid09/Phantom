@@ -126,3 +126,39 @@ def test_artifact_policy_exposes_ttl_days_left():
     now = time.time()
     v = ttl_days_left("downloads", now, now=now)
     assert v == 30
+
+
+def test_artifacts_route_returns_the_class_as_a_string(tmp_path, monkeypatch):
+    """The Electron media strip calls this route on boot.
+
+    `classify(subdir)` returns the governance metadata dict; the route used to
+    pass a second `name` argument to it, so every `/api/c2/artifacts` request
+    raised `TypeError: classify() takes 1 positional argument but 2 were given`
+    and the packaged C2 dashboard could not load any artifact.
+    """
+    import asyncio
+    from aiohttp.test_utils import TestClient, TestServer
+    from phantom.api.server import create_app
+    from phantom.utils import c2_crypto
+
+    (tmp_path / "screenshots").mkdir()
+    (tmp_path / "screenshots" / "shot.png").write_bytes(b"not-a-real-png")
+    monkeypatch.setattr("phantom.utils.paths.data_dir", lambda: str(tmp_path))
+
+    async def scenario():
+        client = TestClient(TestServer(create_app()))
+        await client.start_server()
+        try:
+            response = await client.get(
+                "/api/c2/artifacts",
+                headers={"Authorization": f"Bearer {c2_crypto.get_api_token()}"},
+            )
+            assert response.status == 200, await response.text()
+            return await response.json()
+        finally:
+            await client.close()
+
+    payload = asyncio.run(scenario())
+    item = next(a for a in payload["artifacts"] if a["name"] == "shot.png")
+    assert item["kind"] == "image"
+    assert item["class"] == "screen_capture"

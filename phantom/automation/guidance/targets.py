@@ -52,6 +52,82 @@ def _looks_like_tld(label: str) -> bool:
 IDENTITY_TYPES = ("email", "username", "phone")
 NETWORK_TYPES = ("ip", "domain", "url")
 
+# A social PROFILE URL is an identity target, not a website to scan. The
+# mapping is deliberately small and explicit: guessing from an arbitrary host
+# would turn a normal web engagement into social OSINT.
+_SOCIAL_PROFILE_HOSTS = {
+    "instagram.com": "instagram",
+    "tiktok.com": "tiktok",
+    "x.com": "x",
+    "twitter.com": "x",
+    "github.com": "github",
+    "t.me": "telegram",
+    "telegram.me": "telegram",
+    "reddit.com": "reddit",
+}
+_SOCIAL_RESERVED = {
+    "p", "reel", "reels", "explore", "stories", "accounts", "direct",
+    "about", "login", "signup", "signin", "home", "search", "i",
+    "intent", "share", "settings", "help", "tos", "privacy", "joinchat",
+    "video", "photo", "playlist", "status",
+}
+
+
+def social_profile_target(target: str) -> Optional[tuple]:
+    """(handle, platform) when `target` is a social PROFILE URL.
+
+    Accepts a full URL, a bare `instagram.com/<handle>`, or a `@handle`
+    (platform unknown, handle already explicit). Returns None for ordinary
+    URLs and for share/video/listing paths: those are not an account.
+    """
+    t = (target or "").strip()
+    if not t:
+        return None
+    if t.startswith("@") and " " not in t and "/" not in t:
+        return t[1:], ""
+    if "://" not in t:
+        if not t.lower().startswith(tuple(
+                f"{h}" for h in _SOCIAL_PROFILE_HOSTS)) \
+                and not t.lower().startswith("www."):
+            return None
+        t = "https://" + t
+    try:
+        parsed = urlparse(t)
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    platform = next((p for h, p in _SOCIAL_PROFILE_HOSTS.items()
+                     if host == h or host.endswith("." + h)), "")
+    if not platform:
+        return None
+    segments = [s for s in parsed.path.split("/") if s]
+    if not segments:
+        return None
+    if platform == "reddit":
+        if segments[0].lower() not in ("user", "u") or len(segments) < 2:
+            return None
+        handle = segments[1]
+    elif platform == "tiktok":
+        handle = segments[0]
+        if not handle.startswith("@"):
+            return None
+        handle = handle[1:]
+        if len(segments) > 1 and segments[1].lower() in (
+                "video", "photo", "playlist"):
+            return None
+    else:
+        handle = segments[0].lstrip("@")
+        if handle.lower() in _SOCIAL_RESERVED:
+            return None
+        if len(segments) > 1 and segments[1].lower() in ("status", "statuses"):
+            return None
+    handle = handle.strip().lstrip("@")
+    if not handle or not re.match(r"^[A-Za-z0-9_.-]{1,64}$", handle):
+        return None
+    return handle, platform
+
 
 def split_host_port(target: str) -> tuple:
     """("host", port_or_None) for a bare ``host:port``, else the input.

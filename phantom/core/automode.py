@@ -801,6 +801,16 @@ def _ensure_c2_listener(server=None) -> bool:
     notifier.status(f"Starting C2 listener on {bind_host}:{port} "
                     f"(HTTPS/mTLS auto; beacons dial {dial_host})")
     try:
+        # The listener loads its TLS context when it starts. The beacon
+        # builder may regenerate the server certificate LATER for the address
+        # beacons actually dial, but the running listener keeps serving the
+        # old certificate; the new beacon pins the new one and every check-in
+        # dies on the pin. Prepare the certificate for the dialed host BEFORE
+        # the listener loads it, so the build and the listener agree.
+        from phantom.utils.state import use_mtls
+        if use_mtls():
+            from phantom.utils.beacon_auth import ensure_mtls_material
+            ensure_mtls_material(getattr(srv, "cert_dir", None), dial_host)
         srv.start(host=bind_host, port=port, use_ssl=True)
         return True
     except Exception as exc:
@@ -914,6 +924,21 @@ def run_auto_mode(targets=None, aggressive: bool = False, stealth: bool = False,
     if not _apply_range_policy(networks, resolved, raw,
                                force_network, plan):
         return
+
+    # A social PROFILE URL is an identity, not a website: accept the exact
+    # URL the operator copied, then run the identity chain on its handle.
+    from phantom.automation.guidance.targets import social_profile_target
+    normalized = []
+    for _target in resolved:
+        _social = social_profile_target(_target)
+        if _social:
+            _handle, _platform = _social
+            normalized.append(f"@{_handle}")
+            if not social_platform:
+                social_platform = _platform
+        else:
+            normalized.append(_target)
+    resolved = normalized
 
     notifier.success("=" * 25 + " PHANTOM AUTO-MODE (agent) " + "=" * 25)
     # profile <-> target coherence: the profile is the ENVIRONMENT, the

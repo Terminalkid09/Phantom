@@ -64,10 +64,15 @@ class WebModule(BaseModule):
         if not t:
             notifier.error("No target set.")
             return
-        notifier.status(f"Starting Nikto scan on {t}...")
+        try:
+            url, host = _web_url(t)
+        except ValueError as exc:
+            notifier.error(str(exc))
+            return
+        notifier.status(f"Starting Nikto scan on {url}...")
         output = run_command(
-            f"nikto -h {quote_arg(t)} -Tuning 123b -Delay 2 -nointeractive",
-            target_ip=t)
+            f"nikto -h {quote_arg(url)} -Tuning 123b -Delay 2 -nointeractive",
+            target_ip=host)
         findings = self._extract_nikto_findings(output)
         if findings:
             table = Table(title="Nikto Findings", border_style="red")
@@ -86,10 +91,15 @@ class WebModule(BaseModule):
         if not t:
             notifier.error("No target set.")
             return
-        output = run_command(f"whatweb http://{quote_arg(t)} --aggression 1",
-                             target_ip=t)
+        try:
+            url, host = _web_url(t)
+        except ValueError as exc:
+            notifier.error(str(exc))
+            return
+        output = run_command(f"whatweb {quote_arg(url)} --aggression 1",
+                             target_ip=host)
         notifier.info(f"Web fingerprint:\n{output[:2000]}")
-        session.add_note(f"Web: whatweb fingerprint of {t}")
+        session.add_note(f"Web: whatweb fingerprint of {url}")
 
     def do_hunt(self, arg):
         """hunt — behavioural bug-class hunting (baseline + statistical
@@ -155,10 +165,15 @@ class WebModule(BaseModule):
         """dirsearch <wordlist> — Fast directory brute-force."""
         t = session.target
         if not t: return notifier.error("No target set.")
+        try:
+            url, host = _web_url(t)
+        except ValueError as exc:
+            notifier.error(str(exc))
+            return
         wl = args.strip() or session.active_wordlist or "/usr/share/wordlists/dirb/common.txt"
         output = run_command(
-            f"dirsearch -u http://{quote_arg(t)} -w {quote_arg(wl)} "
-            f"--format plain", target_ip=t)
+            f"dirsearch -u {quote_arg(url)} -w {quote_arg(wl)} "
+            f"--format plain", target_ip=host)
         urls = re.findall(r'(?m)^\d{3}\s+.*?(http\S+)', output)
         if urls:
             for u in urls: console.print(f"  [green]{u}[/]")
@@ -228,39 +243,44 @@ class WebModule(BaseModule):
         t = session.target
         if not t:
             return {}
+        try:
+            url, host = _web_url(t)
+        except ValueError:
+            return {}
+        base = url.rstrip("/")
         wl = session.active_wordlist if session.active_wordlist else "/usr/share/wordlists/dirb/common.txt"
         return self._with_suggestions({
             "SCANNING & VULN": [
                 f"creds  # extract leaked creds (SSRF + SQLi + hash-crack)",
-                f"nuclei -u http://{quote_arg(t)} -severity critical,high",
-                f"nikto -h {quote_arg(t)} -Tuning 123b -Delay 2",
-                f"whatweb http://{quote_arg(t)}",
-                f"wafw00f http://{quote_arg(t)}",
+                f"nuclei -u {quote_arg(url)} -severity critical,high",
+                f"nikto -h {quote_arg(url)} -Tuning 123b -Delay 2",
+                f"whatweb {quote_arg(url)}",
+                f"wafw00f {quote_arg(url)}",
             ],
             "FUZZING (Dir/File)": [
-                f"ffuf -w {quote_arg(wl)} -u http://{quote_arg(t)}/FUZZ "
+                f"ffuf -w {quote_arg(wl)} -u {quote_arg(base + '/FUZZ')} "
                 f"-mc 200,301,302 -t 50",
-                f"gobuster dir -u http://{quote_arg(t)} -w {quote_arg(wl)} "
+                f"gobuster dir -u {quote_arg(url)} -w {quote_arg(wl)} "
                 f"-x php,html,txt,js,bak -k",
-                f"feroxbuster -u http://{quote_arg(t)} -w {quote_arg(wl)} "
+                f"feroxbuster -u {quote_arg(url)} -w {quote_arg(wl)} "
                 f"--silent",
             ],
             "FUZZING (VHost/DNS)": [
-                f"ffuf -w {quote_arg(wl)} -u http://{quote_arg(t)} "
-                f"-H 'Host: FUZZ.{t}' -fs 0",
-                f"gobuster vhost -u http://{quote_arg(t)} -w "
+                f"ffuf -w {quote_arg(wl)} -u {quote_arg(url)} "
+                f"-H 'Host: FUZZ.{host}' -fs 0",
+                f"gobuster vhost -u {quote_arg(url)} -w "
                 f"/usr/share/seclists/Discovery/DNS/"
                 f"subdomains-top1million-5000.txt",
             ],
             "API & PARAMETERS": [
-                f"ffuf -w {quote_arg(wl)} -u http://{quote_arg(t)}/api/FUZZ",
-                f"arjun -u http://{quote_arg(t)} -m GET",
+                f"ffuf -w {quote_arg(wl)} -u {quote_arg(base + '/api/FUZZ')}",
+                f"arjun -u {quote_arg(url)} -m GET",
             ],
             "SQL INJECTION": [
-                f"sqlmap -u http://{quote_arg(t)} --forms --batch "
+                f"sqlmap -u {quote_arg(url)} --forms --batch "
                 f"--random-agent --threads 1 --delay 2 --level 2 --risk 2  "
                 f"AGGRESSIVE",
-                f"sqlmap -u http://{quote_arg(t)} --dbs --batch "
+                f"sqlmap -u {quote_arg(url)} --dbs --batch "
                 f"--random-agent --threads 1 --delay 2  AGGRESSIVE",
             ],
         }, self.suggest_commands())

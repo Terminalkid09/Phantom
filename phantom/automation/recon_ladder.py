@@ -330,7 +330,8 @@ def parse_scan(output: str, *, proto: str = "tcp") -> Tuple[List[int], Dict[int,
             continue
         if port not in open_ports:
             open_ports.append(port)
-            services[port] = service
+            from phantom.automation.perception import normalize_service
+            services[port] = normalize_service(port, service)
     filtered = 0
     for m in _NOT_SHOWN.finditer(output or ""):
         if m.group(3).lower() == proto:
