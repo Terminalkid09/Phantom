@@ -17,7 +17,8 @@ that produced it; anything else is named as unverified.
 
 | Area | Level | Evidence |
 | --- | --- | --- |
-| Python suite | Lab | Full suite on 2026-11-12: **6596 passed, 5 skipped, 115 subtests, 698.75 s** (same command as CI, JUnit report). The suites touched by this change were re-run separately and are green. |
+| Python suite | Lab | Full suite on 2026-11-12: **6595 passed, 5 skipped, 115 subtests, 508.91 s** on the Windows lab (8 workers, same test selection as CI). The 5 skips are platform/toolchain-only cases. CI on Linux reports **6564 passed, 36 skipped** per interpreter, because Electron/node_modules and native tools are absent there. |
+| CI `dev` | CI | Run [`43265195253`](https://github.com/Terminalkid09/Phantom/actions/runs/43265195253) at `decd7cf`: **success, 21/21 jobs** — Python 3.10/3.11/3.12, Electron build, C2, beacon smoke Windows/Linux/macOS/Android, security, Docker, integration-tools and c2d. The preceding run `43257501577` was red on a test-isolation defect (below); the fix is test-only (`0ed35b0`). One non-blocking annotation remains: pinned actions still target Node 20. |
 | Auto-mode kill chain (Linux) | Lab | 2026-11-12: HTTPS/mTLS C2, real beacon check-in **`B-975383D9360DB20A`**, **`beacon=True persistence=True creds=2 actions=4`**, goal `deliver` reached in **41 s**. |
 | Persistence (Linux) | Lab | The same run records `persistence_installed=True`. The beacon's native `persist` verb had already succeeded on this host; the defect was in auto-mode's separate shell path (below). |
 | CLI | Lab (real PTY) | **17/17** checks: `set target`, `suggest`, real `nmap` run, quiet scan, `auto`, refusal of `run` in AUTO-MODE, Ctrl+C auto→manual, final Ctrl+C. |
@@ -27,6 +28,21 @@ that produced it; anything else is named as unverified.
 | macOS / Android | Compiled | CI produces the artifact and verifies its container/architecture. Runtime is not exercised. |
 | Phishing | Lab (local half) | Everything up to the send works; an end-to-end send has never been exercised. See [`PHISHING_STATUS.md`](PHISHING_STATUS.md). |
 | Auto-mode benchmark | Lab (offline) | Ground-truth scenarios with a simulated runner; it does not prove effectiveness on a real target. See [`AutoModeBenchmark.md`](AutoModeBenchmark.md). |
+
+## The red CI was a test leak (fixed 2026-11-12)
+
+Run `43257501577` failed on all three Python legs, but the failures were one
+defect: the autouse fixture in `tests/test_executor.py` patched global
+`shutil.which` to return `/usr/bin/tool`. A second `monkeypatch` in the same
+module was restored after the fixture, so the fake path survived into later
+files. Those files then tried to execute it, or believed `nmap` was installed,
+and failed only in the full run.
+
+The fixture now replaces only the executor's view of `shutil`, and the test
+that actually launches external binaries is marked `integration_tool` (it runs
+in the job that installs `nmap`). The full suite is green locally, and run
+`43265195253` is green across all 21 jobs. This was a test defect, not a
+regression in the product.
 
 ## The persistence defect (fixed 2026-11-12)
 
@@ -63,10 +79,11 @@ received an unterminated quote. The dispatcher now takes the whole argument
 
 ## Verdict
 
-The code is ready for a **v3.0.0 tag as a controlled release**: the kill chain
-is green end-to-end, the full suite is green, and the desktop and CLI paths
-have been exercised. The remaining items are distribution evidence, not code
-failures. Until a clean-machine install smoke and an explicit signing/SmartScreen
-decision are recorded, describe the release as *verified in the lab and on the
-operator's Windows endpoint*, not as *installer-verified on a clean machine of
-every OS*.
+The code is ready for a **v3.0.0 tag as a controlled release**: CI is green
+across all 21 jobs, the kill chain is green end-to-end, the full suite is
+green, and the desktop and CLI paths have been exercised. The remaining items
+are distribution evidence, not code failures. Until a clean-machine install
+smoke and an explicit signing/SmartScreen decision are recorded, describe the
+release as *verified in the lab and on the operator's Windows endpoint*, not as
+*installer-verified on a clean machine of every OS*. `main` has not been
+merged or tagged as part of this verification.

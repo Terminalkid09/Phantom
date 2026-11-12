@@ -86,6 +86,29 @@ behind it; the ones that were not measured are named as such.
 
 ## [Unreleased] — current development (v3.0.0 line)
 
+### Release validation: the red CI was a test leak — 2026-11-12
+
+- **The red CI was one test-isolation defect, not a product regression.** The
+  autouse fixture in `tests/test_executor.py` patched global `shutil.which` to
+  `/usr/bin/tool`; a nested `monkeypatch` was restored after the fixture and
+  left that fake path active for later files. Those files then tried to execute
+  it, or believed `nmap` was present, and failed only in the full run. The
+  fixture now replaces only the executor's view of `shutil`; the test that
+  launches external binaries is marked `integration_tool` and runs in the job
+  that installs `nmap`. This is test-only (`0ed35b0`).
+- **Search selects the beacon it actually found.** The endpoint now returns
+  the full `beacon_id`; the palette used to scrape a hex id from the label with
+  `/([a-f0-9]+)/i`, which matched `Beac` inside the word `Beacon` (`94c3b00`).
+- **The command reference no longer calls `screenshot` Windows-only.** Linux
+  and Android have POSIX paths and macOS degrades; the generated page now says
+  so (`decd7cf`).
+- **Measured state.** Local Windows suite: **6595 passed, 5 skipped, 115
+  subtests, 508.91 s**. GitHub CI run `43265195253` at `decd7cf`: **success,
+  21/21 jobs**, including the 3.10/3.11/3.12 unit legs, Electron build, C2,
+  beacon smoke on Windows/Linux/macOS/Android, security, Docker and
+  integration-tools. The only annotation is the existing Node 20 deprecation
+  warning on pinned actions.
+
 ### Persistence: the auto-mode command was truncated at the first newline — 2026-11-12
 
 - **Auto-mode was not skipping `persistence_install`; the beacon was failing
