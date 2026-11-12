@@ -397,6 +397,7 @@ FEATURES: Tuple[Feature, ...] = (
 HELPER_HEADERS: Mapping[str, str] = {
     "build_id.h": "build provenance string",
     "c2_config.h": "transport/endpoint configuration struct",
+    "command_line.h": "preserves the whole shell argument, newlines included",
     "config_encrypted.h": "generated: the encrypted config blob",
     "config_encrypted.h.in": "template for the generated config header",
     "crypto_config.h": "generated: the per-beacon crypto material",

