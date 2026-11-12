@@ -1,5 +1,12 @@
 # Action plan — 2026-10-31
 
+> **HISTORICAL — closed 2026-11-12. Do not read this as current state.**
+> This is the plan as written on 31 Oct 2026. Its open items were superseded
+> by measurements on 8–12 Nov 2026 (the full Python suite, the CLI in a real
+> PTY, the Electron E2E run, the lab kill chain, and the Windows endpoint
+> check-in recorded in `CHANGELOG.md`). It is kept for traceability only.
+> Current status and evidence: [`RELEASE_STATUS.md`](RELEASE_STATUS.md).
+
 Follows the previous plan (2026-10-29, now in git history and summarised in
 [`../CHANGELOG.md`](../CHANGELOG.md)). This document
 covers three things: what was closed today (measured, not promised), the three

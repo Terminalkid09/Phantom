@@ -4,7 +4,9 @@ This folder holds the **current truth only**: specifications, contracts and
 runbooks that a reader is meant to act on today. Point-in-time material —
 audits, reviews, live-test transcripts — is not kept here: it stops being true
 the day after it is written, and a reader cannot tell when. That history lives
-in [`../CHANGELOG.md`](../CHANGELOG.md) and in git.
+in [`../CHANGELOG.md`](../CHANGELOG.md) and in git. The only exceptions are the
+two closed snapshots listed at the end, kept with a prominent banner and never
+used as current state.
 
 **Version lines** — `dev` is the **v3.0.0** line (in development, not tagged
 yet) and this folder documents that line; `main` is the released line at
@@ -15,8 +17,7 @@ repository root.
 
 | Document | What it is |
 | --- | --- |
-| [`ROADMAP.md`](ROADMAP.md) | Consolidated work roadmap. Where it disagrees with a review, the roadmap wins; the code wins over both. |
-| [`Action_Plan_2026-10-31.md`](Action_Plan_2026-10-31.md) | Current action plan: what closed on 31 Oct with its measurement, the open phases and an acceptance criterion for each. |
+| [`RELEASE_STATUS.md`](RELEASE_STATUS.md) | **Current release state.** What is verified (compiled / lab / endpoint / operator-reported), what is not, and the remaining release gates. |
 | [`THREAT_MODEL.md`](THREAT_MODEL.md) | What Phantom defends (the operator and the engagement), from whom, and — explicitly — what it does not defend. |
 | [`beacon_platform_matrix.md`](beacon_platform_matrix.md) | Which beacon features actually build/run per platform (the live contract, CI-checked). |
 | [`AutoModeBenchmark.md`](AutoModeBenchmark.md) | How auto-mode is MEASURED (ground-truth scenarios, failure injection, what the numbers do and do not prove) and how to run the suite. |
@@ -24,6 +25,13 @@ repository root.
 | [`c2d.md`](c2d.md) | The Go data plane (`c2d/`): what it ports, what stays in Python (answered `501`), and how to run it. |
 | [`PHISHING_STATUS.md`](PHISHING_STATUS.md) | What the phishing surface does today, what is credential-gated, and what is explicitly out of scope (SPF/DKIM/DMARC, end-to-end delivery). |
 | [`COMMAND_REFERENCE.md`](COMMAND_REFERENCE.md) | Every shell, module, C2 and AUTO-MODE command with what it does. **Generated** from the live registries — regenerate it, never hand-edit it. |
+
+## Historical (do not act on these)
+
+| Document | Status |
+| --- | --- |
+| [`Action_Plan_2026-10-31.md`](Action_Plan_2026-10-31.md) | Closed 2026-11-12. Its open items were superseded by later measurements; see `RELEASE_STATUS.md`. |
+| [`ROADMAP.md`](ROADMAP.md) | Snapshot at `f6771f5` (2026-09-13), log through 2026-10-12. Kept for traceability only. |
 
 **Test counts.** Only the repository root [`README.md`](../README.md) states a
 current test count, and it is contract-tested against the tree

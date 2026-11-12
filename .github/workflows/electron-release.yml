@@ -38,7 +38,10 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt pyinstaller==6.21.0
+          # constraints.txt is the VERIFIED set: the release artefacts must be
+          # built from the same versions the suite was tested against, not
+          # from whatever the `>=` floors resolve to on release day.
+          python -m pip install -r requirements.txt -c constraints.txt pyinstaller==6.21.0
 
       # onedir (not onefile): the onefile bootloader is a well-known AV
       # heuristic trigger (false positives on Windows Defender / McAfee).

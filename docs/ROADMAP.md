@@ -1,5 +1,12 @@
 # Phantom — Roadmap di lavoro (audit consolidato)
 
+> **STORICO — non è lo stato attuale. Non agire su questo file.**
+> Snapshot con baseline `f6771f5` (2026-09-13); il log in fondo arriva al
+> 2026-10-12. Gli item ancora aperti qui sono stati chiusi o superati dalle
+> verifiche dell'8–12 novembre 2026, e alcune righe della matrice P2-2 sono
+> oggi verificate. Tenuto solo per tracciabilità.
+> Stato corrente e prove: [`RELEASE_STATUS.md`](RELEASE_STATUS.md).
+
 **Commit di riferimento:** `f6771f55967e4d0d33c5c3536316736946dbaea3` (branch `dev`)
 **Fonti:** il codice fa fede. La roadmap è stata consolidata dagli audit dell'ottobre 2026 — rimossi da `docs/` perché materiale datato: vivono in [`../CHANGELOG.md`](../CHANGELOG.md) e nella storia git — più una verifica indipendente.
 **Data creazione:** 2026-09-13

@@ -86,6 +86,32 @@ behind it; the ones that were not measured are named as such.
 
 ## [Unreleased] — current development (v3.0.0 line)
 
+### Persistence: the auto-mode command was truncated at the first newline — 2026-11-12
+
+- **Auto-mode was not skipping `persistence_install`; the beacon was failing
+  it.** The lab chain recorded `persistence = fail` while the C2's native
+  `persist` task on the same host reported success. The target's answer was
+  `sh: 1: Syntax error: Unterminated quoted string`: the Linux builder ships a
+  systemd unit with real newlines inside single quotes, and the beacon's
+  `shell` / `exec` / `run` dispatcher read its argument with `std::getline`,
+  which stops at the first newline. `sh -c` then received an unterminated
+  quote. The dispatcher now takes the whole argument (`command_line.h`),
+  covered by a compiled-and-run test (`tests/test_beacon_command_line.py`).
+  Re-run of the same lab chain: **`beacon=True persistence=True creds=2
+  actions=4`, goal `deliver` reached in 41 s** (`B-975383D9360DB20A`).
+- **Release docs reconciled.** [`docs/RELEASE_STATUS.md`](docs/RELEASE_STATUS.md)
+  is now the single current status page, separating compiled / lab / endpoint /
+  reported evidence. `ROADMAP.md` and `Action_Plan_2026-10-31.md` carry a
+  prominent banner and are listed as historical in `docs/README.md`, so their
+  open items can no longer be read as today's state. The README counts (test
+  files, API routes) were updated, and the SmartScreen limitation is now stated
+  next to the installers.
+- **Distribution hardening.** `install/install.ps1` validates the extracted
+  archive before removing the existing install, so a truncated download cannot
+  leave the operator with neither version. The Electron release workflow builds
+  the backend against `constraints.txt` — the version set the suite was verified
+  against — instead of resolving the `>=` floors on release day.
+
 ### Review verification: seven warnings were nineteen — 2026-11-08
 
 - **The review was checked claim by claim, not accepted.** The previous `dev`

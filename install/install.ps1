@@ -74,7 +74,6 @@ if ((Get-Item $Zip).Length -lt $minSize) {
 
 # ── 3. extract
 Step "Installing to $Dest (branch: $Branch)"
-if (Test-Path $Dest) { Remove-Item -Recurse -Force $Dest }
 Expand-Archive -Path $Zip -DestinationPath $env:TEMP -Force
 $inner = Get-ChildItem $env:TEMP -Directory -Filter "Phantom-$Branch*" |
          Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -88,6 +87,11 @@ foreach ($needed in @("phantom\main.py", "requirements.txt", "setup.py")) {
         exit 1
     }
 }
+# Replace the existing install only AFTER the new archive is proven to carry
+# the files this script relies on. The old order removed $Dest first, so a
+# truncated download or a wrong branch left the operator with neither the
+# previous version nor a working new one.
+if (Test-Path $Dest) { Remove-Item -Recurse -Force $Dest }
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 if ($FullTree) {
     Say "PHANTOM_FULL_TREE=1: copying the whole tree (old behaviour)"
