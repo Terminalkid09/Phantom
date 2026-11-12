@@ -96,8 +96,13 @@ class TestMsfRunner(unittest.TestCase):
 
     def test_spawn_requires_msfconsole(self):
         runner = MsfRunner()
-        with self.assertRaises(ToolMissingError):
-            runner.spawn("nonexistent.rc")
+        # Hermetic: this host may legitimately resolve msfconsole through WSL.
+        # The property is that spawn refuses when the resolver says missing.
+        from unittest.mock import patch
+        with patch("phantom.automation.runtime.msf._require_tool",
+                   side_effect=ToolMissingError("msfconsole not found")):
+            with self.assertRaises(ToolMissingError):
+                runner.spawn("nonexistent.rc")
 
 
 if __name__ == "__main__":

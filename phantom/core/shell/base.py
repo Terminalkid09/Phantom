@@ -106,13 +106,11 @@ class PhantomShell(cmd.Cmd):
         return stop
 
     def cmdloop(self, intro=None):
-        """First Ctrl+C cancels input + shows hint; second Ctrl+C (within 2s) exits.
+        """Ctrl+C at the prompt exits; Ctrl+C during a command aborts that run.
 
         Re-implemented inline so that preloop() runs only once — the stdlib
         cmdloop would re-print the full banner on every KeyboardInterrupt,
-        burying the exit hint."""
-        import time as _time
-
+        burying the exit message."""
         self.preloop()
         if intro is not None:
             self.intro = intro
@@ -128,8 +126,6 @@ class PhantomShell(cmd.Cmd):
             except (ImportError, AttributeError):
                 pass
 
-        self._intr_count = 0
-        self._last_intr = 0.0
         stop = None
         try:
             while not stop:
@@ -156,23 +152,25 @@ class PhantomShell(cmd.Cmd):
                             else:
                                 line = line.rstrip("\r\n")
                     line = self.precmd(line)
+                    # Deliberately NOT in a finally: if onecmd raises
+                    # KeyboardInterrupt, the handler below must still see
+                    # that a run was in progress (and abort the run, not the
+                    # shell). The normal path clears it explicitly.
+                    self._busy = True
                     stop = self.onecmd(line)
                     stop = self.postcmd(stop, line)
-                    # reset double-exit window after a successful command
-                    self._intr_count = 0
+                    self._busy = False
                 except KeyboardInterrupt:
-                    now = _time.monotonic()
-                    if now - self._last_intr > 2.0:
-                        self._intr_count = 0
-                    self._intr_count += 1
-                    self._last_intr = now
-                    if self._intr_count >= 2:
-                        _sh.console.print("\n[dim]Phantom closed.[/dim]\n")
-                        raise SystemExit(0)
-                    _sh.console.print()
-                    _sh.console.print(
-                        "[bold yellow]^C  —  Ctrl+C again to exit, or keep typing.[/bold yellow]")
-                    continue
+                    # At an idle prompt, Ctrl+C closes: the old two-press
+                    # window made the shell look unkillable. DURING a run it
+                    # aborts that run and returns to the prompt, so the next
+                    # keystroke can decide what to do.
+                    if getattr(self, "_busy", False):
+                        self._busy = False
+                        _sh.console.print("\n[bold yellow]^C  run interrupted — back at the prompt.[/bold yellow]")
+                        continue
+                    _sh.console.print("\n[dim]Phantom closed.[/dim]\n")
+                    raise SystemExit(0)
             self.postloop()
         finally:
             if self.use_rawinput and self.completekey and self.old_completer is not None:

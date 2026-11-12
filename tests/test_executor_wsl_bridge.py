@@ -70,9 +70,16 @@ class TestWrapperAwareGate(unittest.TestCase):
 
     def test_wrapper_is_not_reported_as_installed_tool(self):
         # the regression: `sudo` resolves on Windows 11 (disabled sudo.exe)
-        # and on any Linux box, so `sudo <missing-tool>` passed the gate
-        self.assertFalse(_is_tool_installed("sudo definitely-not-a-tool-xyz 1"))
-        self.assertFalse(_is_tool_installed("sudo -n definitely-not-a-tool-xyz 1"))
+        # and on any Linux box, so `sudo <missing-tool>` passed the gate.
+        # Hermetic: another test may leave a WSL probe cache behind.
+        def _which(name):
+            return r"C:\Windows\System32\sudo.exe" if name == "sudo" else None
+        with mock.patch("phantom.core.executor.shutil.which",
+                        side_effect=_which), \
+             mock.patch("phantom.automation.runtime.toolchain._wsl_which",
+                        return_value=None):
+            self.assertFalse(_is_tool_installed("sudo definitely-not-a-tool-xyz 1"))
+            self.assertFalse(_is_tool_installed("sudo -n definitely-not-a-tool-xyz 1"))
 
     def test_empty_command_is_not_a_missing_tool(self):
         self.assertTrue(_is_tool_installed(""))

@@ -226,8 +226,6 @@ class AutoShell(cmd.Cmd):
         self._run_started = 0.0
         self.events: Dict[str, List[Dict[str, Any]]] = {}
         self.has_run = False
-        self._intr_count = 0
-        self._last_intr = 0.0
         self._last_line = ""
         self._last_status_sig = None
         from phantom.core.shell.ui import build_prompt
@@ -282,8 +280,6 @@ class AutoShell(cmd.Cmd):
         return stop
 
     def cmdloop(self, intro=None):
-        import time as _time
-
         self.preloop()
         if intro is not None:
             self.intro = intro
@@ -295,22 +291,19 @@ class AutoShell(cmd.Cmd):
                 try:
                     line = input(self.prompt) if self.use_rawinput else self._raw_line()
                     line = self.precmd(line)
+                    # NOT a finally: the handler must still see that a run was
+                    # in flight, so Ctrl+C aborts the run instead of the shell.
+                    self._busy = True
                     stop = self.onecmd(line)
                     stop = self.postcmd(stop, line)
-                    self._intr_count = 0
+                    self._busy = False
                 except KeyboardInterrupt:
-                    now = _time.monotonic()
-                    if now - self._last_intr > 2.0:
-                        self._intr_count = 0
-                    self._intr_count += 1
-                    self._last_intr = now
-                    if self._intr_count >= 2:
-                        console.print("\n[dim]AUTO-MODE closed.[/dim]\n")
-                        raise SystemExit(0)
-                    console.print()
-                    console.print(
-                        "[bold yellow]^C  —  Ctrl+C again to exit, or keep typing.[/bold yellow]")
-                    continue
+                    if getattr(self, "_busy", False):
+                        self._busy = False
+                        console.print("\n[bold yellow]^C  run interrupted — back at the prompt.[/bold yellow]")
+                        continue
+                    console.print("\n[dim]AUTO-MODE closed.[/dim]\n")
+                    raise SystemExit(0)
         finally:
             self.postloop()
 
@@ -716,7 +709,7 @@ class AutoShell(cmd.Cmd):
             console.print("\n[dim]Returning to AUTO-MODE.[/]")
         finally:
             # Same guarantee as the standalone shell: the engagement is
-            # persisted on EVERY close path, including a double Ctrl+C.
+            # persisted on EVERY close path, including Ctrl+C.
             try:
                 exported = auto_export()
                 if exported:

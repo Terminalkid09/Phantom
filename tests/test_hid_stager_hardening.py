@@ -152,6 +152,10 @@ class TestTheRetryLoopIsBounded:
         failure mode this test exists to catch is "runs for ever", and a test
         that also runs for ever when it catches it is not a test.
         """
+        if os.name == "nt":
+            # Windows ships timeout.exe (a different program) and cannot
+            # execute the POSIX loop this test runs under the watchdog.
+            pytest.skip("POSIX-only: needs a POSIX shell and GNU timeout")
         shell = shutil.which("sh")
         watchdog = shutil.which("timeout")
         if not shell or not watchdog:

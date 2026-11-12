@@ -3,13 +3,12 @@
 Covers:
 - status bar renders (listener, beacons, target)
 - context hint adapts to state (no listener / no beacons / no active / active)
-- double Ctrl+C within the window exits (SystemExit)
-- single Ctrl+C does NOT exit and schedules the auto-fading hint
+- a single Ctrl+C at the prompt exits (SystemExit)
+- a Ctrl+C during a command aborts the run and returns to the prompt
 - help command shows the C2 command table including config
 """
 import io
 import sys
-import time
 import unittest
 from unittest.mock import patch
 
@@ -97,33 +96,30 @@ class TestC2Help(unittest.TestCase):
 
 
 class TestC2CtrlC(unittest.TestCase):
-    def test_double_ctrl_c_exits(self):
-        """Two Ctrl+C within the 2 s window raises SystemExit (clean exit)."""
+    @staticmethod
+    def _shell():
         sh = C2Shell()
-        sh._intr_count = 0
-        sh._last_intr = 0.0
-        now = time.monotonic()
-        # first interrupt
-        sh._intr_count += 1
-        sh._last_intr = now
-        self.assertEqual(sh._intr_count, 1)
-        # second interrupt within the window -> exits
-        with self.assertRaises(SystemExit):
-            sh._intr_count += 1
-            sh._last_intr = now
-            if sh._intr_count >= 2:
-                raise SystemExit(0)
+        sh.preloop = lambda: None
+        sh.postloop = lambda: None
+        sh.postcmd = lambda stop, line: stop
+        return sh
 
-    def test_single_ctrl_c_resets_after_window(self):
-        """A Ctrl+C older than 2 s resets the counter (no accidental exit)."""
-        sh = C2Shell()
-        sh._intr_count = 1
-        sh._last_intr = time.monotonic() - 5.0  # older than the window
-        now = time.monotonic()
-        if now - sh._last_intr > 2.0:
-            sh._intr_count = 0
-        sh._intr_count += 1
-        self.assertEqual(sh._intr_count, 1)
+    @patch("builtins.input", side_effect=KeyboardInterrupt)
+    def test_single_ctrl_c_at_idle_exits(self, _input):
+        """At an idle prompt ONE Ctrl+C closes the C2 shell (clean exit)."""
+        with self.assertRaises(SystemExit):
+            self._shell().cmdloop()
+
+    def test_ctrl_c_during_command_returns_to_prompt(self):
+        """During a run Ctrl+C aborts the run, not the whole C2 shell."""
+        sh = self._shell()
+        sh.onecmd = lambda line: (_ for _ in ()).throw(KeyboardInterrupt()) \
+            if line == "longrun" else (line == "exit")
+        answers = iter(["longrun", "exit"])
+        with patch("builtins.input", side_effect=lambda _p="": next(answers)):
+            sh.cmdloop()
+        self.assertFalse(sh._busy)
+        self.assertIsNone(next(answers, None))
 
 
 if __name__ == "__main__":

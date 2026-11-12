@@ -15,7 +15,9 @@ from unittest.mock import MagicMock, patch, mock_open, call
 
 import pytest
 
-from phantom.core.executor import run_command, run_commands, _is_safe_target
+from phantom.core.executor import (
+    run_command, run_commands, _is_safe_target, _command_head,
+)
 from phantom.core.session import session
 
 
@@ -69,6 +71,34 @@ class TestIsSafeTarget:
         assert _is_safe_target("10.0.0.1 -p-") is False
 
 
+class TestSudoPrefix:
+    def test_root_and_missing_sudo_drops_the_prefix(self, monkeypatch):
+        import phantom.core.executor as ex
+        monkeypatch.setattr(ex.os, "name", "posix")
+        monkeypatch.setattr(ex.os, "geteuid", lambda: 0, raising=False)
+        assert ex._drop_useless_sudo("sudo nmap -Pn 10.0.0.1") == "nmap -Pn 10.0.0.1"
+        assert ex._drop_useless_sudo("sudo -n nmap -Pn 10.0.0.1") == "nmap -Pn 10.0.0.1"
+
+    def test_keeps_sudo_when_it_can_work(self, monkeypatch):
+        import phantom.core.executor as ex
+        monkeypatch.setattr(ex.os, "name", "posix")
+        monkeypatch.setattr(ex.os, "geteuid", lambda: 1000, raising=False)
+        monkeypatch.setattr(ex.shutil, "which", lambda name: "/usr/bin/sudo" if name == "sudo" else None)
+        assert ex._drop_useless_sudo("sudo nmap 10.0.0.1") == "sudo nmap 10.0.0.1"
+
+
+class TestCommandHead:
+    def test_environment_assignment_is_not_the_tool(self):
+        prefix, tool, _rest = _command_head(
+            "SSHPASS='S3cure' sshpass -e ssh -p 2222 backup@10.0.0.1 'id'")
+        assert tool == "sshpass"
+        assert prefix == "SSHPASS='S3cure'"
+
+    def test_env_wrapper_with_assignment_resolves_the_tool(self):
+        _prefix, tool, _rest = _command_head("env FOO=bar nmap -sV 10.0.0.1")
+        assert tool == "nmap"
+
+
 class TestRunCommand:
     """Tests for run_command() function."""
 
@@ -118,20 +148,20 @@ class TestRunCommand:
         assert isinstance(output, str)
 
     def test_run_command_handles_keyboard_interrupt(self, monkeypatch, capsys):
-        """run_command should catch KeyboardInterrupt and kill the process."""
+        """Ctrl+C kills the child AND propagates, so a batch cannot continue."""
         mock_process = MagicMock()
         mock_process.stdout = []
         mock_process.kill = MagicMock()
+        mock_process.wait = MagicMock()
 
         def raise_interrupt(*args, **kwargs):
             raise KeyboardInterrupt()
 
         with patch.object(subprocess, "Popen", return_value=mock_process):
             with patch("phantom.core.executor.threading.Thread", side_effect=raise_interrupt):
-                output = run_command("sleep 10")
-                assert output == ""
-                # Process should have been killed
-                # (Note: in real code, kill is called, but in this mock test we can't easily verify)
+                with pytest.raises(KeyboardInterrupt):
+                    run_command("sleep 10")
+                mock_process.kill.assert_called_once()
 
     def test_run_command_with_timeout_user_continues(self, monkeypatch):
         """Verify timeout handling doesn't crash (mocking is complex)."""

@@ -108,6 +108,31 @@ def is_comment(cmd: str) -> bool:
     return str(cmd or "").lstrip().startswith("#")
 
 
+def _sudo_usable() -> bool:
+    """Can a `sudo` prefix actually run here?
+
+    Root does not need it, and a minimal Linux image/container often has no
+    sudo binary at all. The module suggestions hard-code `sudo nmap ...`, so
+    a real CLI run failed with `/bin/sh: sudo: not found` even though nmap
+    was installed and the process already had root.
+    """
+    # On Windows keep the prefix: `_rewrite_wsl` turns `sudo` into the
+    # distro's `-u root`, while a native Windows sudo.exe is disabled. Only
+    # POSIX execution strips it when root/no sudo can make it fail.
+    if os.name == "nt":
+        return True
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return False
+    return shutil.which("sudo") is not None
+
+
+def _drop_useless_sudo(cmd: str) -> str:
+    if _sudo_usable():
+        return cmd
+    match = re.match(r"^\s*sudo(?:\s+-[A-Za-z-]+)*\s+", cmd)
+    return cmd[match.end():] if match else cmd
+
+
 def _command_head(cmd: str) -> tuple:
     """``(prefix, tool, rest)`` for a shell command line.
 
@@ -119,6 +144,13 @@ def _command_head(cmd: str) -> tuple:
     tokens = cmd.split()
     idx = 0
     while idx < len(tokens):
+        # `SSHPASS=… sshpass -e ssh …` / `env FOO=bar nmap …`: the assignment
+        # is shell syntax, not the binary. Reading it as the tool made
+        # execute_quiet refuse every SSH probe/deploy with "tool
+        # 'SSHPASS=…' not installed" before the password was ever tried.
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[idx]):
+            idx += 1
+            continue
         if tokens[idx] in _WRAPPER_PREFIXES:
             idx += 1
             continue
@@ -452,6 +484,7 @@ def _is_tool_installed(cmd: str) -> bool:
     """
     if is_comment(cmd):
         return True
+    cmd = _drop_useless_sudo(cmd)
     _prefix, tool, _rest = _command_head(cmd)
     if not tool:
         return True
@@ -812,6 +845,7 @@ def run_command(cmd: str, target_ip: str = "", status=None) -> str:
             status.refused_command(cmd, f"unsafe target: {target_ip}")
         return ""
 
+    cmd = _drop_useless_sudo(cmd)
     if not _is_tool_installed(cmd):
         _p, _tool, _r = _command_head(cmd)
         tool = _tool or "Unknown"
@@ -943,7 +977,11 @@ def run_command(cmd: str, target_ip: str = "", status=None) -> str:
             process.wait(timeout=2)
         except Exception:
             pass
-        console.print("\n[yellow][!] Interrupted by user (Ctrl+C). Moving to next command.[/]")
+        console.print("\n[yellow][!] Interrupted by user (Ctrl+C) — stopping this run.[/]")
+        # Re-raise: swallowing it here made Ctrl+C advance to the NEXT command
+        # of a batch, so a run that felt stuck could never be stopped. The
+        # shell loop (or the module) decides what an abort means.
+        raise
 
     except Exception as e:
         console.print(f"[red][!] Execution error: {type(e).__name__}: {e}[/]")
@@ -1048,8 +1086,10 @@ def execute_quiet(
         return QuietResult(cmd=cmd, stdout=cmd.lstrip().lstrip("#").strip(),
                            returncode=0)
 
+    cmd = _drop_useless_sudo(cmd)
     if check_tool and not _is_tool_installed(cmd):
-        tool = cmd.split()[0] if cmd.split() else "Unknown"
+        _prefix, tool, _rest = _command_head(cmd)
+        tool = tool or "Unknown"
         return QuietResult(cmd=cmd, error=f"tool '{tool}' not installed", returncode=-1)
 
     # WSL toolbox: run through the distro when the binary is Windows-missing
@@ -1142,6 +1182,7 @@ def execute_quiet_bg(cmd: str, target_ip: str = "") -> "BackgroundProcess":
     # metacharacters) must never reach the shell=True child here either.
     if target_ip and not _is_safe_target(target_ip):
         raise ValueError(f"unsafe target chars: {target_ip}")
+    cmd = _drop_useless_sudo(cmd)
     if not _is_tool_installed(cmd):
         raise FileNotFoundError(f"tool '{cmd.split()[0] if cmd.split() else '?'}' not installed")
 

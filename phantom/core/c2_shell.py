@@ -173,8 +173,6 @@ class C2Shell(cmd.Cmd):
     def __init__(self):
         super().__init__()
         self.active_beacon = None
-        self._intr_count = 0
-        self._last_intr = 0.0
         self._last_status_sig = None
         from phantom.core.shell.ui import build_prompt
         self.prompt = build_prompt("C2", depth=2)
@@ -290,22 +288,19 @@ class C2Shell(cmd.Cmd):
                             else:
                                 line = line.rstrip("\r\n")
                     line = self.precmd(line)
+                    # NOT a finally: the handler must still see that a run was
+                    # in flight, so Ctrl+C aborts the run instead of the shell.
+                    self._busy = True
                     stop = self.onecmd(line)
                     stop = self.postcmd(stop, line)
-                    self._intr_count = 0
+                    self._busy = False
                 except KeyboardInterrupt:
-                    now = _time.monotonic()
-                    if now - self._last_intr > 2.0:
-                        self._intr_count = 0
-                    self._intr_count += 1
-                    self._last_intr = now
-                    if self._intr_count >= 2:
-                        console.print("\n[dim]C2 closed.[/dim]\n")
-                        raise SystemExit(0)
-                    console.print()
-                    console.print(
-                        "[bold yellow]^C  —  Ctrl+C again to exit, or keep typing.[/bold yellow]")
-                    continue
+                    if getattr(self, "_busy", False):
+                        self._busy = False
+                        console.print("\n[bold yellow]^C  run interrupted — back at the prompt.[/bold yellow]")
+                        continue
+                    console.print("\n[dim]C2 closed.[/dim]\n")
+                    raise SystemExit(0)
             self.postloop()
         finally:
             if self.use_rawinput and self.completekey and self.old_completer is not None:
