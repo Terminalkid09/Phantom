@@ -30,6 +30,8 @@ import argparse
 import json
 import re
 import socket
+import ssl
+import struct
 import subprocess
 import sys
 import time
@@ -44,9 +46,14 @@ CONTAINER_PREFIX = "phantom-lab-"
 #: Ports the benchmark probes on every host port it finds. Identified, never
 #: assumed: an HTTP port that answers TCP but not HTTP is reported as unknown.
 HTTP_HINT = {80, 443, 8000, 8080, 8081, 8443, 3000}
+#: Ports whose HTTP listener speaks TLS. The old benchmark sent a cleartext
+#: GET to 8443, got an SSL error and scored the phone's real MDM as `unknown`:
+#: the probe was wrong, not the service.
+TLS_HINT = {443, 8443, 9443, 10443}
 REDIS_HINT = {6379}
 SSH_HINT = {22, 2222}
 FTP_HINT = {21, 2121}
+ADB_HINT = {5555}
 
 
 def _docker(args: List[str]) -> str:
@@ -117,12 +124,27 @@ def _probe_tcp(port: int, host: str = "127.0.0.1",
         sock.close()
 
 
-def _probe_http(port: int, host: str = "127.0.0.1") -> Optional[str]:
-    """The response head, or None. A real request, not a port check."""
+def _probe_http(port: int, host: str = "127.0.0.1",
+                tls: Optional[bool] = None) -> Optional[str]:
+    """The response head, or None. A real request, not a port check.
+
+    ``tls`` defaults to the port class: 443/8443/9443 speak TLS, the other
+    HTTP hints speak cleartext. Wrapping is deliberately unverified — the lab
+    uses a self-signed certificate, and the benchmark measures identification,
+    not PKI.
+    """
+    if tls is None:
+        tls = port in TLS_HINT
     request = (f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\n"
                "Connection: close\r\nUser-Agent: phantom-bench\r\n\r\n")
     try:
-        with socket.create_connection((host, port), timeout=3) as sock:
+        with socket.create_connection((host, port), timeout=3) as raw:
+            sock = raw
+            if tls:
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                sock = context.wrap_socket(raw, server_hostname=host)
             sock.sendall(request.encode())
             sock.settimeout(3)
             chunks: List[bytes] = []
@@ -132,8 +154,52 @@ def _probe_http(port: int, host: str = "127.0.0.1") -> Optional[str]:
                     break
                 chunks.append(data)
             return b"".join(chunks).decode("latin-1")
-    except OSError:
+    except (OSError, ssl.SSLError):
         return None
+
+
+def _recv_exact(sock: socket.socket, count: int) -> bytes:
+    """Read exactly ``count`` bytes or raise OSError (short reads are real)."""
+    data = b""
+    while len(data) < count:
+        chunk = sock.recv(count - len(data))
+        if not chunk:
+            raise OSError("connection closed")
+        data += chunk
+    return data
+
+
+def _adb_cnxn_packet() -> bytes:
+    """A framed ADB CNXN packet, exactly the shape adbd expects.
+
+    The phone's real adbd frames even the handshake: 4-byte length, then the
+    24-byte header (with the magic complement), then the payload. A raw
+    24-byte header made the probe time out even though the daemon was there.
+    """
+    payload = b"host::\0"
+    command = 0x4E584E43                       # CNXN
+    header = struct.pack("<6I", command, 0x01000001, 4096, len(payload),
+                         sum(payload) & 0xFFFFFFFF, command ^ 0xFFFFFFFF)
+    body = header + payload
+    return struct.pack("<I", len(body)) + body
+
+
+def _probe_adb(port: int, host: str = "127.0.0.1") -> Optional[str]:
+    """Identify a real adbd, not merely an open 5555."""
+    try:
+        with socket.create_connection((host, port), timeout=3) as sock:
+            sock.settimeout(3)
+            sock.sendall(_adb_cnxn_packet())
+            (length,) = struct.unpack("<I", _recv_exact(sock, 4))
+            if length < 24 or length > 65536:
+                return None
+            body = _recv_exact(sock, length)
+            command = struct.unpack("<I", body[:4])[0]
+            if command in (0x4E584E43, 0x48545541):     # CNXN / AUTH
+                return "CNXN" if command == 0x4E584E43 else "AUTH"
+    except (OSError, struct.error):
+        return None
+    return None
 
 
 def _probe_redis(port: int, host: str = "127.0.0.1") -> Optional[str]:
@@ -164,6 +230,10 @@ def identify(port: int) -> Tuple[str, str]:
         reply = _probe_redis(port)
         if reply and "PONG" in reply.upper():
             return "redis", reply.strip()[:40]
+    if port in ADB_HINT:
+        reply = _probe_adb(port)
+        if reply:
+            return "adb", reply
     if port in SSH_HINT:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
