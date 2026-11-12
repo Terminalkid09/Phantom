@@ -1439,7 +1439,7 @@ class C2Shell(cmd.Cmd):
         self._wait_for_result(task_id)
 
     def do_screenshot(self, arg):
-        """screenshot - Capture a screenshot of the target (Windows only)"""
+        """screenshot - Capture a screenshot of the target (Windows, Linux, Android; macOS degrades)"""
         if not self.active_beacon:
             notifier.error("No active beacon.")
             return

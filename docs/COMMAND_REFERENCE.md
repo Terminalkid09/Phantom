@@ -288,7 +288,7 @@ _No module-specific commands; use `suggest`, `run` or `preview`._
 | `results` | results [n\|all] - show results for the active beacon (default last 10) |
 | `screen-open` | screen-open [name] — open a saved screen recording (mp4) in the OS video player. Without a name, opens the newest recording. |
 | `screen-watch` | screen-watch [gui] — Watch beacon screen recordings. |
-| `screenshot` | screenshot - Capture a screenshot of the target (Windows only) |
+| `screenshot` | screenshot - Capture a screenshot of the target (Windows, Linux, Android; macOS degrades) |
 | `set-sleep` | set-sleep <ms> [jitter%] - Rotate the beacon cadence mid-session (no restart, no redeploy). The beacon applies it at the next check-in. |
 | `telegram` | telegram — Start the Telegram bot to manage beacons from mobile |
 | `tunnel` | tunnel [start [port]\|install\|stop] - Public hop for delivery (c2.front). |
