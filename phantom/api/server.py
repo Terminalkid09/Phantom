@@ -2392,7 +2392,13 @@ async def search_global(request: web.Request) -> web.Response:
     # Search C2 beacons
     for b in _c2_beacons_list():
         if query in b["id"].lower() or query in b.get("hostname", "").lower() or query in b.get("user", "").lower():
-            results.append({"source": "c2", "type": "beacon", "label": f"Beacon {b['id'][:12]} @ {b.get('hostname', '?')}", "action": "c2"})
+            # Carry the FULL id: the renderer used to scrape it back out of
+            # the label with a hex regex, which matched "Beac" in the word
+            # "Beacon" and selected a beacon that does not exist.
+            results.append({"source": "c2", "type": "beacon",
+                            "beacon_id": b["id"],
+                            "label": f"Beacon {b['id']} @ {b.get('hostname', '?')}",
+                            "action": "c2"})
 
     # Search all module commands
     for mod_name in _MODULES:

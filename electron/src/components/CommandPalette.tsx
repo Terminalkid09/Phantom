@@ -11,6 +11,9 @@ interface SearchResult {
   group?: string
   action: string
   command?: string
+  /** Present on C2 beacon hits: the server owns the id, the UI must not
+   *  scrape it back out of the human-readable label. */
+  beacon_id?: string
 }
 
 export default function CommandPalette() {
@@ -65,10 +68,10 @@ export default function CommandPalette() {
       localStorage.setItem(`phantom:${result.module}:selected`, result.command || '')
     } else if (result.action === 'c2') {
       setActiveTab('c2')
-      if (result.type === 'beacon') {
-        // Extract beacon ID from label
-        const id = result.label.match(/([a-f0-9]+)/i)
-        if (id) setActiveBeacon(id[1])
+      // Use the id the API returned. A regex over the label matched the
+      // "Beac" inside the word "Beacon" and selected nothing.
+      if (result.type === 'beacon' && result.beacon_id) {
+        setActiveBeacon(result.beacon_id)
       }
     } else if (result.action === 'session') {
       setActiveTab('session')
