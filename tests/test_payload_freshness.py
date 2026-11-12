@@ -231,3 +231,30 @@ def test_rebuild_when_endpoint_changes(tmp_path, monkeypatch):
 def test_rebuild_when_binary_is_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(B, "crypto_fingerprint", lambda: "fp")
     assert B._needs_rebuild(str(tmp_path), "beacon.exe") is True
+
+
+def test_rebuild_when_mtls_material_rotates(tmp_path, monkeypatch):
+    """A new data-dir CA must rebuild the beacon: its client cert is baked in.
+
+    Live defect 2026-11-11: the deploy used a binary built for an older CA,
+    the listener required a client certificate, and every beacon check-in was
+    reset in the TLS handshake.
+    """
+    monkeypatch.setattr(B, "crypto_fingerprint", lambda: "fp")
+    monkeypatch.setattr(B, "_mtls_fingerprint", lambda: "ca-old")
+    (tmp_path / "beacon.exe").write_bytes(b"MZ")
+    B._mark_built(str(tmp_path), "beacon.exe")
+    assert B._needs_rebuild(str(tmp_path), "beacon.exe") is False
+
+    monkeypatch.setattr(B, "_mtls_fingerprint", lambda: "ca-new")
+    assert B._needs_rebuild(str(tmp_path), "beacon.exe") is True
+
+
+def test_linux_rebuilds_when_static_deploy_artifact_is_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(B, "crypto_fingerprint", lambda: "fp")
+    monkeypatch.setattr(B, "_mtls_fingerprint", lambda: "")
+    (tmp_path / "beacon_linux").write_bytes(b"ELF")
+    B._mark_built(str(tmp_path), "beacon_linux")
+    assert B._needs_rebuild(str(tmp_path), "beacon_linux") is True
+    (tmp_path / "beacon_linux_static").write_bytes(b"ELF")
+    assert B._needs_rebuild(str(tmp_path), "beacon_linux") is False
