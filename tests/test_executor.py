@@ -11,6 +11,7 @@ Tests:
 
 import subprocess
 import shutil
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, mock_open, call
 
 import pytest
@@ -22,10 +23,22 @@ from phantom.core.session import session
 
 
 @pytest.fixture(autouse=True)
-def mock_shutil_which():
-    """Mock shutil.which to always return True for tests."""
-    with patch("shutil.which", return_value="/usr/bin/tool"):
-        yield
+def mock_shutil_which(monkeypatch):
+    """Make every tool look installed, WITHOUT touching global ``shutil``.
+
+    This fixture used to patch ``shutil.which`` itself. One test below also
+    monkeypatched that function, and pytest restored the two layers in the
+    opposite order, leaving the fake ``/usr/bin/tool`` installed for the rest
+    of the worker: unrelated files then tried to execute it (or believed
+    ``nmap`` existed) and failed only in the full run. ``executor`` calls
+    ``shutil.which`` and nothing else from the module, so replacing its view
+    of ``shutil`` keeps the mock local to this file.
+    """
+    monkeypatch.setattr(
+        "phantom.core.executor.shutil",
+        SimpleNamespace(which=lambda _name: "/usr/bin/tool"),
+    )
+    yield
 
 
 class TestIsSafeTarget:
@@ -83,7 +96,10 @@ class TestSudoPrefix:
         import phantom.core.executor as ex
         monkeypatch.setattr(ex.os, "name", "posix")
         monkeypatch.setattr(ex.os, "geteuid", lambda: 1000, raising=False)
-        monkeypatch.setattr(ex.shutil, "which", lambda name: "/usr/bin/sudo" if name == "sudo" else None)
+        monkeypatch.setattr(
+            ex.shutil, "which",
+            lambda name: "/usr/bin/sudo" if name == "sudo" else None,
+        )
         assert ex._drop_useless_sudo("sudo nmap 10.0.0.1") == "sudo nmap 10.0.0.1"
 
 

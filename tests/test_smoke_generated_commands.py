@@ -149,9 +149,15 @@ def test_every_generated_command_has_real_tool_on_path():
             + ", ".join(sorted({t for t, _ in missing})))
 
 
+@pytest.mark.integration_tool
 def test_installed_tools_parse_their_generated_flags():
     """Syntax-level validation only: run the tool's own version/help probe.
-    This proves the toolchain can execute; it never touches a target."""
+    This proves the toolchain can execute; it never touches a target.
+
+    It launches binaries that are not part of a checkout, so it belongs to
+    the integration-tool job (which installs nmap) rather than the hermetic
+    gate. The companion test above only resolves names and can stay there.
+    """
     checked = 0
     probed = set()
     for cmd in _collect_commands():
