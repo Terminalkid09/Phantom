@@ -20,7 +20,7 @@ unverified.
 | --- | --- | --- |
 | Python suite | Lab + CI | Full suite green in CI at `f3d2ca8` (run [`43395995444`](https://github.com/Terminalkid09/Phantom/actions/runs/43395995444)); **6,603 tests collected locally**. The preceding full local baseline (2026-11-12) was **6,595 passed, 5 skipped, 115 subtests, 508.91 s** on the Windows lab (8 workers). |
 | CI `main` / `dev` | CI | Run [`43395995444`](https://github.com/Terminalkid09/Phantom/actions/runs/43395995444) at `f3d2ca8`: **success, 21/21 jobs** — Python 3.10/3.11/3.12, Electron build, C2, beacon smoke Windows/Linux/macOS/Android, security, Docker, integration-tools, c2d and model-integrity. The merge commit before the changelog audit, `5de69fc`, was also green (run `43394592667`). One non-blocking annotation remains: pinned actions still target Node 20. |
-| Release | Published | GitHub release [`v3.0.0`](https://github.com/Terminalkid09/Phantom/releases/tag/v3.0.0). Its Full changelog link resolves to `main`; the tag itself points at the merge commit `5de69fc` (see gate 5). |
+| Release | Published | GitHub release [`v3.0.0`](https://github.com/Terminalkid09/Phantom/releases/tag/v3.0.0). Its Full changelog link resolves to `main`; a downloaded source archive is fixed at the tag (see gate 5). |
 | Auto-mode kill chain (Linux) | Lab | 2026-11-12: HTTPS/mTLS C2, real beacon check-in **`B-975383D9360DB20A`**, **`beacon=True persistence=True creds=2 actions=4`**, goal `deliver` reached in **41 s**. |
 | Persistence (Linux) | Lab | The same run records `persistence_installed=True`. The beacon's native `persist` verb had already succeeded on this host; the defect was in auto-mode's separate shell path (below). |
 | CLI | Lab (real PTY) | **17/17** checks: `set target`, `suggest`, real `nmap` run, quiet scan, `auto`, refusal of `run` in AUTO-MODE, Ctrl+C auto→manual, final Ctrl+C. |
@@ -74,12 +74,11 @@ received an unterminated quote. The dispatcher now takes the whole argument
    Windows→Linux (Kali WSL) and Linux→Windows (MinGW) exist in the builder; CI
    builds each OS on its own runner instead of testing both cross directions.
 4. **macOS and Android runtime** are compiled, not exercised.
-5. **The published tag predates the documentation audit.** The GitHub release
-   `v3.0.0` and its tag point at merge commit `5de69fc`; the current `main` and
-   `dev` head contains the corrected documentation and changelog. The release
-   page's Full changelog link resolves to `main`, so it shows the corrected
-   file, but a source archive taken from the tag does not. Retag the release to
-   the current head before treating the tag as the complete release snapshot.
+5. **The tag snapshot can lag the documentation head.** The release page's
+   Full changelog link resolves to `main`, so it shows the corrected file; a
+   source archive is fixed at the tag. Before treating the tag as the complete
+   release snapshot, verify that `v3.0.0` points at the current `main`/`dev`
+   head, and retag it if it does not.
 
 ## Verdict
 
