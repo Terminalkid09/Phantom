@@ -129,9 +129,9 @@ python scripts/c2d_parity_check.py     # Python <-> Go key derivation
 bandit -r phantom/ -c .bandit          # no unbaselined HIGH findings
 ```
 
-The full hermetic suite is large (~5 100 tests) and takes roughly 15–20
-minutes serially. `pytest-xdist` is available (`-n auto`) but serial is the
-default on purpose: several modules hold process-wide singletons.
+The full hermetic suite is large (6,600+ tests). Run the layer your change
+touches; CI runs all of them. `pytest-xdist` is available (`-n auto`) but
+serial is the default on purpose: several modules hold process-wide singletons.
 
 ## Branches and commits
 

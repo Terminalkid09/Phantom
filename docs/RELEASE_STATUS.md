@@ -1,8 +1,9 @@
-# Release status — `dev` (v3.0.0 line)
+# Release status — v3.0.0 (`main` and `dev`)
 
-Snapshot: **2026-11-12**, branch `dev`. This is the single current statement of
-what has been PROVEN. A green claim is repeated here only with the evidence
-that produced it; anything else is named as unverified.
+Snapshot: **2026-11-13**, `main` and `dev` at the documentation head. This is
+the single current statement of what has been PROVEN. A green claim is repeated
+here only with the evidence that produced it; anything else is named as
+unverified.
 
 ## Verification levels
 
@@ -17,8 +18,9 @@ that produced it; anything else is named as unverified.
 
 | Area | Level | Evidence |
 | --- | --- | --- |
-| Python suite | Lab | Full suite on 2026-11-12: **6595 passed, 5 skipped, 115 subtests, 508.91 s** on the Windows lab (8 workers, same test selection as CI). The 5 skips are platform/toolchain-only cases. CI on Linux reports **6564 passed, 36 skipped** per interpreter, because Electron/node_modules and native tools are absent there. |
-| CI `dev` | CI | Run [`43265195253`](https://github.com/Terminalkid09/Phantom/actions/runs/43265195253) at `decd7cf`: **success, 21/21 jobs** — Python 3.10/3.11/3.12, Electron build, C2, beacon smoke Windows/Linux/macOS/Android, security, Docker, integration-tools and c2d. The preceding run `43257501577` was red on a test-isolation defect (below); the fix is test-only (`0ed35b0`). One non-blocking annotation remains: pinned actions still target Node 20. |
+| Python suite | Lab + CI | Full suite green in CI at `f3d2ca8` (run [`43395995444`](https://github.com/Terminalkid09/Phantom/actions/runs/43395995444)); **6,603 tests collected locally**. The preceding full local baseline (2026-11-12) was **6,595 passed, 5 skipped, 115 subtests, 508.91 s** on the Windows lab (8 workers). |
+| CI `main` / `dev` | CI | Run [`43395995444`](https://github.com/Terminalkid09/Phantom/actions/runs/43395995444) at `f3d2ca8`: **success, 21/21 jobs** — Python 3.10/3.11/3.12, Electron build, C2, beacon smoke Windows/Linux/macOS/Android, security, Docker, integration-tools, c2d and model-integrity. The merge commit before the changelog audit, `5de69fc`, was also green (run `43394592667`). One non-blocking annotation remains: pinned actions still target Node 20. |
+| Release | Published | GitHub release [`v3.0.0`](https://github.com/Terminalkid09/Phantom/releases/tag/v3.0.0). Its Full changelog link resolves to `main`; the tag itself points at the merge commit `5de69fc` (see gate 5). |
 | Auto-mode kill chain (Linux) | Lab | 2026-11-12: HTTPS/mTLS C2, real beacon check-in **`B-975383D9360DB20A`**, **`beacon=True persistence=True creds=2 actions=4`**, goal `deliver` reached in **41 s**. |
 | Persistence (Linux) | Lab | The same run records `persistence_installed=True`. The beacon's native `persist` verb had already succeeded on this host; the defect was in auto-mode's separate shell path (below). |
 | CLI | Lab (real PTY) | **17/17** checks: `set target`, `suggest`, real `nmap` run, quiet scan, `auto`, refusal of `run` in AUTO-MODE, Ctrl+C auto→manual, final Ctrl+C. |
@@ -40,9 +42,8 @@ and failed only in the full run.
 
 The fixture now replaces only the executor's view of `shutil`, and the test
 that actually launches external binaries is marked `integration_tool` (it runs
-in the job that installs `nmap`). The full suite is green locally, and run
-`43265195253` is green across all 21 jobs. This was a test defect, not a
-regression in the product.
+in the job that installs `nmap`). The full suite is green locally, and the
+release runs are green. This was a test defect, not a regression in the product.
 
 ## The persistence defect (fixed 2026-11-12)
 
@@ -73,17 +74,20 @@ received an unterminated quote. The dispatcher now takes the whole argument
    Windows→Linux (Kali WSL) and Linux→Windows (MinGW) exist in the builder; CI
    builds each OS on its own runner instead of testing both cross directions.
 4. **macOS and Android runtime** are compiled, not exercised.
-5. **No `v3.0.0` tag exists** (tags in this repository: `v1.0.0`, `v1.1.0`,
-   `v2.0.0`). The `3.0.0` section in `CHANGELOG.md` is the release note for
-   this line, not evidence of a published tag.
+5. **The published tag predates the documentation audit.** The GitHub release
+   `v3.0.0` and its tag point at merge commit `5de69fc`; the current `main` and
+   `dev` head contains the corrected documentation and changelog. The release
+   page's Full changelog link resolves to `main`, so it shows the corrected
+   file, but a source archive taken from the tag does not. Retag the release to
+   the current head before treating the tag as the complete release snapshot.
 
 ## Verdict
 
-The code is ready for a **v3.0.0 tag as a controlled release**: CI is green
-across all 21 jobs, the kill chain is green end-to-end, the full suite is
-green, and the desktop and CLI paths have been exercised. The remaining items
-are distribution evidence, not code failures. Until a clean-machine install
-smoke and an explicit signing/SmartScreen decision are recorded, describe the
-release as *verified in the lab and on the operator's Windows endpoint*, not as
-*installer-verified on a clean machine of every OS*. `main` has not been
-merged or tagged as part of this verification.
+**v3.0.0 is published as a controlled release.** `main` and `dev` are at the
+same documentation head; CI is green across all 21 jobs, the kill chain is
+green end-to-end, the full suite is green, and the desktop and CLI paths have
+been exercised. The remaining items are distribution evidence, not code
+failures. Until a clean-machine install smoke and an explicit
+signing/SmartScreen decision are recorded, describe the release as *verified
+in the lab and on the operator's Windows endpoint*, not as *installer-verified
+on a clean machine of every OS*.

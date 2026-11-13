@@ -8,10 +8,10 @@ in [`../CHANGELOG.md`](../CHANGELOG.md) and in git. The only exceptions are the
 two closed snapshots listed at the end, kept with a prominent banner and never
 used as current state.
 
-**Version lines** — `dev` is the **v3.0.0** line (in development, not tagged
-yet) and this folder documents that line; `main` is the released line at
-**v2.0.0**. Tags: `v1.0.0`, `v1.1.0`, `v2.0.0`. The changelog is at the
-repository root.
+**Version lines** — `main` is the released **v3.0.0** line (tag `v3.0.0`) and
+this folder documents it; `dev` is the integration branch, currently at the
+same commit. Older tags (`v1.0.0`, `v1.1.0`, `v2.0.0`) are historical. The
+changelog is at the repository root.
 
 ## Canonical (read these)
 

@@ -27,7 +27,7 @@
 
 ---
 
-**Phantom** is an offensive security framework for red teams that combines a full-featured C2 platform, 12 interactive pentest modules, and an autonomous kill-chain engine — all in one tool. The C2 beacon runs on Windows, Linux, Android, and macOS, using AES-256-GCM + mTLS + per-beacon HMAC authentication.
+**Phantom** is an offensive security framework for red teams that combines a full-featured C2 platform, 11 interactive pentest modules, and an autonomous kill-chain engine — all in one tool. The C2 beacon runs on Windows, Linux, Android, and macOS, using AES-256-GCM + mTLS + per-beacon HMAC authentication.
 
 Phantom also includes a **React + TypeScript Electron desktop app** (`electron/`) for campaign management, and an **autonomous agent** (`phantom/automation/`) that handles the full kill chain from reconnaissance to persistence without an LLM — fully offline, no data leaves your machine.
 
@@ -1081,9 +1081,9 @@ curl -fsSL https://raw.githubusercontent.com/Terminalkid09/Phantom/main/install/
 
 Both installers: download the repo tarball and install only what a run needs (the `phantom` package, `setup.py`, `MANIFEST.in`, `requirements.txt` — not `docs/`, `tests/`, the Electron app or `data/`) into `%LOCALAPPDATA%\Phantom` / `~/.phantom`, create a private venv, write the `phantom` / `phantom.c2` / `phantom.auto` launchers into the **user** PATH. **No admin, no registry beyond HKCU, nothing silent** — re-running refreshes in place.
 
-They install the **`dev`** branch (the line these docs describe, v3.0.0); `PHANTOM_BRANCH=main` installs the released line instead, and `PHANTOM_FULL_TREE=1` restores the old whole-tree copy.
+They install the **`dev`** branch by default (the integration line); the released **v3.0.0** line is `main`. Set `PHANTOM_BRANCH=main` to install the release, and `PHANTOM_FULL_TREE=1` restores the old whole-tree copy.
 
-**Integrity, stated honestly:** the download is verified to be a gzip/tar archive of the expected branch that actually contains `phantom/main.py`, `requirements.txt` and `setup.py` — three checks that a truncated download or a captive-portal HTML page fails. It is **not** a signed release and there is no published checksum for a branch tarball, so for provenance fetch a tag and read the commit: `git clone --branch v2.0.0 https://github.com/Terminalkid09/Phantom`.
+**Integrity, stated honestly:** the download is verified to be a gzip/tar archive of the expected branch that actually contains `phantom/main.py`, `requirements.txt` and `setup.py` — three checks that a truncated download or a captive-portal HTML page fails. It is **not** a signed release and there is no published checksum for a branch tarball, so for provenance fetch a tag and read the commit: `git clone --branch v3.0.0 https://github.com/Terminalkid09/Phantom`.
 
 Package paths: `pip install -e .` and `pip install -r requirements.txt` install the **same** dependency set, because `setup.py` reads `requirements.txt` instead of keeping a second copy (`tests/test_dependency_manifests.py` pins it).
 
@@ -1149,7 +1149,7 @@ Python API Server  (localhost:9876, 103 route registrations)
         ├─ phantom.core.automode   → auto-mode kill chain
         ├─ phantom.core.c2_server   → C2 listener + beacon control
         ├─ phantom.core.session     → session + knowledge + vault
-        ├─ phantom.modules.*        → 12 manual modules
+        ├─ phantom.modules.*        → 11 manual modules
         └─ phantom.api.backend       → WSL2 / Native / SSH dispatcher
 ```
 
@@ -1321,7 +1321,7 @@ phantom/                        # repository root
 │   ├── core/                   # Shell, C2 server, session, automode, knowledge
 │   ├── modules/                # 11 manual pentest modules
 │   ├── automation/             # Autonomous agent, planner, stealth, anomaly engine
-│   ├── api/                    # Electron API bridge (102 routes)
+│   ├── api/                    # Electron API bridge (103 routes)
 │   ├── exploits/               # Dynamic exploit scripts
 │   └── utils/                  # builder.py, c2_crypto.py, paths.py
 ├── phantom/payloads/beacon/src/
@@ -1373,5 +1373,5 @@ Phantom is intended for authorized penetration testing and educational purposes 
 ## Documentation
 
 - **Command reference** — every shell, module, C2 and AUTO-MODE command with a one-line description: [docs/COMMAND_REFERENCE.md](docs/COMMAND_REFERENCE.md).
-- **Release status** — what is verified, how, and what remains before the tag: [docs/RELEASE_STATUS.md](docs/RELEASE_STATUS.md).
+- **Release status** — what is verified, how, and what remains before installer-level verification: [docs/RELEASE_STATUS.md](docs/RELEASE_STATUS.md).
 - **Documentation index** — [docs/README.md](docs/README.md).

@@ -4,8 +4,8 @@
 #
 # What it does:
 #   1. downloads the repository tarball from the BRANCH you chose (github
-#      codeload; `dev` by default — the line these docs describe — override
-#      with $env:PHANTOM_BRANCH = 'main' for the released line)
+#      codeload; `dev` by default — the integration line. Override with
+#      $env:PHANTOM_BRANCH = 'main' for the released v3.0.0 line)
 #   2. verifies the download (size sanity + zip integrity + the files the
 #      installer is about to rely on)
 #   3. installs into %LOCALAPPDATA%\Phantom (user scope, no admin) — the files

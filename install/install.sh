@@ -13,9 +13,9 @@
 #   5. launchers in ~/.local/bin (PATH-checked, user scope)
 #   6. prints the follow-up steps (`phantom doctor`, `phantom setup`)
 #
-# Branch: `dev` by default, because that is the line these docs describe
-# (v3.0.0). The released line is `main` (v2.0.0) — install it explicitly with
-# `PHANTOM_BRANCH=main`. The installer PRINTS what it installed, so the version
+# Branch: `dev` by default (the integration line). The released line is `main`
+# (v3.0.0) — install it explicitly with `PHANTOM_BRANCH=main`. The installer
+# PRINTS what it installed, so the version
 # you get is never a surprise.
 #
 # Size: the copy is a KEEP-LIST (code, packaging metadata, requirements). The
