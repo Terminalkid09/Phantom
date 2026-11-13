@@ -4,10 +4,11 @@ All notable changes to Phantom.
 
 ---
 
-## [3.0.0] — 2026-11-05
+## [3.0.0] — 2026-11-13
 
-Release cut from the audit of 5 Nov 2026. Every entry below has a measurement
-behind it; the ones that were not measured are named as such.
+Release cut from the audit of 5 Nov 2026 and completed with the verification
+recorded through 13 Nov 2026. Every entry below has a measurement behind it;
+the ones that were not measured are named as such.
 
 ### Security
 
@@ -78,15 +79,21 @@ behind it; the ones that were not measured are named as such.
 
 ### Not claimed
 
-- The beacon check-in has not been observed live in this cycle.
-- `--ai integrated` is consulted but has not been shown to change a decision.
+- The beacon check-in is verified in the lab and reported on the operator's
+  Windows endpoint; it has not been re-observed on a clean machine for every
+  platform in this cycle.
+- `--ai integrated` is consulted and records changed decisions, but no
+  benchmark has demonstrated improved outcomes on a real target.
 - The phishing chain has never been exercised end-to-end; see
   `docs/PHISHING_STATUS.md` for what works, what needs credentials and what is
   absent.
 
-## [Unreleased] — current development (v3.0.0 line)
+### Detailed development log (2026-10-21 – 2026-11-12)
 
-### Release validation: the red CI was a test leak — 2026-11-12
+The entries below are the audit trail from the 3.0.0 development cycle. They
+record the verification, defects and fixes behind the release summary above.
+
+#### Release validation: the red CI was a test leak — 2026-11-12
 
 - **The red CI was one test-isolation defect, not a product regression.** The
   autouse fixture in `tests/test_executor.py` patched global `shutil.which` to
@@ -109,7 +116,7 @@ behind it; the ones that were not measured are named as such.
   integration-tools. The only annotation is the existing Node 20 deprecation
   warning on pinned actions.
 
-### Persistence: the auto-mode command was truncated at the first newline — 2026-11-12
+#### Persistence: the auto-mode command was truncated at the first newline — 2026-11-12
 
 - **Auto-mode was not skipping `persistence_install`; the beacon was failing
   it.** The lab chain recorded `persistence = fail` while the C2's native
@@ -135,7 +142,7 @@ behind it; the ones that were not measured are named as such.
   the backend against `constraints.txt` — the version set the suite was verified
   against — instead of resolving the `>=` floors on release day.
 
-### Review verification: seven warnings were nineteen — 2026-11-08
+#### Review verification: seven warnings were nineteen — 2026-11-08
 
 - **The review was checked claim by claim, not accepted.** The previous `dev`
   head (`3d2810d`) had a green GitHub CI (run `42376614153`, 21/21 jobs); model
@@ -188,7 +195,7 @@ behind it; the ones that were not measured are named as such.
   matrix lists tracked headers with one `git ls-files` instead of ~90. Final
   local run: **12 jobs, 24 steps, 0 failed, 731 s**.
 
-#### Measured end-to-end on 2026-11-08
+##### Measured end-to-end on 2026-11-08
 
 - Lab phone: `scripts/lab_phone_smoke.py` 19/19; the web lab lockout returns
   `429` with `Retry-After: 59` on the fifth attempt.
@@ -204,7 +211,7 @@ behind it; the ones that were not measured are named as such.
   instead of pretending to differ from `--ai off`.
 - Full suite: **6446 passed, 6 skipped, 16 warnings, 115 subtests, 380.43 s**.
 
-### OSINT: interaction traces, secondary handles and two live defects — 2026-11-08
+#### OSINT: interaction traces, secondary handles and two live defects — 2026-11-08
 
 - **The live OSINT path was reading nothing.** `_fetch_ex` used
   `@@PHANTOM_STATUS@@` as its `curl -w` sentinel; curl treats `-w @file` as
@@ -249,7 +256,7 @@ behind it; the ones that were not measured are named as such.
   reports that a port and FQBN/board id are required. Physical upload remains
   unverified until a board is identified — the build and API paths are.
 
-### The planner ranker is real, promoted and consulted — 2026-11-08
+#### The planner ranker is real, promoted and consulted — 2026-11-08
 
 - **The missing model was a DATA gap, not a wiring gap.** The old probe fitted
   the `exploit` question (access ids) and produced `ssh_banner +0.98`; the
@@ -290,7 +297,7 @@ behind it; the ones that were not measured are named as such.
   superiority. The next data step is outcome-labelled capability rows, not a
   larger rubric.
 
-### Shell and release checks found four real defects — 2026-11-08
+#### Shell and release checks found four real defects — 2026-11-08
 
 - `coverage` printed the correct audit and then failed with `'str' object has
   no attribute 'ok'`: the verdict lives on `CoverageAudit`, not on the
@@ -308,13 +315,13 @@ behind it; the ones that were not measured are named as such.
   an unnecessary regex escape. `lint`, `typecheck` and `build` now pass, as do
   the 12 renderer contract tests.
 
-#### Not changed, deliberately
+##### Not changed, deliberately
 
 - No model was invented for mobile: the probe was made TLS-aware and
   cross-platform instead. The lab is protocol-level, not a real device; the
   deliver path was not re-run with nmap installed.
 
-### AI in the live run: measured, and what it is not — 2026-11-07
+#### AI in the live run: measured, and what it is not — 2026-11-07
 
 - **The two live runs are identical, and that is now stated instead of
   implied.** `--auto 127.0.0.1 --goal deliver` with `--ai off` and with
@@ -333,7 +340,7 @@ behind it; the ones that were not measured are named as such.
   vocabulary. Recorded here so the next session works on DATA, not on another
   call site.
 
-### The toolset that was there and was reported missing — 2026-11-07
+#### The toolset that was there and was reported missing — 2026-11-07
 
 - **A tool could be "missing" because of the ORDER it was asked about.**
   `_wsl_which` probed a distro once per tool, ~2 s each: a twenty-binary
@@ -356,7 +363,7 @@ behind it; the ones that were not measured are named as such.
   resolves nmap/hydra/msfconsole/nikto/gobuster in 2.6 s from the cache
   (18 s cold, budget left 12.7 s instead of exhausted).
 
-### The lab could not be seen by a normal scan — 2026-11-07
+#### The lab could not be seen by a normal scan — 2026-11-07
 
 - The DMZ published only `2121/2222/8081`. A default sweep (`--top-ports
   1000`, what every real tool starts with) does not look at those, so
@@ -368,7 +375,7 @@ behind it; the ones that were not measured are named as such.
   5 actions — and `scripts/live_benchmark.py` still PASSes (6 ports, 100%
   recall/identification, 0 false positives).
 
-### Windows: a redirect is not a reason to leave Windows — 2026-11-07
+#### Windows: a redirect is not a reason to leave Windows — 2026-11-07
 
 - **A binary that exists was reported as missing.**
   `execute_quiet('C:\\…\\python.exe -c "…" 2>/dev/null')` came back
@@ -388,7 +395,7 @@ behind it; the ones that were not measured are named as such.
   failed only under `-n auto` contention and pass serially. Recorded here so a
   red run is not mistaken for a regression next time.
 
-### Supply chain: a model must be the bytes that were measured — 2026-11-06
+#### Supply chain: a model must be the bytes that were measured — 2026-11-06
 
 - **The manifest's `sha256` was never computed by anything.** `models/exploit/
   ranker-2026-11-03/manifest.json` declared `ba9023a2…` while the artifact in
@@ -422,7 +429,7 @@ behind it; the ones that were not measured are named as such.
   2026-11-06), refuses an asset with no pin instead of trusting the network,
   and discards the download on a mismatch. Upgrading is a deliberate commit.
 
-### AI: the efficacy number was measuring a vocabulary mismatch — 2026-11-06
+#### AI: the efficacy number was measuring a vocabulary mismatch — 2026-11-06
 
 - **The benchmark invented its own candidate ids.** `services` became
   `ssh:22`, `beacon_deploy`, `creds:ssh`, while production emits
@@ -455,7 +462,7 @@ behind it; the ones that were not measured are named as such.
   the efficacy the authority rests on instead of only whether the layer was
   asked.
 
-### Identity: two scorers for the same pair of accounts — 2026-11-06
+#### Identity: two scorers for the same pair of accounts — 2026-11-06
 
 - **`correlate_accounts` carried its own numbers**: a shared avatar hash was
   emitted at confidence **0.85**, contradicting the rule the rest of the code
@@ -479,7 +486,7 @@ behind it; the ones that were not measured are named as such.
   still do. Precision is the metric that matters when a wrong answer means
   contacting a stranger.
 
-### Anomaly hunt: one process per probe — 2026-11-06
+#### Anomaly hunt: one process per probe — 2026-11-06
 
 - `anomaly.curl_runner` spawned a `curl` subprocess for EVERY probe: a full
   hunt over one endpoint measured **90 s**, and under a loaded parallel test
@@ -490,7 +497,7 @@ behind it; the ones that were not measured are named as such.
   subprocess kept as `_curl_subprocess_runner` — the fallback, and the
   reference the parity is contract-tested against.
 
-### Windows: a native first word is not a native command — 2026-11-06
+#### Windows: a native first word is not a native command — 2026-11-06
 
 - **Auto-mode executed nothing on this Windows host and said so.** Live run
   against the docker lab (`--auto 127.0.0.1 --goal deliver`): 4 actions, all
@@ -509,7 +516,7 @@ behind it; the ones that were not measured are named as such.
   not exist — a run in that state can only be honest about it, and it was
   (`partial`, beacon False, checkpoint and both reports written).
 
-### The lab's own FTP never started — 2026-11-06
+#### The lab's own FTP never started — 2026-11-06
 
 - `lab/Dockerfile` wrote `PORT=YES` (not a vsftpd option; the real one is
   `port_enable`), so vsftpd rejected the config and exited before binding.
@@ -528,7 +535,7 @@ behind it; the ones that were not measured are named as such.
   does not answer is a failure); and `identify()` had no FTP branch, so a
   real FTP service was reported `unknown`.
 
-### CI and reproducibility — 2026-11-06
+#### CI and reproducibility — 2026-11-06
 
 - `numpy` is pinned in `constraints.txt` (it was `>=1.26` in
   `requirements-dev.txt` and absent from the pinned set, which failed five
@@ -546,7 +553,7 @@ behind it; the ones that were not measured are named as such.
   documents what the agreement numbers do and do not prove, including the
   scoreable-coverage column.
 
-### AI: from "authority" to an effect you can measure — 2026-11-03
+#### AI: from "authority" to an effect you can measure — 2026-11-03
 
 - **The model was never in the decision path.** `next_moves.rank_next_moves`
   is the single ranked list behind `run <n>`, `suggest` and the auto-mode move
@@ -576,7 +583,7 @@ behind it; the ones that were not measured are named as such.
   under that rule: 15 train rows, 23 out-of-fold evaluations, ndcg 1.000 vs
   baseline 0.871, delta +0.1295, CI [+0.104, +0.151].
 
-### Manual modules: a missing tool is named, not a silent degradation — 2026-11-03
+#### Manual modules: a missing tool is named, not a silent degradation — 2026-11-03
 
 - The tool registry knew 10 of the binaries the modules actually invoke.
   `preflight`, the API toolchain panel and the Electron installer could not
@@ -596,7 +603,7 @@ behind it; the ones that were not measured are named as such.
   are excluded from the tool gate: they were being translated into
   `apt-get install bind`.
 
-### Windows Defender: the warning was aimed at the wrong machine — 2026-11-03
+#### Windows Defender: the warning was aimed at the wrong machine — 2026-11-03
 
 - `defender_note(platform)` returned "" unless the OPERATOR's box had the
   `Windefend` service, so a Windows TARGET deployed from Linux/macOS got no
@@ -608,7 +615,7 @@ behind it; the ones that were not measured are named as such.
   UNSCANNED — never as a pass. The caveat names the command that answers the
   question on the target (`Get-MpThreatDetection`).
 
-### AI: an authority the runtime can actually deliver — 2026-11-02
+#### AI: an authority the runtime can actually deliver — 2026-11-02
 
 - **A promoted manifest whose artefact is missing is no longer promoted.**
   `models/exploit/ranker-2026-10-30` still said `promoted: true` after its
@@ -649,7 +656,7 @@ behind it; the ones that were not measured are named as such.
   operator choice), and the default path follows `--phase`.
   `tests/test_ranker_export.py` pins all three.
 
-### Benchmark: the autonomy number was measuring the handoff — 2026-11-02
+#### Benchmark: the autonomy number was measuring the handoff — 2026-11-02
 
 - `operator_interventions` counted three different events: the terminal
   `handoff` (the shell handover, by design), `escalation` on a target that
@@ -661,7 +668,7 @@ behind it; the ones that were not measured are named as such.
 - **Re-measured:** goal 85.7%, honest 100%, no false positive **100%**
   (was 90.9%), no forbidden action 100%, mid-run interventions **0/11**.
 
-### Auto-mode: a banner is a claim, not a measurement — 2026-11-02
+#### Auto-mode: a banner is a claim, not a measurement — 2026-11-02
 
 - `decoy_scan` advertised MySQL on 3306 that does not exist and the run stored
   it as a confirmed `service`, which the benchmark scored as a false
@@ -675,7 +682,7 @@ behind it; the ones that were not measured are named as such.
 - The simulation was corrected with it: `nc -z` now answers from ground truth
   only, so a connect probe can prove a port while a scan report still lies.
 
-### HID: six more layouts, with the tables measured — 2026-11-02
+#### HID: six more layouts, with the tables measured — 2026-11-02
 
 - `fr`, `es`, `uk`, `pt`, `br`, `us-intl`, with aliases and **fail-closed**
   translation: a character a layout does not cover is refused with its name
@@ -691,7 +698,7 @@ behind it; the ones that were not measured are named as such.
 - Still hardware-unverified per layout: one real flash each before calling
   them measured.
 
-### Tests: three isolation defects the full run exposed — 2026-11-02
+#### Tests: three isolation defects the full run exposed — 2026-11-02
 
 - **A test no longer writes the operator's audit chain.** `AuditLog`
   defaults to `<data_dir>/c2_audit.log`, so every C2-touching test appended
@@ -712,7 +719,7 @@ behind it; the ones that were not measured are named as such.
 - README's test-file count is derived from the tree by a contract test, and it
   moved to 428 with `tests/test_ranker_export.py`.
 
-### Beacon: the Defender utility has a call site — 2026-11-02
+#### Beacon: the Defender utility has a call site — 2026-11-02
 
 - `defender_check.is_defender_present()` was dead code. `defender_note()`
   now runs in the manual `payload deploy` path for Windows targets and warns
@@ -720,7 +727,7 @@ behind it; the ones that were not measured are named as such.
   payload failed. Warning only: nothing is disabled automatically, and no
   success/failure is inferred from it.
 
-### HID: three deliveries per flash, faster, and the right characters — 2026-11-01
+#### HID: three deliveries per flash, faster, and the right characters — 2026-11-01
 
 - **The delivery counter replaces the one-shot byte.** A board that types
   exactly once is a board you must re-flash on the bench before the second
@@ -746,7 +753,7 @@ behind it; the ones that were not measured are named as such.
   combo, ~12 combos in a stager), which removes the whole class of "right key,
   wrong character".
 
-### ML: the data finally has a wire — 2026-11-01
+#### ML: the data finally has a wire — 2026-11-01
 
 - **`phantom/automation/exploit/decision_log.py` logs every attempted
   candidate** with its own `success`/`noise`/`complexity` plus the context it
@@ -768,7 +775,7 @@ behind it; the ones that were not measured are named as such.
   now every real engagement adds rows where they vary, and the same gate
   decides when the nonlinear model overtakes the linear one.
 
-### ML: the production features are finally a feature — 2026-11-01
+#### ML: the production features are finally a feature — 2026-11-01
 
 - **`success`, `noise`, `complexity` are in `ranker.CONTEXT` on both sides.**
   These are the three numbers `AccessCandidate` already computes for every
@@ -789,7 +796,7 @@ behind it; the ones that were not measured are named as such.
   not architecture: auto-mode records `Capability`, not the
   `AccessCandidate` stats, so the corpus still has no variance to learn from.
 
-### ML: a nonlinear ranker that refuses to flatter itself — 2026-11-01
+#### ML: a nonlinear ranker that refuses to flatter itself — 2026-11-01
 
 - **`training.net` is the neural version of the same ranker**: one hidden
   layer, pairwise logistic loss, over the SAME feature vector (`ranker.CONTEXT`
@@ -821,7 +828,7 @@ behind it; the ones that were not measured are named as such.
   decision with its features and outcome in production vocabulary, and the
   same gate decides when the net overtakes the linear model.
 
-### HID: the board is reflashable with no hardware — 2026-11-01
+#### HID: the board is reflashable with no hardware — 2026-11-01
 
 - **A sketch that never opens a serial port and ejects itself cannot be
   reflashed.** Presented as `HID only`, a 32U4 exposes no COM port, so there is
@@ -846,7 +853,7 @@ behind it; the ones that were not measured are named as such.
   be reflashed. `--no-serial-rescue` restores the HID-only profile at the
   price of the physical reset.
 
-### HID: the four defects a live injection on the HP exposed — 2026-11-01
+#### HID: the four defects a live injection on the HP exposed — 2026-11-01
 
 Measured on real hardware, on a second machine, with a real stager. Every one
 of these made the board look broken while the payload was fine.
@@ -888,7 +895,7 @@ the Enter landed and the board ejected itself — the three things the previous
 artefact failed at. (The beacon check-in that test was for had no listener on
 the C2 port at that moment, so delivery from there is still unproven.)
 
-### HID: which board it is, and not leaving a keyboard behind — 2026-10-31
+#### HID: which board it is, and not leaving a keyboard behind — 2026-10-31
 
 - **The board says what it is instead of the operator guessing.** `--flash`
   used to require the operator to know the COM port, and fell back to
@@ -934,7 +941,7 @@ the C2 port at that moment, so delivery from there is still unproven.)
   target groups. On the 3-target golden set it honestly reports `k=3` over 3
   groups, and a non-measurement prints a reason instead of `mean=0.0000`.
 
-### HID: the typing rhythm is part of the artefact — 2026-10-31
+#### HID: the typing rhythm is part of the artefact — 2026-10-31
 
 - **Human cadence for keystroke boards.** A board left at full speed typed the
   227-char Windows stager in a fraction of a second; no human does, and any
@@ -972,7 +979,7 @@ the C2 port at that moment, so delivery from there is still unproven.)
   Verified on this machine (hidden PowerShell + curl + `iex $s` runs the
   fetched script).
 
-### Auto-mode CVE chain, scriptable manual shell, ML data honesty — 2026-10-27
+#### Auto-mode CVE chain, scriptable manual shell, ML data honesty — 2026-10-27
 
 - **Auto-mode fires the CVE payload again.** `version_detect` declares the
   `service` fact the scan just produced, so the planner never asked for it and
@@ -1022,7 +1029,7 @@ the C2 port at that moment, so delivery from there is still unproven.)
   forward+backward), which makes a three-epoch six-phase run ~4 h here. Loading
   Qwen3 needs `transformers >= 4.51` and `accelerate >= 1.6`.
 
-### Per-phase AI layer, training pipeline and campaign completion — 2026-10-25
+#### Per-phase AI layer, training pipeline and campaign completion — 2026-10-25
 
 - **Optional AI, one advisor per phase, off by default.** `automation/ai/`
   provides a single `ask(phase, payload)` entry point with a closed JSON
@@ -1054,7 +1061,7 @@ the C2 port at that moment, so delivery from there is still unproven.)
   rotation and opt-in SYN. Coverage is unchanged (every port once), the
   budget still bounds the run, and no sub-agent is used for target contact.
 
-### Bounded recon escalation and campaign quality — 2026-10-25
+#### Bounded recon escalation and campaign quality — 2026-10-25
 
 - **A filtered host no longer costs hours.** The single `-p 1-65535`
   escalation is replaced by `recon_ladder`: a preflight (ICMP + 22/80/443),
@@ -1088,7 +1095,7 @@ the C2 port at that moment, so delivery from there is still unproven.)
   It needs its own training and evaluation cycle, so it stays out of this
   change deliberately.
 
-### Access planning, payload catalog and generic CVE intake — 2026-10-25
+#### Access planning, payload catalog and generic CVE intake — 2026-10-25
 
 - **`run` and `--exploit-all` execute the best access path, not every CVE.**
   The new `access.py` ranks every CVE, confirmed web anomaly, credential,
@@ -1129,7 +1136,7 @@ the C2 port at that moment, so delivery from there is still unproven.)
   access planner produced 0 candidates, 0 attempts and no false compromise.
   Full suite: **5720 passed, 5 skipped, 0 failed** (`python -m pytest -q`).
 
-### Remediation validation — 2026-10-21
+#### Remediation validation — 2026-10-21
 
 - **Full-range scan was bounded, not abandoned.** Stealth keeps `-T2` but adds
   `--min-rate 500 --max-retries 1 --host-timeout 200s`; the default stays
@@ -1156,7 +1163,7 @@ the C2 port at that moment, so delivery from there is still unproven.)
   as the beacon/remote **connect** address. Unreachable targets need a
   public relay or a pre-staged deliverable, never a `0.0.0.0` callback.
 
-### Reliability — the operator can see what a command actually did
+#### Reliability — the operator can see what a command actually did
 
 The same failure shape ran through the shells, the auto-mode, the lure layer
 and the desktop app: a value that was accepted but never checked, or a result
@@ -1219,7 +1226,7 @@ reason existed only in the code.
   credential dialogs, the swarm profile/target refusal, `run-diff` verdicts,
   the payload OS fallback). Text only — no control flow or meaning changed.
 
-### Security & reliability — per-endpoint pins, real CI, scope hardening, audit
+#### Security & reliability — per-endpoint pins, real CI, scope hardening, audit
 
 - **Per-endpoint certificate pins.** A fallback ladder whose rungs are
   different redirectors cannot share one certificate. `C2_HOST_PINS` is
@@ -1261,7 +1268,7 @@ reason existed only in the code.
   `scripts/ci_beacon_token_scan.py` that the deployment payload token never
   reaches the built binary. `c2_config.h` is no longer tracked.
 
-### Security — per-beacon envelope keys, no deployment token in a binary
+#### Security — per-beacon envelope keys, no deployment token in a binary
 
 - **Per-beacon AES-256-GCM envelope key.** An enrolled beacon now derives its
   own key with HKDF-SHA256 from its own HMAC secret
@@ -1284,7 +1291,7 @@ reason existed only in the code.
   osxcross toolchain, which made the platform unbuildable on the platform
   itself.
 
-### Added — full POSIX stealth parity (Linux / macOS)
+#### Added — full POSIX stealth parity (Linux / macOS)
 
 - **Anti-analysis is REAL on POSIX, not a stub.** `beacon/src/evasion.h` used to
   return `false` for `is_debugger_present()` / `is_vm()` and no-op the rest on
@@ -1314,7 +1321,7 @@ reason existed only in the code.
   the pin generated from its own certificate (README +
   `server_cert_fingerprint` docstring).
 
-### Added — every browser, every platform (cookie collection)
+#### Added — every browser, every platform (cookie collection)
 
 - **The on-box reader (`local_cookies`) is no longer "Windows, Chrome/Edge
   only".** It now covers the **Chromium family** (Chrome, Edge, Brave,
@@ -1339,7 +1346,7 @@ reason existed only in the code.
   enabled by `__has_include(<openssl/evp.h>)`, so a build without OpenSSL
   headers still compiles.
 
-### CI — real cross-platform parity
+#### CI — real cross-platform parity
 
 - `beacon-syntax` now generates its headers with the REAL generators
   (`scripts/ci_beacon_prepare.py`) instead of a hand-written stub, and also
@@ -1352,7 +1359,7 @@ reason existed only in the code.
 - New **`c2d-test` job**: `gofmt`, `go vet`, `go test` on the Go data plane
   plus the Python ↔ Go ↔ beacon key-derivation parity check.
 
-### Added — closed learning loop, `doctor`, `run-diff`, `why`
+#### Added — closed learning loop, `doctor`, `run-diff`, `why`
 
 - **Experience memory ON by default** (`automation.experience`, opt-out
   with `--no-experience` on `auto`/`agent` or the config key): every run
@@ -1372,7 +1379,7 @@ reason existed only in the code.
   (`brain/trace`) surfaces in the shell: driver lens, runner-up, top
   contributions, veto, live or from a finished run's checkpoint.
 
-### Changed
+#### Changed
 
 - **The CLI boots into AUTO-MODE.** Bare `phantom` opened the manual module
   shell and auto-mode was a flag; that meant two entry points, two state
@@ -1394,7 +1401,7 @@ reason existed only in the code.
 - `coverage <profile>` prints through the shell console instead of raw
   stdout (consistent capture for tests and tools).
 
-### Added — real-target hardening (simulation across every profile × goal)
+#### Added — real-target hardening (simulation across every profile × goal)
 
 A pass that simulated each engagement profile against real targets found
 places where a run could look successful and still be unreachable,
@@ -1468,7 +1475,7 @@ unresolvable, or silent. Fixed end to end:
   and `c2.dead_drop` is now declared in the config SCHEMA (it was read at
   call sites but invisible to the config plane).
 
-### Added — XSS bug class in the anomaly engine (`exploit/xss.py`)
+#### Added — XSS bug class in the anomaly engine (`exploit/xss.py`)
 
 XSS was the one bug class the hunt engine did not carry at all: the only
 traces were four fuzz tokens and a tool-list entry, so a reflected/stored
@@ -1499,7 +1506,7 @@ XSS was invisible to both the manual workflow and the auto-mode.
   `tests/test_anomaly.py`. Verify: 198 passed across the anomaly/hunt/
   exploit/attack-chain suites.
 
-### Added — exploit: XSS weaponization + the closed orphan edges
+#### Added — exploit: XSS weaponization + the closed orphan edges
 
 Two gaps found while auditing exploitation:
 
@@ -1519,7 +1526,7 @@ Two gaps found while auditing exploitation:
   it.) `xss_exfil` added to `GOAL_FACTS["exploit"]` so the planner reaches
   the weaponizer. Tests: `tests/test_xss_weaponize.py` (15).
 
-### Fixed — self-improvement loop: three accounting/leak bugs
+#### Fixed — self-improvement loop: three accounting/leak bugs
 
 - **The PR budget is now claimed atomically, right before the push.**
   `publish()` used `can_pr()` + `count_pr()` — a check-then-act window in
@@ -1540,7 +1547,7 @@ Two gaps found while auditing exploitation:
   `EvolutionState.release_gate_slot()` (floored at zero).
   Tests: `tests/test_evolution_accounting.py`.
 
-### Changed — tool choice is now target-aware (and actually wired)
+#### Changed — tool choice is now target-aware (and actually wired)
 
 The toolbelt ranked tools by what is installed on the OPERATOR box and,
 because nothing ever stamped `wm.chosen_tool`, its pick never reached the
@@ -1556,7 +1563,7 @@ adapters — every command silently used the hard-coded default. Now:
   it and a bad fit is auditable. Absent the stamp the adapters keep their
   deterministic default. Tests: `tests/test_toolbelt_target.py`.
 
-### Changed — reasoning: a confirmed bug now promotes its payoff move
+#### Changed — reasoning: a confirmed bug now promotes its payoff move
 
 New `AutonomousAgent._payoff_bonus()`: a CONFIRMED code-execution / session
 primitive (cmdi/ssti/deser → `rce_foothold`, ssrf → `cloud_creds`,
@@ -1566,7 +1573,7 @@ instead of wandering off to re-scan. The bonus disappears the moment the
 payoff finding exists, so it cannot become a loop. Tests:
 `tests/test_reasoning_payoff.py`.
 
-### Changed — two compromises from Fase 7/8/9 closed
+#### Changed — two compromises from Fase 7/8/9 closed
 
 - **Worker toolchain**: the offline `{nmap,curl,nc}` set stays as the test
   default only; the operator paths (`AutonomousAgent`, `run_auto_mode`, the
@@ -1574,7 +1581,7 @@ payoff finding exists, so it cannot become a loop. Tests:
 - **Provisioning**: confirmed install runs ONLY pre-engagement
   (`--allow-install`, never with `--plan`/live runs).
 
-### Added — Fase 7/8/9: reasoning auto-mode, delivery payload, UX operatore
+#### Added — Fase 7/8/9: reasoning auto-mode, delivery payload, UX operatore
 
 Queste tre fasi non sono un rework architetturale: sono la chiusura di
 cuciture già esistenti ma inerti (tabelle non consumate, copie multiple
@@ -1642,7 +1649,7 @@ Log di `docs/ROADMAP.md`.
 Verifica: suite completa **3319 passed, 4 skipped, 12 subtests** ·
 `electron && npx tsc --noEmit` exit 0.
 
-### Fixed — P0 hardening round 1 (docs/ROADMAP.md)
+#### Fixed — P0 hardening round 1 (docs/ROADMAP.md)
 
 - **`chain execute` reported success for failed commands** — `execute_step()`
   now returns the real outcome: non-zero exit / timeout / guard refusal →
@@ -1658,7 +1665,7 @@ Verifica: suite completa **3319 passed, 4 skipped, 12 subtests** ·
   decision Q-1) but every auto-persist queueing lands in the immutable
   hash-chained audit log as `auto_persist_queued`.
 
-### Changed
+#### Changed
 
 - **Reproducible test bootstrap** — `requirements-dev.txt` pins the dev/test
   set; CI installs it instead of ad-hoc pip lines.
@@ -1671,7 +1678,7 @@ Verifica: suite completa **3319 passed, 4 skipped, 12 subtests** ·
 > framework version stays **v3.0.0** until that tag lands. Subheadings
 > keep the original working-version markers only as dates/history.
 
-### Added — AiTM reverse proxy (`craft aitm`), opt-in
+#### Added — AiTM reverse proxy (`craft aitm`), opt-in
 
 Every social lure so far is a page WE wrote, and a clone has a smell: our
 markup, our domain, and any change the real provider makes (logo, extra
@@ -1707,7 +1714,7 @@ against a live service and it needs a **domain with TLS** in front. Stated
 limits (in the module, the CLI and the README): FIDO2/passkeys,
 certificate-pinned clients and device-bound conditional access close it.
 
-### Changed — social DM delivery is decided by the CHANNEL (attachment ≠ link)
+#### Changed — social DM delivery is decided by the CHANNEL (attachment ≠ link)
 
 The cold-link problem the operator kept hitting: a link in a first message is
 clicked by almost nobody, and every free way to host a capture page shows a
@@ -1763,7 +1770,7 @@ call fake, and the capture fires when the recipient opens it.
   only counted text messages would show zero for a channel that delivered the
   artefact perfectly) and reports the strategies seen.
 
-### Fixed — the tracker is a LOCAL transport (4 pre-existing red tests)
+#### Fixed — the tracker is a LOCAL transport (4 pre-existing red tests)
 
 `transport_status()["tracker"]["ready"]` was `_tracker_public() or
 _lab_lures_allowed()`, i.e. **not ready on a fresh checkout** — while the same
@@ -1779,7 +1786,7 @@ detail that still states what is at stake; the OPSEC refusal lives where the
 lure is actually built (the deliverability preflight refuses a link carrying
 the operator's IP, and `engagement.allow_unscoped` is the explicit lab opt-in).
 
-### Fixed — engagement data was committable (`.gitignore`)
+#### Fixed — engagement data was committable (`.gitignore`)
 
 Four runtime paths were not ignored, and they are exactly what must never reach
 the repo: `data/ad_graph.json` (the AD graph of a live engagement),
@@ -1789,14 +1796,14 @@ the repo: `data/ad_graph.json` (the AD graph of a live engagement),
 `data/social_attachments/` for the artefacts this change generates (they embed
 the lure codes). `git status --porcelain data/` is empty.
 
-### Fixed — `test_adapters_are_callable` failed by test ordering
+#### Fixed — `test_adapters_are_callable` failed by test ordering
 
 `from __future__ import annotations` binds a non-callable `annotations` object
 in every phase's `adapters` module; the interpreter twin of this test excludes
 it, this one did not — so it passed or failed depending on whether another test
 had already imported the submodule.
 
-### Added — link-preview crawler guard (the preview is not the victim)
+#### Added — link-preview crawler guard (the preview is not the victim)
 
 - **`is_preview_bot()` + guard in the tracking handler.** When a lure URL is
   pasted into WhatsApp / Instagram / Telegram / Discord / X / iMessage, the
@@ -1811,7 +1818,7 @@ had already imported the submodule.
 - `preview_page()` always resolves to a real thumbnail (`og:image`), so the
   card never renders in the "broken share" state that makes the target
   suspicious.
-### Added — `craft idn`: the homograph verdict, with evidence
+#### Added — `craft idn`: the homograph verdict, with evidence
 
 The Cyrillic-homograph idea ("an instagram with Cyrillic letters") comes up
 because it sounds like the free way to make a link look like the real brand.
@@ -1838,7 +1845,7 @@ because it sounds like the free way to make a link look like the real brand.
   (mixed → punycode, single script → Unicode but not an imitation, ASCII TLD
   not counted as a second script, free alternative always offered).
 
-### Changed — a failed delivery now looks like a REMOVED post, not a clone
+#### Changed — a failed delivery now looks like a REMOVED post, not a clone
 
 The dropper page used to degrade to a generic "Content is loading" footer.
 A half-working **replica** of a platform is suspicious; a platform's own
@@ -1867,7 +1874,7 @@ an exposed clone.
   skin, error block hidden by default, `dead()` wired on both failure paths)
   and the corrected `test_craft_netmap` assertion.
 
-### Added — the second masking mechanism in `craft channels`
+#### Added — the second masking mechanism in `craft channels`
 
 `channel_matrix()` (and `craft channels`) only described the anchor, so for
 WhatsApp / SMS / Instagram / YouTube description it just said "visible" with
@@ -1893,7 +1900,7 @@ now reports both:
 - Covered by new `TestChannelMatrix` cases (mechanism split, channel
   classification, redirect availability everywhere).
 
-### Fixed — the beacon was delivered with an unrunnable filename
+#### Fixed — the beacon was delivered with an unrunnable filename
 
 Two real delivery bugs, either of which made a click worthless: the file
 arrived, and then could not run.
@@ -1921,7 +1928,7 @@ arrived, and then could not run.
   `test_craft_netmap` assertion that encoded the `.mp4` behaviour was
   corrected with it.
 
-### Fixed — `craft real` leaked the tracker URL into the content
+#### Fixed — `craft real` leaked the tracker URL into the content
 
 `craft real` shipped a real outer URL but then handed back the **raw**
 tracker link for the description — which is visible exactly like a raw link
@@ -1953,7 +1960,7 @@ a `destination_visible_on_<host>` warning, `supports_anchor: false`,
 - Covered by new `TestAnchorCapability` and `TestChannelMatrix` cases in
   `tests/test_craft_real.py`.
 
-### Added — `craft real`: the REAL first hop (a convincing link, no domain)
+#### Added — `craft real`: the REAL first hop (a convincing link, no domain)
 
 A URL's domain is the address of the server that answers it, so our host can
 never answer as `instagram.com`. The fix is to **stop putting our host in the
@@ -1983,7 +1990,7 @@ and the capture lives INSIDE that content.
   fixed in the email template: a hidden pixel hurts delivery AND kills the
   capture. It is now a normal inline 1x1 with `border:0`.
 
-### Added — beacon file delivery over DM (Telegram `sendDocument`)
+#### Added — beacon file delivery over DM (Telegram `sendDocument`)
 
 - **`DMTransport.send_document()` + `supports_files`.** The DM chain could
   only send text and a link; it can now attach a real artifact. Telegram is
@@ -2009,7 +2016,7 @@ and the capture lives INSIDE that content.
   token/path guards, per-platform capability, `DM_FILE` markers,
   unsupported-channel fallback).
 
-### Added — two-stage JS gate (scanner-proof delivery, opt-in)
+#### Added — two-stage JS gate (scanner-proof delivery, opt-in)
 
 - **`tracker.js_challenge` (default OFF, `PHANTOM_TRACK_JS_CHALLENGE`).** A
   URL scanner parses HTML; it does not run scripts. On the first pass every
@@ -2029,7 +2036,7 @@ and the capture lives INSIDE that content.
   recorded hit; second pass with the gate cookie serves the real page and
   records the hit; images bypass the gate.
 
-### Added — pre-send deliverability preflight + scanner decoy (email-hop evasion)
+#### Added — pre-send deliverability preflight + scanner decoy (email-hop evasion)
 
 - **`deliverability.py` — pre-send anti-blocking preflight.** The email hop
   is the one stage that fails *silently*: a message dropped by the gateway or
@@ -2067,7 +2074,7 @@ and the capture lives INSIDE that content.
   `TestPreviewCrawlerGuard` cases for scanner detection, decoy response and
   scanner asset delivery.
 
-### Added — image-proxy awareness (the zero-click lure was recording robots)
+#### Added — image-proxy awareness (the zero-click lure was recording robots)
 
 - **`is_image_proxy()` + `OpenEvent.proxied`.** The image lure is the real
   zero-click (`<img src="…/i/<code>">` fires on RENDER), but the big mail
@@ -2090,7 +2097,7 @@ and the capture lives INSIDE that content.
   bot; pixel load by a bot is not an email-open; the human still gets the
   dropper and is recorded).
 
-### Added — wrong-person guardrail (identity confidence) + persisted social state
+#### Added — wrong-person guardrail (identity confidence) + persisted social state
 
 - **Identity-confidence gate** (`phantom/automation/social/identity_confidence.py`)
   — acting on the wrong person (same username, different human) burns the
@@ -2206,7 +2213,7 @@ and the capture lives INSIDE that content.
 - New tests: `tests/test_identity_and_warmup.py` (21),
   `tests/test_ad_graph.py` (11). Regression: 266+ targeted suites green.
 
-### Added — one-liner install + guided setup (`install/`, `phantom setup`, `phantom doctor`)
+#### Added — one-liner install + guided setup (`install/`, `phantom setup`, `phantom doctor`)
 
 Phantom is now installable without `git clone`, like any modern CLI:
 
@@ -2239,7 +2246,7 @@ Phantom is now installable without `git clone`, like any modern CLI:
 New tests: `tests/test_setup_wizard.py` (18) — manifest dedupe, consent
 behaviour, WSL state machine, doctor read-only guarantee.
 
-### Added — self-improvement loop (`--evolution` / `--beta`)
+#### Added — self-improvement loop (`--evolution` / `--beta`)
 
 The experience engine now closes its own gaps. A SINGLE learnable
 failure whose cause is one a capability file can fix (`waf_blocked`,
@@ -2273,7 +2280,7 @@ temp checkout (working tree untouched). `review` in the AUTO shell
 shows authored patterns, budgets and learned capabilities.
 New tests: `tests/test_evolution.py` (31), `tests/test_experience_trigger.py` (7).
 
-### Learning engine, engagement timeline, remote LLM transport
+#### Learning engine, engagement timeline, remote LLM transport
 
 - **`phantom/automation/brain/experience/`** — the case-based LEARNING engine,
   separate from reasoning: situation signature (`signature.py`), failure
@@ -2310,7 +2317,7 @@ New tests: `tests/test_evolution.py` (31), `tests/test_experience_trigger.py` (7
 - **Docs** — README (learning engine, timeline, LLM transport), `.env.example`
   and the AUTO shell `flags` help.
 
-### Internal expansion: recon interno → movimento laterale (auto-mode + core)
+#### Internal expansion: recon interno → movimento laterale (auto-mode + core)
 
 - **Fase `expand`** nella scaletta deep: dopo `post_exploit` l'auto-mode
   pianifica `internal_recon` (interfaces/routes/ARP dal beacon) e
@@ -2332,7 +2339,7 @@ New tests: `tests/test_evolution.py` (31), `tests/test_experience_trigger.py` (7
 - **Test**: nuovo `tests/test_internal_expand.py` (14) + aggiornato
   `test_automation_deep.py`.
 
-### Mobile: superficie device end-to-end, ramo piattaforma Android/iOS
+#### Mobile: superficie device end-to-end, ramo piattaforma Android/iOS
 
 - **Lo stadio `mobile` è realmente pianificato**: `mobile_surface_device`
   (target dispositivo / superficie mobile confermata) e `mobile_surface_host`
@@ -2356,7 +2363,7 @@ New tests: `tests/test_evolution.py` (31), `tests/test_experience_trigger.py` (7
   serve macOS + Xcode + firma enterprise, delivery via MDM).
 - **Test**: nuovo `tests/test_mobile_chain.py` (24).
 
-### Wiring dei dati: auto-mode ↔ core manuale ↔ report
+#### Wiring dei dati: auto-mode ↔ core manuale ↔ report
 
 - **Nuovo `phantom/core/session_bridge.py`** — un unico ponte tra le due
   metà di Phantom, prima con memorie separate:
@@ -2381,7 +2388,7 @@ New tests: `tests/test_evolution.py` (31), `tests/test_experience_trigger.py` (7
 - **Test**: nuovo `tests/test_session_bridge.py` (12) + estensione di
   `tests/test_automation_reporting.py`.
 
-### Cloud/IAM depth: catena cablata + parità GCP/Azure
+#### Cloud/IAM depth: catena cablata + parità GCP/Azure
 
 - **La catena cloud non è più AWS-shaped e scollegata**: `cloud_iam_enum`
   scopriva le identità assumibili ma `cloud_assume_role` richiedeva un
@@ -2396,9 +2403,9 @@ New tests: `tests/test_evolution.py` (31), `tests/test_experience_trigger.py` (7
   `guidance/kit.py`, usati sia dalle capability sia dall'auto-mode.
 - **Test**: nuovo `tests/test_cloud_depth.py` (16).
 
-### 3.8.7 — 2026-09
+#### 3.8.7 — 2026-09
 
-### Screen-recording pipeline end-to-end, .pm bundle UI, session auto-export
+#### Screen-recording pipeline end-to-end, .pm bundle UI, session auto-export
 
 - **Recording artifacts land as media, not base64 text** — the C2 now decodes
   the beacon's `SCREENREC_B64:` / `SCREEN_LIVE:` / `SCREEN_DUMP:` results and
@@ -2431,9 +2438,9 @@ New tests: `tests/test_evolution.py` (31), `tests/test_experience_trigger.py` (7
 
 ---
 
-### 3.8.6 — 2026-09
+#### 3.8.6 — 2026-09
 
-### Sandbox gate, EDR neutralisation, blockable delivery, Android remote
+#### Sandbox gate, EDR neutralisation, blockable delivery, Android remote
 
 - **Sandbox pre-flight extended to EVERY payload** — the detonation check
   that previously guarded only `beacon_deploy` now guards `payload_reverse`,
@@ -2519,9 +2526,9 @@ New tests: `tests/test_evolution.py` (31), `tests/test_experience_trigger.py` (7
 
 ---
 
-### 3.8.5 — 2026-09
+#### 3.8.5 — 2026-09
 
-### Auto-mode depth upgrades — senior-discipline engines
+#### Auto-mode depth upgrades — senior-discipline engines
 
 - **Lockout-aware credential spray (`cred_spray`)** — new
   `phantom/automation/guidance/spray.py`: ONE password per round against
@@ -2556,7 +2563,7 @@ New tests: `tests/test_evolution.py` (31), `tests/test_experience_trigger.py` (7
   (after dynamic shaping) without executing it; `chain go` stays the
   approval gate. Engine-only steps say so explicitly.
 
-### Fixed (regressions flushed by the new suites)
+#### Fixed (regressions flushed by the new suites)
 
 - Transport gating in `_execute_social_capability` now applies ONLY to
   the real `SocialEngine`: an injected/custom engine (tests, plugins)
@@ -2572,9 +2579,9 @@ New tests: `tests/test_evolution.py` (31), `tests/test_experience_trigger.py` (7
 
 ---
 
-### 3.8.4 — 2026-09
+#### 3.8.4 — 2026-09
 
-### Remote Session module — standalone GUI takeover (new)
+#### Remote Session module — standalone GUI takeover (new)
 
 A brand-new post-exploitation capability, separate from the beacon but
 reusing its C2 channel and crypto: **full remote desktop takeover with
@@ -2610,7 +2617,7 @@ Fixed en route: the module initially obfuscated its HTTP request line
 `Content-Length`; both fixed, end-to-end verified against a live C2
 server (register → task → result → frame).
 
-### Manual-core effectiveness pass — chaining, PoC growth, live view
+#### Manual-core effectiveness pass — chaining, PoC growth, live view
 
 - **`chain`** exposes the auto-mode composition engine to the manual
   shell: it projects the session WorldModel into the operator fact
@@ -2640,7 +2647,7 @@ server (register → task → result → frame).
   (normalized coordinates, throttled moves, frame-history strip),
   making the remote module a true VNC-style takeover.
 
-### Manual exploit module — persistent MSF RPC integration
+#### Manual exploit module — persistent MSF RPC integration
 
 The one-shot `msfconsole -q -x` integration killed every Meterpreter
 session the moment the console exited. Now:
@@ -2678,7 +2685,7 @@ task → result). Note: it is deliberately a plain PE/ELF — the full
 PIC/reflective evasion stack stays in the beacon; the module is dropped
 AFTER a foothold exists.
 
-### Manual core payload now uses the enterprise engine
+#### Manual core payload now uses the enterprise engine
 
 `use payload` was still the old static msfvenom wizard while the
 auto-mode shipped a multi-dialect `PayloadEngine`. The manual core now
@@ -2699,9 +2706,9 @@ engine output).
 
 ---
 
-### 3.8.3 — 2026-09
+#### 3.8.3 — 2026-09
 
-### Unified network triage + live status + enriched auto-mode stream
+#### Unified network triage + live status + enriched auto-mode stream
 
 **One triage engine for everything** — the auto-mode CIDR handling no
 longer duplicates the `map` command: `automode` now delegates to
@@ -2738,9 +2745,9 @@ Tests: `test_netmap_triage_liveness.py` (new), `test_agent_run_event.py`
 
 ---
 
-### 3.8.2 — 2026-09
+#### 3.8.2 — 2026-09
 
-### Enterprise payload engine + web exploit surface (cmdi→beacon, SQLi dump, IDOR)
+#### Enterprise payload engine + web exploit surface (cmdi→beacon, SQLi dump, IDOR)
 
 **Payload engine** (`brain/payload/`) — one engine, every delivery primitive:
 - Reverse shells across platforms and dialects: bash, nc, socat, openssl,
@@ -2777,9 +2784,9 @@ rce_foothold, beacon_via_rce, web_rce, idor_scan).
 
 ---
 
-### 3.8.1 — 2026-09
+#### 3.8.1 — 2026-09
 
-### Phases migration completed + sub-agent coordination + hands
+#### Phases migration completed + sub-agent coordination + hands
 
 **All seven kill-chain phases are now first-class packages**
 (`phantom/automation/phases/`): `recon`, `osint`, `exploit`, `foothold`,
@@ -2810,9 +2817,9 @@ the contract test covers every one of them.
 
 ---
 
-### 3.8.0 — 2026-09
+#### 3.8.0 — 2026-09
 
-### The reasoning brain: from checklist to reasoner
+#### The reasoning brain: from checklist to reasoner
 
 The agreed architecture is now in place — shared reasoning engines in
 `phantom/automation/brain/`, target-class doctrine, and the phase
@@ -2891,9 +2898,9 @@ batches). README updated (Reasoning brain section).
 
 ---
 
-### 3.7.19 — 2026-09
+#### 3.7.19 — 2026-09
 
-### Multi-tool capability: the agent is no longer single-tool per phase
+#### Multi-tool capability: the agent is no longer single-tool per phase
 
 New `phantom/automation/brain/` package (shared reasoning engines, the
 future home of the doctrine/target-class work) starting with `toolbelt.py`:
@@ -2923,9 +2930,9 @@ future home of the doctrine/target-class work) starting with `toolbelt.py`:
 
 ---
 
-### 3.7.18 — 2026-09
+#### 3.7.18 — 2026-09
 
-### Deep social recon engine (private profiles are a mapping problem)
+#### Deep social recon engine (private profiles are a mapping problem)
 
 New `phantom/automation/social/recon.py` — the reliable upgrade to
 `profile_recon`, wired as the `deep_recon` capability (osint category):
@@ -2945,7 +2952,7 @@ New `phantom/automation/social/recon.py` — the reliable upgrade to
   `wayback:<ts>`, `avatar_match:<platform>`, `ddg_dork`) so the dossier
   can weigh it. Bounded (<= 20 calls), never raises.
 
-### Hardened-target attack-surface engine
+#### Hardened-target attack-surface engine
 
 New `phantom/automation/surface.py` — the `surface_map` capability and
 the **hardened-perimeter escalation** in the agent: when a scan sees NO
@@ -2969,7 +2976,7 @@ now escalates ONCE from port enumeration to asset enumeration:
 Each asset carries a 0..1 risk score; the interpreter feeds them to the
 WorldModel as `environment` findings the planner can rank.
 
-### Phishing delivery hardening (anti-detection)
+#### Phishing delivery hardening (anti-detection)
 
 - **Message-ID** now generated on the SENDING domain with random local
   part (`phantom.local` was an instant spam signal)
@@ -2985,9 +2992,9 @@ WorldModel as `environment` findings the planner can rank.
 
 ---
 
-### 3.7.17 — 2026-09
+#### 3.7.17 — 2026-09
 
-### Zero-config startup: data/config.json + `setup` wizard
+#### Zero-config startup: data/config.json + `setup` wizard
 
 - New `phantom.utils.config`: `data/config.json` is auto-created with
   defaults on first use (gitignored) — a fresh checkout runs the local
@@ -3006,7 +3013,7 @@ WorldModel as `environment` findings the planner can rank.
   breach API keys, LLM model, C2 host/port, `allow_unscoped` and
   `ransom_sim_allow` now read from config with env fallback.
 
-### Auto-mode kill-chain discipline
+#### Auto-mode kill-chain discipline
 
 - `ssh_banner` now requires an SSH service finding from the footprint
   scan (no more wasted `nc` at closed port 22 — the repeated "ssh banner
@@ -3018,9 +3025,9 @@ WorldModel as `environment` findings the planner can rank.
 
 ---
 
-### 3.7.16 — 2026-09
+#### 3.7.16 — 2026-09
 
-### Manual scan produced ZERO output from Electron/CLI (WSL2 sudo hang)
+#### Manual scan produced ZERO output from Electron/CLI (WSL2 sudo hang)
 
 The WSL2 backend invoked `wsl.exe -d <distro> -- bash -lc "sudo nmap …"`
 with the distro's DEFAULT user (`kali`, not root): `sudo` printed nothing
@@ -3029,7 +3036,7 @@ timed out after 2 minutes with no output at all. The backend now runs as
 `-u root` inside the distro, making `sudo` a no-op — verified live: the
 installed app returns real nmap output for `sudo nmap -sV -sC`.
 
-### Auto-mode: empty `[+] os_detect:` lines + missing finding values
+#### Auto-mode: empty `[+] os_detect:` lines + missing finding values
 
 - `os_detect` on a host nmap cannot fingerprint ("Too many fingerprints
   match this host") produced an EMPTY success line indistinguishable from
@@ -3039,7 +3046,7 @@ installed app returns real nmap output for `sudo nmap -sV -sC`.
   not just fact names — same as Electron already did.
 - Empty `[+]` lines are no longer emitted at all when a run found nothing.
 
-### Beacon: tasks stuck "sent" forever (camera / long media hangs)
+#### Beacon: tasks stuck "sent" forever (camera / long media hangs)
 
 The single-threaded beacon loop executed every task synchronously: a
 camera Media Foundation `ReadSample` hang (or any stuck shell pipe)
@@ -3049,7 +3056,7 @@ now run on a worker thread with a per-command budget (30 s default,
 media captures duration + 15 s, camera 45 s); on timeout the task returns
 `[TASK_TIMEOUT] … beacon continues` and the loop keeps polling.
 
-### Beacon: real evasion was compiled OUT of every shipped binary
+#### Beacon: real evasion was compiled OUT of every shipped binary
 
 The `rbp` inline-asm bug (`mov %0, rbp` = a SYMBOL reference in AT&T
 syntax → "undefined reference to rbp" at link) made the anti-evasion build
@@ -3058,7 +3065,7 @@ mask, stack spoofing, ekko, debugger/VM checks never shipped. Fixed the
 asm (`%%rbp`) and flipped the default so normal builds (CLI/Electron
 generate, automode deploy) get the full evasion stack.
 
-### Beacon artifacts: JPEG camera frames saved as `.bmp` → invisible
+#### Beacon artifacts: JPEG camera frames saved as `.bmp` → invisible
 
 Linux/Android camera frames are JPEG but every save path forced `.bmp`,
 so Electron served them as `image/bmp` and they never rendered. Both save
@@ -3070,9 +3077,9 @@ table (not just a saved path in the result text).
 
 ---
 
-### 3.7.15 — 2026-09
+#### 3.7.15 — 2026-09
 
-### Electron — "AbortError: This operation was aborted" on every long operation
+#### Electron — "AbortError: This operation was aborted" on every long operation
 
 The main process aborted every renderer API request after **120 s**, so any
 network scan, module run, or automode plan longer than two minutes surfaced
@@ -3082,7 +3089,7 @@ run-group batches, the automode plan endpoint). The renderer was rebuilt
 and the packaged app re-verified: the readiness gate and the new timeout
 are in `app.asar`.
 
-### Network map — the phantom "target bubble" finally gone (server-side)
+#### Network map — the phantom "target bubble" finally gone (server-side)
 
 The server still created a fake `host_<target>` node for the session
 target; when the target WAS a discovered device, the bare fake node won
@@ -3090,7 +3097,7 @@ the id-dedup and its metadata (OS/services) was dropped — the bubble whose
 IP seemed to "change" when switching targets. The node no longer exists:
 the session target is only the solid red aura bound to the real device id.
 
-### Beacon — real Windows GPS + real camera frames
+#### Beacon — real Windows GPS + real camera frames
 
 - **GPS**: full WinRT `Geolocator` implementation (async COM init, permission
   check, coordinate + accuracy) with WLAN BSSID/band fallback when the
@@ -3103,7 +3110,7 @@ the session target is only the solid red aura bound to the real device id.
 - C2 side: `CAM_FRAME`/`MEDIA_B64` markers parsed, artifacts stored and
   served via `/api/artifact`; the Electron C2 panel renders them as images.
 
-### Beacon help — every command, structured
+#### Beacon help — every command, structured
 
 `BEACON_COMMANDS` was a rich-formatted *string* that the `/api/c2/beacon-help`
 endpoint iterated as a list of tuples — it errored and fell back to a
@@ -3113,7 +3120,7 @@ auto-loads it when the beacon panel opens, and **autocompletes while you
 type** (so you no longer have to choose between seeing the list or typing).
 Task leases are marked `sent` on delivery so the queue state is truthful.
 
-### Auto-mode — visible findings, no blind repeats, clean identity runs
+#### Auto-mode — visible findings, no blind repeats, clean identity runs
 
 - **Findings are shown**: capability results carry their values into the
   event stream (`[+] http_probe: web_header:Server=nginx/1.24`) instead of
@@ -3129,7 +3136,7 @@ Task leases are marked `sent` on delivery so the queue state is truthful.
   live against the gateway: 4 unique actions, zero repeats, no
   "no affordable path".
 
-### Tests
+#### Tests
 
 - `tests/test_c2_helpers.py` (new): structured beacon command list,
   CAM_FRAME/MEDIA_B64 artifact parsing.
@@ -3140,9 +3147,9 @@ Task leases are marked `sent` on delivery so the queue state is truthful.
 
 ---
 
-### 3.7.14 — 2026-09
+#### 3.7.14 — 2026-09
 
-### Network map — real topology, real device intel, target aura bound to the device
+#### Network map — real topology, real device intel, target aura bound to the device
 
 - **Topology detection**: the network scan now infers the LAN shape —
   `star` (devices behind one gateway), `broadcast`/flat (many hosts expose
@@ -3164,7 +3171,7 @@ Task leases are marked `sent` on delivery so the queue state is truthful.
 - **ARP noise filtered**: multicast/broadcast entries no longer appear as
   devices.
 
-### Beacon generation — deploy command like the CLI
+#### Beacon generation — deploy command like the CLI
 
 `/api/c2/generate` now returns `dropper`: the ready-to-paste one-liner
 (PowerShell PIC stager for Windows, curl|chmod|nohup for Linux/macOS,
@@ -3172,7 +3179,7 @@ TMPDIR exec for Android) that downloads and injects the beacon from any
 RCE / reverse-shell channel. The Electron Generate panel shows it in a
 copyable code block with usage guidance.
 
-### Auto-mode — session target is enough to Launch
+#### Auto-mode — session target is enough to Launch
 
 The Launch/Dry-Run buttons now unlock when the Session panel has a target
 (the session target is target #1 of the run); extra targets remain
@@ -3180,9 +3187,9 @@ optional. The target chips show which one is the session target.
 
 ---
 
-### 3.7.13 — 2026-09
+#### 3.7.13 — 2026-09
 
-### Fixed — beacon generation from Electron was calling a non-existent function
+#### Fixed — beacon generation from Electron was calling a non-existent function
 
 `/api/c2/generate` imported `build_beacon` from `phantom.utils.builder` — a
 symbol that does not exist (the real API is `compile_beacon`, which the CLI
@@ -3193,7 +3200,7 @@ rebuilds only when the config changed, and returns path/size/C2 on success.
 **Verified live on the installed app: linux (274 KB ELF) and windows
 (1.4 MB beacon.bin) both compile and target the real LAN C2 endpoint.**
 
-### Fixed — kill-chain order (blind probes before the scan)
+#### Fixed — kill-chain order (blind probes before the scan)
 
 The captured run opened with `ssh banner → fail → http probe → port scan`:
 the planner submitted probing moves BEFORE any service was known, so they
@@ -3207,7 +3214,7 @@ fired blind, failed, and the whole thing read as a random order. Two gates:
 
 Cold plan verified: `scan_tcp → os_detect → http_probe → ssh_banner`.
 
-### Fixed — panels starting with "fetch failed" until a manual refresh
+#### Fixed — panels starting with "fetch failed" until a manual refresh
 
 The main process answered renderer requests during backend startup (2-4s)
 with instant fetch errors. `api-request` now waits on a readiness gate
@@ -3215,7 +3222,7 @@ with instant fetch errors. `api-request` now waits on a readiness gate
 session; once ready it's a no-op. Opening the app is now clean — no refresh
 required.
 
-### Improved — map wires back + ring layout + aura that follows the target
+#### Improved — map wires back + ring layout + aura that follows the target
 
 - Edges restored (the wires stay), with a **scenographic ellipse ring**: the
   attacker at the anchor, the hub at the stage center, the other devices on
@@ -3225,7 +3232,7 @@ required.
   the matching device — no second fake "target" bubble ever appears, and the
   IP under a node can never silently disagree with the highlight.
 
-### Improved — auto-mode target precedence in the Electron panel
+#### Improved — auto-mode target precedence in the Electron panel
 
 The Session panel's target is now **target #1** of an auto-mode run; targets
 added in the Auto-Mode panel are additional (deduplicated) — matching the
@@ -3234,9 +3241,9 @@ behavior.
 
 ---
 
-### 3.7.12 — 2026-09
+#### 3.7.12 — 2026-09
 
-### Fixed — auto-mode scan timeout loop (the 4-minute repeats)
+#### Fixed — auto-mode scan timeout loop (the 4-minute repeats)
 
 The run the operator captured (scan 4 min → timeout → same scan → timeout …)
 had three stacked causes, all fixed:
@@ -3260,14 +3267,14 @@ Verified end-to-end against 127.0.0.1: every capability now runs exactly once
 (ssh_banner, http_probe, scan_tcp, os_detect, web_creds, web_rce — counts all
 1), version detection is seconds not minutes, no repeats.
 
-### Fixed — module runs from the Electron panels returning empty output
+#### Fixed — module runs from the Electron panels returning empty output
 
 `BackendDispatcher._run_argv` (module Run buttons) also discarded partial
 output on timeout. Same salvage applied: partial stdout is returned with
 `timed_out: true`, so a long module run shows what it found instead of
 "comando sì, output no".
 
-### Improved — weak-spot ranking honesty + UI
+#### Improved — weak-spot ranking honesty + UI
 
 - The ranker now grabs a **service banner** from each device's riskiest open
   port: any readable banner adds exposure (unauthenticated info leak), a
@@ -3280,14 +3287,14 @@ output on timeout. Same salvage applied: partial stdout is returned with
 - Devices with **no open port among the ~60 probed** show "no risk shown"
   semantics instead of an empty LOW badge.
 
-### Fixed — map target placeholder removed
+#### Fixed — map target placeholder removed
 
 The map no longer renders a fake "target" node (the unexplained extra dot).
 The session target is now highlighted with a **red dashed aura** on the real
 device it matches (`is_target` metadata), and services/creds/findings/beacons
 anchor to that device. Beacons always get a position (no orphan edges).
 
-### Improved — C2 beacon interact panel
+#### Improved — C2 beacon interact panel
 
 - Task list is now **newest-first** (immediate feedback after Queue).
 - Rows with a result are **click-to-expand**: the full multi-line output
@@ -3298,9 +3305,9 @@ anchor to that device. Beacons always get a position (no orphan edges).
 
 ---
 
-### 3.7.11 — 2026-09
+#### 3.7.11 — 2026-09
 
-### Fixed — Electron auto-mode dying instantly (the REAL root cause)
+#### Fixed — Electron auto-mode dying instantly (the REAL root cause)
 
 The planner fix (3.7.10) was necessary but not sufficient: the **frozen
 backend exe crashed on its first rich print** — rich's legacy Windows console
@@ -3322,7 +3329,7 @@ Verified on the installed app: automode run against 127.0.0.1 now streams
 real work (ssh banner → http probe → port scan finds 4 services → os detect →
 behavioural hunt) instead of the silent instant halt.
 
-### Fixed — stale renderer shipped to the installed app
+#### Fixed — stale renderer shipped to the installed app
 
 The previous installer packaged a **renderer built before the NetworkMap
 rewrite** (`electron-builder` was invoked without a fresh `vite build`), so the
@@ -3330,7 +3337,7 @@ installed app showed the old map without the weak-spot button and pan/zoom.
 The build now runs `npm run build` (tsc + vite) before packaging, and the
 installed asar was verified to contain the new UI.
 
-### Improved — session target handling
+#### Improved — session target handling
 
 - New **✕ button** next to the Target input: clears the target (leaves the
   session without one) without wiping discovered devices — matches the
@@ -3340,9 +3347,9 @@ installed asar was verified to contain the new UI.
 
 ---
 
-### 3.7.10 — 2026-09
+#### 3.7.10 — 2026-09
 
-### Fixed — auto-mode halting instantly with nothing done
+#### Fixed — auto-mode halting instantly with nothing done
 
 The reported "[■] sequence complete / Auto-mode complete" after ~0 seconds with
 zero actions had a real root cause in the planner: a goal whose fact kinds are
@@ -3362,7 +3369,7 @@ sqli/verb anomalies) → web_creds (admin/backup) → beacon compile → deploy
 attempt (check-in fails on loopback, correct) with 8 real actions, versus 0
 actions before the fix. Regression tests added for both fallback directions.
 
-### Improved — Electron Network Map canvas
+#### Improved — Electron Network Map canvas
 
 Rebuilt as a **pannable/zoomable infinite-style canvas**: drag anywhere to pan,
 mouse wheel to zoom-to-cursor (35%–400%), +/−/reset controls, world background
@@ -3374,9 +3381,9 @@ cards + detail panel, Set-as-Session-Target, attack-path overlay.
 
 ---
 
-### 3.7.9 — 2026-09
+#### 3.7.9 — 2026-09
 
-### Fixed: module names (`handler`, …) no longer appear as installable tools
+#### Fixed: module names (`handler`, …) no longer appear as installable tools
 
 - The preflight filter only knew shell words + module subcommands — a
   suggestion like payload's `handler <port> <payload>` still collected
@@ -3387,7 +3394,7 @@ cards + detail panel, Set-as-Session-Target, attack-path overlay.
   Verified live on the installed app: payload + exploit preflight report
   zero missing tools.
 
-### Added: network exposure ranking — "where do I start?"
+#### Added: network exposure ranking — "where do I start?"
 
 - `rank_hosts_exposure()` / `recommend_starting_target()` in
   `phantom/core/netmap.py`: parallel TCP-connect probe of ~60 common
@@ -3406,9 +3413,9 @@ cards + detail panel, Set-as-Session-Target, attack-path overlay.
 
 ---
 
-### 3.7.8 — 2026-09
+#### 3.7.8 — 2026-09
 
-### Fixed: preflight no longer treats Phantom commands as installable tools
+#### Fixed: preflight no longer treats Phantom commands as installable tools
 
 - The preflight (CLI `preflight`, Electron Session/Module panels,
   `/api/session/preflight`) collected the FIRST TOKEN of every suggested
@@ -3421,7 +3428,7 @@ cards + detail panel, Set-as-Session-Target, attack-path overlay.
 - `install <tool>` refuses phantom command names with a clear message
   instead of attempting a package install.
 
-### Fixed: discovered network devices survive target changes and restarts
+#### Fixed: discovered network devices survive target changes and restarts
 
 - Previously hosts lived only in the in-memory WorldModel, which is reset
   whenever the operator sets a different target and is empty after an app
@@ -3435,9 +3442,9 @@ cards + detail panel, Set-as-Session-Target, attack-path overlay.
 
 ---
 
-### 3.7.7 — 2026-09
+#### 3.7.7 — 2026-09
 
-### Fixed: network devices are now identified (no more "unknown") + install-tool never touches Windows sudo
+#### Fixed: network devices are now identified (no more "unknown") + install-tool never touches Windows sudo
 
 - **Device identification**: after every scan, hosts are enriched from the
   system ARP cache (MAC), a local OUI vendor table (Cisco, Apple, Raspberry
@@ -3466,9 +3473,9 @@ cards + detail panel, Set-as-Session-Target, attack-path overlay.
 
 ---
 
-### 3.7.6 — 2026-09
+#### 3.7.6 — 2026-09
 
-### Fixed: network scan no longer freezes the whole API
+#### Fixed: network scan no longer freezes the whole API
 
 - `/api/network/scan` now runs the sweep in a thread executor instead of
   blocking the aiohttp event loop — previously a scan (or a slow ping
@@ -3482,9 +3489,9 @@ cards + detail panel, Set-as-Session-Target, attack-path overlay.
 
 ---
 
-### 3.7.5 — 2026-09
+#### 3.7.5 — 2026-09
 
-### Fixed: Electron state persistence + craft discoverability + tool install perms
+#### Fixed: Electron state persistence + craft discoverability + tool install perms
 
 - **Panels stay mounted** (hidden when inactive) instead of being unmounted
   on tab switch — a network scan, craft output, module form or auto-mode
@@ -3503,7 +3510,7 @@ cards + detail panel, Set-as-Session-Target, attack-path overlay.
   elevation prompt instead of failing. Linux apt tries plain (root) →
   `sudo -n` → `sudo` with `DEBIAN_FRONTEND=noninteractive`.
 
-### Added: reverse-engineering runs for email targets too
+#### Added: reverse-engineering runs for email targets too
 
 `profile_recon` (the private/public profile mapper + same-handle
 cross-platform search) was gated on username targets only. It now also
@@ -3511,9 +3518,9 @@ fires for **email** targets, mapping the local-part handle
 (`mario.rossi@corp.com` → `mario.rossi`) through the same public-profile
 OSINT pipeline (sherlock + bio/link/@handle extraction).
 
-### 3.7.4 — 2026-09
+#### 3.7.4 — 2026-09
 
-### Added: lure crafting, network mapping, tool install, mobile defender profile
+#### Added: lure crafting, network mapping, tool install, mobile defender profile
 
 (v2) Delivery reworked per operator feedback — QR delivery removed:
 - **`craft reel <link|term>`** — video lure on a REAL video the OPERATOR
@@ -3551,9 +3558,9 @@ OSINT pipeline (sherlock + bio/link/@handle extraction).
   sandbox, mobile EDR, MDM/EMM, carrier SMS filtering, app vetting); a
   phone-number target with the default profile auto-switches to it.
 
-### 3.7.3 — 2026-09
+#### 3.7.3 — 2026-09
 
-### Fixed: autonomous kill chain now completes scan → creds → beacon →
+#### Fixed: autonomous kill chain now completes scan → creds → beacon →
 persistence → reports with zero manual steps (verified live against the lab)
 
 Field-verified end-to-end (`auto 127.0.0.1` → DMZ lab): beacon check-in
@@ -3583,7 +3590,7 @@ Three root causes found while chasing the loop:
   cleanly, so non-interactive/auto-mode handoffs finish instead of spamming
   tasks.
 
-### Tests
+#### Tests
 
 - Sandbox semantics covered: persistent-still-running-at-bound is approved,
   crashed/garbage samples are denied, container-wedge stays denied.
@@ -3592,9 +3599,9 @@ Three root causes found while chasing the loop:
 
 ---
 
-### 3.7.2 — 2026-09
+#### 3.7.2 — 2026-09
 
-### Fixed: Windows AV blocked the Electron backend on launch
+#### Fixed: Windows AV blocked the Electron backend on launch
 
 The onefile PyInstaller build was killed at execute time by real-time AV
 ("file contains a virus") — the classic onefile-bootloader heuristic false
@@ -3603,7 +3610,7 @@ positive. The backend now ships as **onedir** (`phantom-backend.exe` +
 via the same `backend/phantom-backend.exe` path, so no app code changed;
 CI (`electron-release.yml`) zips/unpacks the onedir artifact per OS.
 
-### Electron: real window frame + packaged icon
+#### Electron: real window frame + packaged icon
 
 - Window restored to the **native OS frame** (`frame: true`) — the old
   `frame: false` build had no minimize/maximize/close buttons and no
@@ -3614,7 +3621,7 @@ CI (`electron-release.yml`) zips/unpacks the onedir artifact per OS.
 - Installer rebuilt and reinstalled: app boots, backend spawns, API
   healthy on 127.0.0.1:9876.
 
-### Hygiene
+#### Hygiene
 
 - `.gitignore`: bundled wordlist archives (`data/wordlists/*.txt|*.lst`,
   downloaded at install time) and `data/persistence_rules.json.sample`
@@ -3624,9 +3631,9 @@ CI (`electron-release.yml`) zips/unpacks the onedir artifact per OS.
 
 ---
 
-### 3.7.1 — 2026-09
+#### 3.7.1 — 2026-09
 
-### Verified: full live beacon battery on the operator host
+#### Verified: full live beacon battery on the operator host
 
 Authorized live-fire test on the operator's own Windows machine (MSI,
 user `ilysm`): listener on 18443 → no-disk PowerShell PIC stager →
@@ -3639,7 +3646,7 @@ beacon killed, listener stopped and artifacts deleted. McAfee: no blocks,
 no alerts during the entire session. One gap found by the test and fixed:
 beacons stayed `ACTIVE` after `exit` — see below.
 
-### Fixed: exited beacons shown as ACTIVE
+#### Fixed: exited beacons shown as ACTIVE
 
 The beacon answers `exit` with a sentinel but the C2 never marked the
 beacon down, so `beacons` listed dead sessions as live. Now `add_result`
@@ -3648,7 +3655,7 @@ audit record, and the C2 shell renders `[dim red]EXITED[/]` (never
 LIVE/STALE). API `_beacon_status` mirrors it; Electron beacon rows show
 an `exited` badge and queued-task counts.
 
-### Added: Electron Audit Log viewer + attack-path overlay + telemetry
+#### Added: Electron Audit Log viewer + attack-path overlay + telemetry
 
 - **Audit Log panel** (`AuditViewer.tsx` + `GET /api/c2/audit`): the
   hash-chained C2 audit log visualized — big tamper-evidence verdict
@@ -3660,14 +3667,14 @@ an `exited` badge and queued-task counts.
 - **Beacon telemetry**: EXITED badges, queued-task badges, status dot
   respects confirmed shutdown.
 
-### Built & installed: Windows installer with real icon
+#### Built & installed: Windows installer with real icon
 
 `electron-builder` NSIS build verified end-to-end: multi-size icon
 embedded in `Phantom.exe` resources, `icon256.png` shipped inside the
 asar, silent install run (`/S`), **Phantom.lnk created on the Desktop and
 Start Menu** — both carrying the new icon.
 
-### Fixed: Electron app icon was a 16×16 placeholder
+#### Fixed: Electron app icon was a 16×16 placeholder
 
 `electron/assets/icon.ico` was a single-size 16×16 stub and the builder
 yml declared no `icon:` key — shortcuts/installer fell back to the stock
@@ -3678,7 +3685,7 @@ asset shipped via the `files` list, window and tray both resolve the icon
 through a dev/packaged-safe `iconPath()` helper. Provenance metadata
 (source generator file name) stripped from the shipped assets.
 
-### Fixed: injected toolsets broken by WSL bridge (regression)
+#### Fixed: injected toolsets broken by WSL bridge (regression)
 
 `ToolRegistry.has()` lost its injected-toolset branch when the WSL bridge
 was added: `ToolRegistry(installed={...})` (used by tests and offline
@@ -3687,7 +3694,7 @@ failed with `tool_missing`. The injected branch is authoritative again.
 Test: `test_automation_ad_operator` (the test that caught the regression)
 plus the whole agent suite green.
 
-### Fixed: credential verifiers dead on Windows even with Kali WSL
+#### Fixed: credential verifiers dead on Windows even with Kali WSL
 
 `_verify_ssh` / `_verify_smb` gated on native `shutil.which("sshpass")` —
 on a Windows operator box they returned `None` (tool missing) and the
@@ -3696,20 +3703,20 @@ Kali WSL distro. Both verifiers now resolve tools through the WSL toolbox
 (`_wsl_tool`) and route the argv through it. Verified live: correct lab
 creds return True through the bridge (previously impossible on Windows).
 
-### Fixed: hermetic agent smoke test (test_run_autonomous_function_entry)
+#### Fixed: hermetic agent smoke test (test_run_autonomous_function_entry)
 
 The public-entry smoke ran the REAL web hunt (90s curl budget per host)
 with no injected runner/hunt_runner and no toolchain — production-correct
 but non-hermetic and timeout-prone. Now deterministic like its siblings.
 
-### Perf: WSL tool probes no longer pay the distro-list spawn per miss
+#### Perf: WSL tool probes no longer pay the distro-list spawn per miss
 
 `_wsl_which` re-listed WSL distros (a ~3.5s `wsl --list` spawn) for EVERY
 missing tool; the list is now cached process-wide. First miss still pays
 one probe (~4.4s), subsequent misses ~1s — matters for hosts where most
 of the toolbox lives in WSL and capabilities probe several alternates.
 
-### Verified
+#### Verified
 
 - Full suite: **1550 passed, 1 skipped, 0 failed** (split runs: agent
   simulations 24/24 — inherently slow, not hung; verified via faulthandler
@@ -3720,9 +3727,9 @@ of the toolbox lives in WSL and capabilities probe several alternates.
   impossible from a Windows host).
 - Beacon compile (Windows PE + Linux ELF via WSL g++) unaffected.
 
-### 3.7.0 — 2026-09
+#### 3.7.0 — 2026-09
 
-### Added: immutable C2 audit log (chain-of-custody)
+#### Added: immutable C2 audit log (chain-of-custody)
 
 Every security-relevant C2 event (beacon registration, task queueing,
 task results, rejected authentication) is appended to a **hash-chained,
@@ -3733,7 +3740,7 @@ tamper-evident activity timeline client engagements require. New C2 shell
 command: **`audit [verify|tail N]`**. Tests: `tests/test_audit_log.py`
 (6 — chain creation, in-place tamper, deletion, tail, corrupt lines).
 
-### Added: .pm bundles now carry C2 engagement intel
+#### Added: .pm bundles now carry C2 engagement intel
 
 `export-session` embeds the beacon table, full task history and collected
 results so another operator inherits complete engagement intelligence.
@@ -3745,7 +3752,7 @@ engine; live beacons are NOT adopted (they still check in to their
 original listener — documented). Tests: `tests/test_pm_c2_intel.py`
 (4 — round-trip, secret-scrubbing, import surfacing).
 
-### Added: trust-earned suggestions + `plan <goal>` (manual core)
+#### Added: trust-earned suggestions + `plan <goal>` (manual core)
 
 - **Evidence-tagged suggestions** (`suggest` command): every suggestion
   shows WHY (the concrete findings behind it: `service:tcp/445 + creds...`),
@@ -3759,7 +3766,7 @@ original listener — documented). Tests: `tests/test_pm_c2_intel.py`
   cost and stealth level; nothing executes. Tests: `tests/test_suggest_meta.py`
   (7).
 
-### Added: noise circuit breaker + failure memory (auto-mode)
+#### Added: noise circuit breaker + failure memory (auto-mode)
 
 - **Noise circuit breaker**: every loud move (online brute, AD attack,
   aggressive scan, exploit) feeds a cumulative detection-risk score on
@@ -3772,7 +3779,7 @@ original listener — documented). Tests: `tests/test_pm_c2_intel.py`
   identical failures already prove the approach void with current facts.
   Tests: `tests/test_noise_breaker.py` (6).
 
-### Added: HW-breakpoint unhooking + `edrcheck` (beacon)
+#### Added: HW-breakpoint unhooking + `edrcheck` (beacon)
 
 - **Hardware-breakpoint unhooking** (HWBP engine class): a debug register
   is armed on a clean `syscall; ret` gadget in ntdll and a Vectored
@@ -3789,9 +3796,9 @@ original listener — documented). Tests: `tests/test_pm_c2_intel.py`
   compile-check TU executed on the live host: `ntdll_hooks=0 stubs=0`
   on an unhooked box, clean exit.
 
-### 3.6.23 — 2026-09
+#### 3.6.23 — 2026-09
 
-### Added: cloud lateral-movement chain (planner-grade)
+#### Added: cloud lateral-movement chain (planner-grade)
 
 Three new post-beacon capabilities complete the AWS path from harvested
 metadata creds to cross-account data access:
@@ -3811,7 +3818,7 @@ Wired into the planner (`cloud` goal now includes `cloud_lateral`;
 `tests/test_cloud_lateral.py` (11) — adapter shape, interpreter parsing,
 planner/attack-chain wiring, capability registration.
 
-### Added: advanced SSRF invariants (hunt engine)
+#### Added: advanced SSRF invariants (hunt engine)
 
 Nine new differential probes targeting **filter bypass classes**, not
 specific products: redirect-based IMDS reach, decimal/short/hex IP
@@ -3820,7 +3827,7 @@ gopher scheme (Redis protocol smuggling), CRLF header injection into the
 fetched URL, and an IMDSv2 token attempt (`AQAEA` marker). The hunt engine
 now reasons about *why* a filter failed, not just that 127.0.0.1 echoed.
 
-### Added: MDM vendor fingerprinting (active mobile recon)
+#### Added: MDM vendor fingerprinting (active mobile recon)
 
 **`mobile_mdm_fingerprint`** — when `mobile_probe` finds an MDM surface,
 this capability classifies the vendor (Jamf/Intune/MobileIron/
@@ -3831,9 +3838,9 @@ attack tree. Planner: `mdm_vendor` fact kind sourced from the capability,
 
 ---
 
-### 3.6.22 — 2026-09
+#### 3.6.22 — 2026-09
 
-### Electron UI: enterprise-grade visual upgrades
+#### Electron UI: enterprise-grade visual upgrades
 
 - **Network Map rebuilt on the shared WorldModel**: the map now renders the
   same typed findings the auto-mode reasons over — services (with ports),
@@ -3851,16 +3858,16 @@ attack tree. Planner: `mdm_vendor` fact kind sourced from the capability,
   **local-LLM advisor toggle** (explicitly marked local-only, non-gating).
 - Backend `/api/automode/run` now accepts `resume` and `llm` passthrough.
 
-### C2 shell: health + cadence commands
+#### C2 shell: health + cadence commands
 
 - `health` and `set-sleep <ms> [jitter%]` wired into the interactive C2
   shell (previously beacon-only), beacon-help updated.
 
 ---
 
-### 3.6.21 — 2026-09
+#### 3.6.21 — 2026-09
 
-### Added: sleep mask + thread-stack spoofing (field-verified live)
+#### Added: sleep mask + thread-stack spoofing (field-verified live)
 
 - **`sleep_mask.h`** upgrades the Ekko sleep to the CS 4.9 sleep-mask class:
   RW sections **and the live thread stack** are RC4-encrypted before the
@@ -3875,7 +3882,7 @@ attack tree. Planner: `mdm_vendor` fact kind sourced from the capability,
 - Everything resolved via PEB hashes (new: `NtSetTimer`,
   `kernelbase.dll`), zero new imports.
 
-### Added: beacon health self-report + C2-driven cadence rotation
+#### Added: beacon health self-report + C2-driven cadence rotation
 
 - **`health`** beacon command: uptime, check-ins ok/fail, tasks done,
   current sleep/jitter, build id, last error — the operator sees beacon
@@ -3884,7 +3891,7 @@ attack tree. Planner: `mdm_vendor` fact kind sourced from the capability,
   C2 (no beacon restart, no re-deploy). Live-verified: cadence 5000ms/30%
   → `set-sleep 6000 25` → next `health` reports `sleep_ms=6000 jitter=25%`.
 
-### Field-tested live (previously unverified beacon features)
+#### Field-tested live (previously unverified beacon features)
 
 - **`browser-list`** ✅ (enumerated 13 firefox processes), **`smb-pipe`** ✅
   (named pipe created, commands drained), **`socks`/`socks-stop`** ✅
@@ -3898,9 +3905,9 @@ attack tree. Planner: `mdm_vendor` fact kind sourced from the capability,
 
 ---
 
-### 3.6.20 — 2026-09
+#### 3.6.20 — 2026-09
 
-### Added: direct entry points — `phantom.c2` / `phantom.auto`
+#### Added: direct entry points — `phantom.c2` / `phantom.auto`
 
 - Two new console scripts land straight in the right shell (no flag):
   **`phantom.c2`** → C2 Operations Center, **`phantom.auto`** → AUTO-MODE
@@ -3916,7 +3923,7 @@ attack tree. Planner: `mdm_vendor` fact kind sourced from the capability,
 - argv0-based dispatch: even when the scripts wrap the same `main()`, the
   launcher name routes to the correct shell.
 
-### Fixed: manual core friction
+#### Fixed: manual core friction
 
 - **`set mode` was advertised in help but not implemented** — `set mode
   recon|osint|web|exploit|full|deliver` now works with validation, and the
@@ -3928,9 +3935,9 @@ attack tree. Planner: `mdm_vendor` fact kind sourced from the capability,
 
 ---
 
-### 3.6.19 — 2026-09
+#### 3.6.19 — 2026-09
 
-### Fixed: native audio capture — `audio` now works live (field-verified E2E)
+#### Fixed: native audio capture — `audio` now works live (field-verified E2E)
 
 - **Root cause (crash)**: every COM call in `wasapi_capture.h` read vtable
   slots with `((void***)obj)[N]` — that indexes *the object struct*, not the
@@ -3950,7 +3957,7 @@ attack tree. Planner: `mdm_vendor` fact kind sourced from the capability,
 - Legacy `System.Media.SoundRecorder` path removed — no external tools, no
   powershell, no `<audioclient.h>` import trace.
 
-### Hardening (this session, folded in)
+#### Hardening (this session, folded in)
 - `mem-run`/PIC execution isolated: crashing shellcode can no longer kill
   the beacon (runner thread + VEH-based isolation, error reported to the
   operator instead of a silent process death).
@@ -3963,9 +3970,9 @@ attack tree. Planner: `mdm_vendor` fact kind sourced from the capability,
 
 ---
 
-### 3.6.18 — 2026-09
+#### 3.6.18 — 2026-09
 
-### Fixed: beacon check-in dead on Windows hosts with protected machine certs
+#### Fixed: beacon check-in dead on Windows hosts with protected machine certs
 
 Field-tested live on a Windows 11 host (Defender off, McAfee real-time
 `mc-neo-host` active — the on-disk EXE was quarantined in seconds, which the
@@ -3999,7 +4006,7 @@ in-memory dropper path bypasses by design).
   compiles the real transport headers and reports PFX import, key-prov
   presence, cert binding and a full check-in — reused for future builds.
 
-### Verified live (this host)
+#### Verified live (this host)
 
 | Capability | Result |
 |---|---|
@@ -4015,7 +4022,7 @@ in-memory dropper path bypasses by design).
 | persist (RunKey + self-hollow) | install verified, artifacts removed |
 | Encryption at rest | DPAPI-protected auth state (removed in cleanup) |
 
-### Verified live, session 2 (same host, rebuilt beacon)
+#### Verified live, session 2 (same host, rebuilt beacon)
 
 | Capability | Result |
 |---|---|
@@ -4035,7 +4042,7 @@ in-memory dropper path bypasses by design).
   mistakes (a mistyped task POST looks like success). They now return 404;
   decoy `C2 OK` stays for genuine malleable-looking URIs.
 
-### Persistence rebuilt after field failure: no-disk rebirth verified E2E
+#### Persistence rebuilt after field failure: no-disk rebirth verified E2E
 
 Field test of the classic persist exposed a hard wall: McAfee allows the
 beacon PE **on disk** (file survives untouched) but **blocks its execution**
@@ -4062,16 +4069,16 @@ the blocked process start.
   no disk artifact). RunKey survived (the old one was remediated away);
   the encoded stager value is inert to AV.
 
-### Cleanup
+#### Cleanup
 
 After testing, every artifact was removed and verified: beacon processes
 killed, RunKey deleted, `%APPDATA%\Microsoft\Phantom` deleted,
 `%LOCALAPPDATA%\Phantom` (DPAPI auth state) deleted, listener stopped,
 diagnostic files removed. **Nothing persists on the test host.**
 
-### 3.6.17 — 2026-09
+#### 3.6.17 — 2026-09
 
-### Hunt engine validated against a live external target (demo.testfire.net)
+#### Hunt engine validated against a live external target (demo.testfire.net)
 
 First live-fire run of the hunt engine against IBM's AltoroJ (an
 intentionally vulnerable public test app): **the real SQLi auth-bypass on
@@ -4100,9 +4107,9 @@ Pinned by 6 new tests in `test_anomaly.py` (44 total, green), plus the
 54-test hunt regression suite (anomaly_enterprise, differential, webcreds,
 hunter, dynamic_exploits) green.
 
-### 3.6.16 — 2026-09
+#### 3.6.16 — 2026-09
 
-### Lab: Samba AD domain controller is up — the deep/AD chain now has a REAL target
+#### Lab: Samba AD domain controller is up — the deep/AD chain now has a REAL target
 
 The `dc` lab host (a Samba 4.17 AD DC provisioning `CORP.LOCAL`) finally
 boots and serves Kerberos/LDAP/SMB/GC. Three Docker/Samba fixes landed:
@@ -4124,7 +4131,7 @@ environment notes (AS-REP KDC enforcement and `secretsdump` prefixMap
 friction on Samba 4.17) are documented in `lab/README.md` for re-verification
 from a Kali box.
 
-### Planner bug: cold `goal=crack` could never reach the beacon
+#### Planner bug: cold `goal=crack` could never reach the beacon
 
 `hash_crack` declared `creds` in its effects. Its `creds` output only
 materializes AFTER a captured hash is cracked — an input it does not produce
@@ -4137,14 +4144,14 @@ failing `test_dc_sync_and_hash_crack_full_chain` E2E (privesc → dc_sync →
 hash_crack) is now green, with a planner regression test asserting a cold
 `crack` plan still chains `ssh_login`/`beacon_deploy`.
 
-### Bug: `mobile_probe` never parsed endpoint hits
+#### Bug: `mobile_probe` never parsed endpoint hits
 
 The adapter emits curl `%{http_code}:<path>` — the code comes BEFORE the
 colon — but the interpreter matched `:200`/`:301` (colon first), so MDM/push
 endpoint hits never produced findings. The interpreter now matches
 `200:`/`301:`/`302:` prefixes; `mobile` surface findings flow again.
 
-### Bug: agent stall on unreachable targets (the real red-team case)
+#### Bug: agent stall on unreachable targets (the real red-team case)
 
 Three interacting defects turned "target that answers nothing" into a
 multi-minute stall or an infinite loop — found by a faulthandler stack dump
@@ -4168,7 +4175,7 @@ inside the E2E suite:
   persistence) is green again and now runs hermetically (offline hunt
   runner + bounded budgets) in ~1.6s instead of hanging.
 
-### New direct tests for the cloud / k8s / mobile capabilities
+#### New direct tests for the cloud / k8s / mobile capabilities
 
 `tests/test_cloud_k8s_mobile.py` (22 tests) locks the adapter + interpreter
 contract for `cloud_creds_harvest` (AWS IMDSv2 role JSON, GCP metadata,
@@ -4179,7 +4186,7 @@ sa-token/sa-list-cluster and admin/read-only distinctions). These surfaces
 cannot exist in a unit environment, so the contracts are now pinned and
 regressions are caught without a live cloud.
 
-### Manual core: `next` now routes the FULL capability map
+#### Manual core: `next` now routes the FULL capability map
 
 The shell's reasoning-driven next-step suggestion (`next`) previously only
 mapped the shallow capabilities (scan/web/brute/payload/pivot) — deeper
@@ -4192,9 +4199,9 @@ manual operator gets the same depth of guidance the autonomous agent uses.
 
 ---
 
-### 3.6.15 — 2026-08
+#### 3.6.15 — 2026-08
 
-### Auto-mode: `goal=deep` full-engagement ladder + cross-engagement learning + social cadence
+#### Auto-mode: `goal=deep` full-engagement ladder + cross-engagement learning + social cadence
 
 Three workflow upgrades that take the autonomous mode from "deliver" to a
 complete enterprise engagement:
@@ -4238,9 +4245,9 @@ complete enterprise engagement:
 
 ---
 
-### 3.6.14 — 2026-08
+#### 3.6.14 — 2026-08
 
-### Hunt / anomaly engine: 5 → 13 bug classes, header-aware and discovery that reads modern apps
+#### Hunt / anomaly engine: 5 → 13 bug classes, header-aware and discovery that reads modern apps
 
 The behavioural anomaly engine — the part that finds bugs that are in NO CVE
 list — grew from 5 to 13 classes, with response-header awareness and smarter
@@ -4272,7 +4279,7 @@ confirmed, zero false positives on cmdi/crlf/nosqli/exposure):
   confirmed nosqli/exposure → `web_creds` (harvest creds from the store /
   mine secrets). Reports and severity flow generically.
 
-### Fixed: test-order dependency in the web module command counts
+#### Fixed: test-order dependency in the web module command counts
 
 `test_build_commands_with_target` asserted a fixed group count that silently
 broke when `test_hunter` ran first and left scan results in the global
@@ -4281,9 +4288,9 @@ session state it depends on — no more order-dependent failures.
 
 ---
 
-### 3.6.13 — 2026-08
+#### 3.6.13 — 2026-08
 
-### Added: manual-core creds→SSH→pivot bridge + cloud/IAM/mobile kill chain
+#### Added: manual-core creds→SSH→pivot bridge + cloud/IAM/mobile kill chain
 
 **Manual core now drives the full kill chain to the beacon by hand.** Three
 operational commands close the gap that previously forced a red teamer to
@@ -4319,7 +4326,7 @@ The reasoning engine gained `_rule_cloud_operations` and `_rule_mobile_surface`
 so it deduces these next moves from environment / cloud-cred / mobile findings
 — observational inference over bug classes, not a CVE list.
 
-### Fixed: anomaly hunt deduplication
+#### Fixed: anomaly hunt deduplication
 
 `use web` → `hunt` returned up to 21 duplicate anomalies for the same flaw
 (SQLi ×11, SSRF ×8) because escaped mutations produced one finding each.
@@ -4328,9 +4335,9 @@ confirmation, yielding 2 clean confirmed findings on the lab.
 
 ---
 
-### 3.6.12 — 2026-08
+#### 3.6.12 — 2026-08
 
-### Fixed: anomaly hunt engine — validated live against the segmented lab
+#### Fixed: anomaly hunt engine — validated live against the segmented lab
 
 Field-testing the hunt engine (`HuntEngine`) against the lab's
 "Corp Intranet" app exposed three real defects, all fixed:
@@ -4373,9 +4380,9 @@ false positives eliminated. 101 anomaly/exploit tests green.
 
 ---
 
-### 3.6.11 — 2026-08
+#### 3.6.11 — 2026-08
 
-### Fixed: orchestrator drain-loop hang (test session / CLI exit)
+#### Fixed: orchestrator drain-loop hang (test session / CLI exit)
 
 The agent orchestrator's `run()` loop could stay alive forever when a
 worker thread was stuck inside a capability (the `while not _stop.is_set()`
@@ -4394,9 +4401,9 @@ Verified: 24/24 agent tests pass and the process exits cleanly.
 
 ---
 
-### 3.6.10 — 2026-08
+#### 3.6.10 — 2026-08
 
-### AD chain now works WITHOUT a beacon
+#### AD chain now works WITHOUT a beacon
 
 The AD/domain capabilities were hard-gated behind a beacon session
 (category `post`, precondition `_has_beacon()`), so a domain controller
@@ -4429,9 +4436,9 @@ with a beacon session when one exists, without one when it does not.
 
 ---
 
-### 3.6.9 — 2026-08
+#### 3.6.9 — 2026-08
 
-### Auto-mode now carries its own C2 — fully automatic beacon loop
+#### Auto-mode now carries its own C2 — fully automatic beacon loop
 
 The autonomous kill chain no longer needs the operator to prepare anything:
 `run_auto_mode` now **auto-starts the C2 listener** (HTTPS + auto-generated
@@ -4457,9 +4464,9 @@ is compiled with the **operator's reachable address** instead of a hardcoded
 
 ---
 
-### 3.6.8 — 2026-08
+#### 3.6.8 — 2026-08
 
-### Lab: single box → segmented two-host network
+#### Lab: single box → segmented two-host network
 
 The `lab/` target changed from one vulnerable container to a small segmented
 network so Phantom can be exercised with real **vertical and lateral
@@ -4482,98 +4489,98 @@ movement**, not just a single box.
 
 ---
 
-### 3.6.7 — 2026-08
+#### 3.6.7 — 2026-08
 
-### Fixed (web→creds bridge + test-suite hardening)
+#### Fixed (web→creds bridge + test-suite hardening)
 
-#### Auto-mode no longer dead-ends when credentials are only reachable through a web app
+##### Auto-mode no longer dead-ends when credentials are only reachable through a web app
 - The planner could not link a web app to the `creds` fact: when `ssh_login` (wordlist brute) failed — e.g. on a lab with SSH users/`passwords outside every wordlist` and a vulnerable portal as the actual access path — the plan stalled on `beacon_deploy → persistence_install` with no way to escalate. The agent never explored the web app.
 - New capability **`web_creds`** (`phantom/automation/exploit/webcreds.py`): a socket-level web engine that (a) discovers SSRF-style file reaches and reads `creds`/API-key files, (b) tries SQL-injection dumps for login tables with hashes/plaintext, and (c) attempts auth-bypass on login endpoints. It runs in-process (like the hunt capabilities), emits `creds`/`web_leak` facts, and is registered as the first `creds` source in `_FACT_SOURCES` so the backward chain reaches `ssh_login → beacon_deploy` through a browser-side wall. The fetch path is non-lethal (bounded reads, 5s timeouts, no service degradation).
 - Lab `lab/webapp/app.py` now exposes a real chain: portal login → SSRF parameter able to read an internal file holding a strong credential pair → SSH access → beacon. End-to-end: `scan → (ssh brute fails) → web_creds (SSRF leak) → ssh_login → beacon deploy → persistence → reports`.
 
-#### Paranoid (`--stealth`) no longer rejects the whole kill chain
+##### Paranoid (`--stealth`) no longer rejects the whole kill chain
 - The paranoid gate refused **every** capability with `stealth_level="aggressive"`, including the single precise moves `ssh_login`, `beacon_deploy`, `persistence_install` — the only viable route to the goal — so `--stealth` printed an empty plan and halted.
 - Split capability intent: a new **`forceful`** flag marks the genuinely noisy actions (automated exploitation, legacy brute, AD attacks, lateral, impact). The paranoid gate now rejects only `forceful` capabilities; precise, low-noise moves that are required for the goal stay affordable. `--stealth` now completes deliver (beacon + persistence) — slower on purpose (2–3× cadence, `-T2` scan) but without null planning.
 
-#### Test-suite hardening (3 failures caught by the field/full-suite runs)
+##### Test-suite hardening (3 failures caught by the field/full-suite runs)
 - `tests/test_automation_post.py`: `_ssh/_smb_pivot_failing_runner` blocked on the generic `sshpass + nohup` pair, but the new scp beacon deploy also embeds `nohup` (chmod && nohup <beacon>), so the blocker swallowed the *deploy* — the beacon never checked in and `_await_beacon` burned its 30s retry repeatedly, hanging the pivot E2E tests. Restricting the block to the `PEER` host (+ not-scp) makes the ssh-pivot fail while the deploy registers. `test_recover_stall_noop_when_nothing_failed` was stale vs. the one-shot deep-scan escalation and now asserts the true no-op state.
 - Removed stray build/runtime artifacts that had drifted into the repo tree (`data/agent.py`, `data/kit.py`, `%TEMP%pytest_all_out.txt`, `camp-cli-fail-*/`, `phantom_run_auto.py`).
 - Full suite green: **1414 passed, 1 skipped, 0 failed.**
 
 ---
 
-### 3.6.6 — 2026-08
+#### 3.6.6 — 2026-08
 
-### Fixed (auto-mode full-loop completion — first fully automatic deliver against the lab)
+#### Fixed (auto-mode full-loop completion — first fully automatic deliver against the lab)
 
 The autonomous kill chain now completes **scan → creds → beacon deploy → persistence → reports → handoff** with no manual intervention against the `lab/` container (SSH 2222, FTP 2121, web 8081). Field-tested from Kali WSL: `deliver` reached `beacon=True, persistenza=True, creds=1` in ~2 minutes, and the raw + client reports contain the real `beacon`, `persistence`, `creds` and `service` findings.
 
-#### Port-scan coverage now follows the run flags
+##### Port-scan coverage now follows the run flags
 - Default and `--stealth` sweep the full range up front (`-p 1-65535`); `--speed` and `--aggressive` stay on fast top-ports (`--top-ports 100`, higher `--min-rate`). Plain `-sT` scans label non-standard ports with wrong table guesses (2222 → `EtherNetIP-1`), which broke every service precondition downstream — `-sV` is now always on so real service names/versions feed the planner.
 - Stamped on the WorldModel by the agent (`wm.scan_style`), read by `_scan_port_spec()` in the scan adapters.
 
-#### SSH credential verification broke on modern OpenSSH (CRITICAL)
+##### SSH credential verification broke on modern OpenSSH (CRITICAL)
 - `_verify_ssh` always passed the legacy `KexAlgorithms=+diffie-hellman-group1-sha1` / `HostKeyAlgorithms=+ssh-rsa` options (for Metasploitable2-era servers). Against OpenSSH 9.x those options break auth entirely — "Permission denied" even with valid credentials, so the auto-mode could never harvest creds on modern targets.
 - Also `-o BatchMode=yes` disabled sshpass's password feed on every attempt.
 - Fix: try modern defaults first; re-add the legacy algorithm set only when the failure is an algorithm-negotiation error.
 
-#### Beacon deploy over SSH (auto-mode)
+##### Beacon deploy over SSH (auto-mode)
 - The deploy command must run ON the target — the old wrapper executed the dropper on the operator host, and a curl-dropper via ssh died of SIGHUP mid-download.
 - New path: scp the compiled **static** binary (the dynamic one requires glibc ≥ 2.38 and dies on Debian bookworm-class targets; `compile_beacon` now keeps `beacon_linux_static`), then `setsid ssh … nohup beacon … </dev/null >/dev/null 2>&1 &` with full local redirection so the deploy step returns in <1 s (sshpass + `ssh -f` deadlocks on the pty). Unique staging path per attempt avoids ETXTBSY on a running beacon file.
 
-#### Agent now observes the REAL C2, not its own empty state
+##### Agent now observes the REAL C2, not its own empty state
 - `_await_beacon`/`_BeaconSession` read the in-process `c2_state`, so an agent running in a different process than the listener could never see registrations, tasks or results.
 - When the listener runs in the agent's process (the designed single-process flow: `auto` from the Phantom shell), everything now works end-to-end; loopback/NAT source IPs are accepted for lab targets.
 
-#### Linux persistence with graceful fallback
+##### Linux persistence with graceful fallback
 - The cron method assumed `crontab` exists; minimal containers/stripped distros fail silently, so `persistence_install` never produced a finding. Now `cron → ~/.profile → systemd user unit` are tried in order until one confirms `PERSISTENCE_OK`.
 - C2 auto-persist now queues `persist` (beacon default service name `PhantomBeacon`) instead of `persist systemd` (which created a unit literally named `systemd`).
 
 ---
 
-### 3.6.5 — 2026-08
+#### 3.6.5 — 2026-08
 
-### Fixed (first full end-to-end C2 field test — local docker lab + Kali WSL)
+#### Fixed (first full end-to-end C2 field test — local docker lab + Kali WSL)
 
 Field setup: intentionally vulnerable target container (`lab/` — SSH weak creds, anonymous FTP, SQLi web app), Phantom core running in Kali WSL with real tooling (nmap/hydra/metasploit), C2 listener on the operator host. Full beacon chain exercised: build → deploy over SSH → check-in → task → result.
 
-#### Malleable catch-all dropped the beacon body (CRITICAL)
+##### Malleable catch-all dropped the beacon body (CRITICAL)
 - The beacon rotates URIs and randomizes their casing (`randomize_uri_casing`), but the C2 routed on exact paths. Most rotated POST check-ins (telemetry) fell through to the new catch-all, which consumed the body once for content sniffing; `handle_checkin` then saw `can_read_body == False`, re-read `""`, and every check-in carrying telemetry failed HMAC (signed body vs received empty body). Symptom: the beacon registered once after minutes of silent retries, then was rejected forever with exponential backoff.
 - Fix: catch-all reads the payload once and passes it down (`pre_body=`) to `handle_checkin`/`handle_result`; aiohttp caches the read body, so no handler re-reads the socket.
 
-#### Rotated malleable URIs 404ed (catch-all routing)
+##### Rotated malleable URIs 404ed (catch-all routing)
 - `GET /JS/jquery-3.6.0.min.js`-style randomized paths had no route (aiohttp is case-sensitive); only the exact-cased lucky paths reached the check-in handler.
 - Fix: catch-all GET/POST routes registered last — any unmatched URI carrying `X-Beacon-Id` is routed by CONTENT (GET → check-in; POST with decrypted `task_id` → result; POST otherwise → telemetry check-in). Path-based mTLS protection extended to any request presenting `X-Beacon-Id` (public stager downloads stay open).
 
-#### Partial SSL_write silently dropped the beacon body (beacon C++)
+##### Partial SSL_write silently dropped the beacon body (beacon C++)
 - The Linux/Android network layer wrote the whole request (headers + body) with a single `SSL_write()`/`send()` and ignored the return value. TLS may accept a partial write — the server then sees a POST whose signed body is missing → guaranteed HMAC rejection on those requests (probabilistic, TLS-record dependent).
 - Fix: bounded write loop for both `SSL_write` and `send` until the full request is handed off.
 
-#### Beacon ↔ C2 key material alignment (operational note)
+##### Beacon ↔ C2 key material alignment (operational note)
 - `PHANTOM_C2_KEY` / `PHANTOM_C2_NONCE` overrides in the operator `.env` apply to the C2 at runtime; a beacon built from a checkout whose `.env`/state differs embeds a different AES key and can never decrypt task deliveries (silent backoff loop, HMAC still fine).
 - Documented: build beacons from the operator checkout (or export the same `PHANTOM_C2_KEY`/`PHANTOM_C2_NONCE` to the build environment). Reproduced and verified: aligned-key build registers immediately, executes `whoami` and returns the encrypted result end-to-end.
 
-#### Auto-mode field-test fixes (against the lab)
+##### Auto-mode field-test fixes (against the lab)
 - **Full-range scan escalation:** default `scan_tcp` is top-100 ports only — non-standard SSH (2222) and custom services are invisible, so `deliver` runs on lab/hardened hosts dead-ended with "no path/move". `_recover_stall` now escalates ONCE to `nmap -p 1-65535 --min-rate` when the beacon goal is unmet and no remote-access service (SSH/RDP/WinRM/SMB) is known. Verified: second scan found `tcp/2222`.
 - **SSH login on any port:** `ssh_login` precondition required the exact `tcp/22` finding; new `_has_service_kind("service", "ssh")` matches the SSH service on any discovered port.
 - **Operator wordlists:** the offline brute only used built-in default credentials — real engagements bring their own lists. `load_custom_wordlists()` reads `data/wordlists/custom/<service>_users.txt` / `<service>_passwords.txt` (generic `users.txt`/`passwords.txt` as fallback), service-specific wins.
 - **Dynamic service port for brute:** `_default_cred_discovery` used well-known ports (ssh→22); now prefers the port the scanner discovered (`_service_port`).
 - Tests: `tests/test_automation_ssh_anyport.py` (precondition any-port, wordlist precedence, port discovery, escalation flag logic).
 
-#### Local lab (`lab/`)
+##### Local lab (`lab/`)
 - Added `lab/`: single-container intentionally vulnerable target (SSH `victim`/`v1ct1m!` on 2222, anonymous FTP on 2121, SQLi login on 8081) + README with authorized-testing scope. Used for the beacon chain test above; reusable for exploit/brute/pivot drills.
 
-### Verified end-to-end
+#### Verified end-to-end
 - Kali WSL: nmap scan of the lab → XML → `parse_nmap_xml` (3 services), hydra found the SSH credential, credential harvest written to the shared WorldModel, SQLi confirmed against the lab web app.
 - Beacon: compile (Linux x64 static + XOR payload) → scp over SSH → run → immediate registration with aligned keys → queued `whoami` executed → encrypted result returned and stored by the C2.
 
 ---
 
-### 3.6.4 — 2026-08
+#### 3.6.4 — 2026-08
 
-### Added (field test against testfire.net)
+#### Added (field test against testfire.net)
 
-#### Pure-Python HTTP/HTTPS fingerprint probes
+##### Pure-Python HTTP/HTTPS fingerprint probes
 - The fingerprint engine had probes for SSH/SMB/MySQL/… but **no HTTP probe** — web fingerprinting depended on `curl` (silently skipped on hosts without it). Discovered while field-testing against IBM's public demo target `testfire.net` (authorized): ports 80/443 connected but returned `unknown`.
 - Added `_probe_http`/`_probe_https` (pure socket + stdlib `ssl`, no curl): parses `Server` header, HTTP status, `Location` redirect, `<title>`, and CMS/framework markers (wordpress/drupal/joomla/nginx/apache/tomcat/iis/php/shibboleth).
 - Registered in `PROBE_MAP` (now 17 protocols). Verified live: `testfire.net` → `Apache-Coyote/1.1`, status 200, title `Altoro Mutual`, cms apache — on both 80 and 443 (the Python probe's TLS worked where `curl -I` returned empty).
@@ -4581,11 +4588,11 @@ Field setup: intentionally vulnerable target container (`lab/` — SSH weak cred
 
 ---
 
-### 3.6.3 — 2026-08
+#### 3.6.3 — 2026-08
 
-### Fixed (static-analysis pass — pyflakes over the whole tree)
+#### Fixed (static-analysis pass — pyflakes over the whole tree)
 
-#### Runtime crashes (undefined names)
+##### Runtime crashes (undefined names)
 - `phantom/core/shell.py` — `time` was used (auto-mode from the shell) but never imported → `NameError` at runtime.
 - `phantom/modules/base_module.py` — `notifier` used in `do_preview`/`_execute_flow` (the default flow every module inherits) but never imported → every `preview` on a module without override crashed.
 - `phantom/utils/rce_deployer.py` — `shutil` used in the SMB deploy path but never imported → `NameError` when deploying via psexec/wmiexec.
@@ -4593,181 +4600,181 @@ Field setup: intentionally vulnerable target container (`lab/` — SSH weak cred
 - `phantom/automation/fingerprint/probes.py` — `Callable` used in `PROBE_MAP` annotation without import.
 - `phantom/automation/social/persona.py` — `Any` used in annotations without import.
 
-#### Shared state file format conflict (engagement_history.json)
+##### Shared state file format conflict (engagement_history.json)
 - **`HistoricalLearner` crashed on every init when the history file was in the legacy flat-list format** — the file is written as a list by `core.history` but `automations.fallback` expected a dict-of-techniques, so the auto-mode died at startup on machines with real engagement data. `_load` now migrates the legacy list format, skips junk records, and never raises on corrupt payloads.
 - `core/history.py` now also normalises the dict-of-techniques shape (written by fallback) back into records, so both writers can share the file safely in either direction.
 - Regression tests added in `tests/test_fallback.py` (legacy list migration, corrupt payload).
 
-#### Tests
+##### Tests
 - `test_c2_resilience.py::test_backoff_restored_on_recovery` asserted the old hardcoded-5000 string; updated to assert the new `base_sleep_ms` recovery (the fix from 3.6.2).
 
 ---
 
-### 3.6.2 — 2026-08
+#### 3.6.2 — 2026-08
 
-### Fixed (deep audit)
+#### Fixed (deep audit)
 
-#### Beacon C++ — wire protocol & platform parity
+##### Beacon C++ — wire protocol & platform parity
 - **CRITICAL: HMAC canonical mismatch between beacon and C2 server.** `make_request_auth` in `network.h` joined the canonical string with literal `\n` (backslash-n) while the server's `canonical_request()` joins with real newlines — so the beacon's HMAC never matched and **every authenticated check-in was rejected with 401**. The first field test would have failed immediately. Fixed to real newlines and verified end-to-end (C++-generated signature now passes `verify_request`).
 - **macOS beacon could never use HTTPS without mTLS** — it forced `CURLOPT_SSL_VERIFYPEER=1` against the self-signed C2 certificate, so every TLS check-in failed (Windows/Linux both disable verification). Now mirrors Windows/Linux without mTLS and verifies against the private CA with hostname check off when mTLS is on.
 - **Operator sleep cadence was lost after an outage** — `sleep_ms` doubled as outage backoff, so `sleep 30000` silently reverted to 5s on reconnect (more check-ins = less stealth). New `base_sleep_ms` field preserves the operator cadence across outages.
 
-#### API server (Electron) — security
+##### API server (Electron) — security
 - **The localhost API had no authentication** — only a CORS `*` middleware, so any local process (or a malicious website open in the operator's browser) could read targets/credentials and revoke beacon identities. Every route now requires `Authorization: Bearer <PHANTOM_API_TOKEN>` (OPTIONS preflight exempt); the Electron main process injects the header from the state file, the renderer never sees the token.
 
-#### Tests
+##### Tests
 - New `tests/test_api_auth.py` — 401 without/wrong token, 200 with token, OPTIONS exemption, rotation invalidates the old token.
 - New `tests/test_modules_logic.py` — logic-level coverage for wifi (BSSID/channel/count validation, crack errors), handler (payload mapping, duplicate listener, kill), pivot (command construction, invalid type), telegram (auth headers, API JSON parsing, error handling).
 
 ---
 
-### 3.6.1 — 2026-08
+#### 3.6.1 — 2026-08
 
-### Fixed (full-project audit)
+#### Fixed (full-project audit)
 
-#### Beacon & build pipeline
+##### Beacon & build pipeline
 - **Windows beacon now compiles again** — 4 real C++ errors in `sleep_ekko.h` (missing enums/`WaitAny`), `malleable.h` (generated config included before the namespace declaration), and `winhttp_dynamic.h` (`PFN_WinHttpQueryOption` redeclared). `beacon.bin` builds cleanly.
 - **`CONFIG_SEED` now actually rotates per build** — the header documented per-build rotation but nothing generated it: every binary shipped the same hardcoded seed, so the XOR keystream protecting C2_HOST/PORT was identical across all builds. `builder.py` now rewrites a fresh random 64-bit seed on every build.
 - `config_encrypted.h` and `malleable_config.h` (auto-generated) added to `.gitignore`; `c2_config.h` remains tracked-but-ignored (dead ignore — needs `git rm --cached` at next commit).
 
-#### Test suite (was silently broken)
+##### Test suite (was silently broken)
 - `test_features_final.py` and `test_real_deploy.py` are standalone integration scripts that call `sys.exit(1)` at module level — they killed the entire pytest run. Excluded via `tests/conftest.py` `collect_ignore` + `pytest.ini` (they remain runnable manually / by the release workflow).
 - **Fake social engines in `test_automation_deliver.py` / `test_automation_resume.py` updated** to the full social interface (`set_social_config`, `persona_profile`, `dossier`, `profile_recon`, `campaign`, `dm`, `dm_follow`, `wait_follow`, `harvest`, `phish(use_video=…)`) — the agent was failing every social capability against stale fakes.
 - **Preflight check-in probe now proves the real authenticated path**: it enrolls a throwaway identity in an isolated registry and signs both probe requests with HMAC (counter + nonce), matching the real beacon wire protocol. Previously the HMAC-auth feature rejected unenrolled probes with 401, making the gate fail by design.
 - `test_fresh_run_with_state_path_writes_checkpoint` deployed to `10.0.0.9` while its fake C2 registered `10.0.0.5` — the beacon wait loop spun until timeout. Runner now told which IP the run deploys to.
 - **Environment-dependent tests made deterministic**: `test_workflow_refactor.py` and `test_enterprise_scoring.py` read the operator's REAL `calibrated_weights.json` / `engagement_history.json` (which only exist on used machines), producing negative scores and wrong `decide_next` results. They now isolate the calibration + history singletons (INITIAL_WEIGHTS, empty history) in setUp/tearDown. `test_manual_core.py` replaced the module singletons without restoring them — now restored in `finally`.
 
-#### Core, API, CI
+##### Core, API, CI
 - **Report export path traversal**: target-derived filenames were unsanitized — a URL target (`http://host/path`) created missing subdirectories and broke `export`, and `..` could escape the reports dir. Filenames now sanitize to `[A-Za-z0-9._-]`.
 - **CI would have failed out of the box**: `pytest --timeout=120` requires `pytest-timeout`, which was neither installed in the workflow nor in the Docker test deps. Added to both.
 
 ---
 
-### 3.6.0 — 2026-08
+#### 3.6.0 — 2026-08
 
-### Changed
+#### Changed
 
-#### Modes removed — the core is now guided, not scripted
+##### Modes removed — the core is now guided, not scripted
 - `MODE_SEQUENCES`, `set mode`, `next` and the mode-driven `run` are GONE. Static sequences duplicated what the adaptive `suggest` layer already does from real findings, and sat awkwardly between manual and auto-mode (the full chain belongs to `auto`, the step-by-step control belongs to the shell).
 - `run` is now ADAPTIVE: it reads the live engagement — target type (ip/domain/url vs email/username/phone via `classify_target`), knowledge findings, and the senior reasoning hypotheses (the same engine as auto-mode) — and proposes the single best next module WITH the reason, then asks before executing. `run <module>` runs a specific module directly. No target → clear hint. Identity target → OSINT first; empty network target → scan; then reasoning/module-scoring drives.
 - Status bar / dashboard / prompt now show the target TYPE tag (IP/EMAIL/...) instead of a mode; profile save/load dropped `mode`.
 
-#### `preview` ≠ `run` (module level)
+##### `preview` ≠ `run` (module level)
 - `preview` is now REVIEW-ONLY (shows the command plan, executes nothing); `run` EXECUTES the interactive flow. Previously `do_run` without `--quiet` just called `do_preview` — they were literally the same. Modules' execution flows renamed to `_execute_flow` (10 command modules); the base provides the generic flow + review-only preview.
 - Exploit keeps its dedicated `do_run` (full CVE correlation) — `_execute_flow` is the interactive command selection.
 
-#### Identity targets in the MANUAL core
+##### Identity targets in the MANUAL core
 - `classify_target` now distinguishes **usernames with dots** from domains via a TLD heuristic: `mario.rossi`/`giulia.b` are usernames (OSINT chain), while `testfire.net`, `sub.example.co.uk` and internal suffixes (`dc01.corp`, `web.internal`, `build.local`) stay domains — in BOTH the manual core and auto-mode (shared classifier).
 - `set target` accepts every target type: phones with `+`/dashes/spaces (`+391234567890`), emails, dotted usernames.
 - `run` routes identity targets to **osint first**; network modules (scan/web/exploit/brute/pivot/wifi/handler/payload) warn clearly when used against an email/username/phone target instead of running nmap nonsense on them.
 
-#### Electron
+##### Electron
 - Session Manager dropped the mode select + static sequences; new **Suggest Next** button calls `/api/session/next` (adaptive, same logic as CLI `run`) and shows the suggested module, reason and command preview, with a Run button.
 
-### Changed (API)
+#### Changed (API)
 - `/api/session/next` → adaptive suggestion `{module, reason, commands}` (no execution); `/api/session/run` runs the adaptive step in background; `/api/session/preflight` without a module checks the adaptive next step; reports use the target TYPE instead of MODE.
 
 ---
 
-### 3.5.0 — 2026-08
+#### 3.5.0 — 2026-08
 
-### Added
+#### Added
 
-#### Deepen worker (work during social waits)
+##### Deepen worker (work during social waits)
 - New sub-agent goal `enrich`: while the lead agent sleeps waiting for the human (email open / link click / follow accept), a second agent works in parallel on deeper OSINT, breach checks, profile recon, dossier and persona cover, plus its own grabber polling — if the wait turns out unnecessary, the deepen worker proves it first.
 - Deepen is deliberately passive: the `enrich` goal excludes `phish`/`dm_sent` facts, so it never launches new lures; only the lead sends, the worker enriches and polls.
 - `_auto_workers` now returns 2 by default for identity targets too (previously exploit/web only) — lead + deepen even without `-a`.
 
-#### Portable session bundles (.pm)
+##### Portable session bundles (.pm)
 - `phantom/utils/session_bundle.py`: exports a complete engagement — session state + WorldModel + checkpoint + report index — into a single portable `.pm` file (gzipped JSON), and imports it back on any machine.
 - Auto-mode now writes a checkpoint by default and supports `--resume`; the shell gains `export-session <path>.pm` / `import-session <path>.pm` (plus `--resume <path>` on `auto`) so a session can be handed between operators on opposite sides of the world.
 - Import fully hydrates the reasoning state: the checkpoint's world model (or the manual session `_wm` when no checkpoint exists) is restored into the live knowledge base via `set_wm` — a `.pm` import now brings back findings, not just scalars (mirrors `Session.load`).
 
-#### Encrypted .pm bundles + auto-session
+##### Encrypted .pm bundles + auto-session
 - `.pm` files are now AES-256-GCM ENCRYPTED by default: key is the operator-local `PHANTOM_PM_KEY` secret (auto-generated once in `data/phantom_state.json`, gitignored, 0600; env override). Credentials/notes are never plaintext on disk or in transit; a tampered or wrong-key bundle is rejected cleanly (AES-GCM auth). Legacy plaintext bundles stay readable.
 - `phantom/utils/auto_session.py`: every open is registered in `data/sessions/index.json`; every close auto-exports an encrypted .pm to `latest.pm` (always overwritten) + a dated copy `auto_<YYYY-MM-DD>.pm` that is overwritten only for the SAME engagement (same target + opening timestamp) — a new engagement gets a suffixed file, so per-day history survives.
 - Hooks live in `main.py` (register + "Resume last engagement? [Y/n]" prompt on open, auto-export in `finally`) so `exit`, `quit` AND the double Ctrl+C path all persist the session without asking.
 - `list-sessions` now shows the auto .pm bundles with metadata (target, findings, date, size).
 
-#### Dedicated AUTO-MODE shell (CLI)
+##### Dedicated AUTO-MODE shell (CLI)
 - `auto` with no arguments enters `phantom/core/auto_shell.py` — a first-class interface like `c2` for the C2, mirroring the Electron Auto-Mode panel 1:1
 - Multi-target management (`targets add/rm/list` — the core shell holds one target, the auto shell holds a list), `scope add/rm`, `flags` (aggressive/stealth/speed/agents/goal/profile/llm, validated), `plan` (dry-run), `launch` (with C2 handoff on beacon), `resume <checkpoint|.pm>`, `status` (per-target event summary incl. waiting states), `export <file>.pm` / `import <file>.pm`, `back`
 - Cyan PHANTOM wordmark banner + live status bar + context hints, same family as core (red) and C2 (magenta); double Ctrl+C exits
 - One-shot `auto <targets> [flags]` remains unchanged for scripting
 
-#### Identity targets are always in scope
+##### Identity targets are always in scope
 - `is_identity_target` (email/username/phone/social handle) is exempted from scope pruning in both the agent and `_expand_targets` — a single identity target never wanders outside scope; the only off-target traffic is profile reverse-engineering, which maps the *same person's* public accounts (by design in scope).
 
 ---
 
-### 3.4.0 — 2026-08
+#### 3.4.0 — 2026-08
 
-### Added
+#### Added
 
-#### Real-video IP grabbing
+##### Real-video IP grabbing
 - `video_picker.py` — picks a REAL, harmless public video the target would click on, driven by interests extracted from the profile bio: `yt-dlp ytsearch3:<topic>` when installed, a curated offline catalog of famous uploads otherwise; `--llm` refines the topic via a constrained, injection-hardened advisor call.
 - Tracker lure pages now render the picked video with its real title/channel; `create_video_share_link()` carries the video metadata so `/@user/video/<code>`, `/reel/<code>`, `/shorts/<code>` serve a video that actually interests the victim.
 
-#### Social sleep state (waiting for the human)
+##### Social sleep state (waiting for the human)
 - `harvest_campaign` and the new `wait_follow` capability run as chunked sleeps that emit `waiting` events, breaking on the first real interaction (email open / click / follow accept).
 - Horizon: 600s default, 30s under the fast flag, `PHANTOM_SOCIAL_WAIT` to override — the fast profile never sleeps.
 - `dm_follow` capability + `FOLLOW_SENT:`/`FOLLOW_ACCEPTED:` markers: private accounts run follow → wait → DM → wait → victim_ip, fully unattended; email lures are gated off for private profiles.
 
-#### Sender realism + homoglyphs
+##### Sender realism + homoglyphs
 - `spoof.py` — `derive_sender()` builds the From identity from the dossier (service the target uses: platform brand + domain; person they know: a colleague at the corporate domain; company internal account; honest attacker-mailbox last resort).
 - `homoglyph()` obfuscates the display name + subject with visually-identical Cyrillic lookalikes so naive text filters stop matching canonical keywords; on by default, off in aggressive mode (`PHANTOM_PHISH_HOMOGLYPH`).
 - Zero-click open-tracking pixel now included in single-phish emails too (was campaigns-only).
 
-#### Plumbing
+##### Plumbing
 - Planner: DM chain fixed (harvest/poll accept `dm_sent`; `_FACT_SOURCES` learns `follow_sent`/`follow_accepted`); `dm_ready` precondition ordered before the generic `ad` check (a closure-name collision bug that misplanned private-account DMs as AD work).
 - Electron API: `/api/video-lure` endpoint.
 
 ---
 
-### 3.3.0 — 2026-08
+#### 3.3.0 — 2026-08
 
-### Added
+#### Added
 
-#### Coherent Persona Cover
+##### Coherent Persona Cover
 - `generate_profile()` + `generate_avatar()` (`phantom/automation/social/persona.py`): name, age band *consistent with the job tier* (an intern is never 47), locale-matched city/country, interests, bio and avatar — deterministic per seed, reproducible campaigns
 - Avatar offline-first: Pillow gradient+initials by default; `PHANTOM_PERSONA_AVATAR=randomuser` fetches a free portrait photo cached under `data/personas/avatars/`; graceful None when Pillow is missing
 - New `persona_profile` capability wired into the planner + LLM advisor whitelist; marker `PERSONA_PROFILE:` → `persona_profile` finding
 
-#### Video-Lure IP Grabbing
+##### Video-Lure IP Grabbing
 - Tracker route `/v/<code>` serves a page that mimics **Instagram Reels / TikTok / YouTube Shorts** (`PHANTOM_TRACK_SKIN`, embedded player via `PHANTOM_TRACK_VIDEO_ID`) and plays a real embedded video; page load records the victim's IP exactly like a click
 - `IpGrabber.create_video_link()` + `use_video=True` on `phish`/`campaign` — reel/short links are the highest-converting IP-grab vector
 
-#### Strategic Phishing (Target Dossier)
+##### Strategic Phishing (Target Dossier)
 - `phantom/automation/social/dossier.py`: `TargetDossier` merges all discovered identity facts; **breach correlation across channels** — the same breach name on email *and* phone becomes a cross-channel hook ("Your email and phone were both exposed in the X breach")
 - Deterministic pretext scorer ranks the library per target (phone-only → package_delivery, platform+breach → security_alert, platform-only → password_reset, company → IT/HR, public profile → recruiter)
 - `SocialEngine.dossier()` + new `dossier_analyze` capability (marker `DOSSIER_RECOMMEND:` → `dossier` finding); `strategic=True` on `phish`/`campaign` uses scorer + dossier hook + optional subject twist
 - LLM dossier advisor: `LLMAdvisor.analyze_dossier()` — strict `{pretext, hook, subject_twist}` schema, pretext validated against the library, hook/subject sanitized (no URLs, no braces/placeholders, no control chars, bounded length); a successful injection can only produce a bad hook, never change the channel or execute anything
 
-#### Share-Format Video Links
+##### Share-Format Video Links
 - `IpGrabber.create_video_share_link()` emits the *real share URL shape* — `/@user/video/<code>` (TikTok), `/reel/<code>` (Instagram), `/shorts/<code>` (YouTube) — with the tracking code in the path and **no traceable profile identifier**
 - Tracker serves these paths with the platform skin and records the victim's IP on page load
 
-#### Audience-Aware Personas
+##### Audience-Aware Personas
 - `generate_profile(audience=...)`: `middle` (11-14), `high` (14-19), `university` (18-25), `professional` (job-tier) with student datasets — schools by locale, age-appropriate interests/hobbies/bios; `PersonaProfile` gains `audience` + `school`
 - `SocialEngine.persona_profile()` infers the audience from the discovered platform (Instagram/TikTok/Snapchat -> student) when not specified
 
-#### Profile Reverse-Engineering
+##### Profile Reverse-Engineering
 - `SocialEngine.profile_recon()` (new `profile_recon` capability): fetches the profile page, detects **private / public / missing**, extracts bio + link-in-bio + @handles + emails, and runs sherlock on discovered handles to map the **same person on other platforms** — pure OSINT, private profiles are mapped, never scraped
 - Markers `PROFILE:` / `ACCOUNT_LINK:` -> `profile` / `account_link` findings; profile state feeds the strategic dossier (private profile boosts the security-alert pretext, platform fills from the profile)
 
-#### Sender Realism
+##### Sender Realism
 - Phish From derived from the target's corporate domain (`noreply@acme.it`) or the platform domain (`noreply@linkedin.com`); free-mail providers are never impersonated; fallback stays the configurable env default
 
-#### Electron API
+##### Electron API
 - `POST /api/persona-profile` (generate coherent cover + avatar, `audience` param) and `POST /api/dossier` (breach correlation + recommended pretext) and `POST /api/profile-recon` (profile OSINT mapping)
 
 ---
 
-### 3.2.0 — 2026-08
+#### 3.2.0 — 2026-08
 
-### Added
+#### Added
 
-#### Professional Social Engineering
+##### Professional Social Engineering
 - **Pretext library** (`phantom/automation/social/templates.py`): 7 believable lures (security_alert, it_helpdesk, hr_benefits, recruiter, package_delivery, password_reset, doc_share) rendered from real OSINT context — target name, platform, and the actual breach the address was found in
 - **Credential harvesting**: the self-hosted tracker (`/l/<code>` login pages, `/c/<code>` capture) stores submitted username/password/OTP; `PHANTOM_TRACK_BRAND` + `PHANTOM_TRACK_OTP` env control the page
 - **Campaign engine** (`SocialEngine.campaign/harvest`): multi-target campaigns with per-target lifecycle sent → opened → clicked → creds, stats and reports; new `campaign_launch` + `harvest_campaign` capabilities wired into the planner (`phish` / `victim_ip` / `creds` fact sources)
@@ -4775,39 +4782,39 @@ Field setup: intentionally vulnerable target container (`lab/` — SSH weak cred
 - **Delivery hardening**: HTML multipart emails with action button + tracking pixel, contextual From display names (`PHANTOM_PHISH_FROM`), Message-ID/Reply-To headers
 - Harvested credentials become `creds` findings (service=harvest) that the planner verifies against live services — phish → creds → SSH/WinRM → beacon
 
-#### Dynamic CVE Catalog
+##### Dynamic CVE Catalog
 - Static registry expanded 7 → **12 curated modules** (Spring4Shell, Confluence OGNL, GitLab Exif, vCenter, Elasticsearch added) with **banner-product alias normalization** so real nmap/probe banners ("Apache", "GitLab") match canonical names
 - `service_exploit` now falls back to **live NVD correlation** (resolver, cached) for every fingerprinted product@version not in the registry, then **discovers the weaponizing module dynamically** via `msfconsole search cve:<id>` (Metasploit's self-updating index) — the catalog is genuinely dynamic, never a hardcoded list
 - Unweaponizable CVEs are recorded as `kind=note` knowledge findings so the bug-class anomaly path takes over instead of a dead end
 
-#### Optional Local-LLM Advisor
+##### Optional Local-LLM Advisor
 - `phantom/automation/llm_advisor.py`: `--llm` flag; any GGUF via `PHANTOM_LLM_MODEL` (recommended Qwen2.5-Instruct); llama-cpp-python, zero data egress
 - Injection-hardened: strict `{capability_id, reason}` JSON schema (extra fields dropped at parse), target content wrapped as `<UNTRUSTED_DATA>` and never mixed with instructions, registry validation, paranoid mode drops aggressive suggestions — the advisor can never authorize an action, only add hypotheses the deterministic layer verifies
 
-#### Social DM (direct messages)
+##### Social DM (direct messages)
 - `phantom/automation/social/social_dm.py`: short pretext DMs (security_verify, recruiter, collab, prize, invoice) with per-target tracking links; injectable transports (`TelegramDMTransport` via `PHANTOM_TELEGRAM_BOT_TOKEN`, `DiscordDMTransport` via `PHANTOM_DISCORD_WEBHOOK`, `ConsoleDMTransport` dry-run, `FakeDMTransport` for tests) and custom platform support via `PHANTOM_DM_TRANSPORT=<dotted.path.Class>`
 - `SocialEngine.dm()`: per-target grabbit link, carrier of the identity chain — a DM click converts to `victim_ip` exactly like email
 - New `dm_launch` capability (effects `dm_sent`), `DM_SENT:` marker interpreted into findings, planner fact source + LLM advisor whitelist updated; no transport configured → clear ERROR marker, never a hang
 - Electron: new `POST /api/dm` endpoint (dry-run default from the GUI, real send when a transport is configured)
 
-#### Real Exploit PoC Portfolio (core manual)
+##### Real Exploit PoC Portfolio (core manual)
 - Removed the `CVE_2024_TEST.py` placeholder entirely
 - **6 real, verifiable, stdlib-only PoCs** in `phantom/exploits/pocs/`: Heartbleed (CVE-2014-0160), Apache 2.4.49 traversal+RCE (CVE-2021-41773), Struts2 OGNL RCE (CVE-2017-5638), Log4Shell delivery+reflection with callback mode (CVE-2021-44228), FortiOS SSL-VPN credential leak (CVE-2018-13379), Cisco ASA/FTD file read (CVE-2020-3452)
 - Every PoC runs isolated in a subprocess with a hard timeout and fails softly on unreachable targets; `fire <cve>` / `execute <name>` now have a real catalog to act on
 
-#### Install flow hardening
+##### Install flow hardening
 - `build_helper.py`: bounded subprocess timeouts (`apt-get update` 120s, install 300s) so a slow mirror can never hang the beacon build; EOF/KeyboardInterrupt-safe input; declining the install prints the manual command and skips gracefully instead of dead-ending
 
-### Changed
+#### Changed
 - `.env.example`: `PHANTOM_TRACK_BRAND`, `PHANTOM_TRACK_OTP`, `PHANTOM_GEOIP_DB`, `PHANTOM_PHISH_FROM`, `PHANTOM_LLM_MODEL`, `PHANTOM_DISCORD_WEBHOOK`, `PHANTOM_DM_TRANSPORT`, `PHANTOM_LOG4J_CALLBACK`
 
 ---
 
-### 3.0.0 — 2026-08
+#### 3.0.0 — 2026-08
 
-### Added
+#### Added
 
-#### Beacon Evasion (v3.1 Material)
+##### Beacon Evasion (v3.1 Material)
 - **Direct Syscalls**: embedded `syscall; ret` trampoline in own module — kernel stack return points into our `.text` instead of ntdll, defeating foreign-syscall heuristics
 - **Ekko Sleep Obfuscation**: waitable-timer sleep via `NtWaitForMultipleObjects` with RC4-encrypted RW memory during the wait — thread never appears as "Sleep()-ing"
 - **Early Bird APC Injection**: shellcode queued via `QueueUserAPC` on a suspended process's main thread, runs before `LdrInitializeThunk` — no remote thread
@@ -4826,7 +4833,7 @@ Field setup: intentionally vulnerable target container (`lab/` — SSH weak cred
 - **Reflective Loader Fix**: DllBase offset corrected from 0x20 to 0x30 in PEB walker (LDR_DATA_TABLE_ENTRY)
 - **CRT Initialization Skipped**: `__main` / `__do_global_ctors` bypassed in PIC shellcode — prevents crash on unmapped `.ctors` section during injection
 
-#### Auto-Mode (Full Autonomous Kill Chain)
+##### Auto-Mode (Full Autonomous Kill Chain)
 - Deterministic planner agent with weighted strategy engine
 - Identity chain: OSINT → breach → persona → phish → IP-grabber → network chain
 - Anomaly engine: bug-class hunting (SQLi, SSTI, XXE, SSRF, path traversal) with statistical baseline + validation pass
@@ -4847,27 +4854,27 @@ Field setup: intentionally vulnerable target container (`lab/` — SSH weak cred
 - Campaign report with cleanup & IOCs section
 - `--plan` (dry-run), `--aggressive`, `--no-stealth` flags
 
-#### Enterprise Decision Engine
+##### Enterprise Decision Engine
 - Threat intelligence: NVD, OTX, CISA KEV with 24h caching
 - Bayesian calibration: Beta-Binomial weight learning
 - MITRE ATT&CK mapper: service-to-technique, kill chain phase prioritization
 - Risk engine: business criticality, network position, asset classification
 - Historical learning: technique success/fail tracking with temporal decay
 
-#### Shared Knowledge Engine
+##### Shared Knowledge Engine
 - Typed WorldModel shared between autonomous agent and manual modules
 - `show knowledge`, `suggest` (deterministic reasoning from findings), `brute defaults`
 - Step-aware `run` with precondition checking
 - Session save/load with embedded WorldModel
 
-#### Manual Modules (12 total)
+##### Manual Modules (12 total)
 - State-aware dynamic command suggestions (`preview` + `suggest_commands`)
 - Version-matched MSF commands in exploit module
 - Default credential check in brute module
 - Wordlist generator with pattern tokens and mutation engine
 - Anomaly hunt in web module
 
-#### C2 Enhancements
+##### C2 Enhancements
 - mTLS by default (auto-generated CA + per-beacon client certificates)
 - Per-beacon HMAC authentication with key rotation (120s transition)
 - Task ID collision prevention (timestamp + random suffix)
@@ -4878,7 +4885,7 @@ Field setup: intentionally vulnerable target container (`lab/` — SSH weak cred
 - Dedicated `beacon-auth` command (status/rotate/revoke)
 - Socket limits and result caps
 
-#### Beacon
+##### Beacon
 - AES-256-GCM encryption with random nonce
 - mTLS client certificates + pinned server fingerprint
 - Per-beacon HMAC identity
@@ -4894,7 +4901,7 @@ Field setup: intentionally vulnerable target container (`lab/` — SSH weak cred
 - Wi-Fi and Bluetooth scanning
 - TCP connection monitor (netstat)
 
-#### Electron Desktop App
+##### Electron Desktop App
 - React + TypeScript + Vite + Electron + Tailwind + Zustand
 - Command Palette (Ctrl+K) — fuzzy search across all modules, beacons, credentials
 - 18 panels: C2 Dashboard, Session, Auto-Mode, Timeline, Vault, Network Map, 12 modules, Reports, Settings
@@ -4911,7 +4918,7 @@ Field setup: intentionally vulnerable target container (`lab/` — SSH weak cred
 - Cross-platform packaging: Windows (NSIS), macOS (DMG), Linux (AppImage)
 - GitHub Actions release workflow (PyInstaller backend + electron-builder)
 
-#### CLI UX
+##### CLI UX
 - Artistic emoji-style ghost banner
 - Live status bar (target · mode · scope · counters · beacon count · elapsed time)
 - Faded context hints after every command
@@ -4920,22 +4927,22 @@ Field setup: intentionally vulnerable target container (`lab/` — SSH weak cred
 - Quiet mode for scripting
 - Tab completion for `use` and `set`
 
-#### Reporting
+##### Reporting
 - Dual report: raw operator (full details) + sanitized client (methodology, findings, MITRE, hardening)
 - Campaign report for multi-target engagements
 - Export formats: JSON, HTML, PDF, Markdown
 - Cleanup & IOCs section derived from actual run data
 
-#### CI/CD
+##### CI/CD
 - 74 test files with full coverage
 - GitHub Actions: Python 3.10-3.12, C++ compilation, security scan, Electron release
 - Automated cross-platform beacon compilation verification
 
 ---
 
-### 2.0.0 — 2025
+#### 2.0.0 — 2025
 
-### Added
+#### Added
 - C2 server with HTTPS listener and AES encryption
 - Cross-platform beacon (Windows, Linux, Android)
 - Reflective in-memory loader for Windows
@@ -4951,16 +4958,16 @@ Field setup: intentionally vulnerable target container (`lab/` — SSH weak cred
 
 ---
 
-### 1.0.0 — 2024
+#### 1.0.0 — 2024
 
-### Added
+#### Added
 - Initial release
 - Basic CLI pentest shell
 - Core modules (scan, exploit, payload)
 - Simple C2 communication
-### 3.7.4 — 2026-09-06
+#### 3.7.4 — 2026-09-06
 
-### Fixed — Electron "everything fetch errors" root cause
+#### Fixed — Electron "everything fetch errors" root cause
 
 **Token desync between the Electron main process and the Python backend.**
 A `PHANTOM_API_TOKEN` inherited from a parent shell (e.g. after running
@@ -4977,7 +4984,7 @@ C2 state, network scan, everything).
 - Network scan stays async (previous fix) and was re-verified live: the
   installed app boots, authenticates, and scans without blocking.
 
-### Fixed — network map, wordlists, CLI/C2 help
+#### Fixed — network map, wordlists, CLI/C2 help
 
 - **Network scan found 0 hosts (CLI + Electron)**: `_ping_sweep` passed
   `IPv4Address` objects to `subprocess.run` (expects strings) — every ping
