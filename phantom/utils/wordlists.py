@@ -6,8 +6,12 @@ from phantom.core.session import session
 
 console = Console()
 
-# default search paths
+# default search paths — includes the project-local data dir so wordlists
+# work out of the box on Windows/macOS too (where /usr/share doesn't exist).
+from phantom.utils.paths import data_dir as _data_dir  # noqa: E402
+
 SEARCH_PATHS = [
+    os.path.join(_data_dir(), "wordlists"),
     "/usr/share/wordlists",
     "/usr/share/seclists",
     "/usr/share/dirb/wordlists",
@@ -56,6 +60,33 @@ class WordlistManager:
                         except OSError:
                             pass
         self._built = True
+
+    # ── data-returning API (used by the Electron backend /api routes) ──
+
+    def list_entries(self) -> List[Dict]:
+        """Return the full index (data, not printed)."""
+        self._build_index()
+        return sorted(self._index, key=lambda x: (x["category"], x["name"]))
+
+    def search(self, keyword: str) -> List[Dict]:
+        """Return index entries whose name contains `keyword`."""
+        self._build_index()
+        kw = (keyword or "").lower()
+        return [w for w in self._index if kw in w["name"].lower()]
+
+    def info(self, name: str) -> Optional[Dict]:
+        """Return detailed info (path, size, line count) for a wordlist."""
+        self._build_index()
+        matches = [w for w in self._index if (name or "").lower() in w["name"].lower()]
+        if not matches:
+            return None
+        w = dict(matches[0])
+        try:
+            with open(w["path"], "r", encoding="utf-8", errors="ignore") as f:
+                w["entries"] = sum(1 for _ in f)
+        except Exception:
+            w["entries"] = None
+        return w
 
     def _categorize(self, filename: str) -> str:
         """Assign a category based on filename keywords."""

@@ -6,6 +6,128 @@ from rich.console import Console
 
 console = Console()
 
+# Every subprocess here gets a hard timeout so a slow apt mirror (or a
+# network drop) can never leave the build flow hanging.
+_INSTALL_TIMEOUT = 300   # apt-get install
+_UPDATE_TIMEOUT = 120    # apt-get update
+
+
+# The Windows beacon is a MinGW cross-build: there is no C++ compiler in a
+# stock Windows install, and the failure used to be a dead end ("Install them
+# manually" with no command that installs a toolchain). winget ships with
+# Windows 10 1809+/11 and carries a portable WinLibs MinGW-w64, so the missing
+# compiler is something the tool can fix WITH the operator's consent instead of
+# a manual download nobody documents.
+_MINGW_WINGET_ID = "BrechtSanders.WinLibs.POSIX.UCRT"
+_MINGW_COMPILER = "x86_64-w64-mingw32-g++"
+
+
+def _winget_mingw_bin() -> str:
+    """Directory holding the winget-installed MinGW compiler, or "".
+
+    winget unpacks portable packages under
+    ``%LOCALAPPDATA%\\Microsoft\\WinGet\\Packages\\<Id>_...``; the exact
+    suffix is source-generated, so it is globbed rather than assumed.
+    """
+    import glob
+    local = os.environ.get("LOCALAPPDATA", "")
+    if not local:
+        return ""
+    pattern = os.path.join(local, "Microsoft", "WinGet", "Packages",
+                           f"{_MINGW_WINGET_ID}_*", "mingw64", "bin")
+    for candidate in glob.glob(pattern):
+        if os.path.exists(os.path.join(candidate, _MINGW_COMPILER + ".exe")):
+            return candidate
+    return ""
+
+
+def mingw_bin_dir() -> str:
+    """A usable MinGW ``bin`` directory, from PATH or from a winget install."""
+    found = shutil.which(_MINGW_COMPILER)
+    if found:
+        return os.path.dirname(found)
+    return _winget_mingw_bin()
+
+
+def _activate_mingw() -> str:
+    """Put the discovered MinGW ``bin`` on this process's PATH; return it.
+
+    A winget install does not touch the PATH of a process that is already
+    running, so a build started afterwards sees the compiler on disk and still
+    reports "not found". Detection is cheap and idempotent, so it runs before
+    every Windows build instead of trusting the environment.
+    """
+    bin_dir = mingw_bin_dir()
+    if not bin_dir:
+        return ""
+    parts = os.environ.get("PATH", "").split(os.pathsep)
+    if bin_dir not in parts:
+        os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+    return bin_dir
+
+
+def install_windows_toolchain(consent: bool = False) -> bool:
+    """Fetch MinGW-w64 with winget and put it on THIS process's PATH.
+
+    Returns True only when a compiler is usable afterwards, so a caller never
+    proceeds into a build that would fail the same way. Declining (or no
+    winget) returns False with the command printed: a refusal must still be
+    actionable.
+    """
+    if os.name != "nt":
+        console.print("[yellow][!] The Windows toolchain is only auto-installable "
+                      "on Windows; on this host install g++-mingw-w64 with your "
+                      "package manager.[/]")
+        return False
+    if not consent:
+        return False
+    winget = shutil.which("winget")
+    if not winget:
+        console.print(f"[red][!] winget not found — install '{_MINGW_WINGET_ID}' "
+                      "from the Microsoft Store (App Installer), or install "
+                      "MinGW-w64 manually, then re-run.[/]")
+        return False
+    console.print(f"[cyan][*] Installing MinGW-w64 via winget ({_MINGW_WINGET_ID})...[/]")
+    try:
+        result = subprocess.run(
+            [winget, "install", "-e", "--id", _MINGW_WINGET_ID,
+             "--accept-package-agreements", "--accept-source-agreements",
+             "--disable-interactivity"],
+            capture_output=True, text=True, timeout=_INSTALL_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        console.print(f"[red][!] winget install failed: {exc}[/]")
+        return False
+    # A fresh install does not update THIS process's PATH, and the build runs
+    # in-process: without this the compiler exists and still "is not found".
+    bin_dir = _activate_mingw()
+    if not bin_dir:
+        # Detection FIRST, exit code second: winget answers "Found an existing
+        # package already installed" with a NON-ZERO code (0x8A15002B) on a
+        # box where the toolchain is present and perfectly usable. Reading
+        # the exit code first turned a working install into a reported
+        # failure (measured 2026-10-30).
+        detail = (result.stderr or result.stdout or "").strip()[:300]
+        console.print(f"[red][!] MinGW-w64 could not be found after the winget "
+                      f"run (exit {result.returncode}): {detail}[/]")
+        return False
+    if result.returncode != 0 and "already installed" not in (
+            (result.stdout or "") + (result.stderr or "")).lower():
+        console.print(f"[yellow][!] winget reported exit {result.returncode}; "
+                      "checking the toolchain anyway.[/]")
+    ok = shutil.which(_MINGW_COMPILER) is not None
+    console.print("[green][+] MinGW-w64 ready: " + bin_dir + "[/]" if ok else
+                  "[red][!] MinGW installed but the compiler still does not run.[/]")
+    return ok
+
+
+def _safe_choice(prompt: str, default: str = "n") -> str:
+    """Read y/N input without ever hanging (EOF -> default, then skip)."""
+    try:
+        return input(prompt).strip().lower() or default
+    except (EOFError, KeyboardInterrupt):
+        return default
+
+
 def _in_container():
     return os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv')
 
@@ -17,7 +139,7 @@ def install_dependencies(dependencies, manager="apt"):
     - Avoids sudo if running as root
     - Returns True on success, False otherwise
     """
-    console.print(f"[yellow][?] Dipendenze mancanti: {', '.join(dependencies)}[/]")
+    console.print(f"[yellow][?] Missing dependencies: {', '.join(dependencies)}[/]")
 
     # Inside Docker: auto-install without prompting
     if _in_container():
@@ -25,16 +147,24 @@ def install_dependencies(dependencies, manager="apt"):
         choice = 'y'
     # Only skip interactive prompt if truly non-interactive (CI env, no tty)
     elif not sys.stdin.isatty():
-        console.print("[yellow][!] Non-interactive session.\n    Please install the following packages manually:")
+        console.print("[yellow][!] Non-interactive session — cannot prompt.\n    Please install the following packages manually:")
         if manager == 'apt':
             console.print(f"    sudo apt-get update && sudo apt-get install -y {' '.join(dependencies)}")
         else:
             console.print(f"    {manager} install {' '.join(dependencies)}")
         return False
     else:
-        # Interactive: ask the user
-        choice = input("Vuoi installarle automaticamente ora? [y/N]: ").strip().lower()
+        # Interactive: ask the user. Declining is NOT a hang or a dead end:
+        # we print what is missing and how to install it later, and return
+        # False so callers can skip the step gracefully.
+        choice = _safe_choice("Install them automatically now? [y/N]: ")
         if choice != 'y':
+            console.print(
+                "[yellow][!] Installation skipped. You can install them later with:")
+            if manager == 'apt':
+                console.print(f"    sudo apt-get install -y {' '.join(dependencies)}")
+            else:
+                console.print(f"    {manager} install {' '.join(dependencies)}")
             return False
 
     # Determine command prefix (avoid sudo if running as root)
@@ -46,11 +176,13 @@ def install_dependencies(dependencies, manager="apt"):
     prefix = ["sudo"] if use_sudo else []
 
     if manager == 'apt':
-        # Update package lists first
+        # Update package lists first (bounded: a slow mirror must not hang)
         try:
-            console.print("[cyan][*] Aggiornamento lista pacchetti (apt-get update)...[/]")
+            console.print("[cyan][*] Refreshing package lists (apt-get update)...[/]")
             upd_cmd = prefix + ["apt-get", "update"]
-            subprocess.run(upd_cmd, check=False)
+            subprocess.run(upd_cmd, check=False, timeout=_UPDATE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            console.print("[yellow][!] apt-get update timed out — continuing with install.[/]")
         except Exception:
             pass
 
@@ -58,29 +190,95 @@ def install_dependencies(dependencies, manager="apt"):
     else:
         cmd = prefix + [manager, "install", "-y"] + dependencies
 
-    console.print(f"[cyan][*] Esecuzione: {' '.join(cmd)}[/]")
+    console.print(f"[cyan][*] Running: {' '.join(cmd)}[/]")
     try:
-        subprocess.run(cmd, check=True)
-        console.print("[green][+] Installazione completata.[/]")
+        subprocess.run(cmd, check=True, timeout=_INSTALL_TIMEOUT)
+        console.print("[green][+] Installation complete.[/]")
         return True
-    except subprocess.CalledProcessError as e:
-        console.print("[red][!] Installazione fallita. Controlla i nomi dei pacchetti o installa manualmente.[/]")
-        console.print(f"[red][!] Comando eseguito: {' '.join(cmd)}\n[red][!] Exit: {getattr(e, 'returncode', 'unknown')}[/]")
+    except subprocess.TimeoutExpired:
+        console.print("[red][!] Installation timed out after "
+                      f"{_INSTALL_TIMEOUT}s. Re-run the command or install "
+                      "manually.[/]")
         return False
+    except subprocess.CalledProcessError as e:
+        console.print("[red][!] Installation failed. Check the package names or install manually.[/]")
+        console.print(f"[red][!] Command run: {' '.join(cmd)}\n[red][!] Exit: {getattr(e, 'returncode', 'unknown')}[/]")
+        return False
+
+def _wsl_cmd(args: list) -> list:
+    """Wrap an argv through the Kali WSL distro (Windows hosts only).
+
+    The Linux beacon is compiled INSIDE the WSL toolchain: the Windows
+    host has no native g++/headers, but the Kali distro carries the full
+    build environment. Returns [] when WSL is unavailable.
+    """
+    if os.name != "nt":
+        return []
+    import subprocess as _sp
+    try:
+        r = _sp.run(["wsl", "--list", "--quiet"], capture_output=True, timeout=15)
+        names = (r.stdout or b"").decode("utf-16-le", errors="ignore")
+        if "\x00" in names:
+            names = names.replace("\x00", "")
+        for d in [x.strip() for x in names.splitlines() if x.strip()]:
+            if "kali" in d.lower():
+                return ["wsl", "-d", d, "-e"] + args
+    except Exception:
+        pass
+    return []
+
 
 def check_header(header, flags=[]):
     """Try to compile a tiny snippet to see if a header is available."""
     try:
         # Use -c to only compile, -o /dev/null to discard output
         null_out = "NUL" if os.name == 'nt' else "/dev/null"
-        subprocess.run(["g++"] + flags + ["-x", "c++", "-", "-o", null_out, "-c"], 
-                       input=f"#include <{header}>\nint main(){{}}", 
+        cmd = ["g++"] + flags + ["-x", "c++", "-", "-o", null_out, "-c"]
+        if os.name == "nt":
+            cmd = _wsl_cmd(cmd)
+            if not cmd:
+                return False
+        subprocess.run(cmd,
+                       input=f"#include <{header}>\nint main(){{}}",
                        text=True, capture_output=True, check=True)
         return True
     except Exception:
         return False
 
 def _find_static_lib(libname: str, arch: str = "x64") -> bool:
+    """Check whether a static archive (lib<name>.a) exists on the system.
+
+    Searches the standard library directories for the host architecture.
+    On Windows, the search runs inside the Kali WSL filesystem.
+    """
+    if arch == "x86":
+        search_dirs = [
+            "/usr/lib/i386-linux-gnu",
+            "/usr/lib32",
+            "/usr/local/lib32",
+            "/usr/local/lib/i386-linux-gnu",
+        ]
+    else:
+        search_dirs = [
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+            "/usr/local/lib",
+            "/usr/local/lib/x86_64-linux-gnu",
+            "/usr/lib",
+        ]
+    target = f"lib{libname}.a"
+    if os.name == "nt":
+        probe = " || ".join(f"test -f {d}/{target}" for d in search_dirs)
+        try:
+            r = subprocess.run(_wsl_cmd(["sh", "-c", probe]),
+                               capture_output=True, timeout=20)
+            return r.returncode == 0
+        except Exception:
+            return False
+    for d in search_dirs:
+        if os.path.isfile(os.path.join(d, target)):
+            return True
+    return False
     """Check whether a static archive (lib<name>.a) exists on the system.
 
     Searches the standard library directories for the host architecture.
@@ -219,18 +417,37 @@ def _mark_deps_ready(platform):
 
 
 def check_build_env(platform, arch="x64"):
-    """Verifica dipendenze in base alla piattaforma e propone fix automatico."""
+    """Check dependencies for the platform and offer an automatic fix."""
     if _deps_ready(platform):
-        return True
+        # The marker is written once and outlives the toolchain that justified
+        # it (a reimage, a winget uninstall, a different machine profile). For
+        # Windows the compiler is the ONE fact worth re-checking: trusting a
+        # stale marker sent the build on to a bare "No suitable C++ compiler
+        # found" with no offer to install one (measured 2026-10-30, marker
+        # dated three months earlier). Every other platform keeps the fast
+        # path.
+        if platform != "windows" or _activate_mingw() or shutil.which("cl"):
+            return True
 
     missing = []
     
     if platform == "linux":
         if os.name != "posix":
-            console.print("[yellow][!] Warning: Cross-compiling for Linux from Windows might fail natively.[/]")
-            console.print("[yellow][!] Use WSL or a Linux container if compilation fails.[/]")
-
-        if not shutil.which("g++"): 
+            # Windows host: the Linux toolchain lives in the Kali WSL distro.
+            # g++/headers/static libs are probed THROUGH WSL (check_header /
+            # _find_static_lib are WSL-aware); g++ presence is checked the
+            # same way instead of the Windows PATH.
+            gxx = _wsl_cmd(["sh", "-c", "command -v g++"])
+            gxx_ok = False
+            if gxx:
+                try:
+                    gxx_ok = subprocess.run(gxx, capture_output=True,
+                                            timeout=20).returncode == 0
+                except Exception:
+                    gxx_ok = False
+            if not gxx_ok:
+                missing.append("build-essential (in WSL: apt install build-essential)")
+        elif not shutil.which("g++"):
             missing.append("build-essential")
         
         # Determine flags and package suffix for architecture
@@ -276,6 +493,7 @@ def check_build_env(platform, arch="x64"):
                     missing.append(full_pkg)
         
     elif platform == "windows":
+        _activate_mingw()
         has_cl = shutil.which("cl") is not None
         # Check for mingw cross-compilers on Linux
         mingw_64 = shutil.which("x86_64-w64-mingw32-g++")
@@ -284,7 +502,29 @@ def check_build_env(platform, arch="x64"):
         if os.name == 'nt':
             if not has_cl and not mingw_64 and not mingw_32:
                 console.print("[red][!] 'cl.exe' (MSVC) or mingw toolchain not found in PATH.[/]")
-                return False
+                # There is no compiler in a stock Windows install, so "install
+                # it manually" left the operator with nothing to paste. Offer
+                # the winget install; auto-consent only when explicitly opted
+                # in (PHANTOM_AUTO_INSTALL_TOOLCHAIN=1) or the operator says yes.
+                opt_in = os.environ.get("PHANTOM_AUTO_INSTALL_TOOLCHAIN", "").strip().lower()
+                if opt_in in ("1", "yes", "true", "y"):
+                    consent = True
+                elif sys.stdin.isatty():
+                    consent = _safe_choice(
+                        "Download and install MinGW-w64 with winget? [y/N]: ") == "y"
+                else:
+                    consent = False
+                if not consent:
+                    console.print(
+                        f"[yellow][!] Windows payloads will be skipped until "
+                        f"MinGW-w64 is installed. Either re-run with "
+                        f"PHANTOM_AUTO_INSTALL_TOOLCHAIN=1 (no prompt) or run: "
+                        f"winget install -e --id {_MINGW_WINGET_ID}[/]")
+                    return False
+                if not install_windows_toolchain(consent=True):
+                    return False
+                _mark_deps_ready(platform)
+                return True
         else:
             # On Linux targeting Windows
             if arch == "x64" and not mingw_64:
@@ -293,6 +533,12 @@ def check_build_env(platform, arch="x64"):
                 missing.append("g++-mingw-w64-i686")
     
     elif platform == "macos":
+        # On a real Mac the system clang++ builds the payload directly: no
+        # cross-toolchain is involved. osxcross exists to cross-compile FROM
+        # Linux, and demanding it on macOS made a native build impossible —
+        # the platform was in practice only buildable from Linux.
+        if sys.platform == "darwin" and shutil.which(os.environ.get("CXX") or "clang++"):
+            return True
         # Check for osxcross
         osxcross_root = os.environ.get("OSXCROSS_ROOT", "/opt/osxcross")
         o32_cc = os.path.join(osxcross_root, "bin", "o32-clang++")
@@ -303,6 +549,30 @@ def check_build_env(platform, arch="x64"):
             console.print(f"[red][!] macOS SDK not found at {osxcross_root}/SDK. Download it using: cd {osxcross_root} && ./tools/gen_sdk_package.sh[/]")
             return False
     
+    elif platform == "ios":
+        # iOS: there is NO cross-compiler for a device build. A device
+        # implant/dylib must be compiled and code-signed on macOS with
+        # Xcode (or `theos`), then delivered through MDM as an
+        # enterprise-signed app. We refuse HONESTLY instead of emitting a
+        # binary that could never load on the device.
+        if os.name != "posix" or sys.platform != "darwin":
+            console.print(
+                "[red][!] iOS builds require macOS + Xcode. There is no "
+                "cross-toolchain for an iOS device binary: use a macOS host "
+                "with Xcode and an enterprise signing identity, then deliver "
+                "via MDM.[/]")
+            return False
+        if not shutil.which("xcrun"):
+            console.print("[red][!] 'xcrun' not found — install Xcode command "
+                          "line tools (`xcode-select --install`).[/]")
+            return False
+        sdk = subprocess.run(["xcrun", "--sdk", "iphoneos", "--show-sdk-path"],
+                             capture_output=True, text=True)
+        if sdk.returncode != 0 or not sdk.stdout.strip():
+            console.print("[red][!] iOS SDK not found — install the iOS "
+                          "platform via Xcode.[/]")
+            return False
+
     elif platform == "android":
         # Check for Android NDK
         ndk_home = os.environ.get("ANDROID_NDK_HOME", "/opt/android-ndk")
@@ -328,9 +598,14 @@ def check_build_env(platform, arch="x64"):
                 ok = install_dependencies(runtime_needed)
                 if ok:
                     _mark_deps_ready(platform)
+                else:
+                    console.print(
+                        "[yellow][!] Toolchain not ready — the beacon build "
+                        f"for {platform} will be skipped. You can retry with "
+                        f"'deploy-agent' after installing the packages.[/]")
                 return ok
             else:
-                console.print(f"[red][!] Dipendenze mancanti: {', '.join(runtime_needed)}. Installale manualmente.[/]")
+                console.print(f"[red][!] Missing dependencies: {', '.join(runtime_needed)}. Install them manually.[/]")
                 return False
         # Only static libs missing — not an issue for dynamic linking
         _mark_deps_ready(platform)

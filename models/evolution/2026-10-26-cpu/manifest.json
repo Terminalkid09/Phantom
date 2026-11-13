@@ -1,0 +1,11 @@
+{
+  "adapter": "models\\evolution\\2026-10-26-cpu\\adapter",
+  "base_model": "training/base/Qwen2.5-0.5B-Instruct",
+  "baseline": {},
+  "eval": {},
+  "phase": "evolution",
+  "promoted": false,
+  "sha256": "714e3af7679438debf24f6039037d4b03128c7f7dd4a12211dc073832d18fc90",
+  "trained_at": "2026-10-26T09:06:25Z",
+  "version": "2026-10-26-cpu"
+}

@@ -1,0 +1,17 @@
+{
+  "adapter": "models/scan_parse/2026-10-26-cpu-v3/adapter",
+  "base_model": "training/base/Qwen2.5-0.5B-Instruct",
+  "baseline": {
+    "exact_match": 1.0
+  },
+  "dataset": "training/data/train/scan_parse.jsonl",
+  "eval": {
+    "exact_match": 0.666667
+  },
+  "golden_rows": 3,
+  "phase": "scan_parse",
+  "promoted": false,
+  "sha256": "44d758cef9a6370dda0bab4ec56d45fcb22202b82460b3aa0b2eb2137b112f9c",
+  "trained_at": "2026-10-26T10:04:13Z",
+  "version": "2026-10-26-cpu-v3"
+}

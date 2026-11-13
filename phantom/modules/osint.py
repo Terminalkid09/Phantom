@@ -1,5 +1,6 @@
 import dns.resolver
 import re
+from urllib.parse import urlparse
 from phantom.modules.base_module import BaseModule
 from phantom.core.preview import PreviewSession
 from phantom.core.executor import run_commands, run_command
@@ -12,6 +13,29 @@ import requests
 from phantom.utils.notifier import notifier
 
 console = Console()
+
+# A username is interpolated RAW into a shell command (`sherlock <user> ...`)
+# and the executor only validates the TARGET, not the command string, so the
+# value must be a plain token here: anything with a space, `;`, `|`, `&` or a
+# quote would become extra shell syntax on the operator's own box.
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
+
+
+def _clean_username(value: str) -> str:
+    """A shell-safe username, or "" (fail closed, never "escape and hope")."""
+    candidate = (value or "").strip().lstrip("@")
+    return candidate if _USERNAME_RE.match(candidate) else ""
+
+
+def _shodan_query(value: str) -> str:
+    """Escape a Shodan query for the surrounding double-quoted argument.
+
+    Several dorks contain their own quotes (`"default password"`,
+    `product:"MongoDB"`). Interpolating them raw closes the shell quote and
+    splits the query into extra argv entries, so `shodan search` receives
+    something the operator never typed.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 class OsintModule(BaseModule):
@@ -33,33 +57,43 @@ class OsintModule(BaseModule):
 
         groups = {}
 
-        # CONTROLLO CONTESTO: Se contiene '_' o '@', è un handle social, non un dominio/IP
-        is_social_target = "_" in t or "@" in t
+        # The old heuristic treated only handles containing `_` or `@` as
+        # social: `damiano.silviotti1` (a dotted username, not a domain) fell
+        # through to WHOIS/DNS and `_get_username()` truncated it to
+        # `damiano`. Use the SAME classifier the planner uses, so a bare
+        # username is accepted from the CLI/API without being mistaken for a
+        # domain (2026-10-20 live defect).
+        from phantom.automation.guidance.targets import (
+            classify_target, target_host)
+        kind = classify_target(t)
+        infra_target = target_host(t, kind)
+        is_network_target = kind in ("ip", "domain", "url")
 
-        if not is_social_target:
-            # Popola i comandi infrastrutturali SOLO se è un vero dominio o IP
+        if is_network_target:
+            # Popola i comandi infrastrutturali SOLO se è un vero dominio/IP
             groups["WHOIS / DNS"] = [
-                f"whois {t}",
-                f"host {t}",
-                f"dig {t} ANY +short",
-                f"dig {t} MX +short",
-                f"dig {t} TXT +short",
-                f"dnsrecon -d {t} -t std",
+                f"whois {infra_target}",
+                f"host {infra_target}",
+                f"dig {infra_target} ANY +short",
+                f"dig {infra_target} MX +short",
+                f"dig {infra_target} TXT +short",
+                f"dnsrecon -d {infra_target} -t std",
             ]
             groups["SUBDOMAIN ENUM"] = [
-                f"amass enum -d {t} -passive",
-                f"subfinder -d {t} -silent",
-                f"assetfinder --subs-only {t}",
-                f"theHarvester -d {t} -l 500 -b all",
+                f"amass enum -d {infra_target} -passive",
+                f"subfinder -d {infra_target} -silent",
+                f"assetfinder --subs-only {infra_target}",
+                f"theHarvester -d {infra_target} -l 500 -b all",
             ]
             groups["DORKING (Shodan)"] = [
-                f"shodan search \"net:{t}\"",
-                f"shodan search \"org:'{t}'\"",
-                f"shodan stats \"net:{t}\"",
-            ] + [f"shodan search \"{dork} net:{t}\"" for dork in self.DORKS]
+                f"shodan search \"net:{infra_target}\"",
+                f"shodan search \"org:'{infra_target}'\"",
+                f"shodan stats \"net:{infra_target}\"",
+            ] + [f"shodan search \"{_shodan_query(dork)} net:{infra_target}\""
+                 for dork in self.DORKS]
             groups["VULNERABILITY SEARCH"] = [
-                f"shodan search \"vuln:CVE-2024- net:{t}\"",
-                f"shodan search \"has_vuln:true net:{t}\"",
+                f"shodan search \"vuln:CVE-2024- net:{infra_target}\"",
+                f"shodan search \"has_vuln:true net:{infra_target}\"",
             ]
 
         # Add Sherlock se il target è un candidato username valido
@@ -69,40 +103,173 @@ class OsintModule(BaseModule):
                 f"sherlock {username} --timeout 5 --print-found"
             ]
 
-        return groups
+        return self._with_suggestions(groups, self.suggest_commands())
+
+    def suggest_commands(self) -> dict:
+        """Identity/domain/IP-aware OSINT commands from the session state."""
+        from phantom.modules.suggest import osint_suggestion_group
+        return osint_suggestion_group()
 
     def _get_username(self, target: str) -> str:
-        """Extract a potential username from the target string without breaking social handles."""
-        if not target: 
+        """Extract a potential username without breaking social handles.
+
+        A username is an identity, not a domain: `damiano.silviotti1` must
+        stay whole (the old split-on-dot reduced it to `damiano` and ran
+        Sherlock against the wrong person). URL profiles are accepted too:
+        `instagram.com/<handle>` and `tiktok.com/@<handle>`.
+        """
+        if not target:
             return ""
-        
-        import ipaddress
+        from phantom.automation.guidance.targets import classify_target
+        kind = classify_target(target)
+        if kind == "username":
+            return _clean_username(target)
+        if kind == "email":
+            # the local part is a legitimate OSINT lead (not an identity
+            # proof): keep it only when it is a shell-safe token
+            return _clean_username(target.split("@", 1)[0])
+        if kind == "url":
+            parsed = urlparse(target if "://" in target
+                              else f"https://{target}")
+            parts = [p for p in (parsed.path or "").split("/") if p]
+            if not parts:
+                return ""
+            handle = parts[0]
+            if handle.startswith("@"):
+                handle = handle[1:]
+            # profile URLs only; /reel/<id>, /p/<id> are content, not a user
+            if handle.lower() in ("p", "reel", "reels", "video", "videos",
+                                  "stories", "explore", "about", "share"):
+                return ""
+            return _clean_username(handle)
+        return ""  # IP, domain, phone: not a username
+
+    def do_phone(self, _):
+        """phone — phone-number OSINT: carrier + region via phonenumbers
+        (offline, never the subscriber's identity). Writes an `identity`
+        finding to the shared knowledge."""
+        t = session.target
+        if not t or not (t.startswith("+") or t.replace("+", "").isdigit()):
+            notifier.error("Set target to a phone number (e.g. +391234567890) first.")
+            return
+        import phonenumbers
+        from phonenumbers import carrier, geocoder
         try:
-            ipaddress.ip_address(target)
-            return "" # Un IP non è un username
-        except ValueError:
-            # Se contiene caratteri tipici dei social, l'username è l'intero target (pulito da eventuali @)
-            if "_" in target or "@" in target:
-                return target.lstrip("@")
-            
-            # Se è un dominio classico (es. azienda.com), prendiamo solo la prima parte
-            return target.split('.')[0] if '.' in target else target
+            num = phonenumbers.parse(t, None)
+        except Exception as e:
+            notifier.error(f"Invalid phone number: {e}")
+            return
+        if not phonenumbers.is_valid_number(num):
+            notifier.warn("Number parses but is not valid for its region.")
+        name = carrier.name_for_number(num, "en") or "unknown"
+        region = phonenumbers.region_code_for_number(num) or "unknown"
+        from phantom.core.knowledge import session_wm
+        wm = session_wm()
+        wm.add_finding(
+            "identity", "phone",
+            {"node_type": "phone", "value": t, "carrier": name,
+             "region": region},
+            confidence=0.8, source="osint")
+        notifier.success(f"Phone OSINT: carrier={name}, region={region} "
+                         "— identity written to shared knowledge.")
+        notifier.info("'suggest' will now propose SMS-phish / carrier moves.")
+
+    def _harvest_identity(self):
+        """Write emails/subdomains/social profiles discovered by OSINT into
+        the shared WorldModel as identity findings."""
+        from phantom.core.knowledge import session_wm
+        wm = session_wm()
+        osint_res = session.get_result("osint") or {}
+        for e in (osint_res.get("dns_intel", {}) or {}).get("emails", []) or []:
+            wm.add_finding("identity", f"email:{e}",
+                           {"node_type": "email", "value": e},
+                           confidence=0.6, source="osint")
+        for sd in osint_res.get("crt_sh_subdomains", []) or []:
+            wm.add_finding("subdomain", sd, {"name": sd},
+                           confidence=0.6, source="osint")
+        for p in osint_res.get("social_profiles", []) or []:
+            wm.add_finding("social_profile", p, {"url": p},
+                           confidence=0.6, source="osint")
+        if osint_res:
+            wm.target = session.target or wm.target
 
     def do_sherlock(self, args):
         """sherlock [username] - Search social media for a username."""
-        username = args.strip() or self._get_username(session.target)
+        username = _clean_username(args.strip()) or self._get_username(session.target)
         if not username:
-            notifier.error("No username provided and target is not a valid username candidate.")
+            notifier.error("No safe username provided and target is not a valid "
+                           "username candidate (a username becomes a shell "
+                           "argument, so metacharacters/whitespace are "
+                           "refused).")
             return
         
+        # Tool management: `sherlock` is an optional external binary. On a
+        # box where it is absent (or only present in WSL and mis-detected),
+        # the old path ran a command that failed and reported "no profiles",
+        # which reads as "this person has no accounts". Use the in-process
+        # deep-recon engine instead: same public pages, no external tool.
+        try:
+            import shutil as _shutil
+            from phantom.automation.runtime.toolchain import ToolRegistry
+            has_sherlock = ToolRegistry().has("sherlock")
+        except Exception:
+            has_sherlock = bool(_shutil.which("sherlock"))
+        if not has_sherlock:
+            notifier.warn("sherlock is not available — using Phantom's built-in "
+                          "deep recon (curl, no external tool)")
+            from phantom.automation.social.recon import deep_recon, session_jar
+            from phantom.automation.guidance.kit import store_social_markers
+            from phantom.core.knowledge import session_wm
+            try:
+                jar = session_jar(session_wm())
+            except Exception:
+                jar = {}
+            ok, lines = deep_recon(username, jar=jar or None)
+            for line in lines:
+                if line.startswith(("ACCOUNT_LINK:", "SEARCH_HIT:",
+                                    "TRACE:", "MENTION:",
+                                    "CO_COMMENTER:", "SOCIAL_TRACE:")):
+                    console.print("  " + line)
+            if ok:
+                try:
+                    store_social_markers("\n".join(lines), session_wm())
+                except Exception:
+                    pass
+                existing = session.get_result("osint") or {}
+                existing["social_profiles"] = [
+                    l.split("url=", 1)[1].split()[0]
+                    for l in lines if l.startswith("SEARCH_HIT:") and "url=" in l
+                ][:50]
+                session.add_result("osint", existing)
+                notifier.info("Built-in recon finished; findings are in the "
+                              "identity graph (`social graph`).")
+            else:
+                notifier.error("Built-in recon failed: "
+                               + (lines[-1] if lines else "unknown"))
+            return
+
         notifier.status(f"Running Sherlock for username: {username}...")
         cmd = f"sherlock {username} --timeout 5 --print-found"
         output = run_command(cmd)
         
-        # Parse output for found social links
-        links = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', output)
+        # Parse only PROFILE URLs, and turn each into an account candidate.
+        # The old regex stored every link as a "social profile" and never
+        # extracted the handle, so a hit could not enter the identity graph.
+        from phantom.automation.social.recon import _profile_handle
+        links = []
+        accounts = []
+        seen = set()
+        for raw in re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', output):
+            link = raw.rstrip(".,;)")
+            if link not in seen:
+                seen.add(link)
+                links.append(link)
+            platform, handle = _profile_handle(link)
+            if handle:
+                accounts.append((handle, platform, link))
         if links:
-            notifier.success(f"Found {len(links)} social profiles!")
+            notifier.success(f"Found {len(links)} link(s), "
+                             f"{len(accounts)} account candidate(s)!")
             existing = session.get_result("osint") or {}
             existing["social_profiles"] = links
             session.add_result("osint", existing)
@@ -110,14 +277,78 @@ class OsintModule(BaseModule):
                 console.print(f"  [cyan]{link}[/]")
             if len(links) > 10:
                 notifier.info(f"... and {len(links)-10} more.")
+            try:
+                from phantom.core.knowledge import session_wm
+                wm = session_wm()
+                for handle, platform, link in accounts:
+                    wm.add_finding(
+                        "account_link", f"{handle}:{platform or 'unknown'}",
+                        {"handle": handle, "platform": platform,
+                         "url": link, "relation": "sherlock",
+                         "evidence": "sherlock_profile_url"},
+                        confidence=0.5, source="sherlock")
+            except Exception:
+                pass
+            self._harvest_identity()
+            notifier.info("Profiles written to shared knowledge (show knowledge).")
         else:
             notifier.info("No social profiles found with Sherlock.")
+
+    def do_cookies(self, args):
+        """cookies [domain ...] — read THIS box's browser sessions locally
+        (Chrome/Edge DPAPI, no beacon, no config) for OSINT authed views.
+        Values stay in the WorldModel under the standard protections;
+        only domains + counts are shown here and stored in results."""
+        from phantom.automation.social.local_cookies import (
+            read_browser_cookies)
+        domains = [d.strip().lstrip(".") for d in (args or "").split()
+                   if d.strip()]
+        try:
+            entries = read_browser_cookies(
+                domains=domains or None)
+        except Exception as e:
+            notifier.error(f"Local cookie read failed: {e}")
+            return
+        if not entries:
+            notifier.warn("No local browser cookies found "
+                          "(Windows + Chrome/Edge expected).")
+            return
+        by_host = {}
+        for c in entries:
+            by_host.setdefault(c.get("host", "?"), 0)
+            by_host[c.get("host", "?")] += 1
+        notifier.success(f"{len(entries)} session cookie(s) available "
+                         f"for {len(by_host)} host(s) — values stay local.")
+        for host in sorted(by_host)[:15]:
+            console.print(f"  [cyan]{host}[/]  [dim]{by_host[host]}[/]")
+        try:
+            from phantom.core.knowledge import session_wm
+            from phantom.automation.post.harvest import cookies_interpreter
+            import json as _json
+            wm = session_wm()
+            for f in cookies_interpreter(
+                    "COOKIES:" + _json.dumps(entries[:50]), wm, {}):
+                wm.add_finding(f.kind, f.key, f.value,
+                               confidence=getattr(f, "confidence", 0.9),
+                               source="local")
+            notifier.info("Session jar ready in shared knowledge "
+                          "(deep recon picks it up automatically).")
+        except Exception as e:
+            notifier.warn(f"Knowledge store skipped ({e}); values not kept.")
 
     def do_shodan(self, query):
         """shodan <query> - Execute a Shodan search (Key required in session config)."""
         api_key = session.results.get("config", {}).get("shodan_key", "")
         if not api_key:
-            notifier.warn("Shodan API key not found. Run 'set-key <key>' or use free InternetDB lookups.")
+            try:
+                from phantom.utils import api_keys
+                api_key = api_keys.get("shodan")
+            except Exception:
+                api_key = ""
+        if not api_key:
+            notifier.warn("Shodan API key not found. Run 'set-key <key>, "
+                          "'config keys set shodan <key>' or use free "
+                          "InternetDB lookups.")
             return
 
         def _call():
@@ -134,11 +365,18 @@ class OsintModule(BaseModule):
             notifier.error(f"Shodan error: {e}")
 
     def do_set_key(self, key):
-        """set-key <key> - Save Shodan API key for the session."""
+        """set-key <key> - Save Shodan API key (session AND config plane,
+        so it survives a restart without editing .env)."""
+        key = key.strip()
         config = session.results.get("config", {})
-        config["shodan_key"] = key.strip()
+        config["shodan_key"] = key
         session.add_result("config", config)
-        notifier.success("Shodan key saved.")
+        try:
+            from phantom.utils import api_keys
+            api_keys.set("shodan", key)
+        except Exception:
+            pass
+        notifier.success("Shodan key saved (session + data/config.json).")
 
     def _display_shodan_results(self, data):
         table = Table(title="Shodan Insights")
@@ -149,7 +387,7 @@ class OsintModule(BaseModule):
             table.add_row(m.get("ip_str"), str(m.get("port")), m.get("data", "")[:50].replace("\n", " "))
         console.print(table)
 
-    def do_preview(self, _):
+    def _execute_flow(self, _):
         """Show preview, let user edit, then execute selected commands."""
         if not session.target:
             notifier.error("No target set. Use 'set target <domain/ip/username>' first.")
@@ -166,8 +404,10 @@ class OsintModule(BaseModule):
             return
 
         notifier.status(f"Starting OSINT sequence for {session.target}...")
-        results = run_commands(chosen_commands, session.target)
-        session.add_result("osint", results)
+        from phantom.core.executor import RunStatus
+        status = RunStatus()
+        results = run_commands(chosen_commands, session.target, status=status)
+        session.add_result("osint", results, status=status)
 
         # Esegue l'estrazione automatica via API solo se NON siamo in un contesto puramente social
         if not ("_" in session.target or "@" in session.target):
@@ -175,10 +415,7 @@ class OsintModule(BaseModule):
             self._run_api_lookups()
         else:
             notifier.info("Social handle detected. Automated DNS/Network lookups skipped.")
-
-    def do_run(self, _):
-        """Alias for do_preview."""
-        self.do_preview(_)
+        self._harvest_identity()
 
     def _extract_dns_intel(self, domain):
         """Extract emails/phones/intel from TXT and MX records using dnspython."""

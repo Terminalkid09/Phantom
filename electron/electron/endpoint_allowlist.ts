@@ -1,0 +1,239 @@
+/**
+ * endpoint_allowlist.ts — P1-13 (docs/ROADMAP.md).
+ *
+ * The `api-request` IPC handler used to forward ANY method+endpoint the
+ * renderer sent. A compromised renderer (or a compromised dependency)
+ * could reach every backend route — including destructive ones — even
+ * though the bearer token never left the main process.
+ *
+ * The allowlist below is derived from the endpoints the UI actually
+ * references (grep of src/), grouped read-only vs mutating. Unknown
+ * endpoints are REFUSED in the main process; a missing group match on a
+ * parameterized path falls back to exact/prefix rules below.
+ *
+ * DELIBERATELY NOT BRIDGED (backend-only, reached from the CLI / API, not the
+ * desktop renderer): POST /api/dm, /api/persona-profile, /api/profile-recon,
+ * /api/dossier, /api/video-lure. They are social-engineering features whose
+ * inputs are free text; exposing them here would widen the IPC attack surface
+ * for a panel that does not exist yet. Add a rule (mutating, some with
+ * confirm) only when a panel actually calls them.
+ */
+
+export type EndpointGroup = 'readonly' | 'mutating'
+
+interface Rule {
+  /** exact match, or prefix match when the rule ends with '*' */
+  pattern: string
+  methods: readonly string[]
+  group: EndpointGroup
+  /**
+   * C-1: a MUTATING endpoint that is destructive/irreversible (kills live
+   * sessions, burns identities, rotates secrets). The main process asks the
+   * operator to confirm before forwarding the request; a compromised
+   * renderer can no longer burn the engagement silently. The group is what
+   * tells read from write; this flag is the extra guard for the few calls
+   * worth a dialog.
+   */
+  confirm?: boolean
+}
+
+const RULES: readonly Rule[] = [
+  // ── reads (safe to repeat, no side effects) ────────────────────────────
+  // Guardrails: the manifest is a read of current state, and flipping one is
+  // a configuration change the operator makes deliberately - so it is in the
+  // 'mutating' group (confirm-once), never in a silent-write group.
+  { pattern: '/api/guardrails', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/guardrails', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/capabilities', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/session', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/session/history', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/session/history', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/session/knowledge', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/session/preflight', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/session/preflight', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/session/wordlists', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/session/wordlists/use', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/session/wordlists/generate', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/c2/state', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/c2/audit', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/c2/recordings/live', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/c2/artifacts', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/c2/beacon-help', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/c2/certs', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/modules', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/network-map', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/network/liveness', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/network/liveness', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/search', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/search', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/timeline', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/timeline', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/craft/hits', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/backend/detect', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/backend/detect', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/backend/config', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/backend/config', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/ad/graph', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/ad/mutate', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/ad/mutate', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/attack-graph', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/timeline', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/learning', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/pm/list', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/search', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/automode/status', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/automode/stream', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/vault', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/launcher', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/config/keys', methods: ['GET'], group: 'readonly' },
+  // External tools (ExternalTools, the Settings card for `deps`): the report
+  // only READS what this machine is missing and the command that would fix it.
+  { pattern: '/api/toolchain', methods: ['GET'], group: 'readonly' },
+  // The model's proposals and reasoning journal (LlmProposals, Auto-Mode).
+  // Reading them is free: nothing runs, the queue is inert until an operator
+  // accepts, and the journal is diagnostic data about refused proposals.
+  { pattern: '/api/llm/proposals', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/llm/journal', methods: ['GET'], group: 'readonly' },
+  // Identity graph (SocialGraphPanel). The graph read is pure: it rebuilds the
+  // view from findings already in the session and never touches the network.
+  { pattern: '/api/social/graph', methods: ['GET'], group: 'readonly' },
+  // Profile recon is OUTBOUND (it probes the named social networks), so it is
+  // mutating even though it changes nothing locally. The panel gates it behind
+  // an explicit checkbox; the URL is normalized to a handle server-side.
+  { pattern: '/api/social/recon', methods: ['POST'], group: 'mutating' },
+  // The email PLAN is a read of the rules table (which services, which URLs).
+  // It is safe to repeat and it is what the panel shows BEFORE asking for
+  // confirmation, so it can inform the decision without making the request.
+  { pattern: '/api/social/emails/plan', methods: ['GET'], group: 'readonly' },
+
+  // ── mutating (each one changes backend state — still operator-driven) ──
+  { pattern: '/api/session/run', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/session/save', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/session/load', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/session/next', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/session/notes', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/session/knowledge/reset', methods: ['POST'], group: 'mutating', confirm: true },
+  { pattern: '/api/session/profile/save', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/session/profile/load', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/session/set', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/c2/listener/start', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/c2/listener/stop', methods: ['POST'], group: 'mutating', confirm: true },
+  // Public hop (tunnel): reading it is free; starting it republishes the
+  // listener behind a throwaway edge hostname and rewrites `c2.front` (the
+  // address every artefact embeds), and stopping it drops beacons in flight —
+  // both are writes, the stop is confirm-gated like the listener stop.
+  { pattern: '/api/c2/tunnel', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/c2/tunnel', methods: ['POST'], group: 'mutating' },
+  // HID delivery: `build` only writes a sketch under data/vectors, `flash`
+  // uploads it to a board on a serial port. The upload is the irreversible
+  // one (it rewrites the device), so it carries the confirm dialog; the GET
+  // just reports which boards arduino-cli can see.
+  { pattern: '/api/c2/hid', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/c2/hid', methods: ['POST'], group: 'mutating', confirm: true },
+  { pattern: '/api/c2/generate', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/c2/beacon-auth', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/c2/beacon-auth', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/c2/beacon-auth/revoke', methods: ['POST'], group: 'mutating', confirm: true },
+  { pattern: '/api/c2/beacon-auth/rotate', methods: ['POST'], group: 'mutating', confirm: true },
+  { pattern: '/api/c2/certs/uninstall', methods: ['POST'], group: 'mutating', confirm: true },
+  { pattern: '/api/c2/config/mtls-toggle', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/c2/config/rotate-api-token', methods: ['POST'], group: 'mutating', confirm: true },
+  { pattern: '/api/network/scan', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/network/vulnerable', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/automode/plan', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/automode/run', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/automode/stop', methods: ['POST'], group: 'mutating' },
+  // Recording the operator's decision on a beacon handoff (F-27 / §4). Not
+  // confirm-gated: it records a choice about the UI's next screen, it does not
+  // touch the target, and the run itself keeps going either way.
+  { pattern: '/api/automode/handoff', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/automode/llm', methods: ['POST'], group: 'mutating' },
+  // OSINT preview runs the real recon/social engine for the requested
+  // handle (outbound provider queries, identity checks) — it is a write-side
+  // action, not a pure read. Was mislabelled `readonly`.
+  { pattern: '/api/osint/preview', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/identity/checks', methods: ['GET'], group: 'readonly' },
+  { pattern: '/api/identity/confirm', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/craft', methods: ['POST'], group: 'mutating' },
+  // Asking third-party services whether an address is registered is an
+  // OUTBOUND action (like /api/osint/preview), so it is mutating. No
+  // main-process confirm dialog: the panel already gates it behind the plan
+  // and an explicit checkbox, and it is not destructive — nothing on the
+  // target or the operator's machine changes.
+  { pattern: '/api/social/emails', methods: ['POST'], group: 'mutating' },
+  // Installing one external tool runs a package manager on the operator's
+  // machine: mutating AND confirm-gated, on top of the confirm=true the
+  // backend already requires. Two locks on the one door worth locking twice.
+  { pattern: '/api/toolchain', methods: ['POST'], group: 'mutating', confirm: true },
+  // accept|reject for a model proposal. `accept` EXECUTES the command (through
+  // the same gated executor as any operator command), so the route is
+  // confirm-gated in the main process as well — a second, native dialog on the
+  // action that actually runs something. `reject` shares the path and therefore
+  // shows it too: sharing the confirmation is the safe direction, since the
+  // alternative is a route that executes with no main-process dialog at all.
+  { pattern: '/api/llm/proposals', methods: ['POST'], group: 'mutating', confirm: true },
+  { pattern: '/api/backend/detect', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/backend/install-tool', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/backend/config', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/learning/reset', methods: ['POST'], group: 'mutating', confirm: true },
+  { pattern: '/api/pm/export', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/pm/import', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/reports/generate', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/reports/export', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/reports/export-all', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/export-campaign', methods: ['POST'], group: 'mutating' },
+  { pattern: '/api/config/keys', methods: ['POST'], group: 'mutating' },
+]
+
+/** dynamic segments: /api/<area>/<id>[/<action>] — matched by first segment */
+const PREFIX_GROUPS: readonly { prefix: string; methods: readonly string[]; group: EndpointGroup }[] = [
+  { prefix: '/api/c2/artifact?', methods: ['GET'], group: 'readonly' },
+  { prefix: '/api/c2/beacon/', methods: ['GET', 'POST'], group: 'mutating' },
+  { prefix: '/api/modules/', methods: ['GET', 'POST'], group: 'mutating' },
+  { prefix: '/api/session/notes/', methods: ['GET'], group: 'readonly' },
+  { prefix: '/api/timeline/', methods: ['GET'], group: 'readonly' },
+  { prefix: '/api/network-map/', methods: ['GET'], group: 'readonly' },
+  { prefix: '/api/vault/', methods: ['GET', 'POST'], group: 'mutating' },
+]
+
+export interface CheckResult {
+  allowed: boolean
+  group?: EndpointGroup
+  /** the endpoint is destructive and the main process must confirm (C-1) */
+  confirm?: boolean
+  reason?: string
+}
+
+export function checkEndpoint(method: string, endpoint: string): CheckResult {
+  if (typeof endpoint !== 'string' || !endpoint.startsWith('/api/')) {
+    return { allowed: false, reason: 'endpoint must start with /api/' }
+  }
+  // path-only comparison: drop query string, normalize trailing slash
+  const path = endpoint.split('?')[0].replace(/\/+$/, '') || '/'
+  const m = (method || 'GET').toUpperCase()
+
+  for (const r of RULES) {
+    const pat = r.pattern.replace(/\/+$/, '')
+    if (pat.endsWith('*')) {
+      if (path.startsWith(pat.slice(0, -1)) && r.methods.includes(m)) {
+        return { allowed: true, group: r.group, confirm: r.confirm }
+      }
+      continue
+    }
+    if (path === pat && r.methods.includes(m)) {
+      return { allowed: true, group: r.group, confirm: r.confirm }
+    }
+  }
+
+  for (const p of PREFIX_GROUPS) {
+    const base = p.prefix.replace(/\?$/, '').replace(/\/+$/, '')
+    if ((path + '/').startsWith(base + '/') && p.methods.includes(m)) {
+      return { allowed: true, group: p.group }
+    }
+  }
+
+  return {
+    allowed: false,
+    reason: `endpoint not allowlisted: ${m} ${path}`,
+  }
+}

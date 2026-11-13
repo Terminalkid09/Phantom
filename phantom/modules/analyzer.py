@@ -15,6 +15,11 @@ console = Console()
 class AnalyzerModule(BaseModule):
     module_name = "analyzer"
 
+    def suggest_commands(self) -> dict:
+        """Traffic analysis commands once scan data exists."""
+        from phantom.modules.suggest import analyzer_suggestion_group
+        return analyzer_suggestion_group()
+
     def __init__(self):
         super().__init__()
         self.process = None
@@ -182,6 +187,17 @@ class AnalyzerModule(BaseModule):
 
         # Salva i risultati nella sessione
         session.add_result("analyzer", {"findings": findings, "file": pcap_path})
+        # Write the findings into the shared WorldModel (report + reasoning)
+        try:
+            from phantom.core.knowledge import session_wm
+            wm = session_wm()
+            for sev, typ, detail in findings:
+                wm.add_finding(
+                    "traffic_anomaly", f"{typ}:{detail[:40]}",
+                    {"severity": sev, "type": typ, "detail": detail},
+                    confidence=0.7, source="analyzer")
+        except Exception:
+            pass
 
     def do_privesc(self, arg):
         """privesc — Analyze session data for potential privilege escalation vectors."""

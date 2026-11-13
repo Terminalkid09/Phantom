@@ -1,19 +1,22 @@
 # Phantom Beacon — Cross-Platform C++ Agent
 
 ## Overview
-Highly performant, stealthy C++ beacon/implant for the Phantom C2 framework.
+Cross-platform C++ beacon for authorized Phantom lab engagements. Transport security is provided by AES-256-GCM, per-beacon HMAC, and optional mutual TLS; this is not an EDR-bypass guarantee.
 Supports **Windows**, **Linux**, **macOS**, and **Android** from a single codebase.
 
 **Features:**
 - **Evasion**: Dynamic API resolution via PEB walk (Windows), compile-time XOR string obfuscation (all platforms)
-- **Crypto**: AES-256-CBC — BCrypt/CNG on Windows, OpenSSL on POSIX — zero runtime deps when statically linked
-- **Network**: WinHTTP (Windows) / libcurl (POSIX) with user-agent rotation and sleep/jitter
+- **Crypto**: AES-256-GCM — BCrypt/CNG on Windows, OpenSSL on POSIX — with fresh per-message nonces
+- **Channel auth**: per-beacon HMAC with timestamp/nonce/counter replay protection, optional mTLS, and server certificate pinning
+- **Network**: WinHTTP (Windows), libcurl (macOS), and OpenSSL sockets (Linux/Android) with bounded timeouts
 - **Recon**: Drive/mount enumeration, directory traversal, sensitive path detection
 - **Port Forwarding**: Internal TCP relay for lateral movement (Winsock/POSIX sockets)
 - **File Transfer**: Download/upload files from/to the target
 - **Keylogger**: Context-aware keylogging on Windows (GetAsyncKeyState); stub on POSIX
 
 ## Building
+
+**C++20 is required.** `CMakeLists.txt` sets it, CI compiles with it and the one-liners below pass `-std=c++20`. A `-std=c++17` build fails outright: `evasion.h` obfuscates strings with a lambda in an unevaluated context (`XOR_DEC(XOR_STR(...))`), which C++17 rejects.
 
 ### Windows (MSVC)
 ```bat
@@ -24,25 +27,25 @@ cmake --build . --config Release
 
 ### Windows (MinGW-w64 from Linux)
 ```bash
-x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -o beacon.exe src/main.cpp \
+x86_64-w64-mingw32-g++ -std=c++20 -O2 -s -o beacon.exe src/main.cpp \
     -lwinhttp -lbcrypt -lws2_32 -static
 ```
 
 ### Linux
 ```bash
-g++ -std=c++17 -O2 -s -o beacon_linux src/main.cpp \
+g++ -std=c++20 -O2 -s -o beacon_linux src/main.cpp \
     -lcurl -lssl -lcrypto -lpthread
 ```
 
 ### macOS
 ```bash
-clang++ -std=c++17 -O2 -o beacon_macos src/main.cpp \
+clang++ -std=c++20 -O2 -o beacon_macos src/main.cpp \
     -lcurl -lssl -lcrypto -lpthread -framework CoreGraphics
 ```
 
 ### Android (NDK)
 ```bash
-$NDK_CC -std=c++17 -O2 -s -o beacon_android src/main.cpp -static
+$NDK_CC -std=c++20 -O2 -s -o beacon_android src/main.cpp -static
 ```
 
 ## Usage
@@ -69,6 +72,7 @@ beacon.exe <c2_host> <c2_port>
 | `keylog <start\|stop\|dump>` | Context-aware keylogger (Windows) |
 | `sleep <ms>` | Change beacon sleep interval |
 | `exit` | Terminate the beacon |
+| `auth-rotate <base64-secret>` | Persist a server-approved per-beacon key rotation |
 | `inject <pid>` | Inject beacon shellcode/binary into running PID. Original STAYS → 2 beacons |
 | `migrate` | Process hollow (Win) / fork+inject (Linux): spawn sacrificial process, replace with beacon. Original EXITS → 1 beacon |
 
@@ -76,8 +80,8 @@ beacon.exe <c2_host> <c2_port>
 ```
 main.cpp          Entry point + beacon loop + command dispatch (cross-platform)
 ├── evasion.h     PEB walk (Windows), XOR string obfuscation (all platforms)
-├── crypto.h      AES-256-CBC: BCrypt (Windows) / OpenSSL (POSIX), Base64, PKCS7
-├── network.h     WinHTTP (Windows) / libcurl (POSIX), sleep/jitter, UA rotation
+├── crypto.h      AES-256-GCM: BCrypt (Windows) / OpenSSL (POSIX), Base64, HMAC, protected key state
+├── network.h     WinHTTP/OpenSSL/libcurl transports, mTLS, pinning, timeouts, HMAC headers
 ├── recon.h       FS enumeration (Win32 API / POSIX dirent), critical path detection
 ├── portfwd.h     TCP port forwarding (Winsock / POSIX sockets)
 └── keylogger.h   Context-aware keylogger (Windows) / stub (POSIX)
@@ -88,8 +92,10 @@ main.cpp          Entry point + beacon loop + command dispatch (cross-platform)
 | Feature | Windows | Linux | macOS | Android |
 |---------|---------|-------|-------|---------|
 | Beacon Loop | ✅ | ✅ | ✅ | ✅ |
-| AES-256-CBC | ✅ BCrypt | ✅ OpenSSL | ✅ OpenSSL | ✅ OpenSSL |
-| HTTP/HTTPS | ✅ WinHTTP | ✅ libcurl | ✅ libcurl | ✅ libcurl |
+| AES-256-GCM | ✅ BCrypt | ✅ OpenSSL | ✅ OpenSSL | ✅ OpenSSL |
+| HTTP/HTTPS | ✅ WinHTTP | ✅ OpenSSL sockets | ✅ libcurl | ✅ OpenSSL sockets |
+| Per-beacon HMAC | ✅ | ✅ | ✅ | ✅ |
+| mTLS client | ✅ WinHTTP/PFX | ✅ OpenSSL/PEM | ✅ libcurl/PEM | ✅ OpenSSL/PEM |
 | File Ops | ✅ Win32 | ✅ fstream | ✅ fstream | ✅ fstream |
 | Recon | ✅ Full | ✅ Full | ✅ Full | ✅ Full |
 | Port Fwd | ✅ Winsock | ✅ POSIX | ✅ POSIX | ✅ POSIX |

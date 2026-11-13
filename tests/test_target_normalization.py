@@ -1,0 +1,218 @@
+"""Tests: target normalization (all types, all adapters) + branch-aware
+social tool gating.
+
+A URL target must reach every adapter as a bare host (nmap/ssh/curl)
+or a well-formed URL (http tooling) — never `http://http://...`.
+Social capabilities refuse with tool_missing (not opaque failure)
+when their per-type binary is absent.
+"""
+import unittest
+
+from phantom.automation.belief import WorldModel
+
+
+def _wm(target, ttype):
+    return WorldModel(target=target, target_type=ttype)
+
+
+class TestBareHost(unittest.TestCase):
+    def test_passthrough_types(self):
+        from phantom.automation.guidance.kit import _effective_target
+        self.assertEqual(_effective_target(_wm("10.0.0.5", "ip")),
+                         "10.0.0.5")
+        self.assertEqual(_effective_target(_wm("example.com", "domain")),
+                         "example.com")
+
+    def test_url_forms_reduce_to_host(self):
+        from phantom.automation.guidance.kit import _effective_target
+        for raw in ("http://example.com/", "https://example.com/app?q=1",
+                    "https://example.com:8443/app", "HTTP://EXAMPLE.COM",
+                    "http://user:pw@example.com/", "example.com/",
+                    "example.com."):
+            self.assertEqual(_effective_target(_wm(raw, "url")),
+                             "example.com", raw)
+
+    def test_victim_ip_still_wins(self):
+        from phantom.automation.guidance.kit import _effective_target
+        wm = _wm("someuser", "username")
+        wm.add_finding("victim_ip", "ip:10.9.9.9", {"ip": "10.9.9.9"},
+                       confidence=0.8, source="t")
+        self.assertEqual(_effective_target(wm), "10.9.9.9")
+
+
+class TestServiceTargetPorts(unittest.TestCase):
+    """`host:port` is a host AND a port, never one string."""
+
+    def test_effective_target_strips_service_port(self):
+        from phantom.automation.guidance.kit import _effective_target
+        self.assertEqual(_effective_target(_wm("127.0.0.1:8081", "ip")),
+                         "127.0.0.1")
+
+    def test_nc_scan_uses_bare_host_and_scans_own_port(self):
+        from phantom.automation.guidance.kit import _port_scan_adapter
+        wm = _wm("127.0.0.1:9443", "ip")
+        wm.chosen_tool = {"capability": "scan_tcp", "tool": "nc"}
+        parts = _port_scan_adapter(wm, {}).split()
+        self.assertEqual(parts[:5], ["nc", "-zv", "-w", "1", "127.0.0.1"])
+        self.assertIn("9443", parts)
+        self.assertNotIn("127.0.0.1:9443", parts)
+
+    def test_explicit_target_port_wins_for_web(self):
+        from phantom.automation.guidance.kit import _web_service_target
+        self.assertEqual(_web_service_target(_wm("10.0.0.9:9443", "ip")),
+                         ("10.0.0.9", "9443"))
+
+    def test_discovered_nonstandard_port_is_used(self):
+        from phantom.automation.guidance.kit import _web_service_target
+        wm = _wm("10.0.0.9", "ip")
+        wm.add_finding("service", "tcp/9091",
+                       {"port": "9091", "protocol": "tcp",
+                        "service": "http-alt", "product": "",
+                        "version": ""}, confidence=0.9, source="test")
+        self.assertEqual(_web_service_target(wm), ("10.0.0.9", "9091"))
+
+    def test_rce_uses_target_port_and_https(self):
+        from phantom.automation.guidance.kit import _web_rce_adapter
+        # A REMOTE host: on a local target the operator's own C2 port is
+        # deliberately excluded, so 127.0.0.1:8443 made this test depend on
+        # whatever data/config.json happened to contain on the machine.
+        cmd = _web_rce_adapter(_wm("10.0.0.9:8443", "ip"), {})
+        self.assertIn("https://10.0.0.9:8443/upload", cmd)
+        self.assertIn("curl -s -k -m 8", cmd)   # self-signed TLS must work
+        self.assertIn("|| true", cmd)           # a failed decoy path is not fatal
+        self.assertNotIn("10.0.0.9:80", cmd)
+
+
+class TestHiddenWebPaths(unittest.TestCase):
+    """The RCE handler may exist only as a quoted path inside a script."""
+
+    @classmethod
+    def setUpClass(cls):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/":
+                    body = b'<script src="/static/app.js"></script>'
+                    ctype = "text/html"
+                elif self.path == "/static/app.js":
+                    body = (b"const api='/internal/v2/report/run';"
+                            b"fetch(api,{method:'POST'});")
+                    ctype = "application/javascript"
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def test_quoted_js_endpoint_is_discovered(self):
+        from phantom.automation.guidance.kit import (
+            _candidate_quoted_paths, _discover_web_paths, _probeable_paths)
+        self.assertIn("/internal/v2/report/run",
+                      _candidate_quoted_paths(
+                          "const api='/internal/v2/report/run';"))
+        found = _discover_web_paths(self.base)
+        self.assertIn("/internal/v2/report/run", found)
+        probe = _probeable_paths(found)
+        self.assertIn("/internal/v2/report/run", probe)
+        self.assertNotIn("/static/app.js", probe)   # assets are not handlers
+
+
+class TestEffectiveUrl(unittest.TestCase):
+    def test_bare_host_defaults_http(self):
+        from phantom.automation.guidance.kit import _effective_url
+        self.assertEqual(_effective_url(_wm("10.0.0.5", "ip")),
+                         "http://10.0.0.5")
+
+    def test_url_keeps_scheme_port_path(self):
+        from phantom.automation.guidance.kit import _effective_url
+        self.assertEqual(
+            _effective_url(_wm("https://example.com:8443/app", "url")),
+            "https://example.com:8443/app")
+
+
+class TestAdaptersOnUrl(unittest.TestCase):
+    URL = "https://example.com/app"
+
+    def test_http_probe_no_double_scheme(self):
+        from phantom.automation.guidance.kit import _http_probe_adapter
+        cmd = _http_probe_adapter(_wm(self.URL, "url"), {})
+        self.assertNotIn("http://https://", cmd)
+        self.assertNotIn("https://https://", cmd)
+        self.assertIn("https://example.com/app", cmd)
+
+    def test_scan_adapter_gets_bare_host(self):
+        from phantom.automation.guidance.kit import _version_adapter
+        cmd = _version_adapter(_wm(self.URL, "url"), {"port": "443"})
+        self.assertNotIn("http", cmd)
+        self.assertIn("example.com", cmd)
+
+    def test_hunt_channel_base_is_bare(self):
+        # the anomaly engine builds base URLs itself; the host it gets
+        # must never carry a scheme
+        from phantom.automation.guidance.kit import _effective_target
+        host = _effective_target(_wm(self.URL, "url"))
+        self.assertNotIn("://", host)
+        self.assertEqual(f"https://{host}:443/", "https://example.com:443/")
+
+
+class TestSocialToolGating(unittest.TestCase):
+    def _agent(self, installed):
+        from phantom.automation.agent import AutonomousAgent
+        from phantom.automation.runtime.toolchain import ToolRegistry
+        events = []
+        agent = AutonomousAgent(
+            target="someuser", target_type="username",
+            toolchain=ToolRegistry(installed=set(installed)),
+            on_event=lambda k, d: events.append((k, d)))
+        return agent, events
+
+    def _cap(self, cap_id):
+        from phantom.automation.guidance.commands import make_registry
+        return make_registry().get(cap_id)
+
+    def test_missing_sherlock_is_tool_missing_not_opaque(self):
+        agent, events = self._agent(installed={"curl"})
+        ok = agent._execute_social_capability(self._cap("osint_identity"),
+                                              {})
+        self.assertFalse(ok)
+        kinds = [k for k, _ in events]
+        self.assertIn("tool_missing", kinds)
+        tools = [t for k, d in events if k == "tool_missing"
+                 for t in d.get("tools", [])]
+        self.assertIn("sherlock", tools)
+
+    def test_present_tool_attempts_run(self):
+        agent, events = self._agent(installed={"curl", "sherlock"})
+        agent._execute_social_capability(self._cap("osint_identity"), {})
+        kinds = [k for k, _ in events]
+        self.assertNotIn("tool_missing", kinds)
+        self.assertIn("run", kinds)
+
+    def test_phone_needs_no_binary(self):
+        from phantom.automation.guidance.kit import social_tools_for
+        self.assertEqual(social_tools_for("osint_identity", "phone"), [])
+        self.assertEqual(social_tools_for("osint_identity", "username"),
+                         ["sherlock"])
+        self.assertEqual(social_tools_for("osint_identity", "email"),
+                         ["theHarvester"])
+        self.assertEqual(social_tools_for("nope", "username"), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

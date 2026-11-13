@@ -1,0 +1,78 @@
+# Kubernetes / RBAC practice scenario — LAB FIXTURE, never apply to a real
+# cluster. Deliberately carries the three misconfigurations that turn a
+# workload foothold into cluster-admin access.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: phantom-lab
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: phantom-ci
+  namespace: phantom-lab
+---
+# 1) Over-permissive bind: "make the CI work" shortcut.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: phantom-lab-ci-admin
+subjects:
+  - kind: ServiceAccount
+    name: phantom-ci
+    namespace: phantom-lab
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+  namespace: phantom-lab
+type: Opaque
+stringData:
+  username: phantom_lab
+  password: lab-only-not-a-real-secret
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: phantom-lab
+data:
+  LOG_LEVEL: info
+  DB_HOST: postgres.phantom-lab.svc
+---
+# 2) A workload that mounts the over-privileged ServiceAccount.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: phantom-lab-app
+  namespace: phantom-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: phantom-lab-app
+  template:
+    metadata:
+      labels:
+        app: phantom-lab-app
+    spec:
+      serviceAccountName: phantom-ci
+      containers:
+        - name: app
+          image: nginx:alpine
+          env:
+            # 3) Secret material exposed as an environment variable: an RCE
+            # in this container reads the loot without touching the API.
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: password
+          ports:
+            - containerPort: 80

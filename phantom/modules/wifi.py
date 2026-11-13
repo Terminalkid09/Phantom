@@ -97,16 +97,23 @@ class WifiModule(BaseModule):
         write_path = f"data/sessions/handshake_{bssid.replace(':', '')}"
         dump_cmd = f"sudo airodump-ng --bssid {bssid} --channel {channel} --write {write_path} {self.interface}"
         
-        # Auto-deauth in background thread
+        # Auto-deauth in background thread. argv (no shell): the BSSID above
+        # is validated, but a monitor interface name is not something a shell
+        # should ever reinterpret.
         notifier.info("Sending 10 deauth frames in parallel to force handshake...")
-        deauth_cmd = f"sudo aireplay-ng --deauth 10 -a {bssid} {self.interface}"
-        try:
-            subprocess.Popen(
-                deauth_cmd, shell=True,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except Exception as e:
-            notifier.warn(f"Auto-deauth failed: {e}. You can run it manually in another tab.")
+        if not re.fullmatch(r"[A-Za-z0-9_.:\-]{1,32}", str(self.interface or "")):
+            notifier.warn(f"Refusing auto-deauth: unsafe interface name "
+                          f"{self.interface!r} — run it manually.")
+        else:
+            deauth_argv = ["sudo", "aireplay-ng", "--deauth", "10",
+                           "-a", bssid, self.interface]
+            try:
+                subprocess.Popen(
+                    deauth_argv, shell=False,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            except Exception as e:
+                notifier.warn(f"Auto-deauth failed: {e}. You can run it manually in another tab.")
 
         run_command(dump_cmd)
 
@@ -227,23 +234,31 @@ class WifiModule(BaseModule):
     def build_commands(self) -> dict:
         """Return preset WiFi command groups."""
         iface = self.interface or "wlan0"
-        return {
-            "SETUP": [
-                "sudo airmon-ng check kill",
-                f"sudo airmon-ng start {iface}",
-            ],
-            "SCAN": [
-                f"sudo airodump-ng {iface}mon",
-            ],
-            "ATTACK": [
-                f"sudo aireplay-ng --deauth 15 -a <BSSID> {iface}mon",
-            ],
-            "WPS": [
-                f"sudo reaver -i {iface}mon -b <BSSID> -vv",
-            ]
-        }
+        return self._with_suggestions(
+            {
+                "SETUP": [
+                    "sudo airmon-ng check kill",
+                    f"sudo airmon-ng start {iface}",
+                ],
+                "SCAN": [
+                    f"sudo airodump-ng {iface}mon",
+                ],
+                "ATTACK": [
+                    f"sudo aireplay-ng --deauth 15 -a <BSSID> {iface}mon",
+                ],
+                "WPS": [
+                    f"sudo reaver -i {iface}mon -b <BSSID> -vv",
+                ],
+            },
+            self.suggest_commands(),
+        )
 
-    def do_preview(self, _):
+    def suggest_commands(self) -> dict:
+        """First WiFi steps (interface setup before any attack)."""
+        from phantom.modules.suggest import wifi_suggestion_group
+        return wifi_suggestion_group()
+
+    def _execute_flow(self, _):
         """Interactive command builder."""
         groups = self.build_commands()
         preview = PreviewSession(groups)
@@ -251,5 +266,3 @@ class WifiModule(BaseModule):
         if chosen:
             run_commands(chosen)
 
-    def do_run(self, _):
-        self.do_preview(_)

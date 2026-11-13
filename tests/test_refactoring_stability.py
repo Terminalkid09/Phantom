@@ -19,16 +19,18 @@ class TestShellStability:
         shell = PhantomShell()
         assert shell.prompt == "\x1b[1;36m[phantom]\x1b[0m > "
 
-    def test_mode_sequences_valid(self):
-        """All mode sequences should reference valid module names."""
-        from phantom.core.shell import MODE_SEQUENCES, PhantomShell
+    def test_adaptive_run_instantiates_suggested_module(self):
+        """The adaptive next step must resolve to an instantiable module."""
+        from phantom.core.shell import PhantomShell
+        from phantom.core.session import session
+        from phantom.core import knowledge as K
         shell = PhantomShell()
-        valid_modules = set()
-        for mode, steps in MODE_SEQUENCES.items():
-            assert isinstance(steps, list)
-            assert len(steps) > 0
-            for step in steps:
-                assert isinstance(step, str)
+        session.target = "10.0.0.5"
+        K.reset_wm("10.0.0.5")
+        suggestion = shell._next_step()
+        assert suggestion is not None
+        module, _reason = suggestion
+        assert shell._instantiate_module(module) is not None
 
     def test_precmd_hyphen_translation(self):
         """Hyphens in commands should be translated to underscores."""
@@ -109,14 +111,12 @@ class TestSessionIntegrity:
         assert "timestamp" in s.notes[0]
         assert s.notes[0]["text"] == "Test note"
 
-    def test_ai_connector_safe_access(self):
-        """Accessing ai_connector via getattr should never crash."""
+    def test_ai_connector_removed(self):
+        """ai_connector was removed in v3.0 — getattr returns None (not crash)."""
         from phantom.core.session import Session
         s = Session()
         ai = getattr(s, "ai_connector", None)
         assert ai is None
-        enabled = getattr(ai, "enabled", False) if ai else False
-        assert enabled is False
 
 
 class TestExecutorSafety:

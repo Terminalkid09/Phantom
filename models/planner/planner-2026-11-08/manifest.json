@@ -1,0 +1,46 @@
+{
+  "base_model": "linear-pairwise-ranker",
+  "baseline": {
+    "ndcg": 0.885402
+  },
+  "baseline_meta": {
+    "kind": "static-fact-order",
+    "note": "compared against the static _FACT_SOURCES order, NOT the learned rubric"
+  },
+  "eval": {
+    "ndcg": 0.994484
+  },
+  "eval_gate": {
+    "baseline": 0.885402,
+    "ci_high": 0.137872,
+    "ci_low": 0.079249,
+    "decide_delta": 0.0344,
+    "delta": 0.109081,
+    "iters": 2000,
+    "min_rows": 20,
+    "n": 26,
+    "passed": true,
+    "phase": "planner",
+    "reasons": [],
+    "score": 0.994484,
+    "seed": 7,
+    "verdict": "promote"
+  },
+  "kind": "linear-ranker",
+  "measurement": {
+    "folds": 0,
+    "mode": "holdout",
+    "rows": 26
+  },
+  "phase": "planner",
+  "promoted": true,
+  "ranker": "ranker.json",
+  "sha256": "7eb407eca9629b5d4c425346354c74f78792e57095fba8bc83d5491e05434b91",
+  "trained_at": "2026-11-08T12:39:13Z",
+  "training": {
+    "corpus": "planner.jsonl",
+    "epochs": 300,
+    "rows": 34
+  },
+  "version": "planner-2026-11-08"
+}

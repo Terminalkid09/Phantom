@@ -2,9 +2,6 @@ import logging
 import os
 from datetime import datetime
 
-import logging
-import os
-from datetime import datetime
 from typing import Optional
 
 _logger: Optional[logging.Logger] = None

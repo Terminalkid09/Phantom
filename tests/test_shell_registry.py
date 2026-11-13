@@ -1,0 +1,110 @@
+"""Contract tests for the modular shell (phantom/core/shell/ package).
+
+The split of the monolithic shell.py must preserve the full operator
+contract: every command registered, documented, dispatched, and the old
+module-level helpers still importable from phantom.core.shell.
+"""
+import pytest
+
+import phantom.core.shell as SH
+from phantom.core.shell import PhantomShell
+from phantom.core.shell.registry import command_names
+
+EXPECTED = {
+    "save_profile", "load_profile", "list_profiles", "set", "show",
+    "note", "notes", "save_session", "load_session", "list_sessions",
+    "export_session", "import_session", "history",
+    "run", "suggest", "plan", "preflight", "craft", "map", "install",
+    "scan_diff", "run_diff", "bench", "where",
+    "use", "plugins",
+    "auto", "agent",
+    "c2", "malleable", "ad", "wordlists", "export", "guardrails",
+    "deps", "llm", "social",
+    "help", "config", "setup", "coverage", "doctor", "experience",
+    "why", "tool", "workflow",
+    "back", "exit", "quit",
+}
+
+
+def test_registry_matches_expected_command_set():
+    assert set(command_names()) == EXPECTED
+
+
+def test_every_command_is_wired_as_do_method_with_help():
+    shell = PhantomShell()
+    for name in EXPECTED:
+        fn = getattr(shell, f"do_{name}", None)
+        assert callable(fn), f"do_{name} missing"
+        assert fn.__doc__ and fn.__doc__.strip(), f"do_{name} has no help text"
+
+
+def test_module_level_helpers_still_importable():
+    for attr in ("console", "Console", "build_banner",
+                 "build_banner_compact", "build_status_bar",
+                 "_context_hint", "_engagement_elapsed",
+                 "load_phantom_env"):
+        assert hasattr(SH, attr), attr
+    assert SH.build_banner().strip()
+    assert SH._engagement_elapsed() == "0s"
+
+
+def test_precmd_hyphen_translation_preserved():
+    shell = PhantomShell()
+    assert shell.precmd("load-profile test") == "load_profile test"
+    assert shell.precmd("") == ""
+
+
+def test_unknown_command_does_not_raise():
+    shell = PhantomShell()
+    shell.onecmd("no_such_command_xyz")
+
+
+def test_quit_delegates_to_exit_help():
+    shell = PhantomShell()
+    assert shell.do_quit.__doc__ == shell.do_exit.__doc__
+
+
+def test_plan_accepts_every_registered_goal(monkeypatch):
+    """`plan deliver` used to say "Unknown goal" for a real auto-mode goal."""
+    from phantom.automation.goals import GOAL_FACTS
+    from phantom.core.shell.commands import run as run_cmds
+    from phantom.core.session import session
+    from phantom.utils.notifier import notifier
+
+    errors = []
+    monkeypatch.setattr(notifier, "error",
+                        staticmethod(lambda msg, *a, **k: errors.append(str(msg))))
+    monkeypatch.setattr(session, "target", "")
+    for goal in GOAL_FACTS:
+        run_cmds.cmd_plan(None, goal)
+    assert not any("Unknown goal" in message for message in errors), errors
+
+
+def test_show_defaults_to_the_session_and_reads_the_mode(monkeypatch):
+    """A bare `show` must print the session (its own usage line says so),
+    and `show mode` must read back what `set mode` wrote."""
+    from phantom.core.shell.commands import session as sess_cmds
+    from phantom.core.session import session
+    from phantom.utils.notifier import notifier
+
+    refusals = []
+    monkeypatch.setattr(notifier, "usage",
+                        staticmethod(lambda *a, **k: refusals.append(a)))
+
+    class FakeConsole:
+        def __init__(self):
+            self.out = []
+
+        def print(self, *a, **k):
+            self.out.append(" ".join(str(x) for x in a))
+
+    fake = FakeConsole()
+    monkeypatch.setattr(sess_cmds._sh, "console", fake)
+    session.mode = "recon"
+
+    sess_cmds.cmd_show(None, "")
+    assert refusals == [], "bare `show` was refused as invalid arguments"
+
+    sess_cmds.cmd_show(None, "mode")
+    assert refusals == [], "`show mode` is advertised but unimplemented"
+    assert "recon" in "\n".join(fake.out)

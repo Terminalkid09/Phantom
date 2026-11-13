@@ -1,0 +1,11 @@
+{
+  "adapter": "models\\_bench\\adapter",
+  "base_model": "training/base/Qwen2.5-0.5B-Instruct",
+  "baseline": {},
+  "eval": {},
+  "phase": "evolution",
+  "promoted": false,
+  "sha256": "81f335154f14dd72632b417abce428f41669e902d9361c649c4aa1b72ef28848",
+  "trained_at": "2026-10-26T08:30:28Z",
+  "version": "bench"
+}

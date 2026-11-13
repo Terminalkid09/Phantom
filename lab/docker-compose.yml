@@ -1,0 +1,69 @@
+# Phantom Lab — DMZ + internal hosts on an isolated docker network.
+# Authorized LOCAL testing only: never expose these networks to anything
+# you do not control.
+services:
+  dmz:
+    build: .
+    container_name: phantom-lab-dmz
+    hostname: dmz
+    ports:
+      # STANDARD ports too. A scanner's default sweep (`--top-ports 1000`,
+      # which is what Phantom and every real tool start with) does NOT include
+      # 2121/2222/8081 — measured 2026-11-07, auto-mode against this lab
+      # honestly reported "0 services" because nothing it looks at first was
+      # listening. The non-standard mappings stay (they exercise port
+      # detection and `_service_port`), and these make the lab reachable the
+      # way a real target is.
+      - "22:2222"     # SSH on the standard port
+      - "21:21"       # FTP anonymous on the standard port
+      - "80:8081"     # Web app on the standard port
+      - "2222:2222"   # SSH (non-standard)
+      - "2121:21"     # FTP anonymous (non-standard)
+      - "8081:8081"   # Web app (non-standard)
+    networks:
+      lab_net:
+        ipv4_address: 172.28.0.10
+    restart: "no"
+
+  internal:
+    build: ./internal
+    container_name: phantom-lab-internal
+    hostname: internal
+    networks:
+      lab_net:
+        ipv4_address: 172.28.0.20
+    restart: "no"
+
+  phone:
+    # A managed phone: MDM on 8443 (the endpoints mobile_probe looks for),
+    # adbd on 5555 speaking the REAL wire protocol, and an app sandbox with
+    # one exported component that escapes its own data directory.
+    build: ./phone
+    container_name: phantom-lab-phone
+    hostname: phone
+    ports:
+      - "5555:5555"    # adb (TCP)
+      - "8443:8443"    # MDM / mobile web (also the standard TLS port)
+    networks:
+      lab_net:
+        ipv4_address: 172.28.0.40
+    restart: "no"
+
+  dc:
+    build: ./dc
+    container_name: phantom-lab-dc
+    hostname: dc
+    # Samba persists security.NTACL xattrs on sysvol during provision and
+    # runtime; that write needs CAP_SYS_ADMIN, which Docker drops by default.
+    cap_add:
+      - SYS_ADMIN
+    networks:
+      lab_net:
+        ipv4_address: 172.28.0.30
+    restart: "no"
+
+networks:
+  lab_net:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

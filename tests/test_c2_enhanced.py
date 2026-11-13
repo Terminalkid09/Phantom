@@ -3,7 +3,7 @@ import os
 import json
 import time
 from unittest.mock import MagicMock, AsyncMock
-from phantom.core.c2_server import handle_payload, PAYLOAD_AUTH_TOKEN, c2_state, decrypt_data, encrypt_data
+from phantom.core.c2_server import handle_payload, c2_state, decrypt_data, encrypt_data
 from phantom.utils.payload_manager import add_custom_beacon, get_custom_beacons, clear_payload_history
 
 @pytest.fixture
@@ -42,13 +42,26 @@ async def test_handle_payload_unauthorized():
     assert "Forbidden" in resp.text
 
 @pytest.mark.asyncio
-async def test_handle_payload_authorized_not_found():
-    # Mock aiohttp request
+async def test_handle_payload_authorized_not_found(monkeypatch):
+    """A valid token on a missing payload must be 404, not 403.
+
+    The token is PINNED here instead of imported from the module. `c2_server`
+    snapshots `PAYLOAD_AUTH_TOKEN = get_payload_token()` at import time while
+    the handler compares against the LIVE `get_payload_token()`, and the state
+    store regenerates it whenever the state file is recreated — so any test
+    that runs against its own `PHANTOM_STATE_FILE` in the same worker could
+    leave this one asserting 404 while the server honestly answered 403
+    (measured on the 3.10 CI leg, 2026-11-07; the suite passed locally because
+    the two files landed in different xdist workers). What this test checks is
+    the ROUTE, not the token lifecycle.
+    """
+    from phantom.core import c2_server
+    monkeypatch.setattr(c2_server, "get_payload_token", lambda: "test-token")
     request = MagicMock()
-    request.query = {"auth": PAYLOAD_AUTH_TOKEN}
+    request.query = {"auth": "test-token"}
     request.headers = {}
     request.path = "/api/v1/payload_nonexistent"
-    
+
     resp = await handle_payload(request)
     assert resp.status == 404
 

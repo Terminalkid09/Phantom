@@ -29,7 +29,7 @@ endif()
 # ── Link libraries ────────────────────────────────────────────────────────
 if(WIN32)
     # Windows native - zero external deps
-    target_link_libraries(beacon PRIVATE winhttp bcrypt ws2_32 bthprops wlanapi iphlpapi)
+    target_link_libraries(beacon PRIVATE winhttp bcrypt ws2_32 bthprops wlanapi iphlpapi crypt32)
     if(MSVC)
         set_target_properties(beacon PROPERTIES LINK_FLAGS_RELEASE "/SUBSYSTEM:WINDOWS")
     endif()

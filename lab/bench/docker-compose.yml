@@ -1,0 +1,102 @@
+# Phantom benchmark lab — a chain, not a single toy container.
+#
+# The point of this stack is that no single step gives the flag:
+#
+#   edge (nginx :8081)  -> app (flask, internal 5000)
+#                             |  SQLi login, IDOR, path traversal, SSRF
+#                             v
+#                          admin (flask, internal 5001)   <- only reachable
+#                                                           THROUGH the app's
+#                                                           SSRF
+#   tomcat 8.5.19 (:8088)  -> CVE-2017-12615 PUT -> JSP -> RCE
+#   redis 5  (internal)    -> unauthenticated, holds a session token
+#
+# Two independent routes to a foothold (web chain and Tomcat), one of which
+# requires chaining two services, and a decoy service that answers 404 so a
+# scanner has something true-but-useless to find.
+services:
+  edge:
+    image: nginx:1.25-alpine
+    container_name: bench-edge
+    ports:
+      - "8081:80"
+    volumes:
+      - ./edge/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  app:
+    build: ./app
+    container_name: bench-app
+    environment:
+      - ADMIN_URL=http://admin:5001
+      - REDIS_HOST=redis
+      - FLASK_ENV=production
+    expose:
+      - "5000"
+    depends_on:
+      - admin
+      - redis
+    restart: unless-stopped
+
+  admin:
+    build: ./admin
+    container_name: bench-admin
+    environment:
+      - FLAG=PHANTOM{chain_complete_ssrf_to_admin}
+    expose:
+      - "5001"
+    restart: unless-stopped
+
+  tomcat:
+    image: vulhub/tomcat:8.5.19
+    container_name: bench-tomcat
+    ports:
+      - "8088:8080"
+    restart: unless-stopped
+
+  redis:
+    image: redis:5
+    container_name: bench-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      # Redis NOT on 6379: a scanner that only checks the standard port finds
+      # nothing, and the fingerprint still has to recognise the protocol.
+      - "16379:6379"
+    restart: unless-stopped
+
+  db:
+    image: mariadb:10.5
+    container_name: bench-db
+    environment:
+      - MYSQL_ROOT_PASSWORD=root
+      - MYSQL_DATABASE=portal
+      - MYSQL_USER=portal
+      - MYSQL_PASSWORD=portal
+    ports:
+      # MySQL on 13306, not 3306: same trick as Redis, one layer higher.
+      - "13306:3306"
+    restart: unless-stopped
+
+  http-on-ssh-port:
+    # The app again, on 2222. A port does not identify a service: a tool that
+    # assumes 2222 is SSH and 8080 is HTTP reports the opposite of the truth.
+    build: ./app
+    container_name: bench-misplaced
+    environment:
+      - ADMIN_URL=http://admin:5001
+    ports:
+      - "2222:5000"
+    depends_on:
+      - admin
+    restart: unless-stopped
+
+  decoy:
+    image: nginx:1.25-alpine
+    container_name: bench-decoy
+    ports:
+      - "9091:80"
+    volumes:
+      - ./edge/decoy.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped

@@ -35,12 +35,13 @@
 #include <thread>
 #include <atomic>
 #include <vector>
+#include <memory>
 
 namespace browser_pivot {
 
-inline void pivot_relay(SOCKET a, SOCKET b, std::atomic<bool>& running) {
+inline void pivot_relay(SOCKET a, SOCKET b, std::shared_ptr<std::atomic<bool>> running) {
     char buf[8192];
-    while (running) {
+    while (!running->load()) {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(a, &fds);
@@ -186,18 +187,21 @@ struct BrowserPivotProxy {
 #else
     pid_t targetPid;
 #endif
-    std::atomic<bool> running{false};
+    std::shared_ptr<std::atomic<bool>> stop_flag;
     std::thread thread;
 
     void start(int port, unsigned long pid = 0) {
         localPort = port;
         targetPid = (pid != 0) ? static_cast<decltype(targetPid)>(pid) : find_browser_pid();
-        running = true;
+        stop_flag = std::make_shared<std::atomic<bool>>(false);
         thread = std::thread([this]() { run(); });
-        thread.detach();
     }
 
-    void stop() { running = false; }
+    void stop() {
+        if (stop_flag) *stop_flag = true;
+        // join before destruction so the thread never touches freed memory
+        if (thread.joinable()) thread.join();
+    }
 
 private:
     void run() {
@@ -206,7 +210,7 @@ private:
         WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
         SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (listenSock == INVALID_SOCKET) return;
+        if (listenSock == INVALID_SOCKET) { *stop_flag = true; return; }
         int opt = 1;
         setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
         sockaddr_in bindAddr{};
@@ -214,10 +218,10 @@ private:
         bindAddr.sin_addr.s_addr = INADDR_ANY;
         bindAddr.sin_port = htons(static_cast<u_short>(localPort));
         if (bind(listenSock, (sockaddr*)&bindAddr, sizeof(bindAddr)) != 0) {
-            closesocket(listenSock); return;
+            closesocket(listenSock); *stop_flag = true; return;
         }
         if (listen(listenSock, SOMAXCONN) != 0) {
-            closesocket(listenSock); return;
+            closesocket(listenSock); *stop_flag = true; return;
         }
 #ifdef _WIN32
         u_long nonBlocking = 1;
@@ -226,11 +230,29 @@ private:
         int flags = fcntl(listenSock, F_GETFL, 0);
         fcntl(listenSock, F_SETFL, flags | O_NONBLOCK);
 #endif
-        while (running) {
+        while (!*stop_flag) {
             SOCKET clientSock = accept(listenSock, nullptr, nullptr);
             if (clientSock == INVALID_SOCKET) { Sleep(100); continue; }
 
-            std::thread([this, clientSock]() {
+            // `this` is deliberately not captured: the thread copies what it
+            // needs (the socket and the stop flag). Capturing it made clang
+            // fail the macOS build with -Werror,-Wunused-lambda-capture.
+            std::thread([clientSock, stop_flag = this->stop_flag]() {
+                // Accepted sockets inherit the listener's non-blocking mode;
+                // put the client back in blocking mode with a timeout so the
+                // request read cannot race the client (same defect fixed in
+                // proxy.h on 2026-10-19).
+#ifdef _WIN32
+                u_long blocking = 0;
+                ioctlsocket(clientSock, FIONBIO, &blocking);
+                DWORD rcvto = 15000;
+                setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvto, sizeof(rcvto));
+#else
+                int fl = fcntl(clientSock, F_GETFL, 0);
+                if (fl != -1) fcntl(clientSock, F_SETFL, fl & ~O_NONBLOCK);
+                timeval rcvto{15, 0};
+                setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, &rcvto, sizeof(rcvto));
+#endif
                 char req[4096];
                 int n = recv(clientSock, req, sizeof(req) - 1, 0);
                 if (n <= 0) { closesocket(clientSock); return; }
@@ -247,8 +269,10 @@ private:
                         std::string target = request.substr(sp1 + 1, sp2 - sp1 - 1);
                         size_t colon = target.rfind(':');
                         if (colon != std::string::npos) {
-                            host = target.substr(0, colon);
-                            port = std::stoi(target.substr(colon + 1));
+                            try {
+                                host = target.substr(0, colon);
+                                port = std::stoi(target.substr(colon + 1));
+                            } catch (...) { closesocket(clientSock); return; }
                         }
                     }
                     if (host.empty() || port == 0) {
@@ -272,7 +296,7 @@ private:
                     freeaddrinfo(result);
                     const char* ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
                     send(clientSock, ok, (int)strlen(ok), 0);
-                    pivot_relay(clientSock, remoteSock, this->running);
+                    pivot_relay(clientSock, remoteSock, stop_flag);
                     closesocket(remoteSock);
                 } else {
                     size_t hostBeg = request.find("Host: ");
@@ -284,8 +308,10 @@ private:
                     std::string hostHeader = request.substr(hostBeg, hostEnd - hostBeg);
                     size_t colon = hostHeader.rfind(':');
                     if (colon != std::string::npos) {
-                        host = hostHeader.substr(0, colon);
-                        port = std::stoi(hostHeader.substr(colon + 1));
+                        try {
+                            host = hostHeader.substr(0, colon);
+                            port = std::stoi(hostHeader.substr(colon + 1));
+                        } catch (...) { closesocket(clientSock); return; }
                     } else {
                         host = hostHeader;
                         port = 80;

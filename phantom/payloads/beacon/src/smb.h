@@ -12,11 +12,11 @@
 namespace smb {
 
 inline std::vector<std::string> pending_smb_commands;
-inline std::string pipe_name = "";
 
 struct SmbPipeServer {
     std::string name;
     std::atomic<bool> running{false};
+    std::atomic<DWORD> threadId{0};
     std::thread thread;
     HANDLE pipeHandle = INVALID_HANDLE_VALUE;
 
@@ -29,15 +29,31 @@ struct SmbPipeServer {
         }
         running = true;
         thread = std::thread([this]() { run(); });
-        thread.detach();
     }
 
     void stop() {
         running = false;
+        // The worker parks in ConnectNamedPipe()/ReadFile(). Closing the
+        // handle from another thread does NOT cancel a synchronous blocking
+        // call: live defect 2026-10-19, `smb-pipe-stop` hung forever and the
+        // pipe stayed alive. CancelSynchronousIo aborts the pending call so
+        // the worker observes running==false and exits.
+        DWORD tid = threadId.load();
+        if (tid != 0) {
+            HANDLE hThread = OpenThread(THREAD_TERMINATE, FALSE, tid);
+            if (hThread) {
+                CancelSynchronousIo(hThread);
+                CloseHandle(hThread);
+            }
+        }
         if (pipeHandle != INVALID_HANDLE_VALUE) {
             DisconnectNamedPipe(pipeHandle);
             CloseHandle(pipeHandle);
             pipeHandle = INVALID_HANDLE_VALUE;
+        }
+        // join before destruction so the thread never touches freed memory
+        if (thread.joinable()) {
+            thread.join();
         }
     }
 
@@ -88,6 +104,7 @@ struct SmbPipeServer {
 
 private:
     void run() {
+        threadId = GetCurrentThreadId();
         while (running) {
             std::string err = wait_for_client();
             if (!err.empty()) {
@@ -121,6 +138,15 @@ inline std::string stop_smb_pipe() {
     active_pipe = nullptr;
     pending_smb_commands.clear();
     return "SMB pipe stopped.";
+}
+
+// Pop the next command received over the named pipe ("" when empty).
+// The main loop drains this queue every cycle.
+inline std::string pop_pending_command() {
+    if (pending_smb_commands.empty()) return "";
+    std::string cmd = pending_smb_commands.front();
+    pending_smb_commands.erase(pending_smb_commands.begin());
+    return cmd;
 }
 
 inline std::string process_smb_command(const std::string& cmd) {

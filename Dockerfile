@@ -30,12 +30,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# ── Stage 1b: ci-smoke — the cheapest REAL build the CI can afford ──────────
+# `docker build --target ci-smoke .` pulls the base image, parses this file
+# and resolves requirements.txt INSIDE the image, without paying for the NDK
+# download / OpenSSL cross-compile / osxcross clone below (30+ minutes).
+#
+# This stage exists because the old `docker-test` job printed "Dockerfile
+# exists and checked" while running nothing that could fail: the Docker path
+# was not gated at all (audit §2.8.5). Building THIS stage is a real gate — a
+# broken COPY, an unresolvable requirement or a base image that moved all
+# fail it. The full image is still built by `docker compose build` (operator)
+# and by .gitlab-ci.yml `docker_build`.
+FROM python:3.12-slim AS ci-smoke
+
+# This stage is the requirements gate, not the runtime. It used to run on the
+# moving `kalilinux/kali-rolling` tag and install Python/apt first, so a base
+# image refresh or an apt mirror hiccup failed CI without a code change
+# (measured 2026-11-10, run #61). A pinned Python base resolves the SAME
+# requirements deterministically; the Kali runtime is covered by the full
+# image build / docker compose build.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+COPY requirements.txt .
+# resolves (and downloads) every requirement, installing nothing: a pin that
+# the interpreter cannot satisfy fails the CI here instead of at run time.
+RUN pip install --no-cache-dir --dry-run \
+        -r requirements.txt > /dev/null
+
 # ── Stage 2: Final runtime image ────────────────────────────────────────────
-FROM kalilinux/kali-rolling
+FROM kalilinux/kali-rolling AS runtime
 
 LABEL org.opencontainers.image.title="Phantom Framework" \
       org.opencontainers.image.description="Offensive Security CLI & C2 Framework" \
-      org.opencontainers.image.version="2.0.0" \
+      org.opencontainers.image.version="3.0.0" \
       org.opencontainers.image.licenses="MIT"
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -60,7 +89,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # WiFi
     aircrack-ng reaver hcxdumptool hcxtools \
     # OSINT
-    sherlock exploitdb \
+    sherlock exploitdb theharvester \
     # C++ build chain (for beacon compilation inside container)
     g++ gcc make cmake pkg-config mingw-w64 clang llvm binutils \
     libcurl4-openssl-dev libssl-dev \
@@ -115,14 +144,11 @@ RUN cd /opt && \
     mkdir -p ${OSXCROSS_ROOT}/SDK && \
     echo "osxcross SDK must be added manually (see osxcross docs)"
 
-# ── C2 keys (optional build-args, expected from .env or docker-compose) ─────
-ARG PHANTOM_C2_KEY=
-ARG PHANTOM_C2_IV=
-ARG PHANTOM_PAYLOAD_TOKEN=
-ENV PHANTOM_C2_KEY=${PHANTOM_C2_KEY} \
-    PHANTOM_C2_IV=${PHANTOM_C2_IV} \
-    PHANTOM_PAYLOAD_TOKEN=${PHANTOM_PAYLOAD_TOKEN} \
-    PATH=${OSXCROSS_ROOT}/bin:${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
+# ── Runtime secrets ─────────────────────────────────────────────────────────
+# Do not pass C2 keys as Docker build args: ARG/ENV values can remain in image
+# metadata and layers. docker-compose injects secrets at runtime via .env;
+# compile_beacon then writes the matching generated config when explicitly run.
+ENV PATH=${OSXCROSS_ROOT}/bin:${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
 
 # ── Application setup ────────────────────────────────────────────────────────
 WORKDIR /app
@@ -133,7 +159,7 @@ RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 COPY . .
 
 RUN pip install --no-cache-dir --break-system-packages -e . \
- && pip install --no-cache-dir --break-system-packages pytest pytest-asyncio pytest-cov
+ && pip install --no-cache-dir --break-system-packages pytest pytest-asyncio pytest-cov pytest-timeout
 
 # ── Pre-build beacon assembly objects & reflective loader ────────────────────
 RUN BEACON_SRC=phantom/payloads/beacon/src && \
@@ -152,10 +178,11 @@ RUN BEACON_SRC=phantom/payloads/beacon/src && \
 # ── Create runtime data directories ──────────────────────────────────────────
 RUN mkdir -p data/logs data/sessions data/presets data/beacons data/cache data/downloads
 
-# ── Generate default crypto config ───────────────────────────────────────────
-RUN python3 -c "import sys; sys.path.insert(0,'.'); \
-    from phantom.utils.c2_crypto import write_beacon_crypto_config; \
-    write_beacon_crypto_config('phantom/payloads/beacon')"
+# Beacon crypto/C2 configuration is generated at runtime by `generate` or
+# `compile_beacon`, after runtime secrets are injected. No secret is baked into
+# this image during the build.
 
 # ── Entry point ──────────────────────────────────────────────────────────────
+# Keep the image ready for an interactive operator session; launch Phantom
+# explicitly so Docker never starts a listener or Telegram bot implicitly.
 CMD ["sleep", "infinity"]

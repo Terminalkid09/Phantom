@@ -1,0 +1,75 @@
+# Phantom Cloud Lab — a LOCAL, free "cloud-like" environment.
+#
+# Purpose: exercise the cloud/IAM chain (enumeration → SSRF → instance
+# metadata → STS assume-role → lateral movement) without an AWS/Azure/GCP
+# account and without spending anything. Everything runs on your machine.
+#
+#   172.31.0.10  localstack   AWS APIs: IAM, STS, S3 (over-privileged role,
+#                             leaked long-lived key, sensitive bucket)
+#   172.31.0.20  imds         EC2-instance-metadata mock (the SSRF target)
+#   172.31.0.30  azurite      Azure Blob/Queue stand-in
+#   172.31.0.40  minio        S3-compatible object store with a public bucket
+#
+# Authorized LOCAL testing only. Never publish these ports to a network you
+# do not control.
+services:
+  localstack:
+    image: localstack/localstack:3
+    container_name: phantom-cloud-localstack
+    environment:
+      - SERVICES=iam,sts,s3
+      - DEBUG=0
+      - PERSISTENCE=0
+    ports:
+      - "4566:4566"
+    networks:
+      cloud_net:
+        ipv4_address: 172.31.0.10
+    volumes:
+      - ./localstack:/etc/localstack/init/ready.d:ro
+    restart: "no"
+
+  imds:
+    build: ./imds
+    container_name: phantom-cloud-imds
+    hostname: imds
+    ports:
+      - "1338:1338"
+    networks:
+      cloud_net:
+        ipv4_address: 172.31.0.20
+    restart: "no"
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    container_name: phantom-cloud-azurite
+    command: azurite --blobHost 0.0.0.0 --queueHost 0.0.0.0 --loose
+    ports:
+      - "10000:10000"
+      - "10001:10001"
+    networks:
+      cloud_net:
+        ipv4_address: 172.31.0.30
+    restart: "no"
+
+  minio:
+    image: minio/minio:latest
+    container_name: phantom-cloud-minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=phantom
+      - MINIO_ROOT_PASSWORD=phantomlab
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      cloud_net:
+        ipv4_address: 172.31.0.40
+    restart: "no"
+
+networks:
+  cloud_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24

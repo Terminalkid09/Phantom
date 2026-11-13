@@ -1,0 +1,855 @@
+name: Phantom CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      # fail-fast off: with three interpreters, a failure on one used to CANCEL
+      # the other two, so a red run told you nothing about whether the problem
+      # was version-specific. Three verdicts cost runner minutes and save
+      # whole debugging sessions.
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          # The dev set is pinned and changes rarely: restoring the wheel
+          # cache turns the install step from tens of seconds into ~2 s on
+          # every leg of the matrix.
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # P0-11: one pinned dev set for the whole suite (pytest + plugins +
+          # pyyaml + bandit). No ad-hoc pip lines in later steps.
+          pip install -r requirements-dev.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run linting (py_compile all sources)
+        run: |
+          python -m py_compile phantom/core/*.py phantom/modules/*.py phantom/utils/*.py \
+            phantom/automation/*.py phantom/automation/guidance/*.py \
+            phantom/automation/exploit/*.py phantom/automation/exploit/modules/*.py \
+            phantom/automation/social/*.py phantom/automation/fingerprint/*.py \
+            phantom/api/*.py
+          if [ $? -ne 0 ]; then exit 1; fi
+
+      - name: Run unit tests (whole suite — glob collected)
+        run: |
+          set -o pipefail
+          # P0-12: glob collection, not a hand-maintained list. The old
+          # explicit TEST_FILES block silently skipped every NEW test file;
+          # collection now tracks the directory itself. The two standalone
+          # integration scripts are EXCLUDED here (their module body compiles
+          # a real beacon and sys.exit()s at import — collect_ignore cannot
+          # save an explicitly-passed file from being imported).
+          TEST_FILES=$(ls tests/test_*.py | sort \
+            | grep -v -e 'tests/test_features_final.py' -e 'tests/test_real_deploy.py' \
+            | tr '\n' ' ')
+          echo "Collected ${#TEST_FILES} test files (glob)"
+          [ -n "$TEST_FILES" ] || { echo "ERROR: no test files found"; exit 1; }
+          # `tail`, never `head`: with pipefail a truncated pipe sends SIGPIPE to
+          # pytest and fails the step even when every test passed. `--maxfail`
+          # instead of `-x` so one flake does not hide the rest of the run.
+          # HERMETIC gate: tool-dependent tests are deselected and run in the
+          # separate `integration-tools` job below, so a missing binary never
+          # masquerades as a product regression here.
+          # `-q` instead of `-v`: the verbose per-test lines were 6k+ lines of
+          # I/O per leg and bought nothing (the failing IDs are annotated by
+          # the next step anyway). Same tests, same gate, less wall clock.
+          python -m pytest $TEST_FILES -m "not integration_tool" -q --tb=short --timeout=120 --maxfail=25 2>&1 \
+            | tee /tmp/pytest.out | tail -200
+
+      - name: Surface the failing tests as annotations
+        # A red run used to be diagnosable only by whoever could open the job
+        # logs. The failing test IDs are emitted as ANNOTATIONS instead, which
+        # the Checks UI shows and the public API returns without a login — so
+        # "CI is red" carries the test that broke with it. Diagnostic only:
+        # this step never changes the verdict of the run (it is `if: failure()`
+        # and its own commands cannot fail the job).
+        if: failure()
+        run: |
+          echo "::warning title=pytest::the unit-test step failed - see the annotations below for the failing tests"
+          if [ -f /tmp/pytest.out ]; then
+            # EVERY failure, not the first ten: a run with `--maxfail=25` was
+            # emitting ten annotations and hiding the rest, so fixing what you
+            # could see revealed another batch. The annotations are the only
+            # channel that survives without admin rights on the job log.
+            total=$(grep -cE '^(FAILED|ERROR) ' /tmp/pytest.out || true)
+            echo "::error title=pytest::${total} failing test(s) - all of them are annotated below"
+            grep -E '^(FAILED|ERROR) ' /tmp/pytest.out | head -50 | while read -r line; do
+              echo "::error title=pytest::${line}"
+            done
+            echo "--- short summary ---"
+            sed -n '/short test summary info/,$p' /tmp/pytest.out | head -60
+          else
+            echo "::error title=pytest::no pytest output captured (the step failed before running the suite)"
+          fi
+
+      - name: Verify the product assets are TRACKED, not just present
+        # The failure this step exists for: `phantom/data/` used to be ignored
+        # as a whole, so the report template existed on every developer's disk
+        # and in no clone. The report tests passed locally, the unit-test step
+        # failed on CI for months, and fourteen other jobs were skipped behind
+        # it. A fresh clone is the only place that difference is visible.
+        run: |
+          tracked=$(git ls-files phantom/data/templates)
+          [ -n "$tracked" ] || {
+            echo "::error title=assets::report templates are NOT tracked in git"
+            exit 1
+          }
+          echo "tracked assets: $tracked"
+          # Same bug class, second instance: the `*.xml` document rule hid the
+          # Android module's manifest, accessibility config and res/values, so
+          # only the .java files survived a clone and the Android tree tests
+          # failed there with FileNotFoundError.
+          android_xml=$(git ls-files phantom/payloads/remote/android/app/src/main \
+            | grep '\.xml$' || true)
+          [ -n "$android_xml" ] || {
+            echo "::error title=assets::the Android module's XML (manifest / accessibility config) is NOT tracked"
+            exit 1
+          }
+          echo "tracked android xml: $android_xml"
+
+      - name: Verify core module imports
+        run: |
+          python -c "
+          from phantom.core.workflow import WorkflowManager, workflow_manager
+          from phantom.core.persistence import persistence_manager, PersistenceManager
+          from phantom.core.automode import run_auto_mode
+          from phantom.modules.wordlist import WordlistModule
+          print('All core modules imported successfully')
+          print(f'Workflow phases: {len(workflow_manager.phases)} target types')
+          print(f'Persistence rules: {len(persistence_manager.rules)} rules')
+          "
+
+      - name: Verify enterprise + automation module imports
+        run: |
+          python -c "
+          from phantom.core.threatintel import threat_intel, ThreatIntelFeed
+          from phantom.core.calibration import calibration_engine, CalibrationEngine
+          from phantom.core.attack_mapping import attack_mapper, AttackMapper
+          from phantom.core.risk_engine import risk_engine, RiskEngine
+          from phantom.core.history import history_analyzer, HistoricalAnalyzer
+          from phantom.automation.fingerprint.probes import FingerprintEngine, PROBE_MAP
+          from phantom.automation.attack_chain import AttackGraph
+          from phantom.automation.exploit.differential import DifferentialEngine
+          from phantom.automation.ad_awareness import ADAwareness
+          from phantom.automation.fallback import FallbackEngine, HistoricalLearner
+          print('All enterprise + automation modules imported successfully')
+          # smoke counts: verify the mappers still expose real data, using the
+          # CURRENT accessors (a rename here is a real breakage worth catching)
+          techniques = attack_mapper.get_enterprise_techniques()
+          assert techniques, 'ATT&CK mapper returned no techniques'
+          print(f'ATT&CK techniques: {len(techniques)}')
+          print(f'Risk service types: {len(risk_engine.business_criticality)}')
+          print(f'Protocol probes: {len(PROBE_MAP)}')
+          "
+
+  electron-build:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Install & typecheck + build Electron
+        run: |
+          cd electron
+          # `npm ci` installs FROM the committed lockfile: the release
+          # workflow already depends on that lock being correct, so the
+          # ordinary CI checks the same artifact instead of resolving a
+          # different tree with `npm install`.
+          npm ci --no-audit --no-fund
+          npx tsc --noEmit
+          npx vite build
+      - name: Renderer logic contracts (these EXECUTE api.ts, not scan it)
+        # `test_electron_job_state.py` / `test_electron_schema_mismatch.py`
+        # compile api.ts with the project's tsc and drive it under node, and
+        # they SKIP when electron/node_modules is absent — i.e. they skipped
+        # in every Python job of the suite. Here node_modules exists, so the
+        # skip becomes a real run (audit §4.3.4).
+        run: |
+          python -m pip install --upgrade pip
+          # pytest-xdist too: `pytest.ini` sets `-n auto` in addopts, so a bare
+          # `pip install pytest` makes this step die with "unrecognized
+          # arguments: -n" before it runs a single test (measured 2026-11-07).
+          pip install pytest pytest-xdist
+          python -m pytest tests/test_electron_job_state.py \
+            tests/test_electron_schema_mismatch.py -v
+
+  c2-test:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
+      - name: C2, auth, state-store and UX tests
+        run: |
+          python -m pytest tests/test_c2*.py tests/test_beacon_auth*.py tests/test_state_store.py tests/test_manual_ux.py tests/test_manual_core.py -v --timeout=60
+      - name: End-to-end C2 <-> beacon protocol smoke
+        # starts the REAL listener and drives check-in -> task -> replay ->
+        # result over HTTP with the real HMAC auth and envelope crypto. This
+        # is the interface a compiled beacon speaks to — the break nothing
+        # else on this runner sees.
+        run: python scripts/e2e_c2_beacon_smoke.py
+
+  beacon-syntax:
+    runs-on: ${{ matrix.os }}
+    needs: lint-and-test
+    strategy:
+      # fail-fast off for the same reason as the unit-test matrix: with three
+      # operating systems, a macOS failure CANCELED the Windows leg, so a red
+      # run said nothing about whether the break was platform-specific.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install C++ toolchain and OpenSSL headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y g++ libssl-dev
+      - name: Install MinGW
+        # The image already ships MinGW, and reinstalling it on every run is a
+        # network round-trip that has failed before (choco exit != 0). When it
+        # failed, the compile step below was SKIPPED, so a red job said nothing
+        # about the code. Probe the known locations first and only fall back to
+        # choco when none of them has a compiler.
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -eu
+          if command -v g++ >/dev/null 2>&1; then
+            echo "using the MinGW already on PATH: $(command -v g++)"
+            g++ --version | head -1
+            exit 0
+          fi
+          for d in \
+            "/c/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/bin" \
+            "/c/mingw64/bin" \
+            "/c/msys64/mingw64/bin" \
+            "/c/Strawberry/c/bin"; do
+            if [ -x "$d/g++.exe" ]; then
+              echo "$(cygpath -w "$d")" >> "$GITHUB_PATH"
+              echo "using the preinstalled MinGW in $d"
+              "$d/g++.exe" --version | head -1
+              exit 0
+            fi
+          done
+          echo "no preinstalled MinGW found; installing via chocolatey"
+          choco install mingw -y --no-progress
+          echo 'C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin' >> "$GITHUB_PATH"
+      - name: Install OpenSSL headers on macOS
+        if: runner.os == 'macOS'
+        run: brew install openssl@3
+      - name: Set up Python (the generators need it)
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install Python deps (header generators import Phantom)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
+      - name: Generate the REAL build headers (never a hand-written stub)
+        # The same generators the release build uses: a drift in a generated
+        # header — a renamed macro, a malformed array, a new required define —
+        # then fails HERE instead of only on an operator's machine.
+        shell: bash
+        run: |
+          python scripts/ci_beacon_prepare.py --dir phantom/payloads/beacon --ci-identity
+          python scripts/ci_beacon_prepare.py --dir phantom/payloads/remote --ci-identity
+      - name: Compile beacon AND remote translation units (warnings are errors)
+        shell: bash
+        run: |
+          set -o pipefail
+          # -Werror on a CURATED set: the WinAPI noise (`#pragma comment`,
+          # partial Win32 struct init, FARPROC casts) is suppressed, every
+          # other warning fails the job. Linux and Windows were verified
+          # warning-free with exactly these flags; macOS also tolerates an
+          # unknown warning option so a clang version skew cannot break it.
+          #
+          # -c -o /dev/null, NOT -fsyntax-only: g++ only runs its
+          # unused-function pass when it actually compiles, so -fsyntax-only
+          # let a static helper that is dead on this platform (but live on
+          # another) sail past the Linux and Windows legs while the macOS leg —
+          # clang diagnoses it during semantic analysis — failed. Codegen costs
+          # a few seconds and makes all three legs able to catch it.
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            CXX=clang++
+            CPPFLAGS="-I$(brew --prefix openssl@3)/include"
+            WARNS="-Wall -Wextra -Werror -Wno-unknown-pragmas -Wno-missing-field-initializers -Wno-cast-function-type -Wno-unknown-warning-option"
+          else
+            CXX=g++
+            CPPFLAGS=""
+            WARNS="-Wall -Wextra -Werror -Wno-unknown-pragmas -Wno-missing-field-initializers -Wno-cast-function-type"
+          fi
+          # The remote module carries its OWN copy of crypto.h and the
+          # transport: exactly the kind of duplication that drifts silently.
+          {
+            $CXX -std=c++20 -c $WARNS $CPPFLAGS -Iphantom/payloads/beacon/src phantom/payloads/beacon/src/main.cpp -o /dev/null
+            $CXX -std=c++20 -c $WARNS $CPPFLAGS -Iphantom/payloads/remote/src phantom/payloads/remote/src/main.cpp -o /dev/null
+          } 2>&1 | tee /tmp/beacon.out
+
+      - name: Surface the compiler error as an annotation
+        # Diagnostic only (see the unit-test step): the job log needs admin,
+        # annotations are public, and this job compiles on three platforms.
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f /tmp/beacon.out ]; then
+            # the ERROR line first: the Checks API caps annotations per step,
+            # so a bare tail can spend the budget on progress chatter (that is
+            # how the Android failure arrived without its cause)
+            grep -nEi "error|fatal|undefined|not declared|cannot find|No such file" /tmp/beacon.out \
+              | head -8 | while IFS= read -r line; do
+              echo "::error title=beacon-syntax::${line}"
+            done
+            echo "::error title=beacon-syntax::--- last 8 lines ---"
+            tail -8 /tmp/beacon.out | while IFS= read -r line; do
+              echo "::error title=beacon-syntax::${line}"
+            done
+          else
+            # An earlier step (toolchain install, header generation) failed and
+            # skipped the compile, so there is no output to quote. Say that
+            # instead of leaving a bare red X with no cause.
+            echo "::error title=beacon-syntax::the compile step never ran — an earlier step (toolchain install / header generation) failed; open that step's annotation, not this one"
+          fi
+
+  beacon-smoke:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install deps and C++ toolchain
+        run: |
+          set -o pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
+          # The packages the BUILDER refuses to build without, taken from the
+          # static-dependency map `check_build_env` checks — not a hand-kept
+          # list. That list had half of them, and this job failed on the
+          # missing third-party static archives (libcurl/brotli/nghttp2) with
+          # "Build environment not ready for linux (x64)" before compiling a
+          # single line: on a runner there is no container auto-install to
+          # fill the gap.
+          PKGS=$(python -c "from phantom.utils.build_helper import _LINUX_STATIC_DEPS as m; print(' '.join(sorted(set(m.values()))))")
+          echo "builder-required packages: $PKGS"
+          sudo apt-get update && sudo apt-get install -y g++ $PKGS
+      - name: Compile the beacon through the RELEASE path
+        # tee'd so the failure can be annotated (see the step below).
+        # the real build function the release uses, not a hand-rolled
+        # command: a break in the generated headers, the flags or the link
+        # fails here instead of at an engagement. The canary token is set so
+        # the NEXT step can prove it never reaches the binary.
+        env:
+          PHANTOM_PAYLOAD_TOKEN: phantom-canary-deployment-token
+        run: |
+          set -o pipefail
+          python scripts/ci_beacon_smoke.py --platform linux --require 2>&1 \
+            | tee /tmp/beacon.out
+
+      - name: Verify the artefact against the GRID (linux/x86_64)
+        # The smoke step proves a real binary came out of the release path;
+        # this proves it is the artefact the grid says this CELL must produce
+        # (container + machine), and prints the parity gap of this OS.
+        run: |
+          python scripts/beacon_matrix_verify.py --platform linux \
+            --arch x86_64 --require
+
+      - name: Surface the build failure as an annotation
+        # Diagnostic only: the job log needs admin rights, annotations do not.
+        if: failure()
+        run: |
+          if [ -f /tmp/beacon.out ]; then
+            grep -nEi "error|fatal|undefined|not declared|cannot find|No such file" /tmp/beacon.out \
+              | head -8 | while IFS= read -r line; do
+              echo "::error title=beacon-smoke::${line}"
+            done
+            echo "::error title=beacon-smoke::--- last 8 lines ---"
+            tail -8 /tmp/beacon.out | while IFS= read -r line; do
+              echo "::error title=beacon-smoke::${line}"
+            done
+          else
+            echo "::error title=beacon-smoke::the build step never ran — an earlier step (toolchain install / header generation) failed; open that step's annotation, not this one"
+          fi
+
+      - name: The built binary carries no deployment payload token
+        # An enrolled build derives its own download token at runtime; if the
+        # deployment-wide token ever leaks in, one captured beacon unlocks
+        # every payload, forever.
+        run: |
+          python scripts/ci_beacon_token_scan.py \
+            --artefact phantom/payloads/beacon/beacon_linux \
+            --token phantom-canary-deployment-token
+
+  beacon-smoke-windows:
+    # A Windows build is NOT a variant of the Linux one: it uses BCrypt
+    # instead of OpenSSL, GNU as for the stub/syscall objects and a different
+    # linker shape. It has to be built here or it is never built.
+    runs-on: windows-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install MinGW (g++ AND as)
+        shell: powershell
+        run: choco install mingw -y --no-progress
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
+      - name: Compile the beacon for Windows (release path)
+        shell: bash
+        run: |
+          set -o pipefail
+          python scripts/ci_beacon_smoke.py --platform windows --require 2>&1 \
+            | tee /tmp/beacon.out
+
+      - name: Verify the artefact against the GRID (windows/x86_64)
+        shell: bash
+        run: |
+          python scripts/beacon_matrix_verify.py --platform windows \
+            --arch x86_64 --require
+
+      - name: Surface the build failure as an annotation
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f /tmp/beacon.out ]; then
+            grep -nEi "error|fatal|undefined|not declared|cannot find|No such file" /tmp/beacon.out \
+              | head -8 | while IFS= read -r line; do
+              echo "::error title=beacon-smoke-windows::${line}"
+            done
+            echo "::error title=beacon-smoke-windows::--- last 8 lines ---"
+            tail -8 /tmp/beacon.out | while IFS= read -r line; do
+              echo "::error title=beacon-smoke-windows::${line}"
+            done
+          else
+            echo "::error title=beacon-smoke-windows::the build step never ran — an earlier step (toolchain install / header generation) failed; open that step's annotation, not this one"
+          fi
+
+  beacon-smoke-macos:
+    # Native clang++ on a real Mac: osxcross only exists to cross-compile FROM
+    # Linux, and demanding it on macOS made the platform unbuildable there.
+    runs-on: macos-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install OpenSSL (Homebrew's is keg-only)
+        run: brew install openssl@3
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
+      - name: Compile the beacon for macOS (release path)
+        shell: bash
+        run: |
+          set -o pipefail
+          python scripts/ci_beacon_smoke.py --platform macos --require 2>&1 \
+            | tee /tmp/beacon.out
+
+      - name: Verify the artefact against the GRID (macos)
+        shell: bash
+        # --any-arch: a macOS runner is Apple silicon OR Intel and the builder
+        # compiles for the host, so the CONTAINER is the fixed part of the
+        # cell. The matched arch is printed either way.
+        run: |
+          python scripts/beacon_matrix_verify.py --platform macos \
+            --any-arch --require
+
+      - name: Surface the build failure as an annotation
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f /tmp/beacon.out ]; then
+            grep -nEi "error|fatal|undefined|not declared|cannot find|No such file" /tmp/beacon.out \
+              | head -8 | while IFS= read -r line; do
+              echo "::error title=beacon-smoke-macos::${line}"
+            done
+            echo "::error title=beacon-smoke-macos::--- last 8 lines ---"
+            tail -8 /tmp/beacon.out | while IFS= read -r line; do
+              echo "::error title=beacon-smoke-macos::${line}"
+            done
+          else
+            echo "::error title=beacon-smoke-macos::the build step never ran — an earlier step (toolchain install / header generation) failed; open that step's annotation, not this one"
+          fi
+
+  beacon-smoke-android:
+    # The NDK does not ship OpenSSL; the build helper cross-compiles it into
+    # the NDK sysroot on first use. That is exactly what runs here, so a real
+    # aarch64 payload is produced — an honest failure if any link of that
+    # chain breaks.
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install Python deps and build tools (OpenSSL bootstrap needs them)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
+          sudo apt-get update && sudo apt-get install -y build-essential perl
+      - name: Compile the beacon for Android (release path)
+        shell: bash
+        run: |
+          # The runner image ships an NDK under ANDROID_NDK_LATEST_HOME; the
+          # other names are honoured too, exactly like the builder does.
+          set -o pipefail
+          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-/opt/android-ndk}}"
+          echo "NDK: $ANDROID_NDK_HOME"
+          python scripts/ci_beacon_smoke.py --platform android --require 2>&1 \
+            | tee /tmp/beacon.out
+
+      - name: Verify the artefact against the GRID (android/aarch64)
+        shell: bash
+        run: |
+          python scripts/beacon_matrix_verify.py --platform android \
+            --arch aarch64 --require
+
+      - name: Surface the build failure as an annotation
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f /tmp/beacon.out ]; then
+            grep -nEi "error|fatal|undefined|not declared|cannot find|No such file" /tmp/beacon.out \
+              | head -8 | while IFS= read -r line; do
+              echo "::error title=beacon-smoke-android::${line}"
+            done
+            echo "::error title=beacon-smoke-android::--- last 8 lines ---"
+            tail -8 /tmp/beacon.out | while IFS= read -r line; do
+              echo "::error title=beacon-smoke-android::${line}"
+            done
+          else
+            echo "::error title=beacon-smoke-android::the build step never ran — an earlier step (toolchain install / header generation) failed; open that step's annotation, not this one"
+          fi
+
+  c2d-test:
+    # The Go data plane is a SECOND implementation of the wire protocol. It is
+    # only honest to ship it if CI proves it builds, vets and agrees with the
+    # Python side on the key derivation.
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 'stable'
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
+      - name: gofmt / vet / test
+        working-directory: c2d
+        run: |
+          set -o pipefail
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then echo "ERROR: gofmt needed for:"; echo "$UNFORMATTED"; exit 1; fi
+          go vet ./...
+          go test ./... -v 2>&1 | tail -40
+      - name: Python <-> Go key derivation parity
+        run: python scripts/c2d_parity_check.py
+
+  beacon-lint:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Beacon source hygiene
+        # Not a file-existence check: required units, `#pragma once`, generated
+        # headers NOT tracked, no committed build artefacts, no debug prints,
+        # no deployment secret in tracked source.
+        run: python scripts/ci_beacon_lint.py
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Run bandit security scan (blocking on unbaselined HIGH)
+        run: |
+          # bandit 1.7.5 imports pbr but does not declare it as a wheel
+          # dependency; pin both so the scan never depends on the runner's
+          # preinstalled packages. Python is pinned above for the same reason.
+          python -m pip install bandit==1.7.5 pbr==6.1.1
+          # .bandit holds the reviewed, accepted-by-design HIGH checks; any
+          # OTHER high-severity finding now FAILS the job (it used to only
+          # warn, so a real regression could merge unseen).
+          #
+          # Coverage now includes the helper scripts and the Electron tree:
+          # scripts/ is REAL Python that was previously unscanned, and bandit
+          # skips non-Python files, so `electron/` only ever contributes a
+          # stray .py if one appears. The .bandit baseline covers both.
+          python -m bandit -r phantom/ scripts/ electron/ -c .bandit -f json -o bandit-results.json || true
+          python -c "
+          import json
+          with open('bandit-results.json') as f:
+              data = json.load(f)
+          high = [r for r in data.get('results', []) if r.get('issue_severity') == 'HIGH']
+          if high:
+              print(f'FAIL: {len(high)} high-severity issue(s) outside the .bandit baseline')
+              for r in high[:10]:
+                  print(f'  - {r[\"test_id\"]}: {r[\"issue_text\"]} @ {r[\"filename\"]}:{r[\"line_number\"]}')
+              raise SystemExit(1)
+          print('No unbaselined high-severity issues found')
+          "
+
+  model-integrity:
+    # The promoted model must be the bytes that were MEASURED.
+    #
+    # Measured defect (2026-11-06): `models/exploit/ranker-2026-11-03/
+    # manifest.json` declared `sha256: ba9023a2…` while the artifact in git
+    # hashed `b7e3b978…`, and nothing in the repository ever computed either
+    # number — so a ranker edited after its evaluation kept being served as
+    # the promoted model. The runtime registry now reproduces the digest on
+    # load; this job is the build-time counterpart, and it fails on a
+    # mismatch instead of warning.
+    #
+    # No `pip install`: `phantom.automation.ai.registry` is stdlib-only, so
+    # this gate costs seconds. Speed is the point — an integrity check that
+    # is slow enough gets skipped.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Recompute every promoted artifact's digest
+        run: python scripts/verify_model_integrity.py --json model-integrity.json
+      - name: Upload the integrity report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: model-integrity
+          path: model-integrity.json
+          if-no-files-found: ignore
+
+  static-analysis:
+    # ruff + mypy — the quality gate the tree never had. Both are RATCHETS,
+    # not full-tree cleanups: `ruff.toml` / `mypy.ini` start from the rules
+    # and the modules that are GREEN today and record the measured debt each
+    # disabled rule still carries, so a regression fails this job while the
+    # old noise (434 unused imports, 376 type errors in 93 modules) cannot
+    # drown it. Growing a ratchet = deleting a line from ruff.toml's
+    # `ignore`, or adding one directory to mypy.ini's `files`; never the
+    # other way round.
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: ruff (blocking — the enforced rule set)
+        run: python -m ruff check .
+      - name: mypy (blocking — the ratchet scope)
+        run: python -m mypy
+      - name: Type debt outside the ratchet (advisory, never gating)
+        # The number this step exists for is the TREE-WIDE count, which has to
+        # be able to go down: it is an annotation, not an exit code. A step
+        # that failed on 380 pre-existing errors would be red forever and get
+        # ignored — which is how a gate dies.
+        run: |
+          total=$(python -m mypy phantom 2>&1 | tail -1 || true)
+          echo "::warning title=mypy::tree-wide type debt (advisory): ${total}"
+          echo "tree-wide: ${total}"
+
+  offline-sims:
+    # The two offline coverage simulators are the project's own answer to
+    # "does the planner have a move for this target?" — and nothing ever ran
+    # them in CI, so a planner/registry rename could silently break the very
+    # diagnostic meant to catch it. Both are fully offline (scripted runner,
+    # no packet leaves the box).
+    #
+    # Honest framing: these are SIMULATIONS, not gates. Both `main()`s return
+    # 0 by design even when the matrix reports a coverage GAP, so a green step
+    # means "the script still runs end-to-end", not "coverage improved". A
+    # crash (import error, planner API break) does fail the step.
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Offline coverage simulations (non-gating — they report, not assert)
+        run: |
+          python scripts/coverage_matrix_sim.py
+          python scripts/hardened_target_sim.py
+
+      - name: AutoMode benchmark — ground truth + failure injection
+        # GATING, unlike the simulators above: every scenario has DECLARED
+        # ground truth and expectations, so this step fails on a change in
+        # BEHAVIOUR (a false positive the target never had, a lost goal, a
+        # forbidden action, an unrecovered injected failure) rather than only
+        # on a crash. Fully offline: the scripted runner answers everything.
+        run: python scripts/automode_benchmark.py
+
+  integration-tools:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    # External-tool tests are NOT hermetic: they need nmap and may fail for
+    # environment reasons. Kept separate (and non-blocking) so a missing
+    # binary never blocks a merge nor masquerades as a product regression —
+    # the hermetic job above is the required gate.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies + external tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          sudo apt-get update && sudo apt-get install -y nmap
+      - name: Run integration-tool tests
+        run: |
+          set -o pipefail
+          python -m pytest tests/ -m "integration_tool" -v --timeout=120 2>&1 | tail -100
+
+  security-sweep:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Security invariant tests
+        run: |
+          set -o pipefail
+          # Glob, not a hand-maintained list: a NEW security test file has to
+          # run here without anyone remembering to add it. The hermetic job
+          # had the same bug (P0-12) and was fixed the same way; the old
+          # explicit list here silently skipped every security test added
+          # after it was written.
+          SECURITY_TESTS=$(ls tests/test_security*.py tests/test_p0_*.py \
+            tests/test_c2_token_rotation.py tests/test_remote_viewer.py \
+            tests/test_config_secret_perms.py \
+            tests/test_electron_allowlist_sync.py tests/test_endpoint_allowlist_drift.py \
+            2>/dev/null | sort -u | tr '\n' ' ')
+          echo "Security sweep files: $SECURITY_TESTS"
+          [ -n "$SECURITY_TESTS" ] || { echo "ERROR: no security tests found"; exit 1; }
+          # `not integration_tool`: these files contain end-to-end execution
+          # asserts that need a real native/WSL2/SSH backend. Without the
+          # filter they fail on a runner that has none and the sweep reads as
+          # a product regression instead of an environment gap.
+          python -m pytest $SECURITY_TESTS -m "not integration_tool" \
+            -v --timeout=120 2>&1 | tail -100
+
+  docker-test:
+    # This job used to print "Dockerfile exists and checked" and swallow its
+    # own failure (`|| true`), so the Docker path was NOT gated by anything
+    # (audit §2.8.5): a broken Dockerfile shipped green. It now does two
+    # things that can actually fail, and it says what it does NOT check.
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Lint the Dockerfile (hadolint, errors are fatal)
+        # `--failure-threshold error`: syntax/invalid-instruction errors fail
+        # the job; style advice (pinned versions, etc.) does not, so the gate
+        # stays about correctness instead of taste.
+        run: |
+          docker run --rm -i hadolint/hadolint:2.12.0 \
+            hadolint --failure-threshold error - < Dockerfile
+      - name: Build the ci-smoke stage (the cheapest REAL build)
+        # Pulls the base image, parses the file and resolves requirements.txt
+        # INSIDE the image. The full image (NDK + OpenSSL cross + osxcross) is
+        # deliberately NOT built here: it is a 30+ minute job, and it is what
+        # `docker compose build` / .gitlab-ci.yml `docker_build` are for.
+        # Registry/apt hiccups are infrastructure, not a product regression:
+        # retry the same build instead of failing the run on the first 429.
+        run: |
+          for attempt in 1 2 3; do
+            if docker build --target ci-smoke -t phantom-ci-smoke .; then
+              exit 0
+            fi
+            echo "ci-smoke build attempt ${attempt} failed; retrying"
+            sleep $((attempt * 10))
+          done
+          exit 1

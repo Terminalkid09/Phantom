@@ -1,0 +1,11 @@
+{
+  "adapter": "models\\osint\\2026-10-26-cpu\\adapter",
+  "base_model": "training/base/Qwen2.5-0.5B-Instruct",
+  "baseline": {},
+  "eval": {},
+  "phase": "osint",
+  "promoted": false,
+  "sha256": "201160666c9f1ebf6f7d74b7fe50bb6e3eeaadfc955e88600d7761698cd68402",
+  "trained_at": "2026-10-26T08:46:54Z",
+  "version": "2026-10-26-cpu"
+}

@@ -1,0 +1,228 @@
+import { useEffect, useState } from 'react'
+import { useStore, componentForTab } from '@/store'
+import { useApi } from '@/hooks/useApi'
+import { useAppVersion } from '@/hooks/useAppVersion'
+import { useApiActivity } from '@/hooks/apiActivity'
+import Sidebar from '@/components/Sidebar'
+import StatusBar from '@/components/StatusBar'
+import C2Dashboard from '@/components/C2Dashboard'
+import SessionPanel from '@/components/SessionPanel'
+import AutoModePanel from '@/components/AutoModePanel'
+import ReportsPanel from '@/components/ReportsPanel'
+import SettingsPanel from '@/components/SettingsPanel'
+import ModulePanel from '@/components/ModulePanel'
+import CommandPalette from '@/components/CommandPalette'
+import TimelinePanel from '@/components/TimelinePanel'
+import VaultPanel from '@/components/VaultPanel'
+import NetworkMap from '@/components/NetworkMap'
+import AuditViewer from '@/components/AuditViewer'
+import RecordingsPanel from '@/components/RecordingsPanel'
+import BundlesPanel from '@/components/BundlesPanel'
+import LearningPanel from '@/components/LearningPanel'
+import AdGraphPanel from '@/components/AdGraphPanel'
+import SocialGraphPanel from '@/components/SocialGraphPanel'
+import ErrorBoundary from '@/components/ErrorBoundary'
+import { ToastContainer } from '@/components/Toast'
+
+export default function App() {
+  const { activeTab, setActiveTab, elapsed, setElapsed, setSettings, capabilities, setCapabilities } = useStore()
+  const [backendError, setBackendError] = useState<string | null>(null)
+  const version = useAppVersion()
+  const activity = useApiActivity()
+  useApi(true)
+
+  // Surface backend lifecycle failures instead of a silent dead UI
+  useEffect(() => {
+    window.phantom?.onApiStatus?.((s) => {
+      if (s.state === 'error') setBackendError(s.detail || 'backend failed to start')
+      else if (s.state === 'exited') setBackendError(`backend exited (code ${s.code})`)
+    })
+  }, [])
+
+  // Hydrate settings from the backend at startup — the store starts with
+  // defaults, so without this the saved WSL2/SSH config looked "lost" on
+  // every app restart (it was saved, just never loaded back into the UI).
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      const res = await window.phantom?.request('GET', '/api/backend/config')
+      if (!cancelled && res?.status === 200 && res.data) {
+        const d = res.data as { kind: string; distro: string; host: string; port: number; user: string }
+        setSettings({
+          backend_type: (['wsl2', 'native', 'ssh', 'none'].includes(d.kind) ? d.kind : 'none') as never,
+          wsl_distro: d.distro || 'kali-linux',
+          ssh_host: d.host || '',
+          ssh_port: d.port || 22,
+          ssh_user: d.user || 'root',
+        })
+      }
+    })()
+    return () => { cancelled = true }
+  }, [setSettings])
+
+  // Capability discovery: the backend announces which components it exposes;
+  // the shell enables only those sections (a core-only build hides C2/auto-mode
+  // without a forked UI). Default is all-on, so this only ever narrows.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      const res = await window.phantom?.request('GET', '/api/capabilities')
+      if (!cancelled && res?.status === 200 && res.data) {
+        const d = res.data as { capabilities?: Partial<typeof capabilities> }
+        if (d.capabilities) setCapabilities(d.capabilities)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [setCapabilities])
+
+  // Session timer
+  useEffect(() => {
+    // Start the timer
+    const start = Date.now()
+    const tick = () => {
+      const secs = Math.floor((Date.now() - start) / 1000)
+      const h = Math.floor(secs / 3600)
+      const m = Math.floor((secs % 3600) / 60)
+      const s = secs % 60
+      if (h) setElapsed(`${h}h ${m}m`)
+      else if (m) setElapsed(`${m}m ${s}s`)
+      else setElapsed(`${s}s`)
+    }
+    tick()
+    const interval = setInterval(tick, 1000)
+    return () => clearInterval(interval)
+  }, [setElapsed])
+
+  // Every panel stays MOUNTED (hidden when inactive) instead of being
+  // unmounted on tab switch. Unmounting wiped each panel's local state —
+  // a network scan, craft output, module form or auto-mode view reset to
+  // zero the moment you looked at another tab. Panels are cheap to keep
+  // around and their polls are light, so state survives navigation.
+  const MODULE_TABS = ['scan', 'web', 'exploit', 'brute', 'osint', 'wifi', 'payload', 'pivot', 'handler', 'analyzer', 'wordlist']
+  const panels: Array<{ id: string; node: React.ReactNode }> = [
+    { id: 'c2', node: <C2Dashboard /> },
+    { id: 'session', node: <SessionPanel /> },
+    { id: 'automode', node: <AutoModePanel /> },
+    { id: 'reports', node: <ReportsPanel /> },
+    { id: 'settings', node: <SettingsPanel /> },
+    { id: 'timeline', node: <TimelinePanel standalone /> },
+    { id: 'vault', node: <VaultPanel standalone /> },
+    { id: 'network', node: <NetworkMap standalone /> },
+    { id: 'audit', node: <AuditViewer standalone /> },
+    { id: 'recordings', node: <RecordingsPanel /> },
+    { id: 'bundles', node: <BundlesPanel /> },
+    { id: 'learning', node: <LearningPanel /> },
+    { id: 'adgraph', node: <AdGraphPanel /> },
+    { id: 'social', node: <SocialGraphPanel /> },
+  ]
+  for (const m of MODULE_TABS) panels.push({ id: m, node: <ModulePanel moduleId={m} /> })
+  // Feature-gating: drop the panels whose component this build does not expose
+  const visible = panels.filter((p) => capabilities[componentForTab(p.id)])
+  const active = visible.find((p) => p.id === activeTab) ?? visible[0]
+  // Capability gating can HIDE the tab the store still points at (a build
+  // that does not expose C2 or auto-mode). The panel below then falls back to
+  // a different entry while the sidebar keeps highlighting the OLD one — or
+  // highlights nothing at all — so the navigation and the content disagreed
+  // about where the operator was. Point the store at what is rendered.
+  const activeId = active?.id
+  useEffect(() => {
+    if (activeId && activeId !== activeTab) setActiveTab(activeId)
+  }, [activeId, activeTab, setActiveTab])
+
+  if (backendError) {
+    return (
+      <div className="h-screen w-screen flex flex-col items-center justify-center bg-surface text-text-primary gap-3 p-8">
+        <p className="text-lg font-bold text-phantom-red">Phantom backend is not running</p>
+        <pre className="text-xs font-mono text-text-dim max-w-xl whitespace-pre-wrap text-center">{backendError}</pre>
+        <p className="text-xs text-text-secondary max-w-lg text-center">
+          The Python API process could not start (missing backend executable or a
+          crash at boot). In dev, run <code className="text-phantom-cyan">python phantom/api/launcher.py --port 9876</code> and
+          check its output; in the packaged app reinstall Phantom.
+        </p>
+        <button
+          onClick={() => location.reload()}
+          className="mt-2 px-4 py-2 rounded bg-phantom-cyan/15 text-phantom-cyan text-sm hover:bg-phantom-cyan/25"
+        >
+          Retry
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex h-screen w-screen overflow-hidden">
+      <Sidebar />
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* Keyboard users land on the sidebar first; this jumps straight to
+            the panel, and is only visible while focused. */}
+        <a
+          href="#main"
+          className="sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:z-50 focus:rounded focus:bg-surface-card focus:px-3 focus:py-1 focus:text-xs focus:text-phantom-cyan"
+        >
+          Skip to content
+        </a>
+        {/* Title bar with drag region */}
+        <div style={{ WebkitAppRegion: 'drag' } as any} className="h-9 flex-shrink-0 bg-surface-card border-b border-surface-border flex items-center px-4">
+          <span className="text-sm font-semibold text-phantom-red tracking-wider">
+            PHANTOM
+          </span>
+          <span className="ml-2 text-xs text-text-dim">
+            {version ? `v${version}` : ''}
+          </span>
+        </div>
+
+        {/* Panel content — all panels mounted, only the active one visible */}
+        <main
+          id="main"
+          aria-label={`Phantom panel: ${active?.id ?? 'none'}`}
+          aria-busy={activity.visible}
+          className="flex-1 overflow-auto min-h-0"
+        >
+          {/* Global request feedback. Every panel shares it, so an action can
+              never look inert just because that panel had no local spinner. */}
+          {activity.visible && (
+            <div
+              data-testid="global-activity"
+              role="status"
+              aria-live="polite"
+              aria-busy="true"
+              aria-label={`Backend working: ${activity.label}`}
+              className="fixed right-4 top-12 z-50 flex items-center gap-2 rounded-full border border-phantom-cyan/40 bg-surface-card/95 px-3 py-1.5 text-[11px] font-medium text-phantom-cyan shadow-lg backdrop-blur"
+            >
+              <span
+                aria-hidden="true"
+                className="h-3 w-3 animate-spin rounded-full border-2 border-phantom-cyan/30 border-t-phantom-cyan"
+              />
+              <span className="max-w-[320px] truncate">Working — {activity.label}</span>
+              {activity.pending > 1 && (
+                <span className="text-text-dim">+{activity.pending - 1}</span>
+              )}
+            </div>
+          )}
+          {visible.map((p) => (
+            <div
+              key={p.id}
+              data-panel={p.id}
+              aria-hidden={p.id === active.id ? undefined : true}
+              className={p.id === active.id ? 'h-full' : 'hidden'}
+            >
+              {/* One panel's bad data must not blank the whole window: every
+                  panel is mounted at boot, so without this boundary a single
+                  throw unmounts the entire tree. */}
+              <ErrorBoundary label={p.id}>{p.node}</ErrorBoundary>
+            </div>
+          ))}
+        </main>
+
+        {/* Status bar */}
+        <StatusBar />
+
+        {/* Command Palette (global Ctrl+K) */}
+        <CommandPalette />
+        
+        {/* Global Toasts */}
+        <ToastContainer />
+      </div>
+    </div>
+  )
+}

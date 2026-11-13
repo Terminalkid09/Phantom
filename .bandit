@@ -1,0 +1,21 @@
+# Bandit baseline for Phantom (a dual-use, authorised red-team framework).
+#
+# The security-scan CI job now FAILS on any HIGH-severity finding NOT listed
+# here. These five are reviewed and accepted BY DESIGN, not silently ignored:
+#
+#   B324  weak hashlib (md5/sha1) — used only for NON-security identifiers
+#         (stable cache/record keys), never for signatures or password hashing.
+#   B501  requests with verify=False — talking to the operator's OWN C2 with a
+#         self-signed certificate, inside an authorised engagement.
+#   B602  subprocess with shell=True — the documented pipeline execution path;
+#         the interpolation boundary is validated (safe_exec / target checks).
+#   B402  import ftplib — used by exploit/PoC modules for the FTP service.
+#   B321  ftplib.FTP — same; a red-team tool must be able to speak FTP.
+#
+# Anything else at HIGH severity is a regression and should FAIL the scan.
+skips:
+  - B324
+  - B501
+  - B602
+  - B402
+  - B321

@@ -1,0 +1,251 @@
+"""
+commands.py — the Command Knowledge Model.
+
+A Capability is the atomic unit of action. It describes WHAT an action
+needs (preconditions), WHAT it produces (effects), HOW the command string
+is synthesized (adapter, the ONLY place commands exist), and HOW output
+is turned back into beliefs (interpreter). The planner reasons over
+Capabilities + WorldModel, never over raw strings.
+"""
+
+from __future__ import annotations
+
+import inspect
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from phantom.automation.belief import WorldModel, Finding
+
+
+@dataclass
+class InputSlot:
+    """Typed input a capability consumes."""
+    name: str
+    type: str  # ip | port | host | url | username | password | path | wordlist | target | command | choice
+    required: bool = True
+    description: str = ""
+
+    def accepts(self, value: Any) -> bool:
+        if value is None:
+            return not self.required
+        t = self.type
+        if t == "ip":
+            return isinstance(value, str) and bool(re.match(r"^[\d\.]+$", value))
+        if t == "port":
+            return isinstance(value, str) and value.isdigit() or (isinstance(value, int) and 0 < value < 65536)
+        if t in ("host", "url"):
+            return isinstance(value, str) and len(value) > 0
+        if t in ("username", "password", "path", "wordlist", "command", "choice"):
+            return isinstance(value, str) and len(value) > 0
+        if t == "target":
+            return isinstance(value, str) and len(value) > 0
+        return False
+
+
+@dataclass
+class Capability:
+    """One atomic red-team action."""
+
+    id: str
+    category: str  # recon | osint | service | creds | exploit | lateral | persistence | beacon | exfil | social
+    description: str
+    # P2-1: how this capability actually executes — drives both the
+    # validation matrix and the honest classification of stubs.
+    #   shell_command    : produces a real command line for execute_quiet
+    #   in_process_engine: runs inside this process (hunt/idor/webcreds…)
+    #   marker_only      : adapter returns a marker; the agent owns the run
+    #   beacon_task      : queued as a task to an established beacon
+    #   lab_only         : only meaningful against the compose lab
+    #   not_validated    : no runtime proof yet — treat as untrusted
+    exec_class: str = "shell_command"
+    inputs: List[InputSlot] = field(default_factory=list)
+    preconditions: List[Callable[[WorldModel], bool]] = field(default_factory=list)
+    # A-2: DECLARATIVE preconditions for machine-authored capabilities, so a
+    # learned module never has to be imported in-process to be planned.
+    # Grammar: "<kind>" (any finding of that kind), "<kind>:<key>" (exact),
+    # "<kind>:<attr>=<value>" (value attribute match).
+    requires: List[str] = field(default_factory=list)
+    effects: List[str] = field(default_factory=list)  # fact kinds produced, e.g. ["service"]
+    adapter: Optional[Callable[[WorldModel, Dict[str, Any]], str]] = None
+    # An in-process ENGINE: the code that actually does the work when
+    # exec_class is "in_process_engine". It is SEPARATE from the adapter on
+    # purpose — building a command (which the chain preview does for every
+    # candidate) must never touch the network. With an engine set,
+    # make_command returns a placeholder and the agent runs the engine at
+    # execution time, under a timeout, with its result cached.
+    engine: Optional[Callable[[WorldModel, Dict[str, Any]], str]] = None
+    interpreter: Optional[Callable[[str, WorldModel, Dict[str, Any]], List[Finding]]] = None
+    opsec_cost: float = 1.0
+    detection_risk: float = 0.1  # probability of tripping blue team, 0..1
+    stealth_level: str = "passive"  # passive | active | aggressive
+    forceful: bool = False  # loud by nature (mass brute, auto-exploit, AD
+                            # attacks, lateral movement) — refused in paranoid
+                            # mode even when stealth_level is aggressive, while
+                            # PRECISE access moves (single ssh_login with a
+                            # known pair, beacon deploy, persistence) stay
+                            # available or the kill chain can never complete.
+    timeout: int = 30
+    banner: str = ""  # one-line label shown in the decision stream
+    tools: List[str] = field(default_factory=list)  # binaries needed on operator box
+
+    def make_command(self, wm: WorldModel, slot_values: Dict[str, Any]) -> str:
+        for slot in self.inputs:
+            if slot.required and (slot.name not in slot_values or not slot.accepts(slot_values[slot.name])):
+                raise ValueError(f"capability {self.id}: missing/invalid input '{slot.name}' ({slot.type})")
+        if self.engine is not None:
+            # In-process engine: its real work happens at EXECUTION time
+            # (`run_engine`), never here. Building a command must be pure —
+            # the chain preview calls this for every candidate and used to
+            # fire live socket probes through the adapters.
+            return f"# in-process engine ({self.id}): runs at execution time"
+        if self.adapter is None:
+            raise ValueError(f"capability {self.id} has no adapter")
+        cmd = self.adapter(wm, slot_values)
+        return cmd
+
+    def interpret(self, output: str, wm: WorldModel, slot_values: Dict[str, Any]) -> List[Finding]:
+        if self.interpreter is None:
+            return []
+        return self.interpreter(output, wm, slot_values)
+
+
+# ── in-process engine execution (timeout + cache) ─────────────────────
+
+# A probe result is only useful within a run; re-running the same engine
+# against the same target within this window returns the cached markers
+# instead of firing the sockets again (the preview/execute split can
+# otherwise ask twice).
+_ENGINE_CACHE_TTL = 120.0
+_engine_cache: Dict[Any, Tuple[float, str]] = {}
+
+
+def run_engine(cap: "Capability", wm: WorldModel,
+               slot_values: Dict[str, Any],
+               injected: Optional[Dict[str, Any]] = None) -> str:
+    """Run an in-process engine under a timeout, with a short TTL cache.
+
+    The engine is the ONE place the I/O happens; it never runs during
+    command synthesis. A timeout returns a comment line the interpreter
+    ignores, so a hung probe cannot stall the run loop.
+
+    ``injected`` carries transports the CALLER owns — today the run's fuzz
+    sender (``AutonomousAgent.fuzz_sender``), the exact analogue of the
+    runner the anomaly hunt is given. A transport is forwarded only to an
+    engine whose signature accepts it, so an engine that takes none keeps
+    working untouched, and an engine that takes one never has to invent its
+    own socket path behind the caller's back.
+    """
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TO
+
+    key = (cap.id, str(getattr(wm, "target", "")),
+           tuple(sorted((k, str(v)) for k, v in (slot_values or {}).items())),
+           tuple(sorted(injected or {})))
+    now = time.time()
+    hit = _engine_cache.get(key)
+    if hit and now - hit[0] < _ENGINE_CACHE_TTL:
+        return hit[1]
+
+    kwargs: Dict[str, Any] = {}
+    if injected:
+        try:
+            accepted = inspect.signature(cap.engine).parameters
+            kwargs = {name: value for name, value in injected.items()
+                      if name in accepted}
+        except (TypeError, ValueError):      # a builtin/opaque callable
+            kwargs = {}
+
+    # wait=False: a timed-out engine thread must NOT block the run loop
+    # while the pool joins. The worker is abandoned to finish on its own.
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(cap.engine, wm, slot_values, **kwargs)
+    try:
+        out = future.result(timeout=max(1, int(cap.timeout)))
+    except _TO:
+        out = f"# in-process engine {cap.id}: timed out"
+    except Exception as exc:  # a broken engine is a comment, not a crash
+        out = f"# in-process engine {cap.id}: {exc}"
+    finally:
+        pool.shutdown(wait=False)
+    _engine_cache[key] = (now, out)
+    return out
+
+
+class Registry:
+    """Capability registry with planner-friendly lookup."""
+
+    def __init__(self) -> None:
+        self._caps: Dict[str, Capability] = {}
+
+    def register(self, cap: Capability) -> None:
+        self._caps[cap.id] = cap
+
+    def get(self, cap_id: str) -> Optional[Capability]:
+        return self._caps.get(cap_id)
+
+    def all(self) -> List[Capability]:
+        return list(self._caps.values())
+
+    def by_category(self, category: str) -> List[Capability]:
+        return [c for c in self._caps.values() if c.category == category]
+
+    def usable(self, wm: WorldModel) -> List[Capability]:
+        """Capabilities whose preconditions are satisfied by current beliefs."""
+        return [c for c in self._caps.values() if self._ok(c, wm)]
+
+    def _ok(self, cap: Capability, wm: WorldModel) -> bool:
+        return all(p(wm) for p in cap.preconditions)
+
+    def find(self, wm: WorldModel, goal_fact: str, budget: float) -> Optional[Capability]:
+        """First capability that can produce `goal_fact` and fits the opsec budget."""
+        best = None
+        for cap in self.usable(wm):
+            if goal_fact in cap.effects and cap.opsec_cost <= budget:
+                if best is None or cap.opsec_cost < best.opsec_cost:
+                    best = cap
+        return best
+
+
+def make_registry() -> Registry:
+    """Instantiate the built-in capability set plus any machine-authored
+    capabilities living in guidance/learned/ (the evolution loop's
+    production location — see phantom/automation/evolution).
+
+    Learned capabilities import AFTER built-ins: a learned id colliding
+    with a built-in id would silently shadow it, which must never happen,
+    so collisions are refused loudly.
+    """
+    from phantom.automation.guidance import kit as _kit
+    reg = Registry()
+    for cap in _kit.CAPABILITIES:
+        reg.register(cap)
+    try:
+        from phantom.automation.guidance.learned import load_learned
+        for cap in load_learned():
+            if reg.get(cap.id) is not None:
+                raise ValueError(
+                    f"learned capability {cap.id!r} collides with an "
+                    "existing capability id — refusing to shadow it")
+            reg.register(cap)
+    except ImportError:
+        pass  # learned/ package absent (trimmed install)
+    try:
+        from phantom.automation.evolution import beta as _beta
+        for cap in _beta.pending():   # --beta staged in this process
+            if reg.get(cap.id) is None:
+                reg.register(cap)
+    except ImportError:
+        pass
+    # Runtime DRIVERS: declarative tool manifests discovered on disk. They
+    # are how a tool Phantom has never shipped becomes a plannable
+    # capability without a code change. A collision with an existing id is
+    # refused (never shadow a built-in) rather than silently overriding it.
+    try:
+        from phantom.automation.runtime.drivers import load_driver_capabilities
+        for cap in load_driver_capabilities():
+            if reg.get(cap.id) is None:
+                reg.register(cap)
+    except ImportError:
+        pass
+    return reg

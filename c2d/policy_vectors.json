@@ -1,0 +1,225 @@
+{
+  "version": 1,
+  "note": "Shared policy contract: Python decides, Go must agree, verb for verb.",
+  "cases": [
+    {
+      "name": "a known verb is allowed with no manifest",
+      "beacon": "B-TEST",
+      "grants": null,
+      "command": "whoami",
+      "typed": null,
+      "allowed": true,
+      "mode": "legacy",
+      "reason": "ok"
+    },
+    {
+      "name": "free-form shell verb is allowed with no manifest",
+      "beacon": "B-TEST",
+      "grants": null,
+      "command": "shell id",
+      "typed": null,
+      "allowed": true,
+      "mode": "legacy",
+      "reason": "ok"
+    },
+    {
+      "name": "an unknown verb is refused",
+      "beacon": "B-TEST",
+      "grants": null,
+      "command": "id",
+      "typed": null,
+      "allowed": false,
+      "mode": "legacy-denied",
+      "reason": "unknown beacon verb 'id' \u2014 wrap OS commands as 'shell <cmd>'"
+    },
+    {
+      "name": "empty command is refused",
+      "beacon": "B-TEST",
+      "grants": null,
+      "command": "   ",
+      "typed": null,
+      "allowed": false,
+      "mode": "legacy-denied",
+      "reason": "empty command"
+    },
+    {
+      "name": "a granted verb is allowed",
+      "beacon": "B-TEST",
+      "grants": [
+        "whoami",
+        "recon"
+      ],
+      "command": "recon",
+      "typed": null,
+      "allowed": true,
+      "mode": "legacy",
+      "reason": "ok"
+    },
+    {
+      "name": "a verb outside the manifest is refused",
+      "beacon": "B-TEST",
+      "grants": [
+        "whoami"
+      ],
+      "command": "edr-kill",
+      "typed": null,
+      "allowed": false,
+      "mode": "legacy-denied",
+      "reason": "verb 'edr-kill' not granted for beacon B-TEST"
+    },
+    {
+      "name": "shell is refused when the manifest omits it",
+      "beacon": "B-TEST",
+      "grants": [
+        "whoami"
+      ],
+      "command": "shell id",
+      "typed": null,
+      "allowed": false,
+      "mode": "legacy-denied",
+      "reason": "verb 'shell' not granted for beacon B-TEST"
+    },
+    {
+      "name": "shell is allowed when the manifest grants it",
+      "beacon": "B-TEST",
+      "grants": [
+        "shell"
+      ],
+      "command": "shell id",
+      "typed": null,
+      "allowed": true,
+      "mode": "legacy",
+      "reason": "ok"
+    },
+    {
+      "name": "a manifest can grant a high-impact verb explicitly",
+      "beacon": "B-TEST",
+      "grants": [
+        "exec"
+      ],
+      "command": "exec id",
+      "typed": null,
+      "allowed": true,
+      "mode": "legacy",
+      "reason": "ok"
+    },
+    {
+      "name": "typed capability granted",
+      "beacon": "B-TEST",
+      "grants": [
+        "recon"
+      ],
+      "command": null,
+      "typed": {
+        "capability_id": "recon"
+      },
+      "allowed": true,
+      "mode": "typed",
+      "reason": "ok"
+    },
+    {
+      "name": "typed capability not granted",
+      "beacon": "B-TEST",
+      "grants": [
+        "whoami"
+      ],
+      "command": null,
+      "typed": {
+        "capability_id": "recon"
+      },
+      "allowed": false,
+      "mode": "typed-denied",
+      "reason": "capability 'recon' not granted for beacon B-TEST"
+    },
+    {
+      "name": "typed capability with no manifest",
+      "beacon": "B-TEST",
+      "grants": null,
+      "command": null,
+      "typed": {
+        "capability_id": "recon"
+      },
+      "allowed": true,
+      "mode": "typed",
+      "reason": "ok"
+    },
+    {
+      "name": "typed capability expired",
+      "beacon": "B-TEST",
+      "grants": [
+        "recon"
+      ],
+      "command": null,
+      "typed": {
+        "capability_id": "recon",
+        "expires_at": 1.0
+      },
+      "allowed": false,
+      "mode": "typed-denied",
+      "reason": "task expired"
+    },
+    {
+      "name": "typed capability missing id",
+      "beacon": "B-TEST",
+      "grants": [
+        "recon"
+      ],
+      "command": null,
+      "typed": {
+        "capability_id": ""
+      },
+      "allowed": false,
+      "mode": "typed-denied",
+      "reason": "missing capability_id"
+    },
+    {
+      "name": "typed args within the cap",
+      "beacon": "B-TEST",
+      "grants": [
+        "recon"
+      ],
+      "command": null,
+      "typed": {
+        "capability_id": "recon",
+        "args": [
+          "a",
+          "a",
+          "a",
+          "a",
+          "a",
+          "a",
+          "a",
+          "a"
+        ]
+      },
+      "allowed": true,
+      "mode": "typed",
+      "reason": "ok"
+    },
+    {
+      "name": "typed args over the cap",
+      "beacon": "B-TEST",
+      "grants": [
+        "recon"
+      ],
+      "command": null,
+      "typed": {
+        "capability_id": "recon",
+        "args": [
+          "a",
+          "a",
+          "a",
+          "a",
+          "a",
+          "a",
+          "a",
+          "a",
+          "a"
+        ]
+      },
+      "allowed": false,
+      "mode": "typed-denied",
+      "reason": "too many args"
+    }
+  ]
+}

