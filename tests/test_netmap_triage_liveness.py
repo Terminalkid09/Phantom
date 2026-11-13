@@ -33,6 +33,12 @@ class TestTriageNetworks(unittest.TestCase):
         self.assertEqual(len(tri["ranked"]), 3)
         self.assertEqual(tri["method"], "nmap -sn")
 
+    # Without nmap, triage falls back to discover_network(). That fallback
+    # reads the 60s _LAST_SCAN cache and can touch the runner's real network;
+    # test order in PR CI left a cached 10.0.0.2 here, while the same test
+    # passed alone. Mock the fallback: this test is about triage's empty
+    # contract, not about live discovery.
+    @patch.object(netmap, "discover_network", return_value={"hosts": []})
     @patch.object(netmap, "_run", return_value="")
     @patch.object(netmap, "save_discovered_hosts")
     @patch("shutil.which", return_value=None)
